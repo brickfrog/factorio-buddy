@@ -16,7 +16,9 @@
       "Bash(cargo build:*)",
       "Bash(cargo run:*)",
       "Bash(cargo test:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(./tests/cleanup.sh)",
+      "Bash(./tests/setup.sh:*)"
     ]
   }
 }

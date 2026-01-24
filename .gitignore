@@ -19,4 +19,4 @@ factorio-current.log
 logs/
 
 # Headless server data (separate from Steam client)
-.factorio-server/
+.factorio-server-data/
