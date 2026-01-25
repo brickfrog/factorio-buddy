@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 use crate::output::Output;
 use crate::world::{Area, Position};
@@ -43,6 +43,12 @@ pub enum GetSubcommand {
         unit_number: u32,
     },
 
+    /// Get an entity's inventories
+    EntityInventory {
+        /// Entity unit number
+        unit_number: u32,
+    },
+
     /// Query resources in an area
     Resources {
         /// Area to search (x1,y1,x2,y2)
@@ -77,7 +83,7 @@ pub enum GetSubcommand {
     },
 }
 
-pub async fn execute(cmd: GetCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: GetCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     match cmd.command {
@@ -103,6 +109,10 @@ pub async fn execute(cmd: GetCommand, conn: &ConnectionArgs) -> Result<()> {
         GetSubcommand::Entity { unit_number } => {
             let entity = client.get_entity(unit_number).await?;
             Output::new(conn.output).print(&entity)?;
+        }
+        GetSubcommand::EntityInventory { unit_number } => {
+            let inv = client.get_entity_inventory(unit_number).await?;
+            println!("{}", serde_json::to_string_pretty(&inv)?);
         }
         GetSubcommand::Resources {
             area,

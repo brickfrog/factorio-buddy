@@ -4,7 +4,9 @@ use clap::{Parser, Subcommand};
 
 pub mod build;
 pub mod character;
+pub mod config;
 pub mod craft;
+pub mod exec;
 pub mod gather;
 pub mod get;
 pub mod insert;
@@ -36,25 +38,56 @@ pub struct Cli {
 #[derive(Parser, Debug, Clone)]
 pub struct ConnectionArgs {
     /// RCON host
-    #[arg(long, default_value = "localhost", global = true)]
-    pub host: String,
+    #[arg(long, global = true, env = "FACTORIO_RCON_HOST")]
+    pub host: Option<String>,
 
     /// RCON port
-    #[arg(long, default_value = "27015", global = true)]
-    pub port: u16,
+    #[arg(long, global = true, env = "FACTORIO_RCON_PORT")]
+    pub port: Option<u16>,
 
     /// RCON password
-    #[arg(long, default_value = "", global = true)]
-    pub password: String,
+    #[arg(long, global = true, env = "FACTORIO_RCON_PASSWORD")]
+    pub password: Option<String>,
 
     /// Output format
     #[arg(long, default_value = "human", global = true)]
     pub output: OutputFormat,
 }
 
+impl ConnectionArgs {
+    /// Resolve connection args with config file fallbacks
+    pub fn resolve(&self) -> ResolvedConnectionArgs {
+        let config = config::Config::load().unwrap_or_default();
+        ResolvedConnectionArgs {
+            host: self.host.clone()
+                .or(config.host)
+                .unwrap_or_else(|| "localhost".to_string()),
+            port: self.port
+                .or(config.port)
+                .unwrap_or(27015),
+            password: self.password.clone()
+                .or(config.password)
+                .unwrap_or_default(),
+            output: self.output,
+        }
+    }
+}
+
+/// Resolved connection arguments with defaults applied
+#[derive(Debug, Clone)]
+pub struct ResolvedConnectionArgs {
+    pub host: String,
+    pub port: u16,
+    pub password: String,
+    pub output: OutputFormat,
+}
+
 /// Top-level commands
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Configure connection settings
+    Config(config::ConfigCommand),
+
     /// Server management commands
     Server(server::ServerCommand),
 
@@ -93,4 +126,7 @@ pub enum Commands {
 
     /// Tick control (pause, resume, speed)
     Tick(tick::TickCommand),
+
+    /// Execute raw Lua command
+    Exec(exec::ExecCommand),
 }

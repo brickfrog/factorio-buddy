@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 use crate::output::{Output, OutputFormat};
 
@@ -21,7 +21,7 @@ pub struct GatherCommand {
     pub radius: u32,
 }
 
-pub async fn execute(cmd: GatherCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: GatherCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     let result = client.gather_resource(&cmd.resource, cmd.amount, cmd.radius).await?;

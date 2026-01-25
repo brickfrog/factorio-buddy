@@ -83,19 +83,20 @@ impl Area {
     }
 }
 
-/// Direction enum matching Factorio's defines.direction
+/// Direction enum matching Factorio 2.0's defines.direction
+/// In Factorio 2.0, direction values are multiples of 4 for cardinal directions
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     #[default]
     North = 0,
-    NorthEast = 1,
-    East = 2,
-    SouthEast = 3,
-    South = 4,
-    SouthWest = 5,
-    West = 6,
-    NorthWest = 7,
+    NorthEast = 2,
+    East = 4,
+    SouthEast = 6,
+    South = 8,
+    SouthWest = 10,
+    West = 12,
+    NorthWest = 14,
 }
 
 impl Direction {
@@ -104,17 +105,17 @@ impl Direction {
         *self as u8
     }
 
-    /// Create from Factorio's numeric direction
+    /// Create from Factorio 2.0's numeric direction
     pub fn from_factorio(n: u8) -> Self {
-        match n % 8 {
+        match n % 16 {
             0 => Direction::North,
-            1 => Direction::NorthEast,
-            2 => Direction::East,
-            3 => Direction::SouthEast,
-            4 => Direction::South,
-            5 => Direction::SouthWest,
-            6 => Direction::West,
-            7 => Direction::NorthWest,
+            2 => Direction::NorthEast,
+            4 => Direction::East,
+            6 => Direction::SouthEast,
+            8 => Direction::South,
+            10 => Direction::SouthWest,
+            12 => Direction::West,
+            14 => Direction::NorthWest,
             _ => Direction::North,
         }
     }

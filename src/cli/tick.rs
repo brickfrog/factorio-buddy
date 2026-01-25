@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 
 #[derive(Args, Debug)]
@@ -33,7 +33,7 @@ pub enum TickSubcommand {
     },
 }
 
-pub async fn execute(cmd: TickCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: TickCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     match cmd.command {

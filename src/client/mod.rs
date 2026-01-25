@@ -98,6 +98,14 @@ impl FactorioClient {
         Ok(entity)
     }
 
+    /// Get an entity's inventories
+    pub async fn get_entity_inventory(&mut self, unit_number: u32) -> Result<serde_json::Value> {
+        let lua = LuaCommand::get_entity_inventory(unit_number);
+        let response = self.execute_lua(&lua).await?;
+        let result: serde_json::Value = serde_json::from_str(&response)?;
+        Ok(result)
+    }
+
     // --- Resource Queries ---
 
     /// Find resources in an area

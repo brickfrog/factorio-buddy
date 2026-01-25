@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 use crate::output::Output;
 use crate::world::Position;
@@ -23,7 +23,7 @@ pub struct MineCommand {
     pub count: u32,
 }
 
-pub async fn execute(cmd: MineCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: MineCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     if let Some(pos_str) = cmd.at {

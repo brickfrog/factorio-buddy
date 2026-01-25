@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 use crate::world::Position;
 
@@ -18,7 +18,7 @@ pub struct WalkToCommand {
     pub run: bool,
 }
 
-pub async fn execute(cmd: WalkToCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: WalkToCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let parts: Vec<f64> = cmd
         .position
         .split(',')

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 use crate::output::{Output, OutputFormat};
 
@@ -68,7 +68,7 @@ pub enum BuildSubcommand {
     },
 }
 
-pub async fn execute(cmd: BuildCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: BuildCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     match cmd.command {

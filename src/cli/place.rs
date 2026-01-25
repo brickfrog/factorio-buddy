@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 use crate::output::Output;
 use crate::world::{Direction, Position};
@@ -22,7 +22,7 @@ pub struct PlaceCommand {
     pub direction: String,
 }
 
-pub async fn execute(cmd: PlaceCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: PlaceCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     let pos = parse_position(&cmd.at)?;

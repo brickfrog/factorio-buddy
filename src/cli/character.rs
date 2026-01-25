@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 use crate::output::Output;
 use crate::world::Position;
@@ -40,7 +40,7 @@ pub enum CharacterSubcommand {
     Inventory,
 }
 
-pub async fn execute(cmd: CharacterCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: CharacterCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     match cmd.command {

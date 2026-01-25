@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use super::ConnectionArgs;
+use super::ResolvedConnectionArgs;
 use crate::client::FactorioClient;
 use crate::world::Position;
 
@@ -18,7 +18,7 @@ pub struct RemoveCommand {
     pub unit_number: Option<u32>,
 }
 
-pub async fn execute(cmd: RemoveCommand, conn: &ConnectionArgs) -> Result<()> {
+pub async fn execute(cmd: RemoveCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     if let Some(pos_str) = cmd.at {

@@ -68,7 +68,14 @@ rcon.print(helpers.table_to_json(result))
     pub fn get_entity(unit_number: u32) -> String {
         format!(
             r#"
-local e = game.get_entity_by_unit_number({})
+-- Find entity by unit_number via search
+local e = nil
+for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
+    if entity.unit_number == {} then
+        e = entity
+        break
+    end
+end
 if e then
     rcon.print(helpers.table_to_json({{
         unit_number = e.unit_number,
@@ -82,6 +89,62 @@ if e then
 else
     rcon.print("null")
 end
+"#,
+            unit_number
+        )
+        .trim()
+        .to_string()
+    }
+
+    /// Get an entity's inventories
+    pub fn get_entity_inventory(unit_number: u32) -> String {
+        format!(
+            r#"
+-- Find entity by unit_number via search
+local e = nil
+for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
+    if entity.unit_number == {} then
+        e = entity
+        break
+    end
+end
+if not e then
+    rcon.print('{{"error": "Entity not found"}}')
+    return
+end
+
+local result = {{
+    unit_number = e.unit_number,
+    name = e.name,
+    inventories = {{}}
+}}
+
+-- Try common inventory types
+local inv_types = {{
+    {{ name = "fuel", define = defines.inventory.fuel }},
+    {{ name = "chest", define = defines.inventory.chest }},
+    {{ name = "furnace_source", define = defines.inventory.furnace_source }},
+    {{ name = "furnace_result", define = defines.inventory.furnace_result }},
+    {{ name = "assembling_machine_input", define = defines.inventory.assembling_machine_input }},
+    {{ name = "assembling_machine_output", define = defines.inventory.assembling_machine_output }},
+    {{ name = "burnt_result", define = defines.inventory.burnt_result }},
+}}
+
+for _, inv_type in pairs(inv_types) do
+    local inv = e.get_inventory(inv_type.define)
+    if inv then
+        local contents = inv.get_contents()
+        local items = {{}}
+        for item, count in pairs(contents) do
+            table.insert(items, {{ name = item, count = count }})
+        end
+        if #items > 0 then
+            result.inventories[inv_type.name] = items
+        end
+    end
+end
+
+rcon.print(helpers.table_to_json(result))
 "#,
             unit_number
         )
@@ -678,7 +741,14 @@ rcon.print('{{"error": "No entity found"}}')
     pub fn remove_entity(unit_number: u32) -> String {
         format!(
             r#"
-local e = game.get_entity_by_unit_number({})
+-- Find entity by unit_number via search
+local e = nil
+for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
+    if entity.unit_number == {} then
+        e = entity
+        break
+    end
+end
 if e then
     e.destroy()
     rcon.print("ok")
@@ -706,7 +776,14 @@ end
 
         format!(
             r#"
-local e = game.get_entity_by_unit_number({})
+-- Find entity by unit_number via search (get_entity_by_unit_number doesn't work for Lua-created entities)
+local e = nil
+for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
+    if entity.unit_number == {} then
+        e = entity
+        break
+    end
+end
 if not e then
     rcon.print('{{"error": "Entity not found"}}')
     return
@@ -731,7 +808,14 @@ rcon.print(helpers.table_to_json({{ inserted = inserted }}))
     pub fn set_recipe(unit_number: u32, recipe: &str) -> String {
         format!(
             r#"
-local e = game.get_entity_by_unit_number({})
+-- Find entity by unit_number via search
+local e = nil
+for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
+    if entity.unit_number == {} then
+        e = entity
+        break
+    end
+end
 if not e then
     rcon.print('{{"error": "Entity not found"}}')
     return
