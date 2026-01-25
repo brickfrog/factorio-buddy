@@ -2,8 +2,10 @@
 
 use clap::{Parser, Subcommand};
 
+pub mod build;
 pub mod character;
 pub mod craft;
+pub mod gather;
 pub mod get;
 pub mod insert;
 pub mod mine;
@@ -12,6 +14,7 @@ pub mod remove;
 pub mod server;
 pub mod set_recipe;
 pub mod tick;
+pub mod walk_to;
 
 // Re-export OutputFormat from output module
 pub use crate::output::OutputFormat;
@@ -61,7 +64,16 @@ pub enum Commands {
     /// Character control (init, teleport, walk, status, inventory)
     Character(character::CharacterCommand),
 
-    /// Mine entities
+    /// Walk to a position (smooth navigation)
+    WalkTo(walk_to::WalkToCommand),
+
+    /// Gather resources (walk to and mine)
+    Gather(gather::GatherCommand),
+
+    /// Build structures (drills, smelters, from plan)
+    Build(build::BuildCommand),
+
+    /// Mine entities (low-level)
     Mine(mine::MineCommand),
 
     /// Craft items

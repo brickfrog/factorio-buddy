@@ -401,55 +401,77 @@ end
     pub fn mine_at(position: Position, count: u32) -> String {
         format!(
             r#"
-if not global then global = {{}} end local c = global.factorioctl_character
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then if not global then global = {{}} end c = global.factorioctl_character end
 if not (c and c.valid) then
     rcon.print('{{"success": false, "error": "No character"}}')
     return
 end
 
+-- Count inventory before mining
+local inv = c.get_main_inventory()
+local before_count = 0
+if inv then
+    for _, item in pairs(inv.get_contents()) do
+        before_count = before_count + item.count
+    end
+end
+
 local mined = 0
-local items_gained = {{}}
 
 for i = 1, {} do
-    local entities = game.surfaces[1].find_entities_filtered{{
+    -- Try to find resources first (iron-ore, coal, etc.)
+    local resources = game.surfaces[1].find_entities_filtered{{
         position = {{ {}, {} }},
-        radius = 1.5
+        radius = 2,
+        type = "resource"
     }}
 
     local target = nil
-    for _, e in pairs(entities) do
-        if e.minable and e ~= c then
-            target = e
-            break
+    if #resources > 0 then
+        target = resources[1]
+    else
+        -- Fall back to other minable entities
+        local entities = game.surfaces[1].find_entities_filtered{{
+            position = {{ {}, {} }},
+            radius = 2
+        }}
+        for _, e in pairs(entities) do
+            if e.minable and e ~= c then
+                target = e
+                break
+            end
         end
     end
 
     if target then
-        local success = c.mine_entity(target, true)
-        if success then
-            mined = mined + 1
-        end
+        c.mine_entity(target, true)
+        mined = mined + 1
     else
         break
     end
 end
 
--- Get inventory to see what we have now
-local inv = c.get_main_inventory()
+-- Count inventory after mining
+local after_count = 0
 local items = {{}}
 if inv then
     for _, item in pairs(inv.get_contents()) do
+        after_count = after_count + item.count
         table.insert(items, {{ name = item.name, count = item.count }})
     end
 end
 
+local items_gained = after_count - before_count
+
 rcon.print(helpers.table_to_json({{
-    success = mined > 0,
-    mined_count = mined,
+    success = items_gained > 0,
+    mined_count = items_gained,
     inventory = items
 }}))
 "#,
-            count, position.x, position.y
+            count, position.x, position.y, position.x, position.y
         )
         .trim()
         .to_string()
@@ -459,7 +481,9 @@ rcon.print(helpers.table_to_json({{
     pub fn mine_nearest(entity_type: &str, count: u32) -> String {
         format!(
             r#"
-if not global then global = {{}} end local c = global.factorioctl_character
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then if not global then global = {{}} end c = global.factorioctl_character end
 if not (c and c.valid) then
     rcon.print('{{"success": false, "error": "No character"}}')
     return
@@ -561,7 +585,9 @@ end
     pub fn place_entity(entity_name: &str, position: Position, direction: Direction) -> String {
         format!(
             r#"
-if not global then global = {{}} end local c = global.factorioctl_character
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then if not global then global = {{}} end c = global.factorioctl_character end
 if not (c and c.valid) then
     rcon.print('{{"error": "No character"}}')
     return
@@ -599,7 +625,7 @@ if e then
     rcon.print(helpers.table_to_json({{
         unit_number = e.unit_number,
         name = e.name,
-        type = e.type,
+        entity_type = e.type,
         position = {{ x = e.position.x, y = e.position.y }},
         direction = e.direction,
         health = e.health,

@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 /// Output format for commands
-#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
     /// Human-readable output
     #[default]
@@ -220,5 +220,68 @@ impl Outputable for crate::world::CraftResult {
             "Queued {} items for crafting (queue size: {})",
             self.queued, self.queue_size
         )
+    }
+}
+
+impl Outputable for crate::world::GatherResult {
+    fn format_human(&self) -> String {
+        if !self.success {
+            return format!(
+                "Gathering failed: {}",
+                self.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        let mut lines = vec![format!(
+            "Gathered {} {} (walked {:.1} tiles)",
+            self.gathered, self.resource_name, self.distance_walked
+        )];
+        if !self.inventory.is_empty() {
+            lines.push("Inventory:".to_string());
+            for item in &self.inventory {
+                lines.push(format!("  {} x{}", item.name, item.count));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+impl Outputable for crate::world::WalkResult {
+    fn format_human(&self) -> String {
+        if self.arrived {
+            format!(
+                "Arrived at ({:.1}, {:.1}) after walking {:.1} tiles",
+                self.final_position.x, self.final_position.y, self.distance_walked
+            )
+        } else {
+            format!(
+                "Stopped at ({:.1}, {:.1}) after walking {:.1} tiles: {}",
+                self.final_position.x,
+                self.final_position.y,
+                self.distance_walked,
+                self.reason.as_deref().unwrap_or("unknown reason")
+            )
+        }
+    }
+}
+
+impl Outputable for crate::world::BuildResult {
+    fn format_human(&self) -> String {
+        let mut lines = vec![format!("Placed {}/{} entities", self.placed, self.total)];
+        for entity in &self.entities {
+            lines.push(format!(
+                "  #{} {} at ({:.1}, {:.1})",
+                entity.unit_number.unwrap_or(0),
+                entity.name,
+                entity.position.x,
+                entity.position.y
+            ));
+        }
+        if !self.errors.is_empty() {
+            lines.push("Errors:".to_string());
+            for err in &self.errors {
+                lines.push(format!("  - {}", err));
+            }
+        }
+        lines.join("\n")
     }
 }

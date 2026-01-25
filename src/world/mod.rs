@@ -3,12 +3,14 @@
 mod entity;
 mod inventory;
 mod resource;
+mod results;
 mod surface;
 mod tile;
 
 pub use entity::*;
 pub use inventory::*;
 pub use resource::*;
+pub use results::*;
 pub use surface::*;
 pub use tile::*;
 
@@ -114,6 +116,21 @@ impl Direction {
             6 => Direction::West,
             7 => Direction::NorthWest,
             _ => Direction::North,
+        }
+    }
+
+    /// Parse from string name
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "north" | "n" | "up" => Some(Direction::North),
+            "northeast" | "ne" => Some(Direction::NorthEast),
+            "east" | "e" | "right" => Some(Direction::East),
+            "southeast" | "se" => Some(Direction::SouthEast),
+            "south" | "s" | "down" => Some(Direction::South),
+            "southwest" | "sw" => Some(Direction::SouthWest),
+            "west" | "w" | "left" => Some(Direction::West),
+            "northwest" | "nw" => Some(Direction::NorthWest),
+            _ => None,
         }
     }
 
