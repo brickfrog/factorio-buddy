@@ -22,6 +22,7 @@ pub mod power;
 pub mod remove;
 pub mod research;
 pub mod route;
+pub mod say;
 pub mod server;
 pub mod set_recipe;
 pub mod tick;
@@ -168,4 +169,7 @@ pub enum Commands {
 
     /// Belt infrastructure commands
     Belt(belt::BeltCommand),
+
+    /// Broadcast a message in-game and/or via TTS
+    Say(say::SayCommand),
 }

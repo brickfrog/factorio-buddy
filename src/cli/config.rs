@@ -1,9 +1,10 @@
-//! Configuration management
+//! Configuration management CLI commands
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+
+// Re-export config types from the shared config module
+pub use crate::config::{BroadcastConfig, Config, TtsConfig};
 
 #[derive(Args, Debug)]
 pub struct ConfigCommand {
@@ -33,53 +34,6 @@ pub enum ConfigSubcommand {
 
     /// Clear saved configuration
     Clear,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Config {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-}
-
-impl Config {
-    /// Get the config file path
-    pub fn path() -> PathBuf {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".factorioctl.json")
-    }
-
-    /// Load config from file
-    pub fn load() -> Result<Self> {
-        let path = Self::path();
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            Ok(serde_json::from_str(&content)?)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
-    /// Save config to file
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path();
-        let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, content)?;
-        Ok(())
-    }
-
-    /// Clear the config file
-    pub fn clear() -> Result<()> {
-        let path = Self::path();
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-        Ok(())
-    }
 }
 
 pub async fn execute(cmd: ConfigCommand) -> Result<()> {

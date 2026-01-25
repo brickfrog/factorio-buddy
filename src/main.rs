@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 mod analyze;
 mod cli;
 mod client;
+mod config;
 mod output;
 mod world;
 
@@ -48,5 +49,6 @@ async fn main() -> Result<()> {
         Commands::Research(cmd) => cli::research::execute(cmd, &conn).await,
         Commands::Power(cmd) => cli::power::execute(cmd, &conn).await,
         Commands::Belt(cmd) => cli::belt::execute(cmd, &conn).await,
+        Commands::Say(cmd) => cli::say::execute(cmd, &conn).await,
     }
 }

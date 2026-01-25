@@ -217,6 +217,13 @@ pub struct ExecuteLuaParams {
     pub lua: String,
 }
 
+/// Parameters for broadcast_thought tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BroadcastThoughtParams {
+    /// The message/thought to broadcast
+    pub message: String,
+}
+
 // === The MCP Server ===
 
 /// The MCP server for Factorio control
@@ -627,6 +634,129 @@ impl FactorioMcp {
         match client.execute_lua(&params.lua).await {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    /// Broadcast a thought or message to the human player.
+    #[tool(description = "Broadcast a thought or message to the human player. \
+        Displays in-game (console and/or flying text) and speaks via TTS based on config. \
+        Use this to communicate your thinking, status updates, or observations.")]
+    async fn broadcast_thought(&self, Parameters(params): Parameters<BroadcastThoughtParams>) -> String {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        // Load config for defaults
+        let config = factorioctl::config::Config::load().unwrap_or_default();
+        let broadcast_config = config.broadcast.unwrap_or_default();
+
+        let mut results = Vec::new();
+
+        // In-game display
+        if broadcast_config.console || broadcast_config.flying_text {
+            let mut client = match self.connect().await {
+                Ok(c) => c,
+                Err(e) => return format!("Error connecting: {}", e),
+            };
+
+            if broadcast_config.console {
+                let escaped = params.message.replace('\\', "\\\\").replace('"', "\\\"");
+                let lua = format!(r#"game.print("[Agent] {}")"#, escaped);
+                if let Err(e) = client.execute_lua(&lua).await {
+                    results.push(format!("Console error: {}", e));
+                } else {
+                    results.push("Console: displayed".to_string());
+                }
+            }
+
+            if broadcast_config.flying_text {
+                let escaped = params.message.replace('\\', "\\\\").replace('"', "\\\"");
+                let lua = format!(
+                    r#"local p = game.players[1] if p and p.character and p.character.valid then \
+                    p.character.surface.create_entity{{name="flying-text", \
+                    position={{p.character.position.x, p.character.position.y - 2}}, \
+                    text="{}", color={{r=0.8,g=0.8,b=1}}}} end"#,
+                    escaped
+                );
+                if let Err(e) = client.execute_lua(&lua).await {
+                    results.push(format!("Flying text error: {}", e));
+                } else {
+                    results.push("Flying text: displayed".to_string());
+                }
+            }
+        }
+
+        // TTS (spawn in background to not block MCP response)
+        if let Some(ref tts_config) = broadcast_config.tts {
+            if tts_config.enabled {
+                let message = params.message.clone();
+                let backend = tts_config.backend.clone();
+                let voice = tts_config.voice.clone();
+                let rate = tts_config.rate;
+                let openai_key = tts_config.openai_api_key.clone()
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+
+                tokio::spawn(async move {
+                    match backend.as_str() {
+                        "say" => {
+                            let mut cmd = Command::new("say");
+                            if let Some(ref v) = voice {
+                                cmd.arg("-v").arg(v);
+                            }
+                            if let Some(r) = rate {
+                                let wpm = (175.0 * r) as u32;
+                                cmd.arg("-r").arg(wpm.to_string());
+                            }
+                            cmd.arg(&message);
+                            let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().await;
+                        }
+                        "openai" => {
+                            if let Some(api_key) = openai_key {
+                                let voice = voice.as_deref().unwrap_or("nova");
+                                let speed = rate.unwrap_or(1.0);
+                                let body = serde_json::json!({
+                                    "model": "tts-1",
+                                    "input": message,
+                                    "voice": voice,
+                                    "speed": speed
+                                });
+
+                                let mut curl = Command::new("curl");
+                                curl.args([
+                                    "-s", "-X", "POST",
+                                    "https://api.openai.com/v1/audio/speech",
+                                    "-H", &format!("Authorization: Bearer {}", api_key),
+                                    "-H", "Content-Type: application/json",
+                                    "-d", &body.to_string(),
+                                    "--output", "-",
+                                ]);
+
+                                if let Ok(output) = curl.output().await {
+                                    if output.status.success() {
+                                        let mut play = Command::new("afplay");
+                                        play.arg("-").stdin(Stdio::piped());
+                                        if let Ok(mut child) = play.spawn() {
+                                            if let Some(mut stdin) = child.stdin.take() {
+                                                use tokio::io::AsyncWriteExt;
+                                                let _ = stdin.write_all(&output.stdout).await;
+                                            }
+                                            let _ = child.wait().await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+
+                results.push("TTS: speaking (background)".to_string());
+            }
+        }
+
+        if results.is_empty() {
+            "No output enabled (check broadcast config in .factorioctl.json)".to_string()
+        } else {
+            results.join(", ")
         }
     }
 }
