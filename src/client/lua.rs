@@ -376,7 +376,11 @@ end
     pub fn teleport_character(position: Position) -> String {
         format!(
             r#"
-if not global then global = {{}} end local c = global.factorioctl_character
+local c = nil
+for _, p in pairs(game.connected_players) do
+    if p.character and p.character.valid then c = p.character break end
+end
+if not c then if not global then global = {{}} end c = global.factorioctl_character end
 if c and c.valid then
     c.teleport({{ {}, {} }})
     rcon.print("ok")
@@ -394,7 +398,11 @@ end
     pub fn walk_character(position: Position) -> String {
         format!(
             r#"
-if not global then global = {{}} end local c = global.factorioctl_character
+local c = nil
+for _, p in pairs(game.connected_players) do
+    if p.character and p.character.valid then c = p.character break end
+end
+if not c then if not global then global = {{}} end c = global.factorioctl_character end
 if c and c.valid then
     -- Calculate direction to target
     local dx = {} - c.position.x

@@ -1,5 +1,13 @@
 # Bug: Exclamation marks rendered as "\!" in game chat
 
+**STATUS: FIXED**
+
+## Root Cause
+Bash's history expansion escapes `!` to `\!` before passing to the program. When the Rust code then escaped backslashes for Lua (`\` → `\\`), `\!` became `\\!`, which Lua displayed as literal `\!`.
+
+## Fix
+Added unescaping step in `src/cli/say.rs` to convert `\!` back to `!` before processing.
+
 ## Command
 ```bash
 ./target/release/factorioctl --host localhost --port 27016 --password test_password say "Hello! This is exciting!"

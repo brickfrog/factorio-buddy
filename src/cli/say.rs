@@ -57,14 +57,20 @@ pub async fn execute(cmd: SayCommand, conn: &ResolvedConnectionArgs) -> Result<(
 }
 
 async fn display_console(client: &mut FactorioClient, message: &str) -> Result<()> {
-    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
+    // Unescape shell-escaped exclamation marks (bash escapes ! as \!)
+    let unescaped = message.replace("\\!", "!");
+    // Escape backslashes and quotes for Lua string
+    let escaped = unescaped.replace('\\', "\\\\").replace('"', "\\\"");
     let lua = format!(r#"game.print("[Agent] {}")"#, escaped);
     client.execute_lua(&lua).await?;
     Ok(())
 }
 
 async fn display_flying_text(client: &mut FactorioClient, message: &str) -> Result<()> {
-    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
+    // Unescape shell-escaped exclamation marks (bash escapes ! as \!)
+    let unescaped = message.replace("\\!", "!");
+    // Escape backslashes and quotes for Lua string
+    let escaped = unescaped.replace('\\', "\\\\").replace('"', "\\\"");
     let lua = format!(
         r#"
 local player = game.players[1]
@@ -107,15 +113,10 @@ async fn speak_macos_say(message: &str, config: &TtsConfig) -> Result<()> {
 
     cmd.arg(message);
 
-    let status = cmd
-        .stdout(Stdio::null())
+    // Spawn without waiting - allows agent to continue while TTS plays
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .await?;
-
-    if !status.success() {
-        anyhow::bail!("macOS say command failed");
-    }
+        .spawn()?;
 
     Ok(())
 }
@@ -139,41 +140,51 @@ async fn speak_openai(message: &str, config: &TtsConfig) -> Result<()> {
         "speed": speed
     });
 
-    // Use curl for simplicity (avoids adding reqwest dependency)
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-s",
-        "-X",
-        "POST",
-        "https://api.openai.com/v1/audio/speech",
-        "-H",
-        &format!("Authorization: Bearer {}", api_key),
-        "-H",
-        "Content-Type: application/json",
-        "-d",
-        &body.to_string(),
-        "--output",
-        "-",
-    ]);
+    // Spawn the entire TTS pipeline in a background task so it doesn't block
+    let body_str = body.to_string();
+    tokio::spawn(async move {
+        // Use curl for simplicity (avoids adding reqwest dependency)
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "-s",
+            "-X",
+            "POST",
+            "https://api.openai.com/v1/audio/speech",
+            "-H",
+            &format!("Authorization: Bearer {}", api_key),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body_str,
+            "--output",
+            "-",
+        ]);
 
-    let output = cmd.output().await?;
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(_) => return,
+        };
 
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("OpenAI TTS request failed: {}", error);
-    }
+        if !output.status.success() {
+            return;
+        }
 
-    // Pipe audio to afplay (macOS) for playback
-    let mut play_cmd = Command::new("afplay");
-    play_cmd.arg("-");
-    play_cmd.stdin(Stdio::piped());
+        // Pipe audio to afplay (macOS) for playback
+        let mut play_cmd = Command::new("afplay");
+        play_cmd.arg("-");
+        play_cmd.stdin(Stdio::piped());
 
-    let mut child = play_cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin.write_all(&output.stdout).await?;
-    }
-    child.wait().await?;
+        let mut child = match play_cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(&output.stdout).await;
+        }
+        // Don't wait for playback to complete
+    });
 
     Ok(())
 }

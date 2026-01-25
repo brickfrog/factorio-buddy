@@ -1,5 +1,13 @@
 # Bug: Character teleport command does not move character
 
+**STATUS: FIXED**
+
+## Root Cause
+The `teleport_character` Lua command only checked `global.factorioctl_character` (the spawned character) but not `game.connected_players` (human player's character).
+
+## Fix
+Updated `src/client/lua.rs` to check connected players first, matching the pattern used in other character commands.
+
 ## Command
 ```bash
 ./target/release/factorioctl --host localhost --port 27016 --password test_password character teleport "76,-26"

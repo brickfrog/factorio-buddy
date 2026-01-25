@@ -1,5 +1,15 @@
 # Bug: TTS should not block command execution
 
+**STATUS: FIXED**
+
+## Root Cause
+Both the macOS `say` backend and OpenAI TTS backend were using blocking calls (`.status().await` and `.wait().await`) that waited for audio playback to complete.
+
+## Fix
+Updated `src/cli/say.rs`:
+- macOS `say`: Changed to `.spawn()` without waiting
+- OpenAI TTS: Wrapped entire pipeline in `tokio::spawn()` to run in background
+
 ## Command
 ```bash
 ./target/release/factorioctl --host localhost --port 27016 --password test_password say "Message to speak"
