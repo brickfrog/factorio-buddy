@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 
+pub mod belt;
 pub mod blueprint;
 pub mod build;
 pub mod character;
@@ -159,4 +160,7 @@ pub enum Commands {
 
     /// Power infrastructure commands
     Power(power::PowerCommand),
+
+    /// Belt infrastructure commands
+    Belt(belt::BeltCommand),
 }

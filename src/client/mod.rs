@@ -731,7 +731,92 @@ end
         })
     }
 
-    /// Smooth walk to a target position
+    /// Walk to a target position using A* pathfinding to avoid obstacles
+    pub async fn walk_to_pathfind(
+        &mut self,
+        target: Position,
+        search_radius: u32,
+    ) -> Result<WalkResult> {
+        use crate::world::find_walk_path;
+
+        let start_pos = self.get_character_position().await?;
+        let start_grid = GridPos::from_position(&start_pos);
+        let end_grid = GridPos::from_position(&target);
+
+        // If already at target, return immediately
+        if start_pos.distance(&target) < 1.5 {
+            return Ok(WalkResult {
+                arrived: true,
+                final_position: start_pos,
+                distance_walked: 0.0,
+                reason: None,
+            });
+        }
+
+        // Build collision map for the area
+        let padding = search_radius as f64;
+        let area = Area {
+            left_top: Position {
+                x: start_pos.x.min(target.x) - padding,
+                y: start_pos.y.min(target.y) - padding,
+            },
+            right_bottom: Position {
+                x: start_pos.x.max(target.x) + padding,
+                y: start_pos.y.max(target.y) + padding,
+            },
+        };
+
+        let collision_map = self.build_collision_map(area).await?;
+
+        // Find path using A*
+        let path_result = find_walk_path(start_grid, end_grid, &collision_map);
+
+        if !path_result.success {
+            // Fall back to direct walking
+            return self.walk_to(target, false).await;
+        }
+
+        // Walk through each waypoint
+        let mut total_distance = 0.0;
+        let mut current_pos = start_pos;
+
+        for waypoint in &path_result.path {
+            let waypoint_pos = waypoint.to_position();
+
+            // Walk to this waypoint using the direct method
+            let result = self.walk_to(waypoint_pos, false).await?;
+            total_distance += result.distance_walked;
+
+            if !result.arrived && result.final_position.distance(&waypoint_pos) > 3.0 {
+                // Got stuck, return current result
+                return Ok(WalkResult {
+                    arrived: false,
+                    final_position: result.final_position,
+                    distance_walked: total_distance,
+                    reason: Some("Blocked on path".to_string()),
+                });
+            }
+
+            current_pos = result.final_position;
+        }
+
+        // Check if we arrived
+        let final_pos = self.get_character_position().await?;
+        let arrived = final_pos.distance(&target) < 3.0;
+
+        Ok(WalkResult {
+            arrived,
+            final_position: final_pos,
+            distance_walked: total_distance,
+            reason: if arrived {
+                None
+            } else {
+                Some("Did not reach target".to_string())
+            },
+        })
+    }
+
+    /// Smooth walk to a target position (direct, no pathfinding)
     pub async fn walk_to(&mut self, target: Position, _run: bool) -> Result<WalkResult> {
         let mut total_distance = 0.0;
         let start_pos = self.get_character_position().await?;

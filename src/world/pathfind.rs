@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{Area, Direction, Position};
 
 /// Grid position for pathfinding (integer coordinates)
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GridPos {
     pub x: i32,
     pub y: i32,
@@ -103,6 +103,20 @@ pub struct RouteResult {
     /// Number of turns in the path
     pub turn_count: u32,
     /// Error message if routing failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Result of walk pathfinding
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalkPathResult {
+    /// Whether a path was found
+    pub success: bool,
+    /// Path waypoints from start to end
+    pub path: Vec<GridPos>,
+    /// Total path length in tiles
+    pub path_length: u32,
+    /// Error message if pathfinding failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -323,6 +337,134 @@ fn count_turns(belts: &[BeltPlacement]) -> u32 {
         }
     }
     turns
+}
+
+/// A* pathfinding for walking (returns simplified waypoints)
+pub fn find_walk_path(start: GridPos, goal: GridPos, collision_map: &CollisionMap) -> WalkPathResult {
+    // Check start and goal are valid
+    if !collision_map.is_walkable(&start) {
+        return WalkPathResult {
+            success: false,
+            path: vec![],
+            path_length: 0,
+            error: Some("Start position is blocked".to_string()),
+        };
+    }
+    if !collision_map.is_walkable(&goal) {
+        return WalkPathResult {
+            success: false,
+            path: vec![],
+            path_length: 0,
+            error: Some("Goal position is blocked".to_string()),
+        };
+    }
+
+    // A* data structures
+    let mut open_set = BinaryHeap::new();
+    let mut came_from: HashMap<GridPos, (GridPos, Direction)> = HashMap::new();
+    let mut g_score: HashMap<GridPos, f64> = HashMap::new();
+    let mut closed_set: HashSet<GridPos> = HashSet::new();
+
+    // Initialize with start node
+    g_score.insert(start, 0.0);
+    open_set.push(PathNode {
+        pos: start,
+        direction: Direction::North,
+        g_cost: 0.0,
+        f_cost: start.manhattan_distance(&goal) as f64,
+    });
+
+    while let Some(current) = open_set.pop() {
+        if current.pos == goal {
+            // Reconstruct and simplify path
+            let full_path = reconstruct_path(&came_from, goal, start);
+            let simplified = simplify_walk_path(&full_path);
+            return WalkPathResult {
+                success: true,
+                path_length: full_path.len() as u32,
+                path: simplified,
+                error: None,
+            };
+        }
+
+        if closed_set.contains(&current.pos) {
+            continue;
+        }
+        closed_set.insert(current.pos);
+
+        let arrival_direction = came_from
+            .get(&current.pos)
+            .map(|(_, d)| *d)
+            .unwrap_or(Direction::North);
+
+        // Explore neighbors (including diagonals for walking)
+        for (neighbor, move_direction) in current.pos.cardinal_neighbors() {
+            if !collision_map.is_walkable(&neighbor) || closed_set.contains(&neighbor) {
+                continue;
+            }
+
+            let is_turn = current.pos != start && arrival_direction != move_direction;
+            let turn_cost = if is_turn { 0.05 } else { 0.0 };
+            let tentative_g = current.g_cost + 1.0 + turn_cost;
+
+            let current_g = g_score.get(&neighbor).copied().unwrap_or(f64::INFINITY);
+            if tentative_g < current_g {
+                came_from.insert(neighbor, (current.pos, move_direction));
+                g_score.insert(neighbor, tentative_g);
+
+                let h = neighbor.manhattan_distance(&goal) as f64;
+                open_set.push(PathNode {
+                    pos: neighbor,
+                    direction: move_direction,
+                    g_cost: tentative_g,
+                    f_cost: tentative_g + h,
+                });
+            }
+        }
+    }
+
+    // No path found
+    WalkPathResult {
+        success: false,
+        path: vec![],
+        path_length: 0,
+        error: Some("No path found - obstacles may be blocking the route".to_string()),
+    }
+}
+
+/// Simplify a walk path by removing intermediate points on straight lines
+/// Only keep waypoints where direction changes or every N tiles
+fn simplify_walk_path(path: &[GridPos]) -> Vec<GridPos> {
+    if path.len() <= 2 {
+        return path.to_vec();
+    }
+
+    let mut simplified = vec![path[0]];
+    let mut last_direction: Option<(i32, i32)> = None;
+    let mut steps_since_waypoint = 0;
+    const MAX_STEPS_BETWEEN_WAYPOINTS: i32 = 10;
+
+    for i in 1..path.len() {
+        let dx = path[i].x - path[i - 1].x;
+        let dy = path[i].y - path[i - 1].y;
+        let current_direction = (dx, dy);
+
+        let is_turn = last_direction.map(|d| d != current_direction).unwrap_or(false);
+        steps_since_waypoint += 1;
+
+        // Add waypoint on direction change or after max steps
+        if is_turn || steps_since_waypoint >= MAX_STEPS_BETWEEN_WAYPOINTS {
+            simplified.push(path[i - 1]);
+            steps_since_waypoint = 0;
+        }
+
+        last_direction = Some(current_direction);
+    }
+
+    // Always add the final destination
+    simplified.push(path[path.len() - 1]);
+
+    simplified
 }
 
 #[cfg(test)]

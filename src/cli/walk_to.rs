@@ -16,6 +16,14 @@ pub struct WalkToCommand {
     /// Run instead of walk (faster)
     #[arg(long, short)]
     pub run: bool,
+
+    /// Use A* pathfinding to avoid obstacles
+    #[arg(long, short = 'p')]
+    pub pathfind: bool,
+
+    /// Search radius for pathfinding obstacle detection (tiles)
+    #[arg(long, default_value = "20")]
+    pub search_radius: u32,
 }
 
 pub async fn execute(cmd: WalkToCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
@@ -35,20 +43,39 @@ pub async fn execute(cmd: WalkToCommand, conn: &ResolvedConnectionArgs) -> Resul
     let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
 
     let start = client.get_character_position().await?;
-    println!("Walking from ({:.1}, {:.1}) to ({:.1}, {:.1})...", start.x, start.y, target.x, target.y);
 
-    let result = client.walk_to(target, cmd.run).await?;
-
-    if result.arrived {
-        println!("Arrived at ({:.1}, {:.1})", result.final_position.x, result.final_position.y);
+    if cmd.pathfind {
+        println!(
+            "Planning path from ({:.0}, {:.0}) to ({:.0}, {:.0}) with A*...",
+            start.x, start.y, target.x, target.y
+        );
     } else {
         println!(
-            "Stopped at ({:.1}, {:.1}) - {}",
-            result.final_position.x, result.final_position.y,
+            "Walking from ({:.0}, {:.0}) to ({:.0}, {:.0})...",
+            start.x, start.y, target.x, target.y
+        );
+    }
+
+    let result = if cmd.pathfind {
+        client.walk_to_pathfind(target, cmd.search_radius).await?
+    } else {
+        client.walk_to(target, cmd.run).await?
+    };
+
+    if result.arrived {
+        println!(
+            "Arrived at ({:.0}, {:.0})",
+            result.final_position.x, result.final_position.y
+        );
+    } else {
+        println!(
+            "Stopped at ({:.0}, {:.0}) - {}",
+            result.final_position.x,
+            result.final_position.y,
             result.reason.unwrap_or_else(|| "unknown".to_string())
         );
     }
-    println!("Distance walked: {:.1}", result.distance_walked);
+    println!("Distance walked: {:.1} tiles", result.distance_walked);
 
     client.close().await?;
     Ok(())

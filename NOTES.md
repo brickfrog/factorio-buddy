@@ -95,6 +95,37 @@ Coal miners at (78, -22) and (78, -24):
 3. Scale up production
 4. Research more technologies
 
+## A* Pathfinding
+
+The CLI now supports A* pathfinding for both walking and belt routing:
+
+### Belt Routing with A*
+```bash
+# Route a belt line avoiding obstacles
+factorioctl belt line --from 0,0 --to 20,0 --search-radius 10
+
+# Dry run to preview the path
+factorioctl belt line --from 0,0 --to 20,0 --dry-run
+
+# Multi-segment route through waypoints
+factorioctl belt route --waypoints "0,0;10,5;20,0"
+```
+
+### Walking with A*
+```bash
+# Walk with pathfinding to avoid obstacles
+factorioctl walk-to 50,50 --pathfind
+
+# Adjust search radius for pathfinding
+factorioctl walk-to 50,50 --pathfind --search-radius 30
+```
+
+The pathfinder:
+- Builds a collision map from tiles and entities
+- Uses A* with turn cost penalties for smoother paths
+- Skips resources (can place belts over ore)
+- Simplifies walk paths to reduce waypoints
+
 ## Bugs Fixed This Session
 
 - `create_blueprint` returns array of entity indices in Factorio 2.0, not count
