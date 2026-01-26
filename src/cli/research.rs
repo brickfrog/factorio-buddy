@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use super::ResolvedConnectionArgs;
+use crate::client::lua::LuaCommand;
 use crate::client::FactorioClient;
 
 #[derive(Args, Debug)]
@@ -35,49 +36,67 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
 
     match cmd.command {
         ResearchSubcommand::Status => {
-            let response = client
-                .execute_lua(
-                    r#"
-local force = game.forces.player
-local researched = {}
-local available = {}
-for name, tech in pairs(force.technologies) do
-    if tech.researched then
-        table.insert(researched, name)
-    elseif tech.enabled then
-        local all_met = true
-        for _, prereq in pairs(tech.prerequisites) do
-            if not prereq.researched then
-                all_met = false
-                break
-            end
-        end
-        if all_met then
-            table.insert(available, name)
-        end
-    end
-end
-table.sort(researched)
-table.sort(available)
-rcon.print(helpers.table_to_json({researched = researched, available = available}))
-"#,
-                )
-                .await?;
+            let lua = LuaCommand::get_research_status();
+            let response = client.execute_lua(&lua).await?;
 
             #[derive(serde::Deserialize)]
+            struct Labs {
+                count: u32,
+                powered: u32,
+                working: u32,
+            }
+            #[derive(serde::Deserialize)]
+            struct SciencePack {
+                name: String,
+                count: u32,
+            }
+            #[derive(serde::Deserialize)]
+            struct CurrentResearch {
+                name: String,
+                research_unit_count: u32,
+            }
+            #[derive(serde::Deserialize)]
             struct Status {
-                researched: Vec<String>,
-                available: Vec<String>,
+                researched_count: u32,
+                total_count: u32,
+                current_research: Option<CurrentResearch>,
+                research_progress: f64,
+                labs: Labs,
+                science_packs_in_labs: Vec<SciencePack>,
+                message: Option<String>,
             }
             let status: Status = serde_json::from_str(&response)?;
 
-            println!("Researched technologies ({}):", status.researched.len());
-            for tech in &status.researched {
-                println!("  {}", tech);
+            println!("Research Status:");
+            println!(
+                "  Technologies: {}/{} researched",
+                status.researched_count, status.total_count
+            );
+
+            if let Some(current) = &status.current_research {
+                println!(
+                    "  Current: {} ({:.1}% complete)",
+                    current.name,
+                    status.research_progress * 100.0
+                );
+            } else {
+                println!("  Current: None");
             }
-            println!("\nAvailable to research ({}):", status.available.len());
-            for tech in &status.available {
-                println!("  {}", tech);
+
+            println!(
+                "\nLabs: {} total, {} powered, {} working",
+                status.labs.count, status.labs.powered, status.labs.working
+            );
+
+            if !status.science_packs_in_labs.is_empty() {
+                println!("Science packs in labs:");
+                for pack in &status.science_packs_in_labs {
+                    println!("  {}: {}", pack.name, pack.count);
+                }
+            }
+
+            if let Some(msg) = status.message {
+                println!("\n⚠️  {}", msg);
             }
         }
 
@@ -180,53 +199,36 @@ end
         }
 
         ResearchSubcommand::Start { tech } => {
-            let response = client
-                .execute_lua(&format!(
-                    r#"
-local force = game.forces.player
-local tech = force.technologies["{}"]
-if not tech then
-    rcon.print('{{"success": false, "error": "Technology not found"}}')
-elseif tech.researched then
-    rcon.print('{{"success": false, "error": "Already researched"}}')
-elseif not tech.enabled then
-    rcon.print('{{"success": false, "error": "Technology not enabled"}}')
-else
-    -- Check prerequisites
-    for _, prereq in pairs(tech.prerequisites) do
-        if not prereq.researched then
-            rcon.print('{{"success": false, "error": "Prerequisites not met: ' .. prereq.name .. '"}}')
-            return
-        end
-    end
-    -- Queue research properly (requires labs with science packs)
-    local added = force.add_research(tech)
-    if added then
-        rcon.print('{{"success": true, "queued": true}}')
-    else
-        rcon.print('{{"success": false, "error": "Failed to queue research"}}')
-    end
-end
-"#,
-                    tech
-                ))
-                .await?;
+            let lua = LuaCommand::start_research(&tech);
+            let response = client.execute_lua(&lua).await?;
 
             #[derive(serde::Deserialize)]
-            struct Result {
+            struct StartResult {
                 success: bool,
-                queued: Option<bool>,
+                name: Option<String>,
                 error: Option<String>,
+                action_needed: Option<String>,
+                hint: Option<String>,
+                message: Option<String>,
             }
-            let result: Result = serde_json::from_str(&response)?;
+            let result: StartResult = serde_json::from_str(&response)?;
 
             if result.success {
-                println!("Queued research: {}", tech);
+                println!("Queued research: {}", result.name.unwrap_or(tech));
+                if let Some(msg) = result.message {
+                    println!("{}", msg);
+                }
             } else {
                 println!(
                     "Failed: {}",
                     result.error.unwrap_or_else(|| "unknown error".to_string())
                 );
+                if let Some(hint) = result.hint {
+                    println!("Hint: {}", hint);
+                }
+                if let Some(action) = result.action_needed {
+                    println!("Action needed: {}", action);
+                }
             }
         }
     }

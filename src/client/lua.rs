@@ -1802,12 +1802,19 @@ rcon.print(helpers.table_to_json(msgs))
     pub fn get_research_status() -> String {
         r#"
 local force = game.forces.player
+local surface = game.surfaces[1]
 local result = {
     researched_count = 0,
     total_count = 0,
     current_research = nil,
     research_progress = 0,
-    research_queue = {}
+    research_queue = {},
+    labs = {
+        count = 0,
+        powered = 0,
+        working = 0
+    },
+    science_packs_in_labs = {}
 }
 
 -- Count technologies
@@ -1821,10 +1828,15 @@ end
 -- Current research
 if force.current_research then
     local tech = force.current_research
+    local ingredients = {}
+    for _, ing in pairs(tech.research_unit_ingredients) do
+        table.insert(ingredients, {name = ing.name, amount = ing.amount})
+    end
     result.current_research = {
         name = tech.name,
         level = tech.level,
-        research_unit_count = tech.research_unit_count
+        research_unit_count = tech.research_unit_count,
+        ingredients = ingredients
     }
     result.research_progress = force.research_progress
 end
@@ -1839,6 +1851,46 @@ if force.research_queue then
     end
 end
 
+-- Check labs
+local labs = surface.find_entities_filtered{type = "lab", force = force}
+result.labs.count = #labs
+
+local science_totals = {}
+for _, lab in pairs(labs) do
+    -- Check if lab has power (energy > 0 or status is working)
+    local status = lab.status
+    if status == defines.entity_status.working then
+        result.labs.working = result.labs.working + 1
+        result.labs.powered = result.labs.powered + 1
+    elseif status ~= defines.entity_status.no_power and status ~= defines.entity_status.low_power then
+        result.labs.powered = result.labs.powered + 1
+    end
+
+    -- Count science packs in lab
+    local inv = lab.get_inventory(defines.inventory.lab_input)
+    if inv then
+        for i = 1, #inv do
+            local stack = inv[i]
+            if stack and stack.valid_for_read then
+                science_totals[stack.name] = (science_totals[stack.name] or 0) + stack.count
+            end
+        end
+    end
+end
+
+for name, count in pairs(science_totals) do
+    table.insert(result.science_packs_in_labs, {name = name, count = count})
+end
+
+-- Add helpful message if no labs
+if result.labs.count == 0 then
+    result.message = "No labs found! Build a lab and insert science packs to research."
+elseif result.labs.powered == 0 then
+    result.message = "Labs have no power! Connect labs to the power grid."
+elseif result.current_research and #result.science_packs_in_labs == 0 then
+    result.message = "Labs are empty! Insert science packs into labs to progress research."
+end
+
 rcon.print(helpers.table_to_json(result))
 "#
         .trim()
@@ -1849,7 +1901,68 @@ rcon.print(helpers.table_to_json(result))
     pub fn get_available_research() -> String {
         r#"
 local force = game.forces.player
-local result = {}
+local surface = game.surfaces[1]
+local result = {
+    technologies = {},
+    lab_status = {
+        count = 0,
+        powered = 0
+    },
+    science_available = {}
+}
+
+-- Check labs and what science packs are available
+local labs = surface.find_entities_filtered{type = "lab", force = force}
+result.lab_status.count = #labs
+
+local science_totals = {}
+for _, lab in pairs(labs) do
+    local status = lab.status
+    if status ~= defines.entity_status.no_power and status ~= defines.entity_status.low_power then
+        result.lab_status.powered = result.lab_status.powered + 1
+    end
+    local inv = lab.get_inventory(defines.inventory.lab_input)
+    if inv then
+        for i = 1, #inv do
+            local stack = inv[i]
+            if stack and stack.valid_for_read then
+                science_totals[stack.name] = (science_totals[stack.name] or 0) + stack.count
+            end
+        end
+    end
+end
+
+for name, count in pairs(science_totals) do
+    table.insert(result.science_available, {name = name, count = count})
+end
+
+-- Get player inventory science packs too
+local c = nil
+for _, p in pairs(game.connected_players) do
+    if p.character and p.character.valid then c = p.character break end
+end
+if not c then if global then c = global.factorioctl_character end end
+if c and c.valid then
+    local inv = c.get_main_inventory()
+    if inv then
+        for _, item in pairs(inv.get_contents()) do
+            if item.name:find("science%-pack") or item.name == "automation-science-pack" or item.name == "logistic-science-pack" then
+                local found = false
+                for _, sci in pairs(result.science_available) do
+                    if sci.name == item.name then
+                        sci.count = sci.count + item.count
+                        sci.in_inventory = item.count
+                        found = true
+                        break
+                    end
+                end
+                if not found then
+                    table.insert(result.science_available, {name = item.name, count = item.count, in_inventory = item.count})
+                end
+            end
+        end
+    end
+end
 
 for name, tech in pairs(force.technologies) do
     if tech.enabled and not tech.researched then
@@ -1864,10 +1977,16 @@ for name, tech in pairs(force.technologies) do
 
         if can_research then
             local ingredients = {}
+            local has_all_packs = result.lab_status.powered > 0
             for _, ing in pairs(tech.research_unit_ingredients) do
+                local have = science_totals[ing.name] or 0
+                if have < ing.amount then
+                    has_all_packs = false
+                end
                 table.insert(ingredients, {
                     name = ing.name,
-                    amount = ing.amount
+                    amount = ing.amount,
+                    available = have
                 })
             end
 
@@ -1892,16 +2011,41 @@ for name, tech in pairs(force.technologies) do
                 end
             end
 
-            table.insert(result, {
+            -- Determine readiness
+            local ready = "ready"
+            local blockers = {}
+            if result.lab_status.count == 0 then
+                ready = "blocked"
+                table.insert(blockers, "no labs - build a lab first")
+            elseif result.lab_status.powered == 0 then
+                ready = "blocked"
+                table.insert(blockers, "labs have no power")
+            end
+            if not has_all_packs then
+                ready = "blocked"
+                table.insert(blockers, "missing science packs in labs")
+            end
+
+            table.insert(result.technologies, {
                 name = tech.name,
                 level = tech.level,
                 research_unit_count = tech.research_unit_count,
-                research_unit_energy = tech.research_unit_energy,
                 ingredients = ingredients,
-                effects = effects
+                effects = effects,
+                ready = ready,
+                blockers = blockers
             })
         end
     end
+end
+
+-- Add guidance message
+if result.lab_status.count == 0 then
+    result.guidance = "To research: 1) Craft a lab (requires iron-gear-wheel, electronic-circuit, transport-belt), 2) Place it with power, 3) Craft science packs, 4) Insert science packs into lab"
+elseif result.lab_status.powered == 0 then
+    result.guidance = "Labs need power! Connect them to your power grid (steam engine -> power poles -> lab)"
+elseif #result.science_available == 0 then
+    result.guidance = "Craft science packs and insert them into labs. Red science (automation-science-pack) requires iron-gear-wheel + copper-plate"
 end
 
 rcon.print(helpers.table_to_json(result))
@@ -1915,6 +2059,7 @@ rcon.print(helpers.table_to_json(result))
         format!(
             r#"
 local force = game.forces.player
+local surface = game.surfaces[1]
 local tech = force.technologies["{}"]
 
 if not tech then
@@ -1940,16 +2085,75 @@ for _, prereq in pairs(tech.prerequisites) do
     end
 end
 
+-- Check for labs
+local labs = surface.find_entities_filtered{{type = "lab", force = force}}
+if #labs == 0 then
+    rcon.print('{{"success": false, "error": "No labs found! Build a lab first (requires: 10 iron-gear-wheel, 10 electronic-circuit, 4 transport-belt)", "action_needed": "build_lab"}}')
+    return
+end
+
+-- Check if any lab has power
+local powered_labs = 0
+for _, lab in pairs(labs) do
+    local status = lab.status
+    if status ~= defines.entity_status.no_power and status ~= defines.entity_status.low_power then
+        powered_labs = powered_labs + 1
+    end
+end
+if powered_labs == 0 then
+    rcon.print('{{"success": false, "error": "Labs have no power! Connect labs to power grid.", "action_needed": "power_labs"}}')
+    return
+end
+
+-- Check for required science packs
+local ingredients = {{}}
+local missing_packs = {{}}
+local science_in_labs = {{}}
+
+-- Count science packs in labs
+for _, lab in pairs(labs) do
+    local inv = lab.get_inventory(defines.inventory.lab_input)
+    if inv then
+        for i = 1, #inv do
+            local stack = inv[i]
+            if stack and stack.valid_for_read then
+                science_in_labs[stack.name] = (science_in_labs[stack.name] or 0) + stack.count
+            end
+        end
+    end
+end
+
+for _, ing in pairs(tech.research_unit_ingredients) do
+    table.insert(ingredients, {{name = ing.name, amount = ing.amount}})
+    local have = science_in_labs[ing.name] or 0
+    if have < ing.amount then
+        table.insert(missing_packs, ing.name .. " (need " .. ing.amount .. ", have " .. have .. " in labs)")
+    end
+end
+
+if #missing_packs > 0 then
+    rcon.print(helpers.table_to_json({{
+        success = false,
+        error = "Missing science packs in labs: " .. table.concat(missing_packs, ", "),
+        action_needed = "insert_science_packs",
+        required_packs = ingredients,
+        hint = "Craft the required science packs and insert them into your labs"
+    }}))
+    return
+end
+
 -- Queue the research properly (not cheating)
 local added = force.add_research(tech)
 if added then
     rcon.print(helpers.table_to_json({{
         success = true,
         name = tech.name,
-        research_unit_count = tech.research_unit_count
+        research_unit_count = tech.research_unit_count,
+        ingredients = ingredients,
+        message = "Research queued! Labs will now consume science packs to progress."
     }}))
 else
-    rcon.print('{{"success": false, "error": "Failed to queue research"}}')
+    rcon.print('{{"success": false, "error": "Failed to queue research - check if another research is in progress"}}')
 end
 "#,
             tech_name

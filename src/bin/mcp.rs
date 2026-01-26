@@ -1562,7 +1562,9 @@ impl FactorioMcp {
     // --- Research Tools ---
 
     /// Get research status.
-    #[tool(description = "Get overall research status including current research progress, researched count, and research queue.")]
+    #[tool(description = "Get overall research status including current research progress, researched count, and research queue. \
+        Also shows lab count, power status, and science packs currently in labs. \
+        IMPORTANT: Research requires labs with power and science packs inserted - this tool shows if you're set up correctly.")]
     async fn get_research_status(&self) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1579,7 +1581,9 @@ impl FactorioMcp {
 
     /// Get available research.
     #[tool(description = "Get technologies that can be researched now (enabled, prerequisites met, not yet researched). \
-        Returns name, ingredients, effects, and research unit count.")]
+        Returns name, ingredients (science packs needed), effects, and whether you're ready to research. \
+        Shows 'ready' or 'blocked' status with specific blockers (no labs, no power, missing science packs). \
+        IMPORTANT: To actually research you need: 1) Labs built, 2) Labs powered, 3) Science packs in labs.")]
     async fn get_available_research(&self) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1596,7 +1600,9 @@ impl FactorioMcp {
 
     /// Start researching a technology.
     #[tool(description = "Queue a technology for research. Uses proper research queue (not cheating). \
-        Technology must be enabled and have all prerequisites researched.")]
+        REQUIREMENTS: 1) Technology enabled with prerequisites met, 2) At least one lab built, \
+        3) Lab connected to power, 4) Required science packs inserted into lab. \
+        Will return specific error if any requirement is missing with guidance on what to do.")]
     async fn start_research(&self, Parameters(params): Parameters<StartResearchParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,

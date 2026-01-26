@@ -51,6 +51,15 @@ Whenever there might be silence, fill it with:
 - Craft and mine items legitimately - no spawning
 - Check player chat periodically and respond
 
+## Research (Factorio 2.0)
+
+Research requires: **Labs + Power + Science Packs in labs**
+
+Use `get_available_research` to see what you can research and what's blocking you.
+Use `start_research` to queue - it will tell you exactly what's missing.
+
+**Early game:** Hand-craft a lab (10 gear + 10 circuit + 4 belt), power it, craft red science packs (copper + gear), insert packs into lab.
+
 ## Handling Movement Blockages
 
 When `walk_to` fails with "Blocked or stuck":
