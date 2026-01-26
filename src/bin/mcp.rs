@@ -761,16 +761,17 @@ impl FactorioMcp {
                 let cy = entity.position.y.floor() as i32;
 
                 // Calculate belt tile based on direction
-                // Empirically tested: items drop just past the drill edge with a perpendicular offset
-                // For East-facing 2x2 drill at (42,-97): items drop at (43.3,-97.5) -> belt at (43,-98)
-                // Belt tile = floor(drop_position), which is 1 tile past edge in facing direction,
-                // and 1 tile offset perpendicular (toward negative on the perpendicular axis)
+                // Empirically tested drop positions for 2x2 burner drills:
+                //   North at (36,-102) -> drops at (35.5,-103.3) -> belt at (35,-104)
+                //   East at (42,-102) -> drops at (43.3,-102.5) -> belt at (43,-103)
+                //   South at (48,-102) -> drops at (48.5,-100.7) -> belt at (48,-101)
+                //   West at (54,-102) -> drops at (52.7,-101.5) -> belt at (52,-102)
                 let (belt_x, belt_y, dir_name) = match entity.direction {
-                    0 => (cx - 1, cy - half_size, "North"),  // North: belt north of drill, offset west
-                    4 => (cx + half_size, cy - 1, "East"),   // East: belt east of drill, offset north
-                    8 => (cx - 1, cy + half_size, "South"),  // South: belt south of drill, offset west
-                    12 => (cx - half_size, cy - 1, "West"),  // West: belt west of drill, offset north
-                    _ => (cx + half_size, cy - 1, "East"),   // Default to east
+                    0 => (cx - 1, cy - half_size - 1, "North"),  // North
+                    4 => (cx + half_size, cy - 1, "East"),       // East
+                    8 => (cx, cy + half_size, "South"),          // South
+                    12 => (cx - half_size - 1, cy, "West"),      // West
+                    _ => (cx + half_size, cy - 1, "East"),       // Default to east
                 };
 
                 let result = serde_json::json!({
