@@ -402,7 +402,7 @@ impl FactorioClient {
             let _ = self.walk_to(position, false).await?;
         }
 
-        // Mine using mine_entity (instant but reliable)
+        // Mine using mine_entity (instant but reliable), also handles items on ground
         let mine_lua = format!(
             r#"
 local c = nil
@@ -415,41 +415,64 @@ if not (c and c.valid) then
     return
 end
 
+local inv = c.get_main_inventory()
 local mined = 0
+local picked_up = 0
+
 for i = 1, {} do
-    local resources = game.surfaces[1].find_entities_filtered{{
+    -- First check for items on ground (item-entity type)
+    local items_on_ground = game.surfaces[1].find_entities_filtered{{
         position = {{ {}, {} }},
         radius = 3,
-        type = "resource"
+        type = "item-entity"
     }}
 
-    local target = nil
-    if #resources > 0 then
-        target = resources[1]
-    else
-        local entities = game.surfaces[1].find_entities_filtered{{
-            position = {{ {}, {} }},
-            radius = 3
-        }}
-        for _, e in pairs(entities) do
-            if e.minable and e ~= c then
-                target = e
-                break
+    if #items_on_ground > 0 then
+        local item_entity = items_on_ground[1]
+        local stack = item_entity.stack
+        if stack and stack.valid_for_read and inv then
+            local inserted = inv.insert(stack)
+            if inserted > 0 then
+                picked_up = picked_up + inserted
+                item_entity.destroy()
             end
         end
-    end
-
-    if target then
-        c.mine_entity(target, true)
-        mined = mined + 1
     else
-        break
+        -- Try resources first
+        local resources = game.surfaces[1].find_entities_filtered{{
+            position = {{ {}, {} }},
+            radius = 3,
+            type = "resource"
+        }}
+
+        local target = nil
+        if #resources > 0 then
+            target = resources[1]
+        else
+            local entities = game.surfaces[1].find_entities_filtered{{
+                position = {{ {}, {} }},
+                radius = 3
+            }}
+            for _, e in pairs(entities) do
+                if e.minable and e ~= c then
+                    target = e
+                    break
+                end
+            end
+        end
+
+        if target then
+            c.mine_entity(target, true)
+            mined = mined + 1
+        else
+            break
+        end
     end
 end
 
-rcon.print('{{"success": true, "mined": ' .. mined .. '}}')
+rcon.print('{{"success": true, "mined": ' .. mined .. ', "picked_up": ' .. picked_up .. '}}')
 "#,
-            count, position.x, position.y, position.x, position.y
+            count, position.x, position.y, position.x, position.y, position.x, position.y
         );
 
         let _ = self.execute_lua(&mine_lua).await?;

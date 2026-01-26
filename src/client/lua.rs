@@ -604,37 +604,57 @@ if inv then
 end
 
 local mined = 0
+local picked_up = 0
 
 for i = 1, {} do
-    -- Try to find resources first (iron-ore, coal, etc.)
-    local resources = game.surfaces[1].find_entities_filtered{{
+    -- First check for items on ground (item-entity type)
+    local items_on_ground = game.surfaces[1].find_entities_filtered{{
         position = {{ {}, {} }},
         radius = 2,
-        type = "resource"
+        type = "item-entity"
     }}
 
-    local target = nil
-    if #resources > 0 then
-        target = resources[1]
-    else
-        -- Fall back to other minable entities
-        local entities = game.surfaces[1].find_entities_filtered{{
-            position = {{ {}, {} }},
-            radius = 2
-        }}
-        for _, e in pairs(entities) do
-            if e.minable and e ~= c then
-                target = e
-                break
+    if #items_on_ground > 0 then
+        local item_entity = items_on_ground[1]
+        local stack = item_entity.stack
+        if stack and stack.valid_for_read then
+            local inserted = inv.insert(stack)
+            if inserted > 0 then
+                picked_up = picked_up + inserted
+                item_entity.destroy()
             end
         end
-    end
-
-    if target then
-        c.mine_entity(target, true)
-        mined = mined + 1
     else
-        break
+        -- Try to find resources (iron-ore, coal, etc.)
+        local resources = game.surfaces[1].find_entities_filtered{{
+            position = {{ {}, {} }},
+            radius = 2,
+            type = "resource"
+        }}
+
+        local target = nil
+        if #resources > 0 then
+            target = resources[1]
+        else
+            -- Fall back to other minable entities (trees, rocks, buildings)
+            local entities = game.surfaces[1].find_entities_filtered{{
+                position = {{ {}, {} }},
+                radius = 2
+            }}
+            for _, e in pairs(entities) do
+                if e.minable and e ~= c then
+                    target = e
+                    break
+                end
+            end
+        end
+
+        if target then
+            c.mine_entity(target, true)
+            mined = mined + 1
+        else
+            break
+        end
     end
 end
 
@@ -651,12 +671,13 @@ end
 local items_gained = after_count - before_count
 
 rcon.print(helpers.table_to_json({{
-    success = items_gained > 0,
+    success = items_gained > 0 or picked_up > 0,
     mined_count = items_gained,
+    picked_up = picked_up,
     inventory = items
 }}))
 "#,
-            count, position.x, position.y, position.x, position.y
+            count, position.x, position.y, position.x, position.y, position.x, position.y
         )
         .trim()
         .to_string()
