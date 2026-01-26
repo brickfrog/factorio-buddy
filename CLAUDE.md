@@ -76,6 +76,18 @@ When `walk_to` fails with "Blocked or stuck":
 
 ## Factory Organization
 
+### Plan Ahead
+
+Reserve areas for different purposes before you need them. This prevents building yourself into a corner.
+
+```
+# Reserve space for future smelting near iron patch
+create_zone id="iron-smelting" zone_type="smelting" x1=50 y1=-20 x2=70 y2=0
+
+# Keep a logistics corridor open for main bus
+create_zone id="main-bus" zone_type="logistics" x1=30 y1=-50 x2=35 y2=50
+```
+
 ### Finding Resources
 
 Use `find_nearest_resource` to locate the closest resource patch of a specific type:
