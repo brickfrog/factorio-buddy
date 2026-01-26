@@ -191,21 +191,56 @@ positions needed - never guess based on entity center coordinates.
 - A drill at (57, -21) facing East outputs at approximately (58, -22)
 - Guessing positions leads to belts that don't catch items!
 
-#### Direction Reference:
-| Direction | Shorthand | Numeric | Inserter Behavior |
-|-----------|-----------|---------|-------------------|
-| "north" | "n" | 0 | Picks from North, drops to South |
-| "east" | "e" | 4 | Picks from East, drops to West |
-| "south" | "s" | 8 | Picks from South, drops to North |
-| "west" | "w" | 12 | Picks from West, drops to East |
+#### Inserter Direction Guide (CRITICAL)
+
+**The Rule:** An inserter PICKS from the direction it faces, and DROPS to the opposite direction.
+
+| Direction | Numeric | Picks From | Drops To |
+|-----------|---------|------------|----------|
+| "south"   | 8       | South      | North    |
+| "north"   | 0       | North      | South    |
+| "east"    | 4       | East       | West     |
+| "west"    | 12      | West       | East     |
 
 **Prefer strings:** Use `direction: "south"` instead of `direction: 8` for clarity.
 
-**Mental model for inserters:**
-- The direction = where the inserter FACES/PICKS from
-- It drops items to the OPPOSITE direction
-- **INPUT inserters** (belt → machine): Point AWAY from machine, towards belt
-- **OUTPUT inserters** (machine → belt): Point TOWARDS machine to pick from it
+#### Concrete Example - Furnace with Belt to the South
+
+```
+        NORTH (y decreases)
+              ↑
+              |
+   y=-15:   [FURNACE]     ← items dropped here
+   y=-14:   [INSERTER]    ← place inserter here
+   y=-13:   [===BELT===]  ← items picked from here
+              |
+              ↓
+        SOUTH (y increases)
+```
+
+**Question:** What direction should an INPUT inserter face (belt → furnace)?
+
+**Answer:** Face **SOUTH** (direction: "south" or 8)
+- Inserter at y=-14 faces SOUTH
+- Picks from SOUTH (y=-13, the belt) ✓
+- Drops to NORTH (y=-15, the furnace) ✓
+
+**Question:** What direction for OUTPUT inserter (furnace → belt) in same layout?
+
+**Answer:** Face **NORTH** (direction: "north" or 0)
+- Picks from NORTH (y=-15, the furnace) ✓
+- Drops to SOUTH (y=-13, the belt) ✓
+
+#### Quick Reference
+
+| Inserter Type | Belt Position | Machine Position | Face Direction |
+|---------------|---------------|------------------|----------------|
+| INPUT (belt→machine)  | South of inserter | North of inserter | **SOUTH** |
+| INPUT (belt→machine)  | North of inserter | South of inserter | **NORTH** |
+| OUTPUT (machine→belt) | South of inserter | North of inserter | **NORTH** |
+| OUTPUT (machine→belt) | North of inserter | South of inserter | **SOUTH** |
+
+**Simple rule:** Face the direction you want to PICK from.
 
 ### Belt and Furnace Layout Patterns
 

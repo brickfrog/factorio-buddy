@@ -100,14 +100,14 @@ mod tests {
     fn test_inserter_interaction() {
         let entities = vec![
             make_entity(0, 0, "iron-chest", Direction::North),
-            make_entity(1, 0, "inserter", Direction::East), // Picks from chest, drops at (2,0)
+            make_entity(1, 0, "inserter", Direction::East), // Picks from (2,0), drops to chest at (0,0)
         ];
 
         let result = analyze_entity_reach(&entities, TilePos::new(0, 0), 3);
 
-        // Should find the inserter that picks up from our target position
+        // Should find the inserter that drops to our target position
         assert_eq!(result.inserters.len(), 1);
-        assert_eq!(result.inserters[0].pickup_position, TilePos::new(0, 0));
+        assert_eq!(result.inserters[0].dropoff_position, TilePos::new(0, 0));
     }
 
     #[test]

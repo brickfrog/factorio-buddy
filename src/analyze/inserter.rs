@@ -34,10 +34,10 @@ fn analyze_single_inserter(
     let pickup_position = position.offset_in_direction(direction);
     let dropoff_position = position.offset_in_direction(direction.opposite());
 
-    // Check for long inserter (picks up 2 tiles away)
+    // Check for long inserter (picks up 2 tiles away in facing direction)
     let is_long = inserter.name.contains("long");
     let pickup_position = if is_long {
-        pickup_position.offset_in_direction(direction.opposite())
+        pickup_position.offset_in_direction(direction) // One more tile in same direction
     } else {
         pickup_position
     };
@@ -121,8 +121,8 @@ mod tests {
 
         let analysis = &results[0];
         assert_eq!(analysis.position, TilePos::new(1, 0));
-        assert_eq!(analysis.pickup_position, TilePos::new(0, 0)); // Behind (west)
-        assert_eq!(analysis.dropoff_position, TilePos::new(2, 0)); // In front (east)
+        assert_eq!(analysis.pickup_position, TilePos::new(2, 0)); // In front (east) - where inserter faces/picks
+        assert_eq!(analysis.dropoff_position, TilePos::new(0, 0)); // Behind (west) - opposite of facing
     }
 
     #[test]
@@ -135,8 +135,8 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let analysis = &results[0];
-        assert_eq!(analysis.pickup_position, TilePos::new(0, 0)); // 2 tiles behind
-        assert_eq!(analysis.dropoff_position, TilePos::new(3, 0)); // 1 tile in front
+        assert_eq!(analysis.pickup_position, TilePos::new(4, 0)); // 2 tiles in front (where inserter faces/picks)
+        assert_eq!(analysis.dropoff_position, TilePos::new(1, 0)); // 1 tile behind (opposite of facing)
     }
 
     #[test]
@@ -152,9 +152,9 @@ mod tests {
 
         let analysis = &results[0];
         assert!(analysis.pickup_target.is_some());
-        assert_eq!(analysis.pickup_target.as_ref().unwrap().name, "iron-chest");
+        assert_eq!(analysis.pickup_target.as_ref().unwrap().name, "transport-belt"); // East-facing picks from east
         assert!(analysis.dropoff_target.is_some());
-        assert_eq!(analysis.dropoff_target.as_ref().unwrap().name, "transport-belt");
+        assert_eq!(analysis.dropoff_target.as_ref().unwrap().name, "iron-chest"); // Drops to west (opposite)
     }
 
     #[test]
