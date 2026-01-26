@@ -2782,9 +2782,8 @@ local area = {{{{{},{}}},{{{},{}}}}}
 local clear_trees = {}
 local clear_rocks = {}
 local dry_run = {}
-local max_distance = 30 -- Must be within 30 tiles of the area center
+local max_distance = 30
 
--- Find character
 local c = nil
 for _, p in pairs(game.connected_players) do
     if p.character and p.character.valid then c = p.character break end
