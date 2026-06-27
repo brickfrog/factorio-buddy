@@ -104,23 +104,11 @@ impl RconClient {
         let auth_packet = RconPacket::new(auth_id, SERVERDATA_AUTH, password);
         client.send(&auth_packet).await?;
 
-        let response = client.receive().await?;
-        if response.request_id == -1 {
-            bail!("Authentication failed");
-        }
-        if response.request_id != auth_id {
-            bail!(
-                "Unexpected RCON auth response id: got {}, expected {}",
-                response.request_id,
-                auth_id
-            );
-        }
-        if response.packet_type != SERVERDATA_AUTH_RESPONSE {
-            bail!(
-                "Unexpected RCON auth response type: got {}, expected {}",
-                response.packet_type,
-                SERVERDATA_AUTH_RESPONSE
-            );
+        loop {
+            let response = client.receive().await?;
+            if auth_response_complete(&response, auth_id)? {
+                break;
+            }
         }
 
         Ok(client)
@@ -132,7 +120,7 @@ impl RconClient {
         let sentinel_id = self.next_id();
         let packet = RconPacket::new(request_id, SERVERDATA_EXECCOMMAND, command);
         self.send(&packet).await?;
-        let sentinel = RconPacket::new(sentinel_id, SERVERDATA_RESPONSE_VALUE, "");
+        let sentinel = response_sentinel_packet(sentinel_id);
         self.send(&sentinel).await?;
 
         let mut packets = Vec::new();
@@ -197,6 +185,35 @@ impl RconClient {
 
         RconPacket::decode(&data)
     }
+}
+
+fn auth_response_complete(packet: &RconPacket, auth_id: i32) -> Result<bool> {
+    if packet.request_id == -1 {
+        bail!("Authentication failed");
+    }
+
+    if packet.request_id != auth_id {
+        bail!(
+            "Unexpected RCON auth response id: got {}, expected {}",
+            packet.request_id,
+            auth_id
+        );
+    }
+
+    match packet.packet_type {
+        SERVERDATA_AUTH_RESPONSE => Ok(true),
+        SERVERDATA_RESPONSE_VALUE if packet.body.is_empty() => Ok(false),
+        SERVERDATA_RESPONSE_VALUE => bail!("Unexpected non-empty RCON auth prelude response"),
+        _ => bail!(
+            "Unexpected RCON auth response type: got {}, expected {}",
+            packet.packet_type,
+            SERVERDATA_AUTH_RESPONSE
+        ),
+    }
+}
+
+fn response_sentinel_packet(sentinel_id: i32) -> RconPacket {
+    RconPacket::new(sentinel_id, SERVERDATA_EXECCOMMAND, "")
 }
 
 fn reassemble_response_packets(
@@ -296,6 +313,24 @@ mod tests {
         // Null terminators
         assert_eq!(encoded[14], 0);
         assert_eq!(encoded[15], 0);
+    }
+
+    #[test]
+    fn test_auth_response_accepts_empty_prelude_then_auth_response() {
+        let prelude = RconPacket::new(42, SERVERDATA_RESPONSE_VALUE, "");
+        let auth = RconPacket::new(42, SERVERDATA_AUTH_RESPONSE, "");
+
+        assert!(!auth_response_complete(&prelude, 42).unwrap());
+        assert!(auth_response_complete(&auth, 42).unwrap());
+    }
+
+    #[test]
+    fn test_response_sentinel_is_sent_as_exec_command() {
+        let sentinel = response_sentinel_packet(7);
+
+        assert_eq!(sentinel.request_id, 7);
+        assert_eq!(sentinel.packet_type, SERVERDATA_EXECCOMMAND);
+        assert_eq!(sentinel.body, "");
     }
 
     #[test]
