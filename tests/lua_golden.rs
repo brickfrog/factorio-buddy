@@ -74,6 +74,15 @@ fn all_lua_cases() -> Vec<LuaCase> {
             LuaCommand::walk_character(&legacy_agent(), pos(12.0, 13.0)),
         ),
         LuaCase::new(
+            "walk_character_named",
+            LuaCommand::walk_character(&named_agent(), pos(12.0, 13.0)),
+        ),
+        LuaCase::new(
+            "walk_to_named_target",
+            LuaCommand::set_walk_target(&named_agent(), pos(12.0, 13.0)),
+        ),
+        LuaCase::new("walk_to_driver", LuaCommand::walk_driver_lua().to_string()),
+        LuaCase::new(
             "character_status",
             LuaCommand::character_status(&legacy_agent()),
         ),
@@ -361,6 +370,49 @@ fn corrected_inventory_readers_document_factorio_2_get_contents_shape() {
     ] {
         assert_uses_factorio_2_get_contents_shape(case.name, &case.lua);
     }
+}
+
+#[test]
+fn named_walk_uses_the_shared_driver_target_without_walking_state() {
+    let agent = named_agent();
+    let walk_character = LuaCommand::walk_character(&agent, pos(12.0, 13.0));
+    let walk_target = LuaCommand::set_walk_target(&agent, pos(12.0, 13.0));
+
+    for (name, lua) in [
+        ("walk_character", walk_character.as_str()),
+        ("walk_target", walk_target.as_str()),
+    ] {
+        assert!(
+            lua.contains(r#"storage.factorioctl_walk_targets["doug"] = { x = 12, y = 13"#),
+            "{name} should store the named agent target for the on_tick driver"
+        );
+        assert!(
+            !lua.contains("walking = true") && !lua.contains("walking=true"),
+            "{name} should not start named orphan agents by relying on walking_state"
+        );
+    }
+
+    let driver = LuaCommand::walk_driver_lua();
+    assert!(
+        driver.contains("tgt.stuck_ticks") && driver.contains("tgt.expires_tick"),
+        "walk driver should clear targets after bounded no-progress/expiry guards"
+    );
+}
+
+#[test]
+fn research_readiness_counts_resolved_character_science_in_totals() {
+    let lua = LuaCommand::get_available_research(&named_agent());
+
+    let inventory_fold = lua
+        .find("science_totals[item.name] = (science_totals[item.name] or 0) + item.count")
+        .expect("character science should be folded into science_totals");
+    let readiness_read = lua
+        .find("local have = science_totals[ing.name] or 0")
+        .expect("research readiness should read science_totals");
+    assert!(
+        inventory_fold < readiness_read,
+        "character science must be folded before readiness is calculated"
+    );
 }
 
 #[test]

@@ -16,6 +16,7 @@ const SERVERDATA_RESPONSE_VALUE: i32 = 0;
 
 /// Default timeout for RCON operations
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_COMMAND_RESPONSE_PACKETS: usize = 32;
 
 /// An RCON packet
 #[derive(Debug, Clone)]
@@ -125,8 +126,18 @@ impl RconClient {
         let request_id = self.next_id();
         let packet = RconPacket::new(request_id, SERVERDATA_EXECCOMMAND, command);
         self.send(&packet).await?;
-        let response = self.receive().await?;
-        Ok(response.body)
+
+        for _ in 0..MAX_COMMAND_RESPONSE_PACKETS {
+            let response = self.receive().await?;
+            if let Some(body) = command_response_body(&response, request_id)? {
+                return Ok(body);
+            }
+        }
+
+        bail!(
+            "RCON command response not received after {} packets",
+            MAX_COMMAND_RESPONSE_PACKETS
+        );
     }
 
     /// Close the connection
@@ -204,6 +215,22 @@ fn auth_response_complete(packet: &RconPacket, auth_id: i32) -> Result<bool> {
     }
 }
 
+fn command_response_body(packet: &RconPacket, command_id: i32) -> Result<Option<String>> {
+    if packet.request_id != command_id {
+        return Ok(None);
+    }
+
+    if packet.packet_type != SERVERDATA_RESPONSE_VALUE {
+        bail!(
+            "Unexpected RCON command response type: got {}, expected {}",
+            packet.packet_type,
+            SERVERDATA_RESPONSE_VALUE
+        );
+    }
+
+    Ok(Some(packet.body.clone()))
+}
+
 impl Drop for RconClient {
     fn drop(&mut self) {
         // Can't do async drop, just drop the stream
@@ -255,4 +282,36 @@ mod tests {
         assert!(auth_response_complete(&auth, 42).unwrap());
     }
 
+    #[test]
+    fn test_command_response_ignores_stray_packet_until_matching_id() {
+        let stray = RconPacket::new(41, SERVERDATA_RESPONSE_VALUE, "old response");
+        let response = RconPacket::new(42, SERVERDATA_RESPONSE_VALUE, "current response");
+
+        assert_eq!(command_response_body(&stray, 42).unwrap(), None);
+        assert_eq!(
+            command_response_body(&response, 42).unwrap(),
+            Some("current response".to_string())
+        );
+    }
+
+    #[test]
+    fn test_command_response_rejects_matching_packet_with_wrong_type() {
+        let auth_response_type = RconPacket::new(42, SERVERDATA_AUTH_RESPONSE, "");
+
+        assert!(command_response_body(&auth_response_type, 42).is_err());
+    }
+
+    #[test]
+    fn test_command_response_treats_matching_packet_as_single_logical_response() {
+        let packet = RconPacket::new(
+            42,
+            SERVERDATA_RESPONSE_VALUE,
+            "line one\nline two\nline three",
+        );
+
+        assert_eq!(
+            command_response_body(&packet, 42).unwrap(),
+            Some("line one\nline two\nline three".to_string())
+        );
+    }
 }

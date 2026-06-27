@@ -457,12 +457,16 @@ rcon.print("ok")
     /// than an instant teleport. Re-registering replaces the prior handler, so it
     /// is idempotent. (Server-side only: with a connected human client this can
     /// desync; deterministic MP movement is the bridge-mod follow-up.)
-    fn walk_driver_lua() -> &'static str {
+    pub fn walk_driver_lua() -> &'static str {
         r#"
 script.on_event(defines.events.on_tick, function()
 local targets = storage.factorioctl_walk_targets
 if not targets then return end
 for id, tgt in pairs(targets) do
+if tgt.expires_tick and game.tick >= tgt.expires_tick then
+targets[id] = nil
+goto continue
+end
 local c = storage.factorioctl_characters and storage.factorioctl_characters[id]
 if c and c.valid then
 local dx = tgt.x - c.position.x
@@ -481,13 +485,56 @@ if not c.teleport({nx, c.position.y}) then
 c.teleport({c.position.x, ny})
 end
 end
+local moved = math.sqrt((c.position.x - (tgt.last_x or c.position.x)) * (c.position.x - (tgt.last_x or c.position.x)) + (c.position.y - (tgt.last_y or c.position.y)) * (c.position.y - (tgt.last_y or c.position.y)))
+if moved < 0.001 then
+tgt.stuck_ticks = (tgt.stuck_ticks or 0) + 1
+else
+tgt.stuck_ticks = 0
+end
+tgt.last_x = c.position.x
+tgt.last_y = c.position.y
+if tgt.stuck_ticks >= 120 then
+targets[id] = nil
+end
 end
 else
 targets[id] = nil
 end
+::continue::
 end
 end)
 "#
+    }
+
+    pub fn set_walk_target(agent_id: &AgentId, position: Position) -> String {
+        let resolve = Self::resolve_required(agent_id);
+        format!(
+            r#"
+{}
+storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
+storage.factorioctl_walk_targets["{}"] = {{ x = {}, y = {}, stuck_ticks = 0, expires_tick = game.tick + 7200, last_x = c.position.x, last_y = c.position.y }}
+{}
+"#,
+            resolve,
+            agent_id.as_str(),
+            position.x,
+            position.y,
+            Self::walk_driver_lua(),
+        )
+        .trim()
+        .to_string()
+    }
+
+    pub fn clear_walk_target(agent_id: &AgentId) -> String {
+        format!(
+            r#"
+storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
+storage.factorioctl_walk_targets["{}"] = nil
+"#,
+            agent_id.as_str()
+        )
+        .trim()
+        .to_string()
     }
 
     /// Start walking character to position.
@@ -519,25 +566,9 @@ rcon.print("ok")
             format!(
                 r#"
 {}
-storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
-storage.factorioctl_walk_targets["{}"] = {{ x = {}, y = {} }}
-local dx = {} - c.position.x
-local dy = {} - c.position.y
-if math.abs(dx) > math.abs(dy) then
-    c.walking_state = {{ walking = true, direction = dx > 0 and defines.direction.east or defines.direction.west }}
-else
-    c.walking_state = {{ walking = true, direction = dy > 0 and defines.direction.south or defines.direction.north }}
-end
-{}
 rcon.print("ok")
 "#,
-                resolve,
-                agent_id.as_str(),
-                position.x,
-                position.y,
-                position.x,
-                position.y,
-                Self::walk_driver_lua(),
+                Self::set_walk_target(agent_id, position),
             )
             .trim()
             .to_string()
@@ -1990,6 +2021,7 @@ if c and c.valid then
     if inv then
         for _, item in pairs(inv.get_contents()) do
             if item.name:find("science%-pack") or item.name == "automation-science-pack" or item.name == "logistic-science-pack" then
+                science_totals[item.name] = (science_totals[item.name] or 0) + item.count
                 local found = false
                 for _, sci in pairs(result.science_available) do
                     if sci.name == item.name then

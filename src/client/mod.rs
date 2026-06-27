@@ -964,6 +964,41 @@ end
     pub async fn walk_to(&mut self, target: Position, _run: bool) -> Result<WalkResult> {
         let mut total_distance = 0.0;
         let start_pos = self.get_character_position().await?;
+
+        if !self.agent_id.is_legacy() {
+            let target_lua = LuaCommand::set_walk_target(&self.agent_id, target);
+            let clear_lua = LuaCommand::clear_walk_target(&self.agent_id);
+            self.execute_lua(&target_lua).await?;
+            let mut last_pos = start_pos;
+
+            for _ in 0..500 {
+                let pos = self.get_character_position().await?;
+                total_distance += pos.distance(&last_pos);
+
+                if pos.distance(&target) < 3.0 {
+                    self.execute_lua(&clear_lua).await?;
+                    return Ok(WalkResult {
+                        arrived: true,
+                        final_position: pos,
+                        distance_walked: total_distance,
+                        reason: None,
+                    });
+                }
+
+                last_pos = pos;
+                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            }
+
+            self.execute_lua(&clear_lua).await?;
+            let pos = self.get_character_position().await?;
+            return Ok(WalkResult {
+                arrived: false,
+                final_position: pos,
+                distance_walked: total_distance,
+                reason: Some("Timeout".to_string()),
+            });
+        }
+
         let mut last_pos = start_pos;
         let mut last_dist = start_pos.distance(&target);
         let mut stuck_count = 0;

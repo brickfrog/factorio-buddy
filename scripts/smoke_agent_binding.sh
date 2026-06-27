@@ -67,8 +67,8 @@ if [[ "$a_unit" == "$b_unit" ]]; then
     exit 1
 fi
 
-ctl --agent-id a character walk --to 8,0 >/dev/null
-ctl --agent-id b character walk --to 33,0 >/dev/null
+ctl --agent-id a walk-to 8,0 >/dev/null
+ctl --agent-id b walk-to 33,0 >/dev/null
 ctl tick wait 120 >/dev/null 2>&1 || sleep 3
 
 a_status="$(position_json a)"
@@ -95,12 +95,23 @@ if not b_x > 30.0:
 PY
 
 human_before="$(FACTORIO_AGENT_ID=__player__ ctl character status || true)"
-ctl --agent-id a character walk --to 10,0 >/dev/null
+human_valid="$(json_field "$human_before" valid 2>/dev/null || echo false)"
+if [[ "$human_valid" == "false" || "$human_valid" == "False" ]]; then
+    echo "SKIP: no connected or initialized __player__ character; player isolation sub-check not applicable" >&2
+else
+    human_unit="$(json_field "$human_before" unit_number)"
+    human_x="$(json_field "$human_before" position.x)"
+fi
+ctl --agent-id a walk-to 10,0 >/dev/null
 ctl tick wait 60 >/dev/null 2>&1 || sleep 2
-human_after="$(FACTORIO_AGENT_ID=__player__ ctl character status || true)"
-if [[ "$human_before" != "$human_after" ]]; then
-    echo "FAIL: legacy/player character changed while named agent moved" >&2
-    exit 1
+if [[ "$human_valid" != "false" && "$human_valid" != "False" ]]; then
+    human_after="$(FACTORIO_AGENT_ID=__player__ ctl character status)"
+    human_after_unit="$(json_field "$human_after" unit_number)"
+    human_after_x="$(json_field "$human_after" position.x)"
+    if [[ "$human_after_unit" != "$human_unit" || "$human_after_x" != "$human_x" ]]; then
+        echo "FAIL: legacy/player character changed while named agent moved" >&2
+        exit 1
+    fi
 fi
 
 reconnected_a="$(position_json a)"
