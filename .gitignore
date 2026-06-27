@@ -25,3 +25,12 @@ logs/
 .dolt/
 *.db
 .beads-credential-key
+
+# === BEGIN choir-tracking (allowlist: ignore server runtime, keep durable artifacts) ===
+/.choir/*
+!/.choir/config.toml
+!/.choir/state/
+/.choir/state/*
+!/.choir/state/audit-gate.json
+!/.choir/state/audit-receipts/
+# === END choir-tracking ===
