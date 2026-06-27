@@ -20,3 +20,8 @@ logs/
 
 # Headless server data (separate from Steam client)
 .factorio-server-data/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
