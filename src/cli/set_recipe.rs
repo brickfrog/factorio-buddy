@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Args;
 
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 
 #[derive(Args, Debug)]
 pub struct SetRecipeCommand {
@@ -16,7 +15,7 @@ pub struct SetRecipeCommand {
 }
 
 pub async fn execute(cmd: SetRecipeCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     // Check proximity before setting recipe
     client

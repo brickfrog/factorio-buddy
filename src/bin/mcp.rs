@@ -6,10 +6,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use rmcp::{
-    ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     schemars::{self, JsonSchema},
-    tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +16,7 @@ use factorioctl::analyze::{
     analyze_belt_reach, analyze_inserters, detect_sushi_belts, find_belt_gaps, find_belt_networks,
     trace_belt_sources, BeltGraph,
 };
-use factorioctl::client::FactorioClient;
+use factorioctl::client::{AgentId, FactorioClient};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
 use factorioctl::world::{
     find_belt_route_with_options, Area, BeltKind, Direction, GridPos, Position, RoutingOptions,
@@ -59,7 +58,9 @@ pub struct AreaParams {
     pub radius: u32,
 }
 
-fn default_radius() -> u32 { 50 }
+fn default_radius() -> u32 {
+    50
+}
 
 impl AreaParams {
     fn to_area(&self) -> Area {
@@ -166,7 +167,9 @@ pub struct MineAtParams {
     pub count: u32,
 }
 
-fn default_count() -> u32 { 1 }
+fn default_count() -> u32 {
+    1
+}
 
 /// Parameters for craft tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -192,7 +195,9 @@ pub struct InsertItemsParams {
     pub inventory_type: String,
 }
 
-fn default_inventory_type() -> String { "chest".to_string() }
+fn default_inventory_type() -> String {
+    "chest".to_string()
+}
 
 /// Parameters for extract_items tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -254,8 +259,12 @@ pub struct RouteBeltParams {
     pub extend_existing: bool,
 }
 
-fn default_belt_type() -> String { "transport-belt".to_string() }
-fn default_search_radius() -> u32 { 10 }
+fn default_belt_type() -> String {
+    "transport-belt".to_string()
+}
+fn default_search_radius() -> u32 {
+    10
+}
 
 /// Parameters for remove_entity tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -297,7 +306,9 @@ pub struct BeltLaneContentsParams {
     pub radius: u32,
 }
 
-fn default_belt_radius() -> u32 { 30 }
+fn default_belt_radius() -> u32 {
+    30
+}
 
 /// Parameters for sushi detection tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -342,7 +353,9 @@ pub struct PowerStatusParams {
     pub radius: u32,
 }
 
-fn default_power_radius() -> u32 { 50 }
+fn default_power_radius() -> u32 {
+    50
+}
 
 /// Parameters for find_power_issues tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -446,7 +459,9 @@ pub struct ScanResourcesParams {
     pub save_as_protected: bool,
 }
 
-fn default_save_as_protected() -> bool { true }
+fn default_save_as_protected() -> bool {
+    true
+}
 
 // === Layout Assistance Parameters ===
 
@@ -496,7 +511,9 @@ pub struct RenderMapParams {
     pub show_power: bool,
 }
 
-fn default_map_radius() -> u32 { 15 }
+fn default_map_radius() -> u32 {
+    15
+}
 
 /// Parameters for get_blank_slate tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -532,8 +549,12 @@ pub struct ClearAreaParams {
     pub dry_run: bool,
 }
 
-fn default_clear_trees() -> bool { true }
-fn default_clear_rocks() -> bool { true }
+fn default_clear_trees() -> bool {
+    true
+}
+fn default_clear_rocks() -> bool {
+    true
+}
 
 // === The MCP Server ===
 
@@ -565,8 +586,11 @@ impl FactorioMcp {
     }
 
     async fn connect(&self) -> Result<FactorioClient, String> {
+        let agent_id = AgentId::new(std::env::var("FACTORIO_AGENT_ID").ok().as_deref())
+            .map_err(|e| format!("Invalid FACTORIO_AGENT_ID: {}", e))?;
         FactorioClient::connect(&self.config.host, self.config.port, &self.config.password)
             .await
+            .map(|client| client.with_agent_id(agent_id))
             .map_err(|e| format!("Failed to connect: {}", e))
     }
 
@@ -592,7 +616,10 @@ impl FactorioMcp {
                 .iter()
                 .map(|m| format!("[{}]: {}", m.player, m.message))
                 .collect();
-            Some(format!("\n\n--- Player Messages ---\n{}", formatted.join("\n")))
+            Some(format!(
+                "\n\n--- Player Messages ---\n{}",
+                formatted.join("\n")
+            ))
         }
     }
 
@@ -610,7 +637,9 @@ impl FactorioMcp {
     // --- Query Tools ---
 
     /// Get all entities in an area. Returns entity names, positions, and types.
-    #[tool(description = "Get all entities in an area. Returns entity names, positions, types, and unit numbers. TIP: Don't scan excessively - trust your memory of recent scans.")]
+    #[tool(
+        description = "Get all entities in an area. Returns entity names, positions, types, and unit numbers. TIP: Don't scan excessively - trust your memory of recent scans."
+    )]
     async fn get_entities(&self, Parameters(params): Parameters<GetEntitiesParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -618,11 +647,20 @@ impl FactorioMcp {
         };
 
         let area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
-        let result = match client.find_entities(area, None, params.name.as_deref()).await {
+        let result = match client
+            .find_entities(area, None, params.name.as_deref())
+            .await
+        {
             Ok(entities) => {
                 let info: Vec<serde_json::Value> = entities
                     .into_iter()
@@ -652,11 +690,16 @@ impl FactorioMcp {
     }
 
     /// Get belt and inserter positions for a machine.
-    #[tool(description = "Get the correct belt and inserter positions for connecting to a machine. \
+    #[tool(
+        description = "Get the correct belt and inserter positions for connecting to a machine. \
         For DRILLS: Returns the exact drop position (where items come out) and the tile where a belt should be placed. \
         For FURNACES/ASSEMBLERS: Returns input_belt, input_inserter, output_belt, output_inserter positions. \
-        ALWAYS use this tool before routing belts to/from machines!")]
-    async fn get_machine_belt_positions(&self, Parameters(params): Parameters<MachineBeltPositionsParams>) -> String {
+        ALWAYS use this tool before routing belts to/from machines!"
+    )]
+    async fn get_machine_belt_positions(
+        &self,
+        Parameters(params): Parameters<MachineBeltPositionsParams>,
+    ) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
@@ -665,7 +708,11 @@ impl FactorioMcp {
         // Get the entity
         let entity = match client.get_entity(params.unit_number).await {
             Ok(e) => e,
-            Err(e) => return self.with_player_messages(format!("Error getting entity: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error getting entity: {}", e))
+                    .await
+            }
         };
 
         // Check if this is a mining drill - they have special drop position handling
@@ -697,7 +744,11 @@ impl FactorioMcp {
 
             let drop_result = match client.execute_lua(&lua).await {
                 Ok(r) => r,
-                Err(e) => return self.with_player_messages(format!("Error querying drop position: {}", e)).await,
+                Err(e) => {
+                    return self
+                        .with_player_messages(format!("Error querying drop position: {}", e))
+                        .await
+                }
             };
 
             // Parse the drop position result
@@ -751,7 +802,9 @@ impl FactorioMcp {
                     )
                 });
 
-                return self.with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default()).await;
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default())
+                    .await;
             } else {
                 // Lua failed - calculate output position from direction and size
                 // Burner-mining-drills are 2x2, electric are 3x3
@@ -767,11 +820,11 @@ impl FactorioMcp {
                 //   South at (48,-102) -> drops at (48.5,-100.7) -> belt at (48,-101)
                 //   West at (54,-102) -> drops at (52.7,-101.5) -> belt at (52,-102)
                 let (belt_x, belt_y, dir_name) = match entity.direction {
-                    0 => (cx - 1, cy - half_size - 1, "North"),  // North
-                    4 => (cx + half_size, cy - 1, "East"),       // East
-                    8 => (cx, cy + half_size, "South"),          // South
-                    12 => (cx - half_size - 1, cy, "West"),      // West
-                    _ => (cx + half_size, cy - 1, "East"),       // Default to east
+                    0 => (cx - 1, cy - half_size - 1, "North"), // North
+                    4 => (cx + half_size, cy - 1, "East"),      // East
+                    8 => (cx, cy + half_size, "South"),         // South
+                    12 => (cx - half_size - 1, cy, "West"),     // West
+                    _ => (cx + half_size, cy - 1, "East"),      // Default to east
                 };
 
                 let result = serde_json::json!({
@@ -799,7 +852,9 @@ impl FactorioMcp {
                     "note": "Belt tile calculated from drill size and direction"
                 });
 
-                return self.with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default()).await;
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default())
+                    .await;
             }
         }
 
@@ -833,7 +888,7 @@ impl FactorioMcp {
 
         // Input belt goes 1 tile beyond south edge (for inserter gap)
         let input_belt_y = cy + half_h + 1;
-        let input_inserter_y = cy + half_h;  // On the south edge tile
+        let input_inserter_y = cy + half_h; // On the south edge tile
 
         // Output belt goes 2 tiles beyond north edge (belt, then inserter, then furnace)
         // For furnace at cy=-107 with half_h=1: inserter at -109, belt at -110
@@ -872,14 +927,17 @@ impl FactorioMcp {
             )
         });
 
-        self.with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default()).await
+        self.with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default())
+            .await
     }
 
     /// Render an ASCII map of an area.
-    #[tool(description = "Render an ASCII map showing entities in an area. Returns a visual representation \
+    #[tool(
+        description = "Render an ASCII map showing entities in an area. Returns a visual representation \
         useful for understanding layouts at a glance. Legend: @=you ^v<>=belt D=drill F=furnace A=assembler \
         i=inserter I=iron C=copper c=coal S=stone B=chest P=pole ~=water X=wreck o=rock. \
-        Use show_power=true to overlay power coverage with network ID numbers (1-9).")]
+        Use show_power=true to overlay power coverage with network ID numbers (1-9)."
+    )]
     async fn render_map(&self, Parameters(params): Parameters<RenderMapParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -892,7 +950,11 @@ impl FactorioMcp {
         } else {
             match client.get_character_position().await {
                 Ok(pos) => pos,
-                Err(e) => return self.with_player_messages(format!("Error getting position: {}", e)).await,
+                Err(e) => {
+                    return self
+                        .with_player_messages(format!("Error getting position: {}", e))
+                        .await
+                }
             }
         };
 
@@ -905,7 +967,11 @@ impl FactorioMcp {
         // Query entities in the area
         let entities = match client.find_entities(area, None, None).await {
             Ok(e) => e,
-            Err(e) => return self.with_player_messages(format!("Error getting entities: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error getting entities: {}", e))
+                    .await
+            }
         };
 
         // Query tiles for water/terrain
@@ -926,7 +992,7 @@ impl FactorioMcp {
             let lua = factorioctl::client::lua::LuaCommand::get_power_coverage(
                 center.x as i32,
                 center.y as i32,
-                params.radius
+                params.radius,
             );
             match client.execute_lua(&lua).await {
                 Ok(result) => {
@@ -936,10 +1002,13 @@ impl FactorioMcp {
                         .and_then(|v| v.get("coverage").cloned())
                         .and_then(|c| {
                             if let serde_json::Value::Object(map) = c {
-                                let mut coverage: std::collections::HashMap<(i32, i32), u8> = std::collections::HashMap::new();
+                                let mut coverage: std::collections::HashMap<(i32, i32), u8> =
+                                    std::collections::HashMap::new();
                                 for (key, val) in map {
                                     if let Some((x_str, y_str)) = key.split_once(',') {
-                                        if let (Ok(x), Ok(y)) = (x_str.parse::<i32>(), y_str.parse::<i32>()) {
+                                        if let (Ok(x), Ok(y)) =
+                                            (x_str.parse::<i32>(), y_str.parse::<i32>())
+                                        {
                                             if let Some(id) = val.as_u64() {
                                                 coverage.insert((x, y), id as u8);
                                             }
@@ -972,7 +1041,9 @@ impl FactorioMcp {
     }
 
     /// Get resource patches (ore, oil) in an area.
-    #[tool(description = "Get resource patches (ore, oil) in an area. Returns patch locations and amounts.")]
+    #[tool(
+        description = "Get resource patches (ore, oil) in an area. Returns patch locations and amounts."
+    )]
     async fn get_resources(&self, Parameters(params): Parameters<GetResourcesParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -980,21 +1051,32 @@ impl FactorioMcp {
         };
 
         let area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
-        let result = match client.find_resources(area, params.resource_type.as_deref()).await {
+        let result = match client
+            .find_resources(area, params.resource_type.as_deref())
+            .await
+        {
             Ok(resources) => {
                 let info: Vec<serde_json::Value> = resources
                     .into_iter()
-                    .map(|r| serde_json::json!({
-                        "name": r.name,
-                        "center_x": r.center.x,
-                        "center_y": r.center.y,
-                        "total_amount": r.total_amount,
-                        "tile_count": r.tile_count,
-                    }))
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.name,
+                            "center_x": r.center.x,
+                            "center_y": r.center.y,
+                            "total_amount": r.total_amount,
+                            "tile_count": r.tile_count,
+                        })
+                    })
                     .collect();
                 serde_json::to_string_pretty(&info).unwrap_or_else(|e| format!("Error: {}", e))
             }
@@ -1004,10 +1086,15 @@ impl FactorioMcp {
     }
 
     /// Find the nearest resource patch of a specific type.
-    #[tool(description = "Find the nearest resource patch (ore, oil) of a specific type from a position. \
+    #[tool(
+        description = "Find the nearest resource patch (ore, oil) of a specific type from a position. \
         Returns the patch center, total amount, tile count, and bounding box. Searches within 200 tiles. \
-        Use this to locate resources for mining operations.")]
-    async fn find_nearest_resource(&self, Parameters(params): Parameters<FindNearestResourceParams>) -> String {
+        Use this to locate resources for mining operations."
+    )]
+    async fn find_nearest_resource(
+        &self,
+        Parameters(params): Parameters<FindNearestResourceParams>,
+    ) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
@@ -1019,11 +1106,18 @@ impl FactorioMcp {
         } else {
             match client.get_character_position().await {
                 Ok(pos) => pos,
-                Err(e) => return self.with_player_messages(format!("Error getting position: {}", e)).await,
+                Err(e) => {
+                    return self
+                        .with_player_messages(format!("Error getting position: {}", e))
+                        .await
+                }
             }
         };
 
-        let result = match client.find_nearest_resource(&params.resource_type, from).await {
+        let result = match client
+            .find_nearest_resource(&params.resource_type, from)
+            .await
+        {
             Ok(resource) => {
                 let bb = &resource.bounding_box;
                 let info = serde_json::json!({
@@ -1046,7 +1140,9 @@ impl FactorioMcp {
     }
 
     /// Get current character status including position and health.
-    #[tool(description = "Get current character status including position, health, and walking state. TIP: Only check when you need to - avoid over-verifying after every action.")]
+    #[tool(
+        description = "Get current character status including position, health, and walking state. TIP: Only check when you need to - avoid over-verifying after every action."
+    )]
     async fn get_character(&self) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1082,10 +1178,12 @@ impl FactorioMcp {
                 let items: Vec<serde_json::Value> = inventory
                     .items
                     .into_iter()
-                    .map(|i| serde_json::json!({
-                        "name": i.name,
-                        "count": i.count,
-                    }))
+                    .map(|i| {
+                        serde_json::json!({
+                            "name": i.name,
+                            "count": i.count,
+                        })
+                    })
                     .collect();
                 serde_json::to_string_pretty(&items).unwrap_or_else(|e| format!("Error: {}", e))
             }
@@ -1112,7 +1210,9 @@ impl FactorioMcp {
     // --- Analysis Tools ---
 
     /// Analyze belt reachability from a position.
-    #[tool(description = "Analyze belt connectivity from a position. Shows all upstream (feeding) and downstream (fed) belts.")]
+    #[tool(
+        description = "Analyze belt connectivity from a position. Shows all upstream (feeding) and downstream (fed) belts."
+    )]
     async fn analyze_belt_reach(&self, Parameters(params): Parameters<BeltReachParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1120,8 +1220,14 @@ impl FactorioMcp {
         };
 
         let area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
         let result = match client.find_entities(area, None, None).await {
@@ -1142,7 +1248,9 @@ impl FactorioMcp {
     }
 
     /// Find all connected belt networks in an area.
-    #[tool(description = "Find all separate belt networks in an area. Shows network sizes and input/output counts.")]
+    #[tool(
+        description = "Find all separate belt networks in an area. Shows network sizes and input/output counts."
+    )]
     async fn analyze_belt_networks(&self, Parameters(params): Parameters<AreaParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1180,7 +1288,9 @@ impl FactorioMcp {
     }
 
     /// Analyze inserters in an area.
-    #[tool(description = "Analyze inserters - shows pickup/dropoff positions and what entities they interact with.")]
+    #[tool(
+        description = "Analyze inserters - shows pickup/dropoff positions and what entities they interact with."
+    )]
     async fn analyze_inserters(&self, Parameters(params): Parameters<AreaParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1200,7 +1310,9 @@ impl FactorioMcp {
     // --- Action Tools ---
 
     /// Walk character to a position.
-    #[tool(description = "Walk character to a position using pathfinding. TIP: Call broadcast_thought in the SAME response to narrate your movement while walking.")]
+    #[tool(
+        description = "Walk character to a position using pathfinding. TIP: Call broadcast_thought in the SAME response to narrate your movement while walking."
+    )]
     async fn walk_to(&self, Parameters(params): Parameters<PositionParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1229,14 +1341,21 @@ impl FactorioMcp {
         } else {
             match Direction::parse(&params.direction) {
                 Some(d) => d,
-                None => return self.with_player_messages(format!(
+                None => {
+                    return self
+                        .with_player_messages(format!(
                     "Invalid direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
                     params.direction
-                )).await,
+                ))
+                        .await
+                }
             }
         };
 
-        let result = match client.place_entity(&params.entity_name, position, direction).await {
+        let result = match client
+            .place_entity(&params.entity_name, position, direction)
+            .await
+        {
             Ok(r) => serde_json::to_string_pretty(&r).unwrap_or_else(|e| format!("Error: {}", e)),
             Err(e) => format!("Error: {}", e),
         };
@@ -1253,7 +1372,9 @@ impl FactorioMcp {
 
         let position = Position::new(params.x, params.y);
         let result = match client.mine_at(position, params.count).await {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e)),
+            Ok(result) => {
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e))
+            }
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
@@ -1268,21 +1389,33 @@ impl FactorioMcp {
         };
 
         let result = match client.craft(&params.recipe, params.count).await {
-            Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e)),
+            Ok(result) => {
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e))
+            }
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
     }
 
     /// Insert items into an entity.
-    #[tool(description = "Insert items from character inventory into an entity (furnace, chest, etc).")]
+    #[tool(
+        description = "Insert items from character inventory into an entity (furnace, chest, etc)."
+    )]
     async fn insert_items(&self, Parameters(params): Parameters<InsertItemsParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let result = match client.insert_items(params.unit_number, &params.item, params.count, &params.inventory_type).await {
+        let result = match client
+            .insert_items(
+                params.unit_number,
+                &params.item,
+                params.count,
+                &params.inventory_type,
+            )
+            .await
+        {
             Ok(()) => format!("Inserted {} {} into entity", params.count, params.item),
             Err(e) => format!("Error: {}", e),
         };
@@ -1290,14 +1423,24 @@ impl FactorioMcp {
     }
 
     /// Extract items from an entity into player inventory.
-    #[tool(description = "Extract items from an entity (furnace, chest, etc) into character inventory.")]
+    #[tool(
+        description = "Extract items from an entity (furnace, chest, etc) into character inventory."
+    )]
     async fn extract_items(&self, Parameters(params): Parameters<ExtractItemsParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let result = match client.extract_items(params.unit_number, &params.item, params.count, &params.inventory_type).await {
+        let result = match client
+            .extract_items(
+                params.unit_number,
+                &params.item,
+                params.count,
+                &params.inventory_type,
+            )
+            .await
+        {
             Ok(extracted) => format!("Extracted {} {} from entity", extracted, params.item),
             Err(e) => format!("Error: {}", e),
         };
@@ -1305,7 +1448,9 @@ impl FactorioMcp {
     }
 
     /// Set recipe on a crafting machine.
-    #[tool(description = "Set or clear the recipe on an assembling machine, chemical plant, or other crafting entity. Use empty string to clear the recipe.")]
+    #[tool(
+        description = "Set or clear the recipe on an assembling machine, chemical plant, or other crafting entity. Use empty string to clear the recipe."
+    )]
     async fn set_recipe(&self, Parameters(params): Parameters<SetRecipeParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1342,8 +1487,10 @@ impl FactorioMcp {
     }
 
     /// Route belts from point A to point B using A* pathfinding.
-    #[tool(description = "Route belts from one position to another using A* pathfinding to avoid obstacles. \
-        This is the recommended way to create belt connections. Use dry_run=true to preview the path before placing.")]
+    #[tool(
+        description = "Route belts from one position to another using A* pathfinding to avoid obstacles. \
+        This is the recommended way to create belt connections. Use dry_run=true to preview the path before placing."
+    )]
     async fn route_belt(&self, Parameters(params): Parameters<RouteBeltParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1366,7 +1513,11 @@ impl FactorioMcp {
         // Build collision map
         let mut collision_map = match client.build_collision_map(area).await {
             Ok(cm) => cm,
-            Err(e) => return self.with_player_messages(format!("Error building collision map: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error building collision map: {}", e))
+                    .await
+            }
         };
 
         // If extend_existing is enabled, unblock start/end positions if they have existing belts
@@ -1421,21 +1572,40 @@ impl FactorioMcp {
         let result = find_belt_route_with_options(start, goal, &collision_map, &routing_options);
 
         if !result.success {
-            return self.with_player_messages(format!("Route failed: {}", result.error.unwrap_or_else(|| "unknown error".to_string()))).await;
+            return self
+                .with_player_messages(format!(
+                    "Route failed: {}",
+                    result.error.unwrap_or_else(|| "unknown error".to_string())
+                ))
+                .await;
         }
 
         // Check inventory for required materials
         let inventory = match client.character_inventory().await {
             Ok(inv) => inv,
-            Err(e) => return self.with_player_messages(format!("Error checking inventory: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error checking inventory: {}", e))
+                    .await
+            }
         };
 
         // Count surface belts and underground belts needed
-        let surface_belts_needed = result.belts.iter().filter(|b| b.kind == BeltKind::Surface).count() as u32;
-        let underground_belts_needed = result.belts.iter().filter(|b| b.kind != BeltKind::Surface).count() as u32;
+        let surface_belts_needed = result
+            .belts
+            .iter()
+            .filter(|b| b.kind == BeltKind::Surface)
+            .count() as u32;
+        let underground_belts_needed = result
+            .belts
+            .iter()
+            .filter(|b| b.kind != BeltKind::Surface)
+            .count() as u32;
 
         // Count belts in inventory
-        let surface_belts_have = inventory.items.iter()
+        let surface_belts_have = inventory
+            .items
+            .iter()
             .find(|i| i.name == params.belt_type)
             .map(|i| i.count)
             .unwrap_or(0);
@@ -1449,41 +1619,53 @@ impl FactorioMcp {
         if params.dry_run {
             let mut msg = format!(
                 "Dry run - would place {} belts with {} turns",
-                result.belt_count,
-                result.turn_count
+                result.belt_count, result.turn_count
             );
             if result.underground_count > 0 {
                 msg.push_str(&format!(", {} underground pairs", result.underground_count));
             }
             // Show inventory status
-            msg.push_str(&format!("\nInventory: {} {} (need {})",
-                surface_belts_have, params.belt_type, surface_belts_needed));
+            msg.push_str(&format!(
+                "\nInventory: {} {} (need {})",
+                surface_belts_have, params.belt_type, surface_belts_needed
+            ));
             if underground_belts_needed > 0 {
                 if let Some(ug_name) = underground_belt_name {
-                    msg.push_str(&format!(", {} {} (need {})",
-                        underground_belts_have, ug_name, underground_belts_needed));
+                    msg.push_str(&format!(
+                        ", {} {} (need {})",
+                        underground_belts_have, ug_name, underground_belts_needed
+                    ));
                 }
             }
-            if surface_belts_have < surface_belts_needed || underground_belts_have < underground_belts_needed {
+            if surface_belts_have < surface_belts_needed
+                || underground_belts_have < underground_belts_needed
+            {
                 msg.push_str("\nWARNING: INSUFFICIENT MATERIALS - route will fail");
             }
-            msg.push_str(&format!("\n{}", serde_json::to_string_pretty(&result.belts).unwrap_or_default()));
+            msg.push_str(&format!(
+                "\n{}",
+                serde_json::to_string_pretty(&result.belts).unwrap_or_default()
+            ));
             return self.with_player_messages(msg).await;
         }
 
         // Pre-check: fail early if not enough materials
         if surface_belts_have < surface_belts_needed {
-            return self.with_player_messages(format!(
-                "Insufficient materials: need {} {}, have {}. Craft more belts first.",
-                surface_belts_needed, params.belt_type, surface_belts_have
-            )).await;
+            return self
+                .with_player_messages(format!(
+                    "Insufficient materials: need {} {}, have {}. Craft more belts first.",
+                    surface_belts_needed, params.belt_type, surface_belts_have
+                ))
+                .await;
         }
         if underground_belts_needed > 0 && underground_belts_have < underground_belts_needed {
             let ug_name = underground_belt_name.unwrap_or("underground-belt");
-            return self.with_player_messages(format!(
+            return self
+                .with_player_messages(format!(
                 "Insufficient materials: need {} {}, have {}. Craft more underground belts first.",
                 underground_belts_needed, ug_name, underground_belts_have
-            )).await;
+            ))
+                .await;
         }
 
         // Place the belts
@@ -1506,16 +1688,22 @@ impl FactorioMcp {
             // Factorio uses direction + type to distinguish entry/exit
             // Entry: direction points in flow direction, type = "input"
             // Exit: direction points in flow direction, type = "output"
-            let place_result = if belt.kind == BeltKind::UndergroundEntry || belt.kind == BeltKind::UndergroundExit {
+            let place_result = if belt.kind == BeltKind::UndergroundEntry
+                || belt.kind == BeltKind::UndergroundExit
+            {
                 let ug_type = match belt.kind {
                     BeltKind::UndergroundEntry => "input",
                     BeltKind::UndergroundExit => "output",
                     _ => "input",
                 };
                 // Place underground belt with type
-                client.place_underground_belt(entity_name, belt.position, belt.direction, ug_type).await
+                client
+                    .place_underground_belt(entity_name, belt.position, belt.direction, ug_type)
+                    .await
             } else {
-                client.place_entity(entity_name, belt.position, belt.direction).await
+                client
+                    .place_entity(entity_name, belt.position, belt.direction)
+                    .await
             };
 
             match place_result {
@@ -1525,7 +1713,10 @@ impl FactorioMcp {
         }
 
         let mut result_msg = if errors.is_empty() {
-            format!("Successfully placed {} belts with {} turns", placed, result.turn_count)
+            format!(
+                "Successfully placed {} belts with {} turns",
+                placed, result.turn_count
+            )
         } else {
             format!(
                 "Placed {}/{} belts. Errors:\n{}",
@@ -1535,23 +1726,37 @@ impl FactorioMcp {
             )
         };
         if result.underground_count > 0 {
-            result_msg.push_str(&format!(" ({} underground pairs)", result.underground_count));
+            result_msg.push_str(&format!(
+                " ({} underground pairs)",
+                result.underground_count
+            ));
         }
         self.with_player_messages(result_msg).await
     }
 
     /// Get belt contents with lane separation.
-    #[tool(description = "Get items on transport belts with left/right lane separation. \
-        Shows what items are on each lane of each belt, useful for diagnosing sushi belts or lane balancing issues.")]
-    async fn get_belt_lane_contents(&self, Parameters(params): Parameters<BeltLaneContentsParams>) -> String {
+    #[tool(
+        description = "Get items on transport belts with left/right lane separation. \
+        Shows what items are on each lane of each belt, useful for diagnosing sushi belts or lane balancing issues."
+    )]
+    async fn get_belt_lane_contents(
+        &self,
+        Parameters(params): Parameters<BeltLaneContentsParams>,
+    ) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
         let area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
         let result = match client.get_belt_lane_contents(area).await {
@@ -1562,51 +1767,82 @@ impl FactorioMcp {
     }
 
     /// Detect sushi belts (mixed items on same lane).
-    #[tool(description = "Detect sushi belts - belts with multiple item types mixed on the same lane. \
+    #[tool(
+        description = "Detect sushi belts - belts with multiple item types mixed on the same lane. \
         Also identifies lane-separated belts (different items on left vs right lane) and pure belts (single item type). \
-        Detects circular loop networks common in sushi setups.")]
-    async fn detect_sushi_belts(&self, Parameters(params): Parameters<SushiDetectParams>) -> String {
+        Detects circular loop networks common in sushi setups."
+    )]
+    async fn detect_sushi_belts(
+        &self,
+        Parameters(params): Parameters<SushiDetectParams>,
+    ) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
         let area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
         // Get belt lane contents
         let lane_contents = match client.get_belt_lane_contents(area).await {
             Ok(r) => r,
-            Err(e) => return self.with_player_messages(format!("Error getting belt contents: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error getting belt contents: {}", e))
+                    .await
+            }
         };
 
         // Get entities for belt graph
         let entities = match client.find_entities(area, None, None).await {
             Ok(e) => e,
-            Err(e) => return self.with_player_messages(format!("Error getting entities: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error getting entities: {}", e))
+                    .await
+            }
         };
 
         let graph = BeltGraph::from_entities(&entities);
         let result = detect_sushi_belts(&lane_contents, &graph);
 
-        let result_str = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        let result_str =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(result_str).await
     }
 
     /// Trace upstream sources for a belt.
-    #[tool(description = "Trace upstream to find all sources (inserters, drills, other belts) that can feed items onto a belt. \
-        Shows which lane each source feeds and detects circular loops. Useful for debugging why certain items appear on a belt.")]
-    async fn trace_belt_sources(&self, Parameters(params): Parameters<BeltSourcesParams>) -> String {
+    #[tool(
+        description = "Trace upstream to find all sources (inserters, drills, other belts) that can feed items onto a belt. \
+        Shows which lane each source feeds and detects circular loops. Useful for debugging why certain items appear on a belt."
+    )]
+    async fn trace_belt_sources(
+        &self,
+        Parameters(params): Parameters<BeltSourcesParams>,
+    ) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
         let area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
         let entities = match client.find_entities(area, None, None).await {
@@ -1627,9 +1863,11 @@ impl FactorioMcp {
     // --- Research Tools ---
 
     /// Get research status.
-    #[tool(description = "Get overall research status including current research progress, researched count, and research queue. \
+    #[tool(
+        description = "Get overall research status including current research progress, researched count, and research queue. \
         Also shows lab count, power status, and science packs currently in labs. \
-        IMPORTANT: Research requires labs with power and science packs inserted - this tool shows if you're set up correctly.")]
+        IMPORTANT: Research requires labs with power and science packs inserted - this tool shows if you're set up correctly."
+    )]
     async fn get_research_status(&self) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1645,17 +1883,19 @@ impl FactorioMcp {
     }
 
     /// Get available research.
-    #[tool(description = "Get technologies that can be researched now (enabled, prerequisites met, not yet researched). \
+    #[tool(
+        description = "Get technologies that can be researched now (enabled, prerequisites met, not yet researched). \
         Returns name, ingredients (science packs needed), effects, and whether you're ready to research. \
         Shows 'ready' or 'blocked' status with specific blockers (no labs, no power, missing science packs). \
-        IMPORTANT: To actually research you need: 1) Labs built, 2) Labs powered, 3) Science packs in labs.")]
+        IMPORTANT: To actually research you need: 1) Labs built, 2) Labs powered, 3) Science packs in labs."
+    )]
     async fn get_available_research(&self) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::get_available_research();
+        let lua = factorioctl::client::lua::LuaCommand::get_available_research(client.agent_id());
         let result = match client.execute_lua(&lua).await {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
@@ -1664,10 +1904,12 @@ impl FactorioMcp {
     }
 
     /// Start researching a technology.
-    #[tool(description = "Queue a technology for research. Uses proper research queue (not cheating). \
+    #[tool(
+        description = "Queue a technology for research. Uses proper research queue (not cheating). \
         REQUIREMENTS: 1) Technology enabled with prerequisites met, 2) At least one lab built, \
         3) Lab connected to power, 4) Required science packs inserted into lab. \
-        Will return specific error if any requirement is missing with guidance on what to do.")]
+        Will return specific error if any requirement is missing with guidance on what to do."
+    )]
     async fn start_research(&self, Parameters(params): Parameters<StartResearchParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -1685,15 +1927,21 @@ impl FactorioMcp {
     // --- Power Network Tools ---
 
     /// Get power network status at a location.
-    #[tool(description = "Get power network status near a position. Returns network ID, connected pole info, \
-        and power flow statistics (production/consumption).")]
+    #[tool(
+        description = "Get power network status near a position. Returns network ID, connected pole info, \
+        and power flow statistics (production/consumption)."
+    )]
     async fn get_power_status(&self, Parameters(params): Parameters<PowerStatusParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::get_power_status(params.x, params.y, params.radius);
+        let lua = factorioctl::client::lua::LuaCommand::get_power_status(
+            params.x,
+            params.y,
+            params.radius,
+        );
         let result = match client.execute_lua(&lua).await {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
@@ -1702,15 +1950,21 @@ impl FactorioMcp {
     }
 
     /// Get all power networks in an area.
-    #[tool(description = "Find all electric power networks in an area. Returns network IDs and pole counts. \
-        Useful for understanding power grid layout.")]
+    #[tool(
+        description = "Find all electric power networks in an area. Returns network IDs and pole counts. \
+        Useful for understanding power grid layout."
+    )]
     async fn get_power_networks(&self, Parameters(params): Parameters<AreaParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::get_power_networks(params.x, params.y, params.radius);
+        let lua = factorioctl::client::lua::LuaCommand::get_power_networks(
+            params.x,
+            params.y,
+            params.radius,
+        );
         let result = match client.execute_lua(&lua).await {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
@@ -1719,16 +1973,25 @@ impl FactorioMcp {
     }
 
     /// Find power issues - entities without power or with low power.
-    #[tool(description = "Find actionable power problems: entities with no_power or low_power status, \
+    #[tool(
+        description = "Find actionable power problems: entities with no_power or low_power status, \
         their positions, and suggested fixes (nearest pole location or need for more generators). \
-        Use this to diagnose and fix power grid issues.")]
-    async fn find_power_issues(&self, Parameters(params): Parameters<FindPowerIssuesParams>) -> String {
+        Use this to diagnose and fix power grid issues."
+    )]
+    async fn find_power_issues(
+        &self,
+        Parameters(params): Parameters<FindPowerIssuesParams>,
+    ) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::find_power_issues(params.x, params.y, params.radius);
+        let lua = factorioctl::client::lua::LuaCommand::find_power_issues(
+            params.x,
+            params.y,
+            params.radius,
+        );
         let result = match client.execute_lua(&lua).await {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
@@ -1739,15 +2002,18 @@ impl FactorioMcp {
     // --- Alert Tools ---
 
     /// Get alerts for urgent conditions.
-    #[tool(description = "Check for urgent conditions in an area: empty drills, entities without fuel, \
-        machines without power/ingredients, nearby enemies. Useful for monitoring factory health.")]
+    #[tool(
+        description = "Check for urgent conditions in an area: empty drills, entities without fuel, \
+        machines without power/ingredients, nearby enemies. Useful for monitoring factory health."
+    )]
     async fn get_alerts(&self, Parameters(params): Parameters<AlertsParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::get_alerts(params.x, params.y, params.radius);
+        let lua =
+            factorioctl::client::lua::LuaCommand::get_alerts(params.x, params.y, params.radius);
         let result = match client.execute_lua(&lua).await {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
@@ -1774,7 +2040,10 @@ impl FactorioMcp {
     #[tool(description = "Broadcast a thought or message to the human player. \
         Displays in-game (console and/or flying text) and speaks via TTS based on config. \
         IMPORTANT: Call this frequently and IN PARALLEL with action tools like walk_to. Good streamers narrate constantly - fill the silence!")]
-    async fn broadcast_thought(&self, Parameters(params): Parameters<BroadcastThoughtParams>) -> String {
+    async fn broadcast_thought(
+        &self,
+        Parameters(params): Parameters<BroadcastThoughtParams>,
+    ) -> String {
         use std::process::Stdio;
         use tokio::process::Command;
 
@@ -1833,7 +2102,9 @@ end
                 let backend = tts_config.backend.clone();
                 let voice = tts_config.voice.clone();
                 let rate = tts_config.rate;
-                let openai_key = tts_config.openai_api_key.clone()
+                let openai_key = tts_config
+                    .openai_api_key
+                    .clone()
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok());
 
                 tokio::spawn(async move {
@@ -1848,7 +2119,11 @@ end
                                 cmd.arg("-r").arg(wpm.to_string());
                             }
                             cmd.arg(&message);
-                            let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().await;
+                            let _ = cmd
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status()
+                                .await;
                         }
                         "openai" => {
                             if let Some(api_key) = openai_key {
@@ -1863,12 +2138,18 @@ end
 
                                 let mut curl = Command::new("curl");
                                 curl.args([
-                                    "-s", "-X", "POST",
+                                    "-s",
+                                    "-X",
+                                    "POST",
                                     "https://api.openai.com/v1/audio/speech",
-                                    "-H", &format!("Authorization: Bearer {}", api_key),
-                                    "-H", "Content-Type: application/json",
-                                    "-d", &body.to_string(),
-                                    "--output", "-",
+                                    "-H",
+                                    &format!("Authorization: Bearer {}", api_key),
+                                    "-H",
+                                    "Content-Type: application/json",
+                                    "-d",
+                                    &body.to_string(),
+                                    "--output",
+                                    "-",
                                 ]);
 
                                 if let Ok(output) = curl.output().await {
@@ -1940,9 +2221,10 @@ end
             .zones
             .values()
             .filter(|z| {
-                params.zone_type.as_ref().map_or(true, |t| {
-                    z.zone_type.to_string() == *t
-                })
+                params
+                    .zone_type
+                    .as_ref()
+                    .map_or(true, |t| z.zone_type.to_string() == *t)
             })
             .map(|z| {
                 serde_json::json!({
@@ -1959,7 +2241,8 @@ end
             })
             .collect();
 
-        let result = serde_json::to_string_pretty(&zones).unwrap_or_else(|e| format!("Error: {}", e));
+        let result =
+            serde_json::to_string_pretty(&zones).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(result).await
     }
 
@@ -1980,7 +2263,8 @@ end
                 },
                 "description": z.description,
                 "allowed_entities": z.zone_type.allowed_entities()
-            })).unwrap_or_else(|e| format!("Error: {}", e)),
+            }))
+            .unwrap_or_else(|e| format!("Error: {}", e)),
             None => format!("Zone '{}' not found", params.id),
         };
         self.with_player_messages(result).await
@@ -2040,8 +2324,10 @@ end
     // === Resource Protection Tools ===
 
     /// Scan for resources and optionally protect them.
-    #[tool(description = "Scan an area for resource patches (ore, oil) and save them as protected. \
-        Protected resources will generate warnings when you try to place non-mining buildings on them.")]
+    #[tool(
+        description = "Scan an area for resource patches (ore, oil) and save them as protected. \
+        Protected resources will generate warnings when you try to place non-mining buildings on them."
+    )]
     async fn scan_resources(&self, Parameters(params): Parameters<ScanResourcesParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -2049,13 +2335,23 @@ end
         };
 
         let area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
         let resources = match client.find_resources(area, None).await {
             Ok(r) => r,
-            Err(e) => return self.with_player_messages(format!("Error scanning: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error scanning: {}", e))
+                    .await
+            }
         };
 
         let mut memory = AgentMemory::load();
@@ -2092,7 +2388,9 @@ end
 
         if params.save_as_protected {
             if let Err(e) = memory.save() {
-                return self.with_player_messages(format!("Error saving memory: {}", e)).await;
+                return self
+                    .with_player_messages(format!("Error saving memory: {}", e))
+                    .await;
             }
         }
 
@@ -2102,13 +2400,16 @@ end
             "resources": info
         });
 
-        let result_str = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        let result_str =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(result_str).await
     }
 
     /// Get all protected resources.
-    #[tool(description = "List all protected resource patches that have been saved. \
-        These are areas where only mining-related buildings should be placed.")]
+    #[tool(
+        description = "List all protected resource patches that have been saved. \
+        These are areas where only mining-related buildings should be placed."
+    )]
     async fn get_protected_resources(&self) -> String {
         let memory = AgentMemory::load();
 
@@ -2131,16 +2432,22 @@ end
             })
             .collect();
 
-        let result = serde_json::to_string_pretty(&resources).unwrap_or_else(|e| format!("Error: {}", e));
+        let result =
+            serde_json::to_string_pretty(&resources).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(result).await
     }
 
     // === Layout Assistance Tools ===
 
     /// Check if a placement is appropriate.
-    #[tool(description = "Check if placing an entity at a position is appropriate. \
-        Validates against zones and protected resources. Use this before placing buildings to avoid bad locations.")]
-    async fn check_placement(&self, Parameters(params): Parameters<CheckPlacementParams>) -> String {
+    #[tool(
+        description = "Check if placing an entity at a position is appropriate. \
+        Validates against zones and protected resources. Use this before placing buildings to avoid bad locations."
+    )]
+    async fn check_placement(
+        &self,
+        Parameters(params): Parameters<CheckPlacementParams>,
+    ) -> String {
         let memory = AgentMemory::load();
         let pos = Position::new(params.x, params.y);
         let check = memory.check_placement(&params.entity_name, &pos);
@@ -2155,7 +2462,8 @@ end
             "overlapping_resources": check.overlapping_resources
         });
 
-        let result_str = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        let result_str =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(result_str).await
     }
 
@@ -2170,14 +2478,24 @@ end
 
         let memory = AgentMemory::load();
         let search_area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
         // Get existing entities to avoid
         let entities = match client.find_entities(search_area, None, None).await {
             Ok(e) => e,
-            Err(e) => return self.with_player_messages(format!("Error getting entities: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error getting entities: {}", e))
+                    .await
+            }
         };
 
         // Build a simple occupancy grid
@@ -2207,9 +2525,7 @@ end
                     );
 
                     // Check for entity overlap
-                    let has_entity = entities.iter().any(|e| {
-                        candidate.contains(&e.position)
-                    });
+                    let has_entity = entities.iter().any(|e| candidate.contains(&e.position));
 
                     if has_entity {
                         continue;
@@ -2223,9 +2539,9 @@ end
 
                     // Check for existing zone overlap
                     let overlapping_zones = memory.zones_overlapping(&candidate);
-                    let has_incompatible_zone = overlapping_zones.iter().any(|z| {
-                        z.zone_type == ZoneType::Reserved
-                    });
+                    let has_incompatible_zone = overlapping_zones
+                        .iter()
+                        .any(|z| z.zone_type == ZoneType::Reserved);
                     if has_incompatible_zone {
                         continue;
                     }
@@ -2244,9 +2560,11 @@ end
                             "y": check_y + height / 2
                         }
                     });
-                    return self.with_player_messages(
-                        serde_json::to_string_pretty(&result).unwrap_or_default()
-                    ).await;
+                    return self
+                        .with_player_messages(
+                            serde_json::to_string_pretty(&result).unwrap_or_default(),
+                        )
+                        .await;
                 }
             }
         }
@@ -2255,12 +2573,15 @@ end
             "found": false,
             "message": format!("No suitable {}x{} area found within radius {}", width, height, params.radius)
         });
-        self.with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default()).await
+        self.with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default())
+            .await
     }
 
     /// Get a blank slate view of constraints only.
-    #[tool(description = "Get only the immovable constraints in an area (terrain, resources, zones) without showing existing buildings. \
-        Useful for thinking fresh about layout without being distracted by existing messy layouts.")]
+    #[tool(
+        description = "Get only the immovable constraints in an area (terrain, resources, zones) without showing existing buildings. \
+        Useful for thinking fresh about layout without being distracted by existing messy layouts."
+    )]
     async fn get_blank_slate(&self, Parameters(params): Parameters<GetBlankSlateParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -2269,14 +2590,24 @@ end
 
         let memory = AgentMemory::load();
         let area = Area {
-            left_top: Position::new(params.x as f64 - params.radius as f64, params.y as f64 - params.radius as f64),
-            right_bottom: Position::new(params.x as f64 + params.radius as f64, params.y as f64 + params.radius as f64),
+            left_top: Position::new(
+                params.x as f64 - params.radius as f64,
+                params.y as f64 - params.radius as f64,
+            ),
+            right_bottom: Position::new(
+                params.x as f64 + params.radius as f64,
+                params.y as f64 + params.radius as f64,
+            ),
         };
 
         // Get resources in area
         let resources = match client.find_resources(area, None).await {
             Ok(r) => r,
-            Err(e) => return self.with_player_messages(format!("Error getting resources: {}", e)).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(format!("Error getting resources: {}", e))
+                    .await
+            }
         };
 
         // Get zones overlapping this area
@@ -2329,13 +2660,16 @@ end
             "tip": "This shows only immovable constraints. Plan your layout around these, then create zones before building."
         });
 
-        let result_str = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        let result_str =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(result_str).await
     }
 
     /// Clear trees and rocks in an area.
-    #[tool(description = "Clear trees and rocks in a rectangular area to make space for building. \
-        Use dry_run=true to preview what will be cleared before actually clearing.")]
+    #[tool(
+        description = "Clear trees and rocks in a rectangular area to make space for building. \
+        Use dry_run=true to preview what will be cleared before actually clearing."
+    )]
     async fn clear_area(&self, Parameters(params): Parameters<ClearAreaParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -2344,6 +2678,7 @@ end
 
         let area = Area::new(params.x1, params.y1, params.x2, params.y2);
         let lua = factorioctl::client::lua::LuaCommand::clear_area(
+            client.agent_id(),
             area,
             params.clear_trees,
             params.clear_rocks,

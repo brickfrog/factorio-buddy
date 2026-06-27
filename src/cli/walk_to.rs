@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Args;
 
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::world::TilePos;
 
 #[derive(Args, Debug)]
@@ -32,20 +31,18 @@ pub async fn execute(cmd: WalkToCommand, conn: &ResolvedConnectionArgs) -> Resul
         anyhow::bail!("Position must be x,y (integers)");
     }
 
-    let x: i32 = parts[0]
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("X coordinate must be an integer, got '{}'", parts[0].trim()))?;
-    let y: i32 = parts[1]
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Y coordinate must be an integer, got '{}'", parts[1].trim()))?;
+    let x: i32 = parts[0].trim().parse().map_err(|_| {
+        anyhow::anyhow!("X coordinate must be an integer, got '{}'", parts[0].trim())
+    })?;
+    let y: i32 = parts[1].trim().parse().map_err(|_| {
+        anyhow::anyhow!("Y coordinate must be an integer, got '{}'", parts[1].trim())
+    })?;
 
     let tile = TilePos::new(x, y);
     // For walking, target the center of the tile (same as 1x1 entity)
     let target = tile.to_world_1x1();
 
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let start = client.get_character_position().await?;
 

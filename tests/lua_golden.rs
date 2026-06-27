@@ -1,4 +1,5 @@
 use factorioctl::client::lua::LuaCommand;
+use factorioctl::client::AgentId;
 use factorioctl::world::{Area, Direction, Position};
 
 struct LuaCase {
@@ -29,6 +30,14 @@ fn area() -> Area {
     Area::new(-1.0, -2.0, 3.0, 4.0)
 }
 
+fn legacy_agent() -> AgentId {
+    AgentId::new(None).expect("legacy agent id")
+}
+
+fn named_agent() -> AgentId {
+    AgentId::new(Some("doug")).expect("named agent id")
+}
+
 fn all_lua_cases() -> Vec<LuaCase> {
     vec![
         LuaCase::new("get_surfaces", LuaCommand::get_surfaces()),
@@ -52,31 +61,73 @@ fn all_lua_cases() -> Vec<LuaCase> {
         ),
         LuaCase::new("get_tiles", LuaCommand::get_tiles(area())),
         LuaCase::new("get_tile", LuaCommand::get_tile(pos(7.0, 8.0))),
-        LuaCase::new("init_character", LuaCommand::init_character()),
+        LuaCase::new(
+            "init_character",
+            LuaCommand::init_character(&legacy_agent(), 0.0, 0.0),
+        ),
         LuaCase::new(
             "teleport_character",
-            LuaCommand::teleport_character(pos(10.0, 11.0)),
+            LuaCommand::teleport_character(&legacy_agent(), pos(10.0, 11.0)),
         ),
         LuaCase::new(
             "walk_character",
-            LuaCommand::walk_character(pos(12.0, 13.0)),
+            LuaCommand::walk_character(&legacy_agent(), pos(12.0, 13.0)),
         ),
-        LuaCase::new("character_status", LuaCommand::character_status()),
-        LuaCase::new("character_inventory", LuaCommand::character_inventory()),
-        LuaCase::new("start_mining", LuaCommand::start_mining(pos(14.0, 15.0))),
-        LuaCase::new("stop_mining", LuaCommand::stop_mining()),
-        LuaCase::new("get_mining_status", LuaCommand::get_mining_status()),
-        LuaCase::new("mine_at", LuaCommand::mine_at(pos(16.0, 17.0), 2)),
-        LuaCase::new("mine_nearest", LuaCommand::mine_nearest("iron-ore", 3)),
-        LuaCase::new("craft", LuaCommand::craft("iron-gear-wheel", 4)),
-        LuaCase::new("wait_for_crafting", LuaCommand::wait_for_crafting()),
+        LuaCase::new(
+            "walk_character_named",
+            LuaCommand::walk_character(&named_agent(), pos(12.0, 13.0)),
+        ),
+        LuaCase::new(
+            "walk_to_named_target",
+            LuaCommand::set_walk_target(&named_agent(), pos(12.0, 13.0)),
+        ),
+        LuaCase::new("walk_to_driver", LuaCommand::walk_driver_lua().to_string()),
+        LuaCase::new(
+            "character_status",
+            LuaCommand::character_status(&legacy_agent()),
+        ),
+        LuaCase::new(
+            "character_inventory",
+            LuaCommand::character_inventory(&legacy_agent()),
+        ),
+        LuaCase::new(
+            "start_mining",
+            LuaCommand::start_mining(&legacy_agent(), pos(14.0, 15.0)),
+        ),
+        LuaCase::new("stop_mining", LuaCommand::stop_mining(&legacy_agent())),
+        LuaCase::new(
+            "get_mining_status",
+            LuaCommand::get_mining_status(&legacy_agent()),
+        ),
+        LuaCase::new(
+            "mine_at",
+            LuaCommand::mine_at(&legacy_agent(), pos(16.0, 17.0), 2),
+        ),
+        LuaCase::new(
+            "mine_nearest",
+            LuaCommand::mine_nearest(&legacy_agent(), "iron-ore", 3),
+        ),
+        LuaCase::new(
+            "craft",
+            LuaCommand::craft(&legacy_agent(), "iron-gear-wheel", 4),
+        ),
+        LuaCase::new(
+            "wait_for_crafting",
+            LuaCommand::wait_for_crafting(&legacy_agent()),
+        ),
         LuaCase::new(
             "place_entity",
-            LuaCommand::place_entity("burner-mining-drill", pos(18.0, 19.0), Direction::East),
+            LuaCommand::place_entity(
+                &legacy_agent(),
+                "burner-mining-drill",
+                pos(18.0, 19.0),
+                Direction::East,
+            ),
         ),
         LuaCase::new(
             "place_underground_belt",
             LuaCommand::place_underground_belt(
+                &legacy_agent(),
                 "underground-belt",
                 pos(20.0, 21.0),
                 Direction::South,
@@ -85,7 +136,12 @@ fn all_lua_cases() -> Vec<LuaCase> {
         ),
         LuaCase::new(
             "place_ghost",
-            LuaCommand::place_ghost("stone-furnace", pos(22.0, 23.0), Direction::West),
+            LuaCommand::place_ghost(
+                &legacy_agent(),
+                "stone-furnace",
+                pos(22.0, 23.0),
+                Direction::West,
+            ),
         ),
         LuaCase::new(
             "remove_entity_at",
@@ -99,7 +155,7 @@ fn all_lua_cases() -> Vec<LuaCase> {
         ),
         LuaCase::new(
             "extract_items",
-            LuaCommand::extract_items(46, "iron-ore", 6, "chest"),
+            LuaCommand::extract_items(&legacy_agent(), 46, "iron-ore", 6, "chest"),
         ),
         LuaCase::new("set_recipe", LuaCommand::set_recipe(47, "copper-cable")),
         LuaCase::new("get_recipe", LuaCommand::get_recipe("iron-plate")),
@@ -142,7 +198,7 @@ fn all_lua_cases() -> Vec<LuaCase> {
         LuaCase::new("get_research_status", LuaCommand::get_research_status()),
         LuaCase::new(
             "get_available_research",
-            LuaCommand::get_available_research(),
+            LuaCommand::get_available_research(&legacy_agent()),
         ),
         LuaCase::new("start_research", LuaCommand::start_research("automation")),
         LuaCase::new("get_power_status", LuaCommand::get_power_status(30, 31, 10)),
@@ -165,7 +221,7 @@ fn all_lua_cases() -> Vec<LuaCase> {
         ),
         LuaCase::new(
             "clear_area",
-            LuaCommand::clear_area(area(), true, true, false),
+            LuaCommand::clear_area(&legacy_agent(), area(), true, true, false),
         ),
     ]
 }
@@ -291,20 +347,72 @@ fn generated_lua_has_rcon_safe_syntax_invariants() {
 #[test]
 fn corrected_inventory_readers_document_factorio_2_get_contents_shape() {
     for case in [
-        LuaCase::new("character_inventory", LuaCommand::character_inventory()),
-        LuaCase::new("mine_at", LuaCommand::mine_at(pos(16.0, 17.0), 2)),
-        LuaCase::new("mine_nearest", LuaCommand::mine_nearest("iron-ore", 3)),
+        LuaCase::new(
+            "character_inventory",
+            LuaCommand::character_inventory(&legacy_agent()),
+        ),
+        LuaCase::new(
+            "mine_at",
+            LuaCommand::mine_at(&legacy_agent(), pos(16.0, 17.0), 2),
+        ),
+        LuaCase::new(
+            "mine_nearest",
+            LuaCommand::mine_nearest(&legacy_agent(), "iron-ore", 3),
+        ),
         LuaCase::new(
             "get_available_research",
-            LuaCommand::get_available_research(),
+            LuaCommand::get_available_research(&legacy_agent()),
         ),
         LuaCase::new(
             "clear_area",
-            LuaCommand::clear_area(area(), true, true, false),
+            LuaCommand::clear_area(&legacy_agent(), area(), true, true, false),
         ),
     ] {
         assert_uses_factorio_2_get_contents_shape(case.name, &case.lua);
     }
+}
+
+#[test]
+fn named_walk_uses_the_shared_driver_target_without_walking_state() {
+    let agent = named_agent();
+    let walk_character = LuaCommand::walk_character(&agent, pos(12.0, 13.0));
+    let walk_target = LuaCommand::set_walk_target(&agent, pos(12.0, 13.0));
+
+    for (name, lua) in [
+        ("walk_character", walk_character.as_str()),
+        ("walk_target", walk_target.as_str()),
+    ] {
+        assert!(
+            lua.contains(r#"storage.factorioctl_walk_targets["doug"] = { x = 12, y = 13"#),
+            "{name} should store the named agent target for the on_tick driver"
+        );
+        assert!(
+            !lua.contains("walking = true") && !lua.contains("walking=true"),
+            "{name} should not start named orphan agents by relying on walking_state"
+        );
+    }
+
+    let driver = LuaCommand::walk_driver_lua();
+    assert!(
+        driver.contains("tgt.stuck_ticks") && driver.contains("tgt.expires_tick"),
+        "walk driver should clear targets after bounded no-progress/expiry guards"
+    );
+}
+
+#[test]
+fn research_readiness_counts_resolved_character_science_in_totals() {
+    let lua = LuaCommand::get_available_research(&named_agent());
+
+    let inventory_fold = lua
+        .find("science_totals[item.name] = (science_totals[item.name] or 0) + item.count")
+        .expect("character science should be folded into science_totals");
+    let readiness_read = lua
+        .find("local have = science_totals[ing.name] or 0")
+        .expect("research readiness should read science_totals");
+    assert!(
+        inventory_fold < readiness_read,
+        "character science must be folded before readiness is calculated"
+    );
 }
 
 #[test]
@@ -320,12 +428,11 @@ fn get_entity_inventory_remains_a_known_pre_factorio_2_reader_for_cjf_2() {
 
 #[test]
 fn inventory_and_crafting_lua_snapshots_are_stable() {
-    LuaCase::new("character_inventory", LuaCommand::character_inventory()).assert_snapshot(
-        r#"local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {} end c = global.factorioctl_character end
+    LuaCase::new("character_inventory", LuaCommand::character_inventory(&legacy_agent())).assert_snapshot(
+        r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then c = storage.factorioctl_characters["__player__"] end
 if c and c.valid then
     local inv = c.get_main_inventory()
     local items = {}
@@ -346,16 +453,12 @@ else
 end"#,
     );
 
-    LuaCase::new("craft", LuaCommand::craft("iron-gear-wheel", 4)).assert_snapshot(
-        r#"local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{"success": false, "error": "No character"}')
-    return
-end
+    LuaCase::new("craft", LuaCommand::craft(&legacy_agent(), "iron-gear-wheel", 4)).assert_snapshot(
+        r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then c = storage.factorioctl_characters["__player__"] end
+if not (c and c.valid) then rcon.print('{"error":"no character for agent __player__; spawn first"}') return end
 
 local crafted = c.begin_crafting{ recipe = "iron-gear-wheel", count = 4 }
 
@@ -378,16 +481,14 @@ rcon.print(helpers.table_to_json({
 fn placement_and_mining_lua_snapshots_are_stable() {
     LuaCase::new(
         "place_ghost",
-        LuaCommand::place_ghost("stone-furnace", pos(22.0, 23.0), Direction::West),
+        LuaCommand::place_ghost(&legacy_agent(), "stone-furnace", pos(22.0, 23.0), Direction::West),
     )
     .assert_snapshot(
-        r#"local c = nil
+        r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = nil
 for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{"error": "No character"}')
-    return
-end
+if not c then c = storage.factorioctl_characters["__player__"] end
+if not (c and c.valid) then rcon.print('{"error":"no character for agent __player__; spawn first"}') return end
 
 -- Create ghost entity (doesn't require items in inventory)
 local e = game.surfaces[1].create_entity{
@@ -399,6 +500,8 @@ local e = game.surfaces[1].create_entity{
 }
 
 if e then
+    storage.factorioctl_entities = storage.factorioctl_entities or {}
+storage.factorioctl_entities[e.unit_number] = e
     rcon.print(helpers.table_to_json({
         unit_number = e.unit_number,
         name = e.ghost_name or "stone-furnace",
@@ -413,16 +516,12 @@ else
 end"#,
     );
 
-    LuaCase::new("start_mining", LuaCommand::start_mining(pos(14.0, 15.0))).assert_snapshot(
-        r#"local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{"success": false, "error": "No character"}')
-    return
-end
+    LuaCase::new("start_mining", LuaCommand::start_mining(&legacy_agent(), pos(14.0, 15.0))).assert_snapshot(
+        r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then c = storage.factorioctl_characters["__player__"] end
+if not (c and c.valid) then rcon.print('{"error":"no character for agent __player__; spawn first"}') return end
 
 -- Find a minable entity at the position
 local target = nil
@@ -705,4 +804,93 @@ else
     rcon.print('{"success": false, "error": "Failed to queue research - check if another research is in progress"}')
 end"#,
     );
+}
+
+#[test]
+fn agent_id_accepts_and_rejects_spec_vectors() {
+    for raw in [
+        None,
+        Some(""),
+        Some("default"),
+        Some("__player__"),
+        Some("doug-nauvis"),
+        Some("a.b:c"),
+        Some("a--b"),
+    ] {
+        AgentId::new(raw).expect("accepted agent id");
+    }
+
+    for raw in [Some("\""), Some("\n"), Some("]"), Some("a\"b")] {
+        assert!(AgentId::new(raw).is_err(), "expected {raw:?} to reject");
+    }
+
+    assert!(AgentId::new(Some(&"a".repeat(65))).is_err());
+    assert!(AgentId::new(None).expect("default").is_legacy());
+    assert!(AgentId::new(Some("default")).expect("default").is_legacy());
+    assert!(!AgentId::new(Some("doug-nauvis"))
+        .expect("named")
+        .is_legacy());
+}
+
+#[test]
+fn resolve_helpers_match_spec_snapshots() {
+    let named = AgentId::new(Some("doug")).unwrap();
+    let legacy = AgentId::new(None).unwrap();
+
+    LuaCase::new("resolve_required_named", LuaCommand::resolve_required(&named)).assert_snapshot(
+        r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = storage.factorioctl_characters["doug"]
+if not (c and c.valid) then rcon.print('{"error":"no character for agent doug; spawn first"}') return end"#,
+    );
+
+    LuaCase::new("resolve_required_legacy", LuaCommand::resolve_required(&legacy)).assert_snapshot(
+        r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then c = storage.factorioctl_characters["__player__"] end
+if not (c and c.valid) then rcon.print('{"error":"no character for agent __player__; spawn first"}') return end"#,
+    );
+
+    LuaCase::new(
+        "resolve_optional_named",
+        LuaCommand::resolve_optional(&named),
+    )
+    .assert_snapshot(
+        r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = storage.factorioctl_characters["doug"]"#,
+    );
+
+    LuaCase::new("resolve_optional_legacy", LuaCommand::resolve_optional(&legacy)).assert_snapshot(
+        r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then c = storage.factorioctl_characters["__player__"] end"#,
+    );
+}
+
+#[test]
+fn static_builder_tests_cover_named_legacy_extract_and_registry_contracts() {
+    let named = named_agent();
+    let legacy = legacy_agent();
+
+    let named_lua = LuaCommand::walk_character(&named, pos(12.0, 13.0));
+    assert!(named_lua.contains("storage.factorioctl_characters[\"doug\"]"));
+    assert!(!named_lua.contains("connected_players"));
+    assert!(!named_lua.contains("global."));
+
+    let legacy_lua = LuaCommand::walk_character(&legacy, pos(12.0, 13.0));
+    assert!(legacy_lua.contains("for _, p in pairs(game.connected_players) do"));
+    assert!(legacy_lua.contains("storage.factorioctl_characters[\"__player__\"]"));
+
+    let extract_lua = LuaCommand::extract_items(&named, 46, "iron-ore", 6, "chest");
+    assert!(extract_lua.contains("local player_inv = c.get_main_inventory()"));
+    assert!(!extract_lua.contains("game.players[1]"));
+
+    for lua in [
+        LuaCommand::get_entity_inventory(42),
+        LuaCommand::extract_items(&named, 46, "iron-ore", 6, "chest"),
+        LuaCommand::set_recipe(47, "copper-cable"),
+    ] {
+        assert!(lua.contains("storage.factorioctl_entities["));
+    }
 }

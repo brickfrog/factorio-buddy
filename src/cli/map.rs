@@ -13,7 +13,7 @@ pub type PowerCoverage = HashMap<(i32, i32), u8>;
 
 /// Execute the map command
 pub async fn execute(cmd: MapCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
     cmd.run(&mut client).await
 }
 
@@ -106,7 +106,9 @@ impl MapCommand {
                                 let mut coverage: PowerCoverage = HashMap::new();
                                 for (key, val) in map {
                                     if let Some((x_str, y_str)) = key.split_once(',') {
-                                        if let (Ok(x), Ok(y)) = (x_str.parse::<i32>(), y_str.parse::<i32>()) {
+                                        if let (Ok(x), Ok(y)) =
+                                            (x_str.parse::<i32>(), y_str.parse::<i32>())
+                                        {
                                             if let Some(id) = val.as_u64() {
                                                 coverage.insert((x, y), id as u8);
                                             }
@@ -404,12 +406,16 @@ pub fn render_ascii_map(
 
     output.push_str(&format!(
         "Map: ({},{}) to ({},{})\n",
-        x_min, y_min, x_max, center.y as i32 + r
+        x_min,
+        y_min,
+        x_max,
+        center.y as i32 + r
     ));
 
     // Legend
     output.push_str("Legend: @=you ^v<>=belt D=drill F=furnace A=assembler i=inserter\n");
-    output.push_str("        I=iron C=copper c=coal S=stone B=chest P=pole ~=water X=wreck o=rock\n");
+    output
+        .push_str("        I=iron C=copper c=coal S=stone B=chest P=pole ~=water X=wreck o=rock\n");
     if power_coverage.is_some() {
         output.push_str("        1-9=power network coverage (network ID)\n");
     }

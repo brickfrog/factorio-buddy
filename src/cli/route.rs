@@ -5,7 +5,6 @@ use clap::{Args, Subcommand};
 
 use super::parsing::parse_tile;
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::world::{find_belt_route, Area, GridPos, Position, TilePos};
 
 #[derive(Args, Debug)]
@@ -45,7 +44,7 @@ pub enum RouteSubcommand {
 }
 
 pub async fn execute(cmd: RouteCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.subcommand {
         RouteSubcommand::Belt {
@@ -68,12 +67,18 @@ pub async fn execute(cmd: RouteCommand, conn: &ResolvedConnectionArgs) -> Result
             );
             println!(
                 "Search area: ({}, {}) to ({}, {})",
-                area.left_top.x as i32, area.left_top.y as i32, area.right_bottom.x as i32, area.right_bottom.y as i32
+                area.left_top.x as i32,
+                area.left_top.y as i32,
+                area.right_bottom.x as i32,
+                area.right_bottom.y as i32
             );
 
             // Build collision map
             let collision_map = client.build_collision_map(area).await?;
-            println!("Collision map: {} blocked tiles", collision_map.blocked_count());
+            println!(
+                "Collision map: {} blocked tiles",
+                collision_map.blocked_count()
+            );
 
             // Find path using GridPos (integer coordinates)
             let start_grid = GridPos::new(start_tile.x, start_tile.y);
@@ -88,7 +93,10 @@ pub async fn execute(cmd: RouteCommand, conn: &ResolvedConnectionArgs) -> Result
             }
 
             if !result.success {
-                println!("Route failed: {}", result.error.as_deref().unwrap_or("unknown"));
+                println!(
+                    "Route failed: {}",
+                    result.error.as_deref().unwrap_or("unknown")
+                );
                 client.close().await?;
                 return Ok(());
             }

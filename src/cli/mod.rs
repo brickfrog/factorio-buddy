@@ -1,5 +1,7 @@
 //! CLI command definitions and handlers
 
+use crate::client::{AgentId, FactorioClient};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod analyze;
@@ -66,24 +68,31 @@ pub struct ConnectionArgs {
     /// Output format
     #[arg(long, default_value = "human", global = true)]
     pub output: OutputFormat,
+
+    /// Agent id for scoped character control
+    #[arg(long, global = true, env = "FACTORIO_AGENT_ID")]
+    pub agent_id: Option<String>,
 }
 
 impl ConnectionArgs {
     /// Resolve connection args with config file fallbacks
-    pub fn resolve(&self) -> ResolvedConnectionArgs {
+    pub fn resolve(&self) -> Result<ResolvedConnectionArgs> {
         let config = config::Config::load().unwrap_or_default();
-        ResolvedConnectionArgs {
-            host: self.host.clone()
+        Ok(ResolvedConnectionArgs {
+            host: self
+                .host
+                .clone()
                 .or(config.host)
                 .unwrap_or_else(|| "localhost".to_string()),
-            port: self.port
-                .or(config.port)
-                .unwrap_or(27015),
-            password: self.password.clone()
+            port: self.port.or(config.port).unwrap_or(27015),
+            password: self
+                .password
+                .clone()
                 .or(config.password)
                 .unwrap_or_default(),
             output: self.output,
-        }
+            agent_id: AgentId::new(self.agent_id.as_deref())?,
+        })
     }
 }
 
@@ -94,6 +103,17 @@ pub struct ResolvedConnectionArgs {
     pub port: u16,
     pub password: String,
     pub output: OutputFormat,
+    pub agent_id: AgentId,
+}
+
+impl ResolvedConnectionArgs {
+    pub async fn connect_client(&self) -> Result<FactorioClient> {
+        Ok(
+            FactorioClient::connect(&self.host, self.port, &self.password)
+                .await?
+                .with_agent_id(self.agent_id.clone()),
+        )
+    }
 }
 
 /// Top-level commands

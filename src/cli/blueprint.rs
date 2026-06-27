@@ -71,7 +71,6 @@ pub enum BlueprintSubcommand {
     },
 
     // --- Native Factorio Blueprint Commands ---
-
     /// Export area to native Factorio blueprint string
     String {
         /// Area to export (x1,y1,x2,y2)
@@ -134,7 +133,7 @@ pub enum BlueprintSubcommand {
 }
 
 pub async fn execute(cmd: BlueprintCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.subcommand {
         BlueprintSubcommand::Apply {
@@ -199,7 +198,6 @@ pub async fn execute(cmd: BlueprintCommand, conn: &ResolvedConnectionArgs) -> Re
         }
 
         // --- Native Factorio Blueprint Commands ---
-
         BlueprintSubcommand::String { area } => {
             let area = parse_area(&area)?;
             let result = client.create_native_blueprint(area).await?;
@@ -231,7 +229,11 @@ pub async fn execute(cmd: BlueprintCommand, conn: &ResolvedConnectionArgs) -> Re
             }
         }
 
-        BlueprintSubcommand::Place { name, at, direction } => {
+        BlueprintSubcommand::Place {
+            name,
+            at,
+            direction,
+        } => {
             let position = parse_position(&at)?;
             let dir = Direction::from_name(&direction).unwrap_or(Direction::North);
             let result = client
@@ -301,9 +303,7 @@ async fn compute_diff(
     let world_entities: Vec<_> = world_entities
         .into_iter()
         .filter(|e| {
-            e.force.as_deref() == Some("player")
-                && e.unit_number.is_some()
-                && e.name != "character"
+            e.force.as_deref() == Some("player") && e.unit_number.is_some() && e.name != "character"
         })
         .collect();
 
@@ -463,10 +463,7 @@ async fn apply_diff(client: &mut FactorioClient, diff: &BlueprintDiff) -> Result
 
     // Add new entities
     for a in &diff.add {
-        match client
-            .place_entity(&a.name, a.position, a.direction)
-            .await
-        {
+        match client.place_entity(&a.name, a.position, a.direction).await {
             Ok(_) => result.added += 1,
             Err(e) => result.errors.push(format!(
                 "Failed to place {} at ({:.1}, {:.1}): {}",
@@ -491,9 +488,7 @@ async fn export_blueprint(
     let entities: Vec<_> = entities
         .into_iter()
         .filter(|e| {
-            e.force.as_deref() == Some("player")
-                && e.unit_number.is_some()
-                && e.name != "character"
+            e.force.as_deref() == Some("player") && e.unit_number.is_some() && e.name != "character"
         })
         .collect();
 

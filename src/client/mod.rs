@@ -4,13 +4,13 @@ pub mod lua;
 pub mod rcon;
 pub mod server;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::world::{
-    Area, BeltContentsResult, BeltLaneContentsResult, BeltLaneSummary, BuildResult, CharacterStatus,
-    CollisionMap, CraftResult, Direction, Entity, GatherResult, GridPos, Inventory, InventoryItem,
-    LaneContents, MineResult, PlacementSpec, Position, Prototype, Recipe, RecipeSummary,
-    ResourcePatch, Surface, Tick, Tile, TilePos, WalkResult,
+    Area, BeltContentsResult, BeltLaneContentsResult, BeltLaneSummary, BuildResult,
+    CharacterStatus, CollisionMap, CraftResult, Direction, Entity, GatherResult, GridPos,
+    Inventory, InventoryItem, LaneContents, MineResult, PlacementSpec, Position, Prototype, Recipe,
+    RecipeSummary, ResourcePatch, Surface, Tick, Tile, TilePos, WalkResult,
 };
 use lua::LuaCommand;
 use rcon::RconClient;
@@ -27,6 +27,37 @@ pub struct FactorioClient {
     rcon: RconClient,
     /// Use /c instead of /silent-command (shows commands in console)
     debug_commands: bool,
+    agent_id: AgentId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentId(String);
+
+impl AgentId {
+    pub fn new(raw: Option<&str>) -> Result<Self> {
+        let normalized = match raw {
+            Some(value) if !value.is_empty() => value,
+            _ => "__player__",
+        };
+
+        let valid_len = (1..=64).contains(&normalized.len());
+        let valid_chars = normalized
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'));
+        if !valid_len || !valid_chars {
+            bail!("invalid agent id");
+        }
+
+        Ok(Self(normalized.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.0 == "default" || self.0 == "__player__"
+    }
 }
 
 impl FactorioClient {
@@ -39,10 +70,20 @@ impl FactorioClient {
             .map(|c| c.debug_commands)
             .unwrap_or(false);
 
-        // Send warmup command (first command after connection may get dropped)
-        let _ = rcon.execute("/silent-command").await;
+        Ok(Self {
+            rcon,
+            debug_commands,
+            agent_id: AgentId::new(None)?,
+        })
+    }
 
-        Ok(Self { rcon, debug_commands })
+    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
+        self.agent_id = agent_id;
+        self
+    }
+
+    pub fn agent_id(&self) -> &AgentId {
+        &self.agent_id
     }
 
     /// Close the connection
@@ -59,8 +100,14 @@ impl FactorioClient {
             .filter(|line| !line.is_empty() && !line.starts_with("--"))
             .collect::<Vec<_>>()
             .join(" ");
-        let prefix = if self.debug_commands { "/c" } else { "/silent-command" };
-        self.rcon.execute(&format!("{} {}", prefix, single_line)).await
+        let prefix = if self.debug_commands {
+            "/c"
+        } else {
+            "/silent-command"
+        };
+        self.rcon
+            .execute(&format!("{} {}", prefix, single_line))
+            .await
     }
 
     /// Execute a Lua command with explicit visibility control
@@ -72,7 +119,9 @@ impl FactorioClient {
             .collect::<Vec<_>>()
             .join(" ");
         let prefix = if visible { "/c" } else { "/silent-command" };
-        self.rcon.execute(&format!("{} {}", prefix, single_line)).await
+        self.rcon
+            .execute(&format!("{} {}", prefix, single_line))
+            .await
     }
 
     // --- Game State Queries ---
@@ -349,8 +398,8 @@ impl FactorioClient {
     // --- Character Control ---
 
     /// Initialize character entity
-    pub async fn init_character(&mut self) -> Result<Entity> {
-        let lua = LuaCommand::init_character();
+    pub async fn init_character(&mut self, x: f64, y: f64) -> Result<Entity> {
+        let lua = LuaCommand::init_character(&self.agent_id, x, y);
         let response = self.execute_lua(&lua).await?;
         let entity: Entity = serde_json::from_str(&response)?;
         Ok(entity)
@@ -358,21 +407,21 @@ impl FactorioClient {
 
     /// Teleport character to position
     pub async fn teleport_character(&mut self, position: Position) -> Result<()> {
-        let lua = LuaCommand::teleport_character(position);
+        let lua = LuaCommand::teleport_character(&self.agent_id, position);
         self.execute_lua(&lua).await?;
         Ok(())
     }
 
     /// Start walking character to position
     pub async fn walk_character(&mut self, position: Position) -> Result<()> {
-        let lua = LuaCommand::walk_character(position);
+        let lua = LuaCommand::walk_character(&self.agent_id, position);
         self.execute_lua(&lua).await?;
         Ok(())
     }
 
     /// Get character status
     pub async fn character_status(&mut self) -> Result<CharacterStatus> {
-        let lua = LuaCommand::character_status();
+        let lua = LuaCommand::character_status(&self.agent_id);
         let response = self.execute_lua(&lua).await?;
         let status: CharacterStatus = serde_json::from_str(&response)?;
         Ok(status)
@@ -380,7 +429,7 @@ impl FactorioClient {
 
     /// Get character inventory
     pub async fn character_inventory(&mut self) -> Result<Inventory> {
-        let lua = LuaCommand::character_inventory();
+        let lua = LuaCommand::character_inventory(&self.agent_id);
         let response = self.execute_lua(&lua).await?;
         let inventory: Inventory = serde_json::from_str(&response)?;
         Ok(inventory)
@@ -403,17 +452,10 @@ impl FactorioClient {
         }
 
         // Mine using mine_entity (instant but reliable), also handles items on ground
+        let resolve = LuaCommand::resolve_required(&self.agent_id);
         let mine_lua = format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{{"success": false, "error": "No character"}}')
-    return
-end
+{}
 
 local inv = c.get_main_inventory()
 local mined = 0
@@ -472,7 +514,7 @@ end
 
 rcon.print('{{"success": true, "mined": ' .. mined .. ', "picked_up": ' .. picked_up .. '}}')
 "#,
-            count, position.x, position.y, position.x, position.y, position.x, position.y
+            resolve, count, position.x, position.y, position.x, position.y, position.x, position.y
         );
 
         let _ = self.execute_lua(&mine_lua).await?;
@@ -499,14 +541,10 @@ rcon.print('{{"success": true, "mined": ' .. mined .. ', "picked_up": ' .. picke
 
         for _ in 0..count {
             // Find nearest entity of type
+            let resolve = LuaCommand::resolve_required(&self.agent_id);
             let find_lua = format!(
                 r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then rcon.print("error") return end
+{}
 
 local entities = game.surfaces[1].find_entities_filtered{{
     name = "{}",
@@ -534,7 +572,7 @@ else
     rcon.print("none")
 end
 "#,
-                entity_type
+                resolve, entity_type
             );
 
             let response = self.execute_lua(&find_lua).await?;
@@ -573,7 +611,7 @@ end
 
     /// Start crafting a recipe
     pub async fn craft(&mut self, recipe: &str, count: u32) -> Result<CraftResult> {
-        let lua = LuaCommand::craft(recipe, count);
+        let lua = LuaCommand::craft(&self.agent_id, recipe, count);
         let response = self.execute_lua(&lua).await?;
         let result: CraftResult = serde_json::from_str(&response)?;
         Ok(result)
@@ -581,7 +619,7 @@ end
 
     /// Wait for crafting to complete
     pub async fn wait_for_crafting(&mut self) -> Result<()> {
-        let lua = LuaCommand::wait_for_crafting();
+        let lua = LuaCommand::wait_for_crafting(&self.agent_id);
         self.execute_lua(&lua).await?;
         Ok(())
     }
@@ -595,7 +633,7 @@ end
         position: Position,
         direction: Direction,
     ) -> Result<Entity> {
-        let lua = LuaCommand::place_entity(entity_name, position, direction);
+        let lua = LuaCommand::place_entity(&self.agent_id, entity_name, position, direction);
         let response = self.execute_lua(&lua).await?;
         // Check for error response
         if response.contains("\"error\"") {
@@ -617,7 +655,7 @@ end
         position: Position,
         direction: Direction,
     ) -> Result<Entity> {
-        let lua = LuaCommand::place_ghost(entity_name, position, direction);
+        let lua = LuaCommand::place_ghost(&self.agent_id, entity_name, position, direction);
         let response = self.execute_lua(&lua).await?;
         if response.contains("\"error\"") {
             #[derive(serde::Deserialize)]
@@ -676,7 +714,8 @@ end
         count: u32,
         inventory_type: &str,
     ) -> Result<u32> {
-        let lua = LuaCommand::extract_items(unit_number, item, count, inventory_type);
+        let lua =
+            LuaCommand::extract_items(&self.agent_id, unit_number, item, count, inventory_type);
         let response = self.execute_lua(&lua).await?;
 
         #[derive(serde::Deserialize)]
@@ -722,7 +761,13 @@ end
         direction: Direction,
         belt_type: &str, // "input" for entry, "output" for exit
     ) -> Result<Entity> {
-        let lua = LuaCommand::place_underground_belt(entity_name, position, direction, belt_type);
+        let lua = LuaCommand::place_underground_belt(
+            &self.agent_id,
+            entity_name,
+            position,
+            direction,
+            belt_type,
+        );
         let response = self.execute_lua(&lua).await?;
         // Check for error response
         if response.contains("\"error\"") {
@@ -803,32 +848,26 @@ end
         max_distance: f64,
     ) -> Result<()> {
         let entity = self.get_entity(unit_number).await?;
-        self.ensure_proximity_to_position(entity.position, max_distance).await
+        self.ensure_proximity_to_position(entity.position, max_distance)
+            .await
     }
 
     // --- High-Level Operations ---
 
     /// Get character's current position (uses first connected player or spawned character)
     pub async fn get_character_position(&mut self) -> Result<Position> {
-        let lua = r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then
-        c = p.character
-        break
-    end
-end
-if not c then
-    if not global then global = {} end
-    c = global.factorioctl_character
-end
+        let lua = format!(
+            "{}\n{}",
+            LuaCommand::resolve_optional(&self.agent_id),
+            r#"
 if c and c.valid then
     rcon.print(c.position.x .. "," .. c.position.y)
 else
     rcon.print("error")
 end
-"#;
-        let response = self.execute_lua(lua).await?;
+"#
+        );
+        let response = self.execute_lua(&lua).await?;
         let parts: Vec<&str> = response.trim().split(',').collect();
         if parts.len() != 2 {
             anyhow::bail!("No character available");
@@ -925,13 +964,51 @@ end
     pub async fn walk_to(&mut self, target: Position, _run: bool) -> Result<WalkResult> {
         let mut total_distance = 0.0;
         let start_pos = self.get_character_position().await?;
+
+        if !self.agent_id.is_legacy() {
+            let target_lua = LuaCommand::set_walk_target(&self.agent_id, target);
+            let clear_lua = LuaCommand::clear_walk_target(&self.agent_id);
+            self.execute_lua(&target_lua).await?;
+            let mut last_pos = start_pos;
+
+            for _ in 0..500 {
+                let pos = self.get_character_position().await?;
+                total_distance += pos.distance(&last_pos);
+
+                if pos.distance(&target) < 3.0 {
+                    self.execute_lua(&clear_lua).await?;
+                    return Ok(WalkResult {
+                        arrived: true,
+                        final_position: pos,
+                        distance_walked: total_distance,
+                        reason: None,
+                    });
+                }
+
+                last_pos = pos;
+                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            }
+
+            self.execute_lua(&clear_lua).await?;
+            let pos = self.get_character_position().await?;
+            return Ok(WalkResult {
+                arrived: false,
+                final_position: pos,
+                distance_walked: total_distance,
+                reason: Some("Timeout".to_string()),
+            });
+        }
+
         let mut last_pos = start_pos;
         let mut last_dist = start_pos.distance(&target);
         let mut stuck_count = 0;
         let mut overshoot_count = 0;
 
         // Helper to stop walking
-        let stop_lua = "local c = nil for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end if not c then if not global then global = {} end c = global.factorioctl_character end if c then c.walking_state = {walking=false} end";
+        let stop_lua = format!(
+            "{}\nif c then c.walking_state = {{walking=false}} end",
+            LuaCommand::resolve_required(&self.agent_id)
+        );
 
         for i in 0..500 {
             let pos = self.get_character_position().await?;
@@ -945,7 +1022,7 @@ end
 
             // Check if arrived (generous tolerance of 3 tiles)
             if dist < 3.0 {
-                self.execute_lua(stop_lua).await?;
+                self.execute_lua(&stop_lua).await?;
                 return Ok(WalkResult {
                     arrived: true,
                     final_position: pos,
@@ -958,12 +1035,16 @@ end
             if i > 2 && dist > last_dist + 0.5 {
                 overshoot_count += 1;
                 if overshoot_count >= 2 {
-                    self.execute_lua(stop_lua).await?;
+                    self.execute_lua(&stop_lua).await?;
                     return Ok(WalkResult {
                         arrived: dist < 5.0, // Close enough
                         final_position: pos,
                         distance_walked: total_distance,
-                        reason: if dist < 5.0 { None } else { Some("Overshot target".to_string()) },
+                        reason: if dist < 5.0 {
+                            None
+                        } else {
+                            Some("Overshot target".to_string())
+                        },
                     });
                 }
             } else {
@@ -974,7 +1055,7 @@ end
             if i > 3 && step_dist < 0.01 && dist > 3.0 {
                 stuck_count += 1;
                 if stuck_count >= 3 {
-                    self.execute_lua(stop_lua).await?;
+                    self.execute_lua(&stop_lua).await?;
                     return Ok(WalkResult {
                         arrived: false,
                         final_position: pos,
@@ -992,15 +1073,31 @@ end
             // Calculate direction using explicit 8-direction logic
             // In Factorio: North=-Y, East=+X, South=+Y, West=-X
             let dir_name = if dx.abs() < 0.5 {
-                if dy < 0.0 { "north" } else { "south" }
+                if dy < 0.0 {
+                    "north"
+                } else {
+                    "south"
+                }
             } else if dy.abs() < 0.5 {
-                if dx > 0.0 { "east" } else { "west" }
+                if dx > 0.0 {
+                    "east"
+                } else {
+                    "west"
+                }
             } else {
                 let ratio = dy.abs() / dx.abs();
                 if ratio < 0.414 {
-                    if dx > 0.0 { "east" } else { "west" }
+                    if dx > 0.0 {
+                        "east"
+                    } else {
+                        "west"
+                    }
                 } else if ratio > 2.414 {
-                    if dy < 0.0 { "north" } else { "south" }
+                    if dy < 0.0 {
+                        "north"
+                    } else {
+                        "south"
+                    }
                 } else {
                     match (dx > 0.0, dy < 0.0) {
                         (true, true) => "northeast",
@@ -1012,12 +1109,11 @@ end
             };
 
             // Set walking state using Factorio's defines.direction
+            let resolve = LuaCommand::resolve_required(&self.agent_id);
             let lua = format!(
-                r#"local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
+                r#"{}
 if c then c.walking_state = {{walking=true, direction=defines.direction.{}}} end"#,
-                dir_name
+                resolve, dir_name
             );
             self.execute_lua(&lua).await?;
 
@@ -1025,9 +1121,7 @@ if c then c.walking_state = {{walking=true, direction=defines.direction.{}}} end
         }
 
         // Timeout
-        self.execute_lua(
-            "local c = nil for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end if not c then if not global then global = {} end c = global.factorioctl_character end if c then c.walking_state = {walking=false} end"
-        ).await?;
+        self.execute_lua(&stop_lua).await?;
         let pos = self.get_character_position().await?;
         Ok(WalkResult {
             arrived: false,
@@ -1049,12 +1143,10 @@ if c then c.walking_state = {{walking=true, direction=defines.direction.{}}} end
 
         for _ in 0..amount {
             // Find nearest resource
+            let resolve = LuaCommand::resolve_required(&self.agent_id);
             let find_lua = format!(
                 r#"
-local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then rcon.print("error") return end
+{}
 
 local entities = game.surfaces[1].find_entities_filtered{{
     name = "{}",
@@ -1080,7 +1172,7 @@ else
     rcon.print("none")
 end
 "#,
-                resource_name, radius
+                resolve, resource_name, radius
             );
 
             let response = self.execute_lua(&find_lua).await?;
@@ -1103,15 +1195,10 @@ end
             total_distance += walk_result.distance_walked;
 
             // Mine the resource using mine_entity (instant but reliable)
+            let resolve = LuaCommand::resolve_required(&self.agent_id);
             let mine_lua = format!(
                 r#"
-local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print("no_char")
-    return
-end
+{}
 
 local resources = game.surfaces[1].find_entities_filtered{{
     position = {{ x = {}, y = {} }},
@@ -1125,7 +1212,7 @@ else
     rcon.print("no_resource")
 end
 "#,
-                target_pos.x, target_pos.y
+                resolve, target_pos.x, target_pos.y
             );
             let mine_result = self.execute_lua(&mine_lua).await?;
 
@@ -1137,10 +1224,10 @@ end
         }
 
         // Get final inventory
-        let inv_lua = r#"
-local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {} end c = global.factorioctl_character end
+        let inv_lua = format!(
+            "{}\n{}",
+            LuaCommand::resolve_required(&self.agent_id),
+            r#"
 if not (c and c.valid) then rcon.print('{"items":[]}') return end
 local inv = c.get_main_inventory()
 local items = {}
@@ -1154,15 +1241,15 @@ if #items == 0 then
 else
     rcon.print(helpers.table_to_json({ items = items }))
 end
-"#;
-        let inv_response = self.execute_lua(inv_lua).await?;
+"#
+        );
+        let inv_response = self.execute_lua(&inv_lua).await?;
         #[derive(serde::Deserialize)]
         struct InvResult {
             items: Vec<crate::world::InventoryItem>,
         }
-        let inv_result: InvResult = serde_json::from_str(&inv_response).unwrap_or(InvResult {
-            items: Vec::new(),
-        });
+        let inv_result: InvResult =
+            serde_json::from_str(&inv_response).unwrap_or(InvResult { items: Vec::new() });
 
         Ok(GatherResult {
             success: gathered > 0,
@@ -1186,14 +1273,10 @@ end
         let dir = Direction::from_name(direction).unwrap_or(Direction::South);
         let near_pos = near.unwrap_or((0.0, 0.0));
 
+        let resolve = LuaCommand::resolve_required(&self.agent_id);
         let lua = format!(
             r#"
-if not global then global = {{}} end
-local c = global.factorioctl_character
-if not (c and c.valid) then
-    rcon.print('{{"placed":0,"total":{count},"entities":[],"errors":["No character"]}}')
-    return
-end
+{resolve}
 
 local inv = c.get_main_inventory()
 local drill_count = 0
@@ -1255,6 +1338,8 @@ for _, res in pairs(resources) do
                 force = c.force
             }}
             if e then
+                storage.factorioctl_entities = storage.factorioctl_entities or {{}}
+                storage.factorioctl_entities[e.unit_number] = e
                 inv.remove{{name = "{drill_type}", count = 1}}
                 placed = placed + 1
                 used_positions[key] = true
@@ -1278,6 +1363,7 @@ rcon.print(helpers.table_to_json({{
 }}))
 "#,
             count = count,
+            resolve = resolve,
             drill_type = drill_type,
             resource = resource,
             near_x = near_pos.0,
@@ -1307,14 +1393,10 @@ rcon.print(helpers.table_to_json({{
             _ => (spacing as f64, 0.0),
         };
 
+        let resolve = LuaCommand::resolve_required(&self.agent_id);
         let lua = format!(
             r#"
-if not global then global = {{}} end
-local c = global.factorioctl_character
-if not (c and c.valid) then
-    rcon.print('{{"placed":0,"total":{count},"entities":[],"errors":["No character"]}}')
-    return
-end
+{resolve}
 
 local inv = c.get_main_inventory()
 local furnace_count = 0
@@ -1348,6 +1430,8 @@ for i = 0, {count} - 1 do
             force = c.force
         }}
         if e then
+            storage.factorioctl_entities = storage.factorioctl_entities or {{}}
+            storage.factorioctl_entities[e.unit_number] = e
             inv.remove{{name = "{furnace_type}", count = 1}}
             placed = placed + 1
             table.insert(entities, {{
@@ -1370,6 +1454,7 @@ rcon.print(helpers.table_to_json({{
 }}))
 "#,
             count = count,
+            resolve = resolve,
             furnace_type = furnace_type,
             start_x = start.0,
             start_y = start.1,
@@ -1453,10 +1538,7 @@ for item_name, count in pairs(item_totals) do
     table.insert(summary, {{name = item_name, count = count}})
 end
 rcon.print(helpers.table_to_json({{belt_count = #belts, total_items = total_items, item_summary = summary, belts = belt_items}}))"#,
-            area.left_top.x,
-            area.left_top.y,
-            area.right_bottom.x,
-            area.right_bottom.y
+            area.left_top.x, area.left_top.y, area.right_bottom.x, area.right_bottom.y
         );
 
         let response = self.execute_lua(&lua).await?;

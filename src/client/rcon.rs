@@ -16,6 +16,7 @@ const SERVERDATA_RESPONSE_VALUE: i32 = 0;
 
 /// Default timeout for RCON operations
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_COMMAND_RESPONSE_PACKETS: usize = 32;
 
 /// An RCON packet
 #[derive(Debug, Clone)]
@@ -114,27 +115,29 @@ impl RconClient {
         Ok(client)
     }
 
-    /// Execute a command and return the response
+    /// Execute a command and return the response.
+    ///
+    /// Factorio returns the complete RCON response in a single length-prefixed
+    /// packet; `receive()` uses `read_exact(size)`, which already reassembles
+    /// TCP segments, so one read yields the whole body regardless of size.
+    /// (An earlier sentinel-based reassembly hung forever: Factorio does not
+    /// reply to the empty sentinel command, so the read loop never terminated.)
     pub async fn execute(&mut self, command: &str) -> Result<String> {
         let request_id = self.next_id();
-        let sentinel_id = self.next_id();
         let packet = RconPacket::new(request_id, SERVERDATA_EXECCOMMAND, command);
         self.send(&packet).await?;
-        let sentinel = response_sentinel_packet(sentinel_id);
-        self.send(&sentinel).await?;
 
-        let mut packets = Vec::new();
-        loop {
+        for _ in 0..MAX_COMMAND_RESPONSE_PACKETS {
             let response = self.receive().await?;
-            let is_sentinel = response.request_id == sentinel_id;
-            packets.push(response);
-
-            if is_sentinel {
-                break;
+            if let Some(body) = command_response_body(&response, request_id)? {
+                return Ok(body);
             }
         }
 
-        reassemble_response_packets(packets, request_id, sentinel_id)
+        bail!(
+            "RCON command response not received after {} packets",
+            MAX_COMMAND_RESPONSE_PACKETS
+        );
     }
 
     /// Close the connection
@@ -212,65 +215,20 @@ fn auth_response_complete(packet: &RconPacket, auth_id: i32) -> Result<bool> {
     }
 }
 
-fn response_sentinel_packet(sentinel_id: i32) -> RconPacket {
-    RconPacket::new(sentinel_id, SERVERDATA_EXECCOMMAND, "")
-}
-
-fn reassemble_response_packets(
-    packets: impl IntoIterator<Item = RconPacket>,
-    request_id: i32,
-    sentinel_id: i32,
-) -> Result<String> {
-    let mut body = String::new();
-    let mut saw_sentinel = false;
-
-    for packet in packets {
-        if packet.request_id == request_id {
-            if packet.packet_type != SERVERDATA_RESPONSE_VALUE {
-                bail!(
-                    "Unexpected RCON response type for request {}: got {}, expected {}",
-                    request_id,
-                    packet.packet_type,
-                    SERVERDATA_RESPONSE_VALUE
-                );
-            }
-            body.push_str(&packet.body);
-        } else if packet.request_id == sentinel_id {
-            if packet.packet_type != SERVERDATA_RESPONSE_VALUE {
-                bail!(
-                    "Unexpected RCON sentinel response type for request {}: got {}, expected {}",
-                    sentinel_id,
-                    packet.packet_type,
-                    SERVERDATA_RESPONSE_VALUE
-                );
-            }
-            if !packet.body.is_empty() {
-                bail!(
-                    "Unexpected non-empty RCON sentinel response for request {}",
-                    sentinel_id
-                );
-            }
-            saw_sentinel = true;
-            break;
-        } else {
-            bail!(
-                "Unexpected RCON response id: got {}, expected {} or sentinel {}",
-                packet.request_id,
-                request_id,
-                sentinel_id
-            );
-        }
+fn command_response_body(packet: &RconPacket, command_id: i32) -> Result<Option<String>> {
+    if packet.request_id != command_id {
+        return Ok(None);
     }
 
-    if !saw_sentinel {
+    if packet.packet_type != SERVERDATA_RESPONSE_VALUE {
         bail!(
-            "Missing RCON sentinel response for request {} after command request {}",
-            sentinel_id,
-            request_id
+            "Unexpected RCON command response type: got {}, expected {}",
+            packet.packet_type,
+            SERVERDATA_RESPONSE_VALUE
         );
     }
 
-    Ok(body)
+    Ok(Some(packet.body.clone()))
 }
 
 impl Drop for RconClient {
@@ -325,27 +283,35 @@ mod tests {
     }
 
     #[test]
-    fn test_response_sentinel_is_sent_as_exec_command() {
-        let sentinel = response_sentinel_packet(7);
+    fn test_command_response_ignores_stray_packet_until_matching_id() {
+        let stray = RconPacket::new(41, SERVERDATA_RESPONSE_VALUE, "old response");
+        let response = RconPacket::new(42, SERVERDATA_RESPONSE_VALUE, "current response");
 
-        assert_eq!(sentinel.request_id, 7);
-        assert_eq!(sentinel.packet_type, SERVERDATA_EXECCOMMAND);
-        assert_eq!(sentinel.body, "");
+        assert_eq!(command_response_body(&stray, 42).unwrap(), None);
+        assert_eq!(
+            command_response_body(&response, 42).unwrap(),
+            Some("current response".to_string())
+        );
     }
 
     #[test]
-    fn test_reassembles_fragmented_response_packets() {
-        let packet_buffers = [
-            RconPacket::new(42, SERVERDATA_RESPONSE_VALUE, "{\"entities\":[").encode(),
-            RconPacket::new(42, SERVERDATA_RESPONSE_VALUE, "{\"name\":\"iron-ore\"}").encode(),
-            RconPacket::new(7, SERVERDATA_RESPONSE_VALUE, "").encode(),
-        ];
-        let packets = packet_buffers
-            .iter()
-            .map(|packet| RconPacket::decode(&packet[4..]).unwrap());
+    fn test_command_response_rejects_matching_packet_with_wrong_type() {
+        let auth_response_type = RconPacket::new(42, SERVERDATA_AUTH_RESPONSE, "");
 
-        let body = reassemble_response_packets(packets, 42, 7).unwrap();
+        assert!(command_response_body(&auth_response_type, 42).is_err());
+    }
 
-        assert_eq!(body, "{\"entities\":[{\"name\":\"iron-ore\"}");
+    #[test]
+    fn test_command_response_treats_matching_packet_as_single_logical_response() {
+        let packet = RconPacket::new(
+            42,
+            SERVERDATA_RESPONSE_VALUE,
+            "line one\nline two\nline three",
+        );
+
+        assert_eq!(
+            command_response_body(&packet, 42).unwrap(),
+            Some("line one\nline two\nline three".to_string())
+        );
     }
 }

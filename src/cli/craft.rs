@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Args;
 
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::output::Output;
 
 #[derive(Args, Debug)]
@@ -22,7 +21,7 @@ pub struct CraftCommand {
 }
 
 pub async fn execute(cmd: CraftCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     if let Some(recipe) = cmd.recipe {
         let result = client.craft(&recipe, cmd.count).await?;

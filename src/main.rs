@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let conn = cli.connection.resolve();
+    let conn = cli.connection.resolve()?;
 
     match cli.command {
         Commands::Analyze(cmd) => cli::analyze::execute(cmd, &conn).await,

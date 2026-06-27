@@ -5,7 +5,6 @@ use clap::Args;
 
 use super::parsing::{parse_direction, parse_tile};
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::output::Output;
 use crate::world::entity_size;
 
@@ -24,7 +23,7 @@ pub struct PlaceCommand {
 }
 
 pub async fn execute(cmd: PlaceCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let tile = parse_tile(&cmd.at)?;
     let dir = parse_direction(&cmd.direction)?;
@@ -38,7 +37,9 @@ pub async fn execute(cmd: PlaceCommand, conn: &ResolvedConnectionArgs) -> Result
         .ensure_proximity_to_position(world_pos, crate::client::PROXIMITY_RANGE_PLACE)
         .await?;
 
-    let entity = client.place_entity(&cmd.entity_name, world_pos, dir).await?;
+    let entity = client
+        .place_entity(&cmd.entity_name, world_pos, dir)
+        .await?;
     Output::new(conn.output).print(&entity)?;
 
     client.close().await?;

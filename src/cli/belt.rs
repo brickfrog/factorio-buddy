@@ -68,7 +68,7 @@ pub enum BeltSubcommand {
 }
 
 pub async fn execute(cmd: BeltCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.command {
         BeltSubcommand::Line {
@@ -115,7 +115,11 @@ pub async fn execute(cmd: BeltCommand, conn: &ResolvedConnectionArgs) -> Result<
 
             for i in 0..points.len() - 1 {
                 // Only apply inserter_gap on the last segment
-                let gap = if i == points.len() - 2 { inserter_gap } else { 0 };
+                let gap = if i == points.len() - 2 {
+                    inserter_gap
+                } else {
+                    0
+                };
                 run_belt_line_astar(
                     &mut client,
                     points[i],
@@ -168,7 +172,10 @@ async fn run_belt_line_astar(
 
     // Build collision map
     let collision_map = client.build_collision_map(area).await?;
-    println!("Collision map: {} blocked tiles", collision_map.blocked_count());
+    println!(
+        "Collision map: {} blocked tiles",
+        collision_map.blocked_count()
+    );
 
     // Find path using A*
     let start_grid = GridPos::from_position(&from);
@@ -191,10 +198,7 @@ async fn run_belt_line_astar(
     // Apply inserter gap by removing the last N belts from the plan
     let belts_to_place = if inserter_gap > 0 && result.belts.len() > inserter_gap as usize {
         let end = result.belts.len() - inserter_gap as usize;
-        println!(
-            "Leaving {} tile gap at end for inserter",
-            inserter_gap
-        );
+        println!("Leaving {} tile gap at end for inserter", inserter_gap);
         &result.belts[..end]
     } else {
         &result.belts[..]

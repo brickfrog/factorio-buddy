@@ -5,7 +5,6 @@ use clap::{Args, Subcommand};
 
 use super::parsing::{parse_tile, parse_tile_area};
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::output::Output;
 
 #[derive(Args, Debug)]
@@ -113,7 +112,7 @@ pub enum GetSubcommand {
 }
 
 pub async fn execute(cmd: GetCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.command {
         GetSubcommand::Tick => {
@@ -238,4 +237,3 @@ pub async fn execute(cmd: GetCommand, conn: &ResolvedConnectionArgs) -> Result<(
     client.close().await?;
     Ok(())
 }
-

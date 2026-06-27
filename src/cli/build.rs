@@ -5,7 +5,6 @@ use clap::{Args, Subcommand};
 
 use super::parsing::parse_tile;
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::output::{Output, OutputFormat};
 use crate::world::entity_size;
 
@@ -71,7 +70,7 @@ pub enum BuildSubcommand {
 }
 
 pub async fn execute(cmd: BuildCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.command {
         BuildSubcommand::DrillArray {
@@ -103,12 +102,19 @@ pub async fn execute(cmd: BuildCommand, conn: &ResolvedConnectionArgs) -> Result
                     result.placed, count, drill_type, resource
                 );
                 if result.placed < count {
-                    println!("Failed to place {}: {}", count - result.placed,
-                        result.errors.join(", "));
+                    println!(
+                        "Failed to place {}: {}",
+                        count - result.placed,
+                        result.errors.join(", ")
+                    );
                 }
                 for entity in &result.entities {
-                    println!("  #{} at ({:.1}, {:.1})", entity.unit_number.unwrap_or(0),
-                        entity.position.x, entity.position.y);
+                    println!(
+                        "  #{} at ({:.1}, {:.1})",
+                        entity.unit_number.unwrap_or(0),
+                        entity.position.x,
+                        entity.position.y
+                    );
                 }
             }
         }
@@ -126,7 +132,13 @@ pub async fn execute(cmd: BuildCommand, conn: &ResolvedConnectionArgs) -> Result
             let world_pos = tile.to_world(w, h);
 
             let result = client
-                .build_smelter_line(count, (world_pos.x, world_pos.y), &furnace_type, &direction, spacing)
+                .build_smelter_line(
+                    count,
+                    (world_pos.x, world_pos.y),
+                    &furnace_type,
+                    &direction,
+                    spacing,
+                )
                 .await?;
 
             if conn.output == OutputFormat::Json {
@@ -134,8 +146,11 @@ pub async fn execute(cmd: BuildCommand, conn: &ResolvedConnectionArgs) -> Result
             } else {
                 println!("Placed {} of {} {}", result.placed, count, furnace_type);
                 if result.placed < count {
-                    println!("Failed to place {}: {}", count - result.placed,
-                        result.errors.join(", "));
+                    println!(
+                        "Failed to place {}: {}",
+                        count - result.placed,
+                        result.errors.join(", ")
+                    );
                 }
             }
         }

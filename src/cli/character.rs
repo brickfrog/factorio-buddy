@@ -5,7 +5,6 @@ use clap::{Args, Subcommand};
 
 use super::parsing::{parse_position, parse_tile};
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::output::Output;
 
 #[derive(Args, Debug)]
@@ -16,8 +15,16 @@ pub struct CharacterCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum CharacterSubcommand {
-    /// Initialize/create character at spawn
-    Init,
+    /// Initialize/create character
+    Init {
+        /// Spawn X coordinate
+        #[arg(long, allow_hyphen_values = true)]
+        x: Option<f64>,
+
+        /// Spawn Y coordinate
+        #[arg(long, allow_hyphen_values = true)]
+        y: Option<f64>,
+    },
 
     /// Teleport character to position (debug command, accepts floats)
     Teleport {
@@ -41,11 +48,16 @@ pub enum CharacterSubcommand {
 }
 
 pub async fn execute(cmd: CharacterCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.command {
-        CharacterSubcommand::Init => {
-            let character = client.init_character().await?;
+        CharacterSubcommand::Init { x, y } => {
+            if !conn.agent_id.is_legacy() && (x.is_none() || y.is_none()) {
+                anyhow::bail!("named agent requires --x/--y");
+            }
+            let character = client
+                .init_character(x.unwrap_or(0.0), y.unwrap_or(0.0))
+                .await?;
             Output::new(conn.output).print(&character)?;
         }
         CharacterSubcommand::Teleport { position } => {
@@ -72,4 +84,3 @@ pub async fn execute(cmd: CharacterCommand, conn: &ResolvedConnectionArgs) -> Re
     client.close().await?;
     Ok(())
 }
-

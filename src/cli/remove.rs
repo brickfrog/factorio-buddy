@@ -5,7 +5,6 @@ use clap::Args;
 
 use super::parsing::parse_position;
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 
 #[derive(Args, Debug)]
 pub struct RemoveCommand {
@@ -19,7 +18,7 @@ pub struct RemoveCommand {
 }
 
 pub async fn execute(cmd: RemoveCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     if let Some(pos_str) = cmd.at {
         let pos = parse_position(&pos_str)?;

@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Args;
 
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 
 #[derive(Args, Debug)]
 pub struct ExecCommand {
@@ -13,7 +12,7 @@ pub struct ExecCommand {
 }
 
 pub async fn execute(cmd: ExecCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let response = client.execute_lua(&cmd.lua).await?;
     println!("{}", response);

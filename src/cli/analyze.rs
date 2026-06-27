@@ -7,7 +7,6 @@ use crate::analyze::{
     analyze_belt_reach, analyze_entity_reach, analyze_inserters, detect_sushi_belts,
     find_belt_gaps, find_belt_networks, trace_belt_sources, BeltGraph,
 };
-use crate::client::FactorioClient;
 use crate::output::Output;
 use crate::world::{Area, TilePos};
 
@@ -198,7 +197,7 @@ fn area_from_center(x: i32, y: i32, radius: u32) -> Area {
 }
 
 async fn execute_belt_reach(args: BeltReachArgs, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let area = area_from_center(args.x, args.y, args.radius);
     let entities = client.find_entities(area, None, None).await?;
@@ -219,7 +218,7 @@ async fn execute_belt_networks(
     args: BeltNetworksArgs,
     conn: &ResolvedConnectionArgs,
 ) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let area = area_from_center(args.x, args.y, args.radius);
     let entities = client.find_entities(area, None, None).await?;
@@ -231,7 +230,7 @@ async fn execute_belt_networks(
 }
 
 async fn execute_belt_gaps(args: BeltGapsArgs, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let area = area_from_center(args.x, args.y, args.radius);
     let entities = client.find_entities(area, None, None).await?;
@@ -243,7 +242,7 @@ async fn execute_belt_gaps(args: BeltGapsArgs, conn: &ResolvedConnectionArgs) ->
 }
 
 async fn execute_inserters(args: InsertersArgs, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let area = area_from_center(args.x, args.y, args.radius);
     let entities = client.find_entities(area, None, None).await?;
@@ -254,7 +253,7 @@ async fn execute_inserters(args: InsertersArgs, conn: &ResolvedConnectionArgs) -
 }
 
 async fn execute_entity_reach(args: EntityReachArgs, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     // Search in a larger radius to find inserters that might reach our target
     let search_radius = args.radius + 5; // Account for long inserters
@@ -271,7 +270,7 @@ async fn execute_belt_contents(
     args: BeltContentsArgs,
     conn: &ResolvedConnectionArgs,
 ) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let area = area_from_center(args.x, args.y, args.radius);
     let result = client.get_belt_lane_contents(area).await?;
@@ -280,7 +279,7 @@ async fn execute_belt_contents(
 }
 
 async fn execute_sushi_detect(args: SushiDetectArgs, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let area = area_from_center(args.x, args.y, args.radius);
 
@@ -298,7 +297,7 @@ async fn execute_sushi_detect(args: SushiDetectArgs, conn: &ResolvedConnectionAr
 }
 
 async fn execute_belt_sources(args: BeltSourcesArgs, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let area = area_from_center(args.x, args.y, args.radius);
     let entities = client.find_entities(area, None, None).await?;

@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 
 #[derive(Args, Debug)]
 pub struct TickCommand {
@@ -34,7 +33,7 @@ pub enum TickSubcommand {
 }
 
 pub async fn execute(cmd: TickCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.command {
         TickSubcommand::Pause => {
@@ -53,7 +52,12 @@ pub async fn execute(cmd: TickCommand, conn: &ResolvedConnectionArgs) -> Result<
             let start = client.get_tick().await?;
             client.wait_ticks(ticks).await?;
             let end = client.get_tick().await?;
-            println!("Waited {} ticks ({} -> {})", end.tick - start.tick, start.tick, end.tick);
+            println!(
+                "Waited {} ticks ({} -> {})",
+                end.tick - start.tick,
+                start.tick,
+                end.tick
+            );
         }
     }
 

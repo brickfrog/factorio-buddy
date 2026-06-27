@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 
 use super::parsing::{parse_area, parse_position};
 use crate::cli::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::world::{Blueprint, BlueprintEntity, Direction, Position};
 
 /// Default clipboard file location
@@ -88,7 +87,10 @@ pub struct PasteCommand {
     pub dry_run: bool,
 }
 
-pub async fn execute_clipboard(cmd: ClipboardCommand, _conn: &ResolvedConnectionArgs) -> Result<()> {
+pub async fn execute_clipboard(
+    cmd: ClipboardCommand,
+    _conn: &ResolvedConnectionArgs,
+) -> Result<()> {
     match cmd.subcommand {
         ClipboardSubcommand::Show => {
             let path = default_clipboard_path();
@@ -122,7 +124,7 @@ pub async fn execute_clipboard(cmd: ClipboardCommand, _conn: &ResolvedConnection
 }
 
 pub async fn execute_copy(cmd: CopyCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     let area = parse_area(&cmd.area)?;
     let origin = if let Some(o) = &cmd.origin {
@@ -140,9 +142,7 @@ pub async fn execute_copy(cmd: CopyCommand, conn: &ResolvedConnectionArgs) -> Re
     let entities: Vec<_> = entities
         .into_iter()
         .filter(|e| {
-            e.force.as_deref() == Some("player")
-                && e.unit_number.is_some()
-                && e.name != "character"
+            e.force.as_deref() == Some("player") && e.unit_number.is_some() && e.name != "character"
         })
         .collect();
 
@@ -176,7 +176,11 @@ pub async fn execute_copy(cmd: CopyCommand, conn: &ResolvedConnectionArgs) -> Re
     let json = serde_json::to_string_pretty(&blueprint)?;
     std::fs::write(&path, &json)?;
 
-    println!("Copied {} entities to {}", blueprint.entities.len(), path.display());
+    println!(
+        "Copied {} entities to {}",
+        blueprint.entities.len(),
+        path.display()
+    );
     println!("Origin: ({}, {})", origin.x, origin.y);
     for e in &blueprint.entities {
         println!(
@@ -190,7 +194,7 @@ pub async fn execute_copy(cmd: CopyCommand, conn: &ResolvedConnectionArgs) -> Re
 }
 
 pub async fn execute_paste(cmd: PasteCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     // Load blueprint
     let path = cmd.from.unwrap_or_else(default_clipboard_path);
@@ -291,11 +295,7 @@ pub async fn execute_paste(cmd: PasteCommand, conn: &ResolvedConnectionArgs) -> 
         }
     }
 
-    println!(
-        "\nPlaced {}/{} entities",
-        placed,
-        blueprint.entities.len()
-    );
+    println!("\nPlaced {}/{} entities", placed, blueprint.entities.len());
     if !errors.is_empty() {
         println!("Errors:");
         for err in &errors {

@@ -3,12 +3,72 @@
 //! These builders generate Lua code that can be executed via RCON.
 //! All commands use rcon.print() to return JSON-formatted results.
 
+use crate::client::AgentId;
 use crate::world::{Area, Direction, Position};
 
 /// Builder for Lua commands
 pub struct LuaCommand;
 
 impl LuaCommand {
+    pub fn resolve_required(agent_id: &AgentId) -> String {
+        if agent_id.is_legacy() {
+            r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then c = storage.factorioctl_characters["__player__"] end
+if not (c and c.valid) then rcon.print('{"error":"no character for agent __player__; spawn first"}') return end"#
+                .to_string()
+        } else {
+            format!(
+                r#"storage.factorioctl_characters = storage.factorioctl_characters or {{}}
+local c = storage.factorioctl_characters["{}"]
+if not (c and c.valid) then rcon.print('{{"error":"no character for agent {}; spawn first"}}') return end"#,
+                agent_id.as_str(),
+                agent_id.as_str()
+            )
+        }
+    }
+
+    pub fn resolve_optional(agent_id: &AgentId) -> String {
+        if agent_id.is_legacy() {
+            r#"storage.factorioctl_characters = storage.factorioctl_characters or {}
+local c = nil
+for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
+if not c then c = storage.factorioctl_characters["__player__"] end"#
+                .to_string()
+        } else {
+            format!(
+                r#"storage.factorioctl_characters = storage.factorioctl_characters or {{}}
+local c = storage.factorioctl_characters["{}"]"#,
+                agent_id.as_str()
+            )
+        }
+    }
+
+    fn entity_lookup(unit_number: u32) -> String {
+        format!(
+            r#"storage.factorioctl_entities = storage.factorioctl_entities or {{}}
+local e = storage.factorioctl_entities[{}]
+if e and not e.valid then storage.factorioctl_entities[{}] = nil e = nil end
+if not e then
+    for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
+        if entity.unit_number == {} then
+            e = entity
+            break
+        end
+    end
+end"#,
+            unit_number, unit_number, unit_number
+        )
+    }
+
+    fn register_entity(var_name: &str) -> String {
+        format!(
+            "storage.factorioctl_entities = storage.factorioctl_entities or {{}}\nstorage.factorioctl_entities[{0}.unit_number] = {0}",
+            var_name
+        )
+    }
+
     /// Get list of surfaces
     pub fn get_surfaces() -> String {
         r#"
@@ -71,16 +131,10 @@ rcon.print(helpers.table_to_json(result))
 
     /// Get a specific entity by unit number
     pub fn get_entity(unit_number: u32) -> String {
+        let lookup = Self::entity_lookup(unit_number);
         format!(
             r#"
--- Find entity by unit_number via search
-local e = nil
-for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
-    if entity.unit_number == {} then
-        e = entity
-        break
-    end
-end
+{}
 if e then
     rcon.print(helpers.table_to_json({{
         unit_number = e.unit_number,
@@ -95,7 +149,7 @@ else
     rcon.print("null")
 end
 "#,
-            unit_number
+            lookup
         )
         .trim()
         .to_string()
@@ -103,16 +157,10 @@ end
 
     /// Get an entity's inventories
     pub fn get_entity_inventory(unit_number: u32) -> String {
+        let lookup = Self::entity_lookup(unit_number);
         format!(
             r#"
--- Find entity by unit_number via search
-local e = nil
-for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
-    if entity.unit_number == {} then
-        e = entity
-        break
-    end
-end
+{}
 if not e then
     rcon.print('{{"error": "Entity not found"}}')
     return
@@ -151,7 +199,7 @@ end
 
 rcon.print(helpers.table_to_json(result))
 "#,
-            unit_number
+            lookup
         )
         .trim()
         .to_string()
@@ -331,109 +379,208 @@ rcon.print(helpers.table_to_json({{
     }
 
     /// Initialize character entity
-    pub fn init_character() -> String {
-        r#"
-if not global then global = {} end
-if global.factorioctl_character and global.factorioctl_character.valid then
-    local c = global.factorioctl_character
-    rcon.print(helpers.table_to_json({
+    pub fn init_character(agent_id: &AgentId, x: f64, y: f64) -> String {
+        let key = if agent_id.is_legacy() {
+            "__player__"
+        } else {
+            agent_id.as_str()
+        };
+        format!(
+            r#"
+storage.factorioctl_characters = storage.factorioctl_characters or {{}}
+storage.factorioctl_entities = storage.factorioctl_entities or {{}}
+if storage.factorioctl_characters["{key}"] and storage.factorioctl_characters["{key}"].valid then
+    local c = storage.factorioctl_characters["{key}"]
+    storage.factorioctl_entities[c.unit_number] = c
+    rcon.print(helpers.table_to_json({{
         unit_number = c.unit_number,
         name = c.name,
         type = c.type,
-        position = { x = c.position.x, y = c.position.y },
+        position = {{ x = c.position.x, y = c.position.y }},
         direction = c.direction,
         health = c.health,
         force = c.force.name
-    }))
+    }}))
 else
-    -- Create new character at spawn
-    local c = game.surfaces[1].create_entity{
+    local c = game.surfaces[1].create_entity{{
         name = "character",
-        position = {0, 0},
+        position = {{{x}, {y}}},
         force = game.forces.player
-    }
+    }}
     if c then
-        global.factorioctl_character = c
-        rcon.print(helpers.table_to_json({
+        storage.factorioctl_characters["{key}"] = c
+        storage.factorioctl_entities[c.unit_number] = c
+        rcon.print(helpers.table_to_json({{
             unit_number = c.unit_number,
             name = c.name,
             type = c.type,
-            position = { x = c.position.x, y = c.position.y },
+            position = {{ x = c.position.x, y = c.position.y }},
             direction = c.direction,
             health = c.health,
             force = c.force.name
-        }))
+        }}))
     else
-        rcon.print('{"error": "Failed to create character"}')
+        rcon.print('{{"error": "Failed to create character"}}')
     end
 end
-"#
+"#,
+            key = key,
+            x = x,
+            y = y
+        )
         .trim()
         .to_string()
     }
 
     /// Teleport character to position
-    pub fn teleport_character(position: Position) -> String {
+    pub fn teleport_character(agent_id: &AgentId, position: Position) -> String {
+        let resolve = Self::resolve_required(agent_id);
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if c and c.valid then
-    c.teleport({{ {}, {} }})
-    rcon.print("ok")
-else
-    rcon.print('{{"error": "No character"}}')
-end
+{}
+c.teleport({{ {}, {} }})
+rcon.print("ok")
 "#,
-            position.x, position.y
+            resolve, position.x, position.y
         )
         .trim()
         .to_string()
     }
 
-    /// Start walking character to position
-    pub fn walk_character(position: Position) -> String {
+    /// On_tick step-walk driver for named (orphan) agent characters.
+    ///
+    /// An orphan character (no controlling player) does NOT move from
+    /// `walking_state` alone, since the engine only walks characters driven by a
+    /// player input controller. This injected on_tick handler steps each agent's
+    /// character toward its stored target at running speed (collision-aware,
+    /// sliding on one axis if blocked), giving real over-time traversal rather
+    /// than an instant teleport. Re-registering replaces the prior handler, so it
+    /// is idempotent. (Server-side only: with a connected human client this can
+    /// desync; deterministic MP movement is the bridge-mod follow-up.)
+    pub fn walk_driver_lua() -> &'static str {
+        r#"
+script.on_event(defines.events.on_tick, function()
+local targets = storage.factorioctl_walk_targets
+if not targets then return end
+for id, tgt in pairs(targets) do
+if tgt.expires_tick and game.tick >= tgt.expires_tick then
+targets[id] = nil
+goto continue
+end
+local c = storage.factorioctl_characters and storage.factorioctl_characters[id]
+if c and c.valid then
+local dx = tgt.x - c.position.x
+local dy = tgt.y - c.position.y
+local dist = math.sqrt(dx * dx + dy * dy)
+local sp = c.character_running_speed or 0.15
+if dist <= sp then
+c.teleport({tgt.x, tgt.y})
+targets[id] = nil
+c.walking_state = {walking = false}
+else
+local nx = c.position.x + (dx / dist) * sp
+local ny = c.position.y + (dy / dist) * sp
+if not c.teleport({nx, ny}) then
+if not c.teleport({nx, c.position.y}) then
+c.teleport({c.position.x, ny})
+end
+end
+local moved = math.sqrt((c.position.x - (tgt.last_x or c.position.x)) * (c.position.x - (tgt.last_x or c.position.x)) + (c.position.y - (tgt.last_y or c.position.y)) * (c.position.y - (tgt.last_y or c.position.y)))
+if moved < 0.001 then
+tgt.stuck_ticks = (tgt.stuck_ticks or 0) + 1
+else
+tgt.stuck_ticks = 0
+end
+tgt.last_x = c.position.x
+tgt.last_y = c.position.y
+if tgt.stuck_ticks >= 120 then
+targets[id] = nil
+end
+end
+else
+targets[id] = nil
+end
+::continue::
+end
+end)
+"#
+    }
+
+    pub fn set_walk_target(agent_id: &AgentId, position: Position) -> String {
+        let resolve = Self::resolve_required(agent_id);
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if c and c.valid then
-    -- Calculate direction to target
-    local dx = {} - c.position.x
-    local dy = {} - c.position.y
-    local dir = 0
-    if math.abs(dx) > math.abs(dy) then
-        dir = dx > 0 and defines.direction.east or defines.direction.west
-    else
-        dir = dy > 0 and defines.direction.south or defines.direction.north
-    end
-    c.walking_state = {{ walking = true, direction = dir }}
-    rcon.print("ok")
-else
-    rcon.print('{{"error": "No character"}}')
-end
+{}
+storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
+storage.factorioctl_walk_targets["{}"] = {{ x = {}, y = {}, stuck_ticks = 0, expires_tick = game.tick + 7200, last_x = c.position.x, last_y = c.position.y }}
+{}
 "#,
-            position.x, position.y
+            resolve,
+            agent_id.as_str(),
+            position.x,
+            position.y,
+            Self::walk_driver_lua(),
         )
         .trim()
         .to_string()
+    }
+
+    pub fn clear_walk_target(agent_id: &AgentId) -> String {
+        format!(
+            r#"
+storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
+storage.factorioctl_walk_targets["{}"] = nil
+"#,
+            agent_id.as_str()
+        )
+        .trim()
+        .to_string()
+    }
+
+    /// Start walking character to position.
+    ///
+    /// Legacy/player ids use `walking_state` (the player controller moves them).
+    /// Named ids store a target and ensure the on_tick step-driver is running.
+    pub fn walk_character(agent_id: &AgentId, position: Position) -> String {
+        let resolve = Self::resolve_required(agent_id);
+        if agent_id.is_legacy() {
+            format!(
+                r#"
+{}
+local dx = {} - c.position.x
+local dy = {} - c.position.y
+local dir = 0
+if math.abs(dx) > math.abs(dy) then
+    dir = dx > 0 and defines.direction.east or defines.direction.west
+else
+    dir = dy > 0 and defines.direction.south or defines.direction.north
+end
+c.walking_state = {{ walking = true, direction = dir }}
+rcon.print("ok")
+"#,
+                resolve, position.x, position.y
+            )
+            .trim()
+            .to_string()
+        } else {
+            format!(
+                r#"
+{}
+rcon.print("ok")
+"#,
+                Self::set_walk_target(agent_id, position),
+            )
+            .trim()
+            .to_string()
+        }
     }
 
     /// Get character status
-    pub fn character_status() -> String {
-        r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {} end c = global.factorioctl_character end
-if c and c.valid then
+    pub fn character_status(agent_id: &AgentId) -> String {
+        format!(
+            "{}\n{}",
+            Self::resolve_optional(agent_id),
+            r#"if c and c.valid then
     rcon.print(helpers.table_to_json({
         valid = true,
         unit_number = c.unit_number,
@@ -445,21 +592,18 @@ if c and c.valid then
     }))
 else
     rcon.print('{"valid": false}')
-end
-"#
+end"#
+        )
         .trim()
         .to_string()
     }
 
     /// Get character inventory
-    pub fn character_inventory() -> String {
-        r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {} end c = global.factorioctl_character end
-if c and c.valid then
+    pub fn character_inventory(agent_id: &AgentId) -> String {
+        format!(
+            "{}\n{}",
+            Self::resolve_optional(agent_id),
+            r#"if c and c.valid then
     local inv = c.get_main_inventory()
     local items = {}
     local free_slots = 0
@@ -476,25 +620,18 @@ if c and c.valid then
     end
 else
     rcon.print('{"items": [], "free_slots": 0}')
-end
-"#
+end"#
+        )
         .trim()
         .to_string()
     }
 
     /// Start mining at a position (uses mining_state for animations)
-    pub fn start_mining(position: Position) -> String {
+    pub fn start_mining(agent_id: &AgentId, position: Position) -> String {
+        let resolve = Self::resolve_required(agent_id);
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{{"success": false, "error": "No character"}}')
-    return
-end
+{}
 
 -- Find a minable entity at the position
 local target = nil
@@ -536,64 +673,53 @@ end
 c.mining_state = {{ mining = true, position = target.position }}
 rcon.print('{{"success": true, "target": "' .. target.name .. '", "position": {{\"x\": ' .. target.position.x .. ', \"y\": ' .. target.position.y .. '}}}}')
 "#,
-            position.x, position.y, position.x, position.y
+            resolve, position.x, position.y, position.x, position.y
         )
         .trim()
         .to_string()
     }
 
     /// Stop mining
-    pub fn stop_mining() -> String {
-        r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {} end c = global.factorioctl_character end
-if c and c.valid then
-    c.mining_state = { mining = false }
-    rcon.print("ok")
+    pub fn stop_mining(agent_id: &AgentId) -> String {
+        format!(
+            "{}\n{}",
+            Self::resolve_optional(agent_id),
+            r#"if c and c.valid then
+c.mining_state = { mining = false }
+rcon.print("ok")
 else
-    rcon.print("error")
-end
-"#
+rcon.print("error")
+end"#
+        )
         .trim()
         .to_string()
     }
 
     /// Get mining status
-    pub fn get_mining_status() -> String {
-        r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {} end c = global.factorioctl_character end
-if c and c.valid then
+    pub fn get_mining_status(agent_id: &AgentId) -> String {
+        format!(
+            "{}\n{}",
+            Self::resolve_optional(agent_id),
+            r#"if c and c.valid then
     rcon.print(helpers.table_to_json({
         mining = c.mining_state.mining,
         position = { x = c.position.x, y = c.position.y }
     }))
 else
     rcon.print('{"mining": false}')
-end
-"#
+end"#
+        )
         .trim()
         .to_string()
     }
 
     /// Mine entity at position (instant - for compatibility)
-    pub fn mine_at(position: Position, count: u32) -> String {
+    pub fn mine_at(agent_id: &AgentId, position: Position, count: u32) -> String {
+        let resolve = Self::resolve_required(agent_id);
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{{"success": false, "error": "No character"}}')
-    return
-end
-
+{}
+ 
 -- Count inventory before mining
 local inv = c.get_main_inventory()
 local before_count = 0
@@ -677,23 +803,18 @@ rcon.print(helpers.table_to_json({{
     inventory = items
 }}))
 "#,
-            count, position.x, position.y, position.x, position.y, position.x, position.y
+            resolve, count, position.x, position.y, position.x, position.y, position.x, position.y
         )
         .trim()
         .to_string()
     }
 
     /// Mine nearest entity of type
-    pub fn mine_nearest(entity_type: &str, count: u32) -> String {
+    pub fn mine_nearest(agent_id: &AgentId, entity_type: &str, count: u32) -> String {
+        let resolve = Self::resolve_required(agent_id);
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{{"success": false, "error": "No character"}}')
-    return
-end
+{}
 
 local mined = 0
 
@@ -744,25 +865,18 @@ rcon.print(helpers.table_to_json({{
     inventory = items
 }}))
 "#,
-            count, entity_type
+            resolve, count, entity_type
         )
         .trim()
         .to_string()
     }
 
     /// Start crafting a recipe
-    pub fn craft(recipe: &str, count: u32) -> String {
+    pub fn craft(agent_id: &AgentId, recipe: &str, count: u32) -> String {
+        let resolve = Self::resolve_required(agent_id);
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{{"success": false, "error": "No character"}}')
-    return
-end
+{}
 
 local crafted = c.begin_crafting{{ recipe = "{}", count = {} }}
 
@@ -779,41 +893,39 @@ rcon.print(helpers.table_to_json({{
     queue = queue
 }}))
 "#,
-            recipe, count
+            resolve, recipe, count
         )
         .trim()
         .to_string()
     }
 
     /// Wait for crafting to complete (poll-based, handled in client)
-    pub fn wait_for_crafting() -> String {
-        r#"
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {} end c = global.factorioctl_character end
-if c and c.valid then
+    pub fn wait_for_crafting(agent_id: &AgentId) -> String {
+        format!(
+            "{}\n{}",
+            Self::resolve_optional(agent_id),
+            r#"if c and c.valid then
     rcon.print(tostring(c.crafting_queue_size))
 else
     rcon.print("0")
-end
-"#
+end"#
+        )
         .trim()
         .to_string()
     }
 
     /// Place an entity from inventory
-    pub fn place_entity(entity_name: &str, position: Position, direction: Direction) -> String {
+    pub fn place_entity(
+        agent_id: &AgentId,
+        entity_name: &str,
+        position: Position,
+        direction: Direction,
+    ) -> String {
+        let resolve = Self::resolve_required(agent_id);
+        let register = Self::register_entity("e");
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{{"error": "No character"}}')
-    return
-end
+{}
 
 local inv = c.get_main_inventory()
 if not inv or inv.get_item_count("{}") < 1 then
@@ -879,6 +991,7 @@ local e = game.surfaces[1].create_entity{{
 }}
 
 if e then
+    {}
     inv.remove{{ name = "{}", count = 1 }}
     rcon.print(helpers.table_to_json({{
         unit_number = e.unit_number,
@@ -893,21 +1006,23 @@ else
     rcon.print('{{"error": "Failed to create entity"}}')
 end
 "#,
-            entity_name,       // inventory check
-            entity_name,       // clear items proto lookup
-            position.x,        // clear_area left_top x
-            position.y,        // clear_area left_top y
-            position.x,        // clear_area right_bottom x
-            position.y,        // clear_area right_bottom y
-            entity_name,       // can_place_entity name
-            position.x,        // can_place_entity position x
-            position.y,        // can_place_entity position y
-            direction.to_factorio(), // can_place_entity direction
-            entity_name,       // create_entity name
-            position.x,        // create_entity position x
-            position.y,        // create_entity position y
-            direction.to_factorio(), // create_entity direction
-            entity_name        // inv.remove
+            resolve,
+            entity_name,
+            entity_name,
+            position.x,
+            position.y,
+            position.x,
+            position.y,
+            entity_name,
+            position.x,
+            position.y,
+            direction.to_factorio(),
+            entity_name,
+            position.x,
+            position.y,
+            direction.to_factorio(),
+            register,
+            entity_name
         )
         .trim()
         .to_string()
@@ -915,20 +1030,17 @@ end
 
     /// Place an underground belt with specified type (input or output)
     pub fn place_underground_belt(
+        agent_id: &AgentId,
         entity_name: &str,
         position: Position,
         direction: Direction,
-        belt_type: &str, // "input" for entry, "output" for exit
+        belt_type: &str,
     ) -> String {
+        let resolve = Self::resolve_required(agent_id);
+        let register = Self::register_entity("e");
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{{"error": "No character"}}')
-    return
-end
+{}
 
 local inv = c.get_main_inventory()
 if not inv or inv.get_item_count("{}") < 1 then
@@ -960,6 +1072,7 @@ local e = game.surfaces[1].create_entity{{
 }}
 
 if e then
+    {}
     inv.remove{{ name = "{}", count = 1 }}
     rcon.print(helpers.table_to_json({{
         unit_number = e.unit_number,
@@ -974,33 +1087,36 @@ else
     rcon.print('{{"error": "Failed to create underground belt"}}')
 end
 "#,
-            entity_name,               // inventory check
-            entity_name,               // can_place_entity name
-            position.x,                // can_place_entity position x
-            position.y,                // can_place_entity position y
-            direction.to_factorio(),   // can_place_entity direction
-            entity_name,               // create_entity name
-            position.x,                // create_entity position x
-            position.y,                // create_entity position y
-            direction.to_factorio(),   // create_entity direction
-            belt_type,                 // create_entity type (input/output)
-            entity_name                // inv.remove
+            resolve,
+            entity_name,
+            entity_name,
+            position.x,
+            position.y,
+            direction.to_factorio(),
+            entity_name,
+            position.x,
+            position.y,
+            direction.to_factorio(),
+            belt_type,
+            register,
+            entity_name
         )
         .trim()
         .to_string()
     }
 
     /// Place a ghost entity (for planning)
-    pub fn place_ghost(entity_name: &str, position: Position, direction: Direction) -> String {
+    pub fn place_ghost(
+        agent_id: &AgentId,
+        entity_name: &str,
+        position: Position,
+        direction: Direction,
+    ) -> String {
+        let resolve = Self::resolve_required(agent_id);
+        let register = Self::register_entity("e");
         format!(
             r#"
-local c = nil
-for _, p in pairs(game.connected_players) do if p.character and p.character.valid then c = p.character break end end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
-if not (c and c.valid) then
-    rcon.print('{{"error": "No character"}}')
-    return
-end
+{}
 
 -- Create ghost entity (doesn't require items in inventory)
 local e = game.surfaces[1].create_entity{{
@@ -1012,6 +1128,7 @@ local e = game.surfaces[1].create_entity{{
 }}
 
 if e then
+    {}
     rcon.print(helpers.table_to_json({{
         unit_number = e.unit_number,
         name = e.ghost_name or "{}",
@@ -1025,10 +1142,12 @@ else
     rcon.print('{{"error": "Failed to create ghost"}}')
 end
 "#,
+            resolve,
             entity_name,
             position.x,
             position.y,
             direction.to_factorio(),
+            register,
             entity_name
         )
         .trim()
@@ -1039,6 +1158,7 @@ end
     pub fn remove_entity_at(position: Position) -> String {
         format!(
             r#"
+storage.factorioctl_entities = storage.factorioctl_entities or {{}}
 local entities = game.surfaces[1].find_entities_filtered{{
     position = {{ {}, {} }},
     radius = 0.5
@@ -1046,6 +1166,7 @@ local entities = game.surfaces[1].find_entities_filtered{{
 
 for _, e in pairs(entities) do
     if e.type ~= "character" then
+        if e.unit_number then storage.factorioctl_entities[e.unit_number] = nil end
         e.destroy()
         rcon.print("ok")
         return
@@ -1061,24 +1182,19 @@ rcon.print('{{"error": "No entity found"}}')
 
     /// Remove entity by unit number
     pub fn remove_entity(unit_number: u32) -> String {
+        let lookup = Self::entity_lookup(unit_number);
         format!(
             r#"
--- Find entity by unit_number via search
-local e = nil
-for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
-    if entity.unit_number == {} then
-        e = entity
-        break
-    end
-end
+{}
 if e then
+    storage.factorioctl_entities[{}] = nil
     e.destroy()
     rcon.print("ok")
 else
     rcon.print('{{"error": "Entity not found"}}')
 end
 "#,
-            unit_number
+            lookup, unit_number
         )
         .trim()
         .to_string()
@@ -1086,16 +1202,10 @@ end
 
     /// Rotate an entity to a new direction
     pub fn rotate_entity(unit_number: u32, direction: u8) -> String {
+        let lookup = Self::entity_lookup(unit_number);
         format!(
             r#"
--- Find entity by unit_number via search
-local e = nil
-for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
-    if entity.unit_number == {} then
-        e = entity
-        break
-    end
-end
+{}
 if e then
     if e.supports_direction then
         e.direction = {}
@@ -1107,7 +1217,7 @@ else
     rcon.print('{{"error": "Entity not found"}}')
 end
 "#,
-            unit_number, direction
+            lookup, direction
         )
         .trim()
         .to_string()
@@ -1127,16 +1237,10 @@ end
             _ => "defines.inventory.fuel",
         };
 
+        let lookup = Self::entity_lookup(unit_number);
         format!(
             r#"
--- Find entity by unit_number via search (get_entity_by_unit_number doesn't work for Lua-created entities)
-local e = nil
-for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
-    if entity.unit_number == {} then
-        e = entity
-        break
-    end
-end
+{}
 if not e then
     rcon.print('{{"error": "Entity not found"}}')
     return
@@ -1151,14 +1255,20 @@ end
 local inserted = inv.insert{{ name = "{}", count = {} }}
 rcon.print(helpers.table_to_json({{ inserted = inserted }}))
 "#,
-            unit_number, inv_define, item, count
+            lookup, inv_define, item, count
         )
         .trim()
         .to_string()
     }
 
     /// Extract items from an entity's inventory into the player's inventory
-    pub fn extract_items(unit_number: u32, item: &str, count: u32, inventory_type: &str) -> String {
+    pub fn extract_items(
+        agent_id: &AgentId,
+        unit_number: u32,
+        item: &str,
+        count: u32,
+        inventory_type: &str,
+    ) -> String {
         let inv_define = match inventory_type {
             "fuel" => "defines.inventory.fuel",
             "input" => "defines.inventory.assembling_machine_input",
@@ -1171,16 +1281,12 @@ rcon.print(helpers.table_to_json({{ inserted = inserted }}))
             _ => "defines.inventory.chest",
         };
 
+        let resolve = Self::resolve_required(agent_id);
+        let lookup = Self::entity_lookup(unit_number);
         format!(
             r#"
--- Find entity by unit_number via search
-local e = nil
-for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
-    if entity.unit_number == {} then
-        e = entity
-        break
-    end
-end
+{}
+{}
 if not e then
     rcon.print('{{"error": "Entity not found"}}')
     return
@@ -1192,15 +1298,9 @@ if not inv then
     return
 end
 
-local player = game.players[1]
-if not player or not player.character then
-    rcon.print('{{"error": "No player character found"}}')
-    return
-end
-
-local player_inv = player.get_main_inventory()
+local player_inv = c.get_main_inventory()
 if not player_inv then
-    rcon.print('{{"error": "Player has no inventory"}}')
+    rcon.print('{{"error": "Character has no inventory"}}')
     return
 end
 
@@ -1226,7 +1326,7 @@ end
 
 rcon.print(helpers.table_to_json({{ extracted = inserted, available = available }}))
 "#,
-            unit_number, inv_define, item, count, item, item, item
+            resolve, lookup, inv_define, item, count, item, item, item
         )
         .trim()
         .to_string()
@@ -1234,16 +1334,10 @@ rcon.print(helpers.table_to_json({{ extracted = inserted, available = available 
 
     /// Set recipe on an assembling machine
     pub fn set_recipe(unit_number: u32, recipe: &str) -> String {
+        let lookup = Self::entity_lookup(unit_number);
         format!(
             r#"
--- Find entity by unit_number via search
-local e = nil
-for _, entity in pairs(game.surfaces[1].find_entities_filtered{{area={{{{-500,-500}},{{500,500}}}}}}) do
-    if entity.unit_number == {} then
-        e = entity
-        break
-    end
-end
+{}
 if not e then
     rcon.print('{{"error": "Entity not found"}}')
     return
@@ -1257,7 +1351,7 @@ end
 local result = e.set_recipe("{}")
 rcon.print(helpers.table_to_json({{ success = result ~= nil }}))
 "#,
-            unit_number, recipe
+            lookup, recipe
         )
         .trim()
         .to_string()
@@ -1644,6 +1738,11 @@ local ghosts = slot.build_blueprint{{
     force_build = true
 }}
 
+storage.factorioctl_entities = storage.factorioctl_entities or {{}}
+for _, ghost in pairs(ghosts) do
+    if ghost.unit_number then storage.factorioctl_entities[ghost.unit_number] = ghost end
+end
+
 slot.clear()
 if saved_item then slot.set_stack{{name = saved_item}} end
 
@@ -1693,6 +1792,11 @@ local ghosts = slot.build_blueprint{{
     direction = {},
     force_build = true
 }}
+
+storage.factorioctl_entities = storage.factorioctl_entities or {{}}
+for _, ghost in pairs(ghosts) do
+    if ghost.unit_number then storage.factorioctl_entities[ghost.unit_number] = ghost end
+end
 
 slot.clear()
 if saved_item then slot.set_stack{{name = saved_item}} end
@@ -1871,9 +1975,11 @@ rcon.print(helpers.table_to_json(result))
     }
 
     /// Get available research (technologies that can be researched now)
-    pub fn get_available_research() -> String {
-        r#"
-local force = game.forces.player
+    pub fn get_available_research(agent_id: &AgentId) -> String {
+        format!(
+            "{}\n{}",
+            Self::resolve_optional(agent_id),
+            r#"local force = game.forces.player
 local surface = game.surfaces[1]
 local result = {
     technologies = {},
@@ -1909,17 +2015,13 @@ for name, count in pairs(science_totals) do
     table.insert(result.science_available, {name = name, count = count})
 end
 
--- Get player inventory science packs too
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if global then c = global.factorioctl_character end end
+-- Get resolved character inventory science packs too
 if c and c.valid then
     local inv = c.get_main_inventory()
     if inv then
         for _, item in pairs(inv.get_contents()) do
             if item.name:find("science%-pack") or item.name == "automation-science-pack" or item.name == "logistic-science-pack" then
+                science_totals[item.name] = (science_totals[item.name] or 0) + item.count
                 local found = false
                 for _, sci in pairs(result.science_available) do
                     if sci.name == item.name then
@@ -2023,6 +2125,7 @@ end
 
 rcon.print(helpers.table_to_json(result))
 "#
+        )
         .trim()
         .to_string()
     }
@@ -2743,25 +2846,27 @@ rcon.print(helpers.table_to_json(result))
     /// Clear trees and rocks in an area by mining them (player gets the items)
     /// Returns the count of cleared entities and items gained
     /// Requires player to be within proximity of the area
-    pub fn clear_area(area: Area, clear_trees: bool, clear_rocks: bool, dry_run: bool) -> String {
+    pub fn clear_area(
+        agent_id: &AgentId,
+        area: Area,
+        clear_trees: bool,
+        clear_rocks: bool,
+        dry_run: bool,
+    ) -> String {
         let trees_filter = if clear_trees { "true" } else { "false" };
         let rocks_filter = if clear_rocks { "true" } else { "false" };
         let dry_run_str = if dry_run { "true" } else { "false" };
+        let resolve = Self::resolve_required(agent_id);
 
         format!(
             r#"
+{}
 local surface = game.surfaces[1]
 local area = {{{{{},{}}},{{{},{}}}}}
 local clear_trees = {}
 local clear_rocks = {}
 local dry_run = {}
 local max_distance = 30
-
-local c = nil
-for _, p in pairs(game.connected_players) do
-    if p.character and p.character.valid then c = p.character break end
-end
-if not c then if not global then global = {{}} end c = global.factorioctl_character end
 
 local result = {{
     trees_found = 0,
@@ -2772,12 +2877,6 @@ local result = {{
     too_far = false,
     items_gained = {{}}
 }}
-
-if not (c and c.valid) then
-    result.error = "No character found"
-    rcon.print(helpers.table_to_json(result))
-    return
-end
 
 -- Check proximity to area center
 local cx, cy = c.position.x, c.position.y
@@ -2844,8 +2943,14 @@ end
 
 rcon.print(helpers.table_to_json(result))
 "#,
-            area.left_top.x, area.left_top.y, area.right_bottom.x, area.right_bottom.y,
-            trees_filter, rocks_filter, dry_run_str
+            resolve,
+            area.left_top.x,
+            area.left_top.y,
+            area.right_bottom.x,
+            area.right_bottom.y,
+            trees_filter,
+            rocks_filter,
+            dry_run_str
         )
         .trim()
         .to_string()

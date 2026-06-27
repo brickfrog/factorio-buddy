@@ -5,7 +5,6 @@ use clap::{Args, Subcommand};
 
 use super::ResolvedConnectionArgs;
 use crate::client::lua::LuaCommand;
-use crate::client::FactorioClient;
 
 #[derive(Args, Debug)]
 pub struct ResearchCommand {
@@ -32,7 +31,7 @@ pub enum ResearchSubcommand {
 }
 
 pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.command {
         ResearchSubcommand::Status => {

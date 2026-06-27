@@ -5,7 +5,6 @@ use clap::{Args, Subcommand};
 
 use super::parsing::parse_tile;
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::client::lua::LuaCommand;
 use crate::world::Position;
 
@@ -79,7 +78,7 @@ pub enum PowerSubcommand {
 }
 
 pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
     match cmd.command {
         PowerSubcommand::Line { from, to, pole } => {

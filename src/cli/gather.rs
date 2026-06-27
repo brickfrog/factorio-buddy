@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Args;
 
 use super::ResolvedConnectionArgs;
-use crate::client::FactorioClient;
 use crate::output::{Output, OutputFormat};
 
 #[derive(Args, Debug)]
@@ -22,9 +21,11 @@ pub struct GatherCommand {
 }
 
 pub async fn execute(cmd: GatherCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
-    let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+    let mut client = conn.connect_client().await?;
 
-    let result = client.gather_resource(&cmd.resource, cmd.amount, cmd.radius).await?;
+    let result = client
+        .gather_resource(&cmd.resource, cmd.amount, cmd.radius)
+        .await?;
 
     if conn.output == OutputFormat::Json {
         Output::new(conn.output).print(&result)?;

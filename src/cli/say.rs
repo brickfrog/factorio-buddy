@@ -34,7 +34,7 @@ pub async fn execute(cmd: SayCommand, conn: &ResolvedConnectionArgs) -> Result<(
 
     // In-game display
     if do_console || do_flying_text {
-        let mut client = FactorioClient::connect(&conn.host, conn.port, &conn.password).await?;
+        let mut client = conn.connect_client().await?;
 
         if do_console {
             display_console(&mut client, &cmd.message).await?;
@@ -114,9 +114,7 @@ async fn speak_macos_say(message: &str, config: &TtsConfig) -> Result<()> {
     cmd.arg(message);
 
     // Spawn without waiting - allows agent to continue while TTS plays
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
 
     Ok(())
 }
@@ -127,7 +125,9 @@ async fn speak_openai(message: &str, config: &TtsConfig) -> Result<()> {
         .openai_api_key
         .clone()
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .ok_or_else(|| anyhow::anyhow!("OpenAI API key required (set in config or OPENAI_API_KEY env var)"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("OpenAI API key required (set in config or OPENAI_API_KEY env var)")
+        })?;
 
     let voice = config.voice.as_deref().unwrap_or("nova");
     let speed = config.rate.unwrap_or(1.0);
