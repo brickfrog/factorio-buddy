@@ -143,7 +143,7 @@ impl ServerManager {
     pub async fn status(&self) -> Result<String> {
         if let Some(ref child) = self.server_process {
             if let Some(id) = child.id() {
-                if process_is_running(id) {
+                if factorio_server_running(id) {
                     return Ok(format!("Running (PID: {})", id));
                 }
             }
@@ -185,7 +185,7 @@ impl ServerManager {
             }
         };
 
-        if process_is_running(pid) {
+        if factorio_server_running(pid) {
             Ok(Some(pid))
         } else {
             let _ = fs::remove_file(&path);
@@ -237,10 +237,23 @@ fn find_factorio_binary() -> Result<PathBuf> {
     )
 }
 
-fn process_is_running(pid: u32) -> bool {
+/// True only if `pid` is alive AND is actually a Factorio server process.
+///
+/// A bare `/proc/<pid>` existence check is unsafe: a stale pidfile plus PID
+/// reuse would make us report an unrelated process as the server (and worse,
+/// kill it on stop). We validate identity via the process command line so a
+/// reused PID running something else is treated as stale.
+fn factorio_server_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        PathBuf::from(format!("/proc/{pid}")).exists()
+        let cmdline = match fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        // /proc/<pid>/cmdline is NUL-separated argv; lossily scan it for the
+        // factorio binary name.
+        let cmd = String::from_utf8_lossy(&cmdline);
+        cmd.contains("factorio")
     }
 
     #[cfg(not(unix))]
@@ -259,7 +272,7 @@ async fn stop_pid(pid: u32) -> Result<()> {
             .status()
             .await
             .context("Failed to stop server process")?;
-        if !status.success() && process_is_running(pid) {
+        if !status.success() && factorio_server_running(pid) {
             bail!("Failed to stop server process {}", pid);
         }
     }
@@ -284,29 +297,38 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn manager_for(saves_dir: PathBuf) -> ServerManager {
+        ServerManager {
+            factorio_binary: PathBuf::from("factorio"),
+            saves_dir,
+            server_process: None,
+        }
+    }
+
     #[tokio::test]
-    async fn status_reads_a_live_pidfile_from_a_prior_manager() {
+    async fn status_reads_a_live_factorio_pidfile_from_a_prior_manager() {
+        // The test binary itself is `factorioctl-<hash>`, so its /proc cmdline
+        // contains "factorio" — a valid stand-in for a live Factorio server.
         let dir = tempdir().unwrap();
         let saves_dir = dir.path().join("saves");
         std::fs::create_dir_all(&saves_dir).unwrap();
         let pidfile = saves_dir.join(".factorioctl-server.pid");
         std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
-        let manager = ServerManager {
-            factorio_binary: PathBuf::from("factorio"),
-            saves_dir,
-            server_process: None,
-        };
+        let manager = manager_for(saves_dir);
 
         let status = manager.status().await.unwrap();
 
         assert!(
             status.contains(&format!("PID: {}", std::process::id())),
-            "status should report the live pid from the persisted pidfile, got {status}"
+            "status should report the live factorio-identified pid, got {status}"
         );
     }
 
     #[tokio::test]
-    async fn stop_kills_a_pidfile_process_and_removes_stale_state() {
+    async fn unrelated_live_pid_is_treated_as_stale_not_killed() {
+        // A reused PID running something that is NOT Factorio (here: `sleep`)
+        // must be treated as a stale pidfile: status says Not running, the
+        // pidfile is removed, and crucially the unrelated process is NOT killed.
         let dir = tempdir().unwrap();
         let saves_dir = dir.path().join("saves");
         std::fs::create_dir_all(&saves_dir).unwrap();
@@ -314,19 +336,19 @@ mod tests {
         let pid = child.id().unwrap();
         let pidfile = saves_dir.join(".factorioctl-server.pid");
         std::fs::write(&pidfile, pid.to_string()).unwrap();
-        let mut manager = ServerManager {
-            factorio_binary: PathBuf::from("factorio"),
-            saves_dir,
-            server_process: None,
-        };
+        let mut manager = manager_for(saves_dir);
 
-        manager.stop_server().await.unwrap();
-        let _ = child.wait().await;
-
-        assert!(
-            !pidfile.exists(),
-            "stop should remove persisted pid state after stopping the process"
-        );
         assert_eq!(manager.status().await.unwrap(), "Not running");
+        assert!(!pidfile.exists(), "stale pidfile should be removed on read");
+
+        // stop_server must not kill the unrelated process.
+        manager.stop_server().await.unwrap();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "stop must not kill an unrelated (non-factorio) reused PID"
+        );
+
+        child.kill().await.unwrap();
+        let _ = child.wait().await;
     }
 }
