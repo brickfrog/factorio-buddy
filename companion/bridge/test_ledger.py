@@ -118,6 +118,65 @@ progress: Started the science plan
         self.assertIn("continuity", pipe.AUTONOMY_PROMPT.lower())
         self.assertIn("<ledger>", pipe.AUTONOMY_PROMPT)
 
+    def test_load_normalizes_null_fields_and_apply_does_not_raise(self):
+        # A ledger persisted with null lists must not crash the next update.
+        (self.base / ".ledger-doug.json").write_text(
+            '{"objective": null, "plan_steps": null, "progress_notes": null}'
+        )
+
+        loaded = ledger.load_ledger("doug")
+        self.assertEqual(loaded["plan_steps"], [])
+        self.assertEqual(loaded["progress_notes"], [])
+        self.assertEqual(loaded["objective"], "")
+
+        # Would raise TypeError (list(None)) before the normalize fix.
+        updated = ledger.apply_ledger_update(
+            "doug", "<ledger>\nprogress: still fine\n</ledger>"
+        )
+        self.assertEqual(updated["progress_notes"], ["still fine"])
+
+    def test_load_returns_default_for_non_utf8_file(self):
+        # UnicodeDecodeError is a ValueError subclass and must be swallowed.
+        (self.base / ".ledger-doug.json").write_bytes(b"\xff\xfe\x00\x01")
+
+        self.assertEqual(ledger.load_ledger("doug"), ledger.default_ledger())
+
+    def test_strip_ledger_only_reply_is_empty(self):
+        # Documents the empty-after-strip case the handle_message guard handles.
+        only_block = "<ledger>\nobjective: x\nprogress: y\n</ledger>"
+
+        self.assertEqual(ledger.strip_ledger_trailer(only_block), "")
+
+    def test_save_is_atomic_and_leaves_no_tmp(self):
+        ledger.save_ledger("doug", ledger.default_ledger())
+
+        self.assertFalse((self.base / ".ledger-doug.json.tmp").exists())
+        self.assertTrue((self.base / ".ledger-doug.json").exists())
+
+    def test_compose_autonomy_prompt_injects_ledger(self):
+        # Prove the persisted objective is actually injected on autonomy ticks,
+        # not just that the prompt copy contains <ledger>.
+        pipe = importlib.import_module("pipe")
+        ledger.save_ledger("doug", {
+            "objective": "Build a smelting column",
+            "plan_steps": ["Place furnaces", "Lay the belt"],
+            "progress_notes": ["Cleared the build site"],
+            "updated_at": "now",
+        })
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.rcon = StubRCON()
+
+        prompt = thread._compose_autonomy_prompt()
+
+        self.assertIn("Build a smelting column", prompt)
+        self.assertIn(pipe.AUTONOMY_PROMPT, prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

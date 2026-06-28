@@ -1,6 +1,7 @@
 """Persistent per-agent objective ledger for bridge autonomy continuity."""
 
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -22,21 +23,60 @@ def default_ledger() -> dict:
     }
 
 
+def _str_list(value) -> list:
+    """Coerce an on-disk value into a list of non-empty strings."""
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str)]
+
+
+def _normalize(data: dict) -> dict:
+    """Coerce a loaded ledger dict to the canonical schema/types so callers
+    never trip over null or wrong-typed fields (e.g. {"plan_steps": null})."""
+    objective = data.get("objective", "")
+    updated_at = data.get("updated_at", "")
+    return {
+        "objective": objective if isinstance(objective, str) else "",
+        "plan_steps": _str_list(data.get("plan_steps", [])),
+        "progress_notes": _str_list(data.get("progress_notes", [])),
+        "updated_at": updated_at if isinstance(updated_at, str) else "",
+    }
+
+
 def load_ledger(agent_name: str) -> dict:
+    # json.JSONDecodeError and UnicodeDecodeError are both ValueError subclasses,
+    # so (ValueError, OSError) covers corrupt JSON and non-UTF8/unreadable files.
     try:
         data = json.loads(_ledger_file(agent_name).read_text())
-        if isinstance(data, dict):
-            return data
+    except (ValueError, OSError):
         return default_ledger()
-    except (json.JSONDecodeError, OSError):
-        return default_ledger()
+    if isinstance(data, dict):
+        return _normalize(data)
+    return default_ledger()
 
 
 def save_ledger(agent_name: str, ledger: dict) -> None:
+    # Atomic write: serialize first, write to a temp file, then os.replace onto
+    # the target so an interrupted/failed write can never truncate the real
+    # ledger. Persistence failures are surfaced (printed), not silently swallowed.
+    path = _ledger_file(agent_name)
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        _ledger_file(agent_name).write_text(json.dumps(ledger) + "\n")
-    except (OSError, TypeError):
+        payload = json.dumps(ledger) + "\n"
+    except TypeError as e:
+        print(f"[ledger] WARNING: refusing to save unserializable ledger for "
+              f"{agent_name}: {e}")
         return None
+    try:
+        tmp.write_text(payload)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[ledger] WARNING: failed to persist ledger for {agent_name}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return None
 
 
 def parse_ledger_trailer(text: str) -> dict | None:

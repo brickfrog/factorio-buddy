@@ -469,6 +469,9 @@ def handle_message(
     reply = sanitize_response(reply)
     apply_ledger_update(agent_name, reply)
     reply = strip_ledger_trailer(reply)
+    # A reply that was ONLY a <ledger> block strips to empty — don't log/send blank.
+    if not reply.strip():
+        reply = "(action complete)"
 
     print(f"[{tname}] {reply}\n")
     sections = parse_response(reply)
@@ -641,6 +644,17 @@ class AgentThread:
         except Exception:
             return ""
 
+    def _compose_autonomy_prompt(self) -> str:
+        """Assemble the autonomy-tick prompt: the persisted objective ledger and
+        a one-line live state are injected ahead of the continuity instructions.
+        Empty parts (no objective, live state unavailable) are dropped."""
+        parts = [
+            render_ledger(load_ledger(self.agent_name)),
+            self._live_state_line(),
+            AUTONOMY_PROMPT,
+        ]
+        return "\n\n".join(part for part in parts if part)
+
     def _next_message(self) -> dict:
         """Block for the next human message, or synthesize an autonomy tick if
         the agent has been idle for heartbeat_interval seconds. When
@@ -659,14 +673,8 @@ class AgentThread:
                         self._waiting_for_player_logged = True
                     continue
                 self._waiting_for_player_logged = False
-                prompt_parts = [
-                    render_ledger(load_ledger(self.agent_name)),
-                    self._live_state_line(),
-                    AUTONOMY_PROMPT,
-                ]
-                prompt = "\n\n".join(part for part in prompt_parts if part)
                 return {
-                    "message": prompt,
+                    "message": self._compose_autonomy_prompt(),
                     "player_index": 0,
                     "player_name": "autonomy",
                     "autonomy": True,
