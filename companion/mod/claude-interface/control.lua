@@ -20,6 +20,7 @@ local function init_storage()
     -- Agent character entities and walk targets (for deterministic on_tick processing)
     storage.characters = storage.characters or {}
     storage.walk_state = storage.walk_state or {}
+    storage.walk_targets = storage.walk_targets or {}
     storage.entity_queue = storage.entity_queue or {}
     -- Map markers for agent characters (chart tag references)
     storage.agent_tags = storage.agent_tags or {}
@@ -471,6 +472,66 @@ local function process_walk_states()
     end
 end
 
+-- Step queued walk targets for agent characters each tick.
+-- Processed in on_tick for deterministic multiplayer behavior.
+local function process_walk_targets()
+    if not storage.walk_targets then return end
+    for agent_id, tgt in pairs(storage.walk_targets) do
+        local c = storage.characters[agent_id]
+        if not (c and c.valid) then
+            storage.walk_targets[agent_id] = nil
+            goto continue
+        end
+        if tgt.expires_tick and game.tick >= tgt.expires_tick then
+            storage.walk_targets[agent_id] = nil
+            goto continue
+        end
+
+        local dx = tgt.x - c.position.x
+        local dy = tgt.y - c.position.y
+        local dist = math.sqrt(dx * dx + dy * dy)
+        local sp = c.character_running_speed or 0.15
+
+        if dist <= sp then
+            c.teleport({tgt.x, tgt.y})
+            storage.walk_targets[agent_id] = nil
+            c.walking_state = {walking = false}
+        else
+            local last_x = tgt.last_x or c.position.x
+            local last_y = tgt.last_y or c.position.y
+            local nx = c.position.x + (dx / dist) * sp
+            local ny = c.position.y + (dy / dist) * sp
+            if not c.teleport({nx, ny}) then
+                if not c.teleport({nx, c.position.y}) then
+                    c.teleport({c.position.x, ny})
+                end
+            end
+
+            local dir = 0
+            if math.abs(dx) > math.abs(dy) then
+                dir = dx > 0 and defines.direction.east or defines.direction.west
+            else
+                dir = dy > 0 and defines.direction.south or defines.direction.north
+            end
+            c.walking_state = {walking = true, direction = dir}
+
+            local moved = math.sqrt((c.position.x - last_x) * (c.position.x - last_x) + (c.position.y - last_y) * (c.position.y - last_y))
+            if moved < 0.001 then
+                tgt.stuck_ticks = (tgt.stuck_ticks or 0) + 1
+            else
+                tgt.stuck_ticks = 0
+            end
+            tgt.last_x = c.position.x
+            tgt.last_y = c.position.y
+            if tgt.stuck_ticks >= 120 then
+                storage.walk_targets[agent_id] = nil
+            end
+        end
+
+        ::continue::
+    end
+end
+
 -- Apply queued entity operations each tick (rotation, etc.).
 -- Processed in on_tick for deterministic multiplayer behavior.
 local function process_entity_queue()
@@ -667,6 +728,22 @@ remote.add_interface("claude_interface", {
         storage.walk_state[agent_id] = {walking = false}
     end,
 
+    -- Set target position for deterministic agent step-walking (processed in on_tick)
+    set_walk_target = function(agent_id, x, y)
+        if not storage.walk_targets then storage.walk_targets = {} end
+        storage.walk_targets[agent_id] = {x = x, y = y, stuck_ticks = 0, expires_tick = game.tick + 7200}
+    end,
+
+    -- Clear target position for deterministic agent step-walking
+    clear_walk_target = function(agent_id)
+        if storage.walk_targets then storage.walk_targets[agent_id] = nil end
+    end,
+
+    -- Report whether an agent has an active deterministic walk target
+    has_walk_target = function(agent_id)
+        return storage.walk_targets ~= nil and storage.walk_targets[agent_id] ~= nil
+    end,
+
     -- Get character entity (safe from any context, uses synced mod storage)
     get_character = function(agent_id)
         if not storage.characters then return nil end
@@ -746,6 +823,7 @@ script.on_init(init_storage)
 script.on_event(defines.events.on_tick, function(event)
     process_rcon_queue()
     process_walk_states()
+    process_walk_targets()
     process_entity_queue()
     -- Update map markers every 60 ticks (~1 second)
     if event.tick % 60 == 0 then

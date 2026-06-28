@@ -554,11 +554,23 @@ end)
         format!(
             r#"
 {}
+if remote.interfaces["claude_interface"] and remote.interfaces["claude_interface"]["set_walk_target"] then
+    remote.call("claude_interface", "register_character", "{}", c)
+    remote.call("claude_interface", "set_walk_target", "{}", {}, {})
+    storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
+    storage.factorioctl_walk_targets["{}"] = nil
+else
 storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
 storage.factorioctl_walk_targets["{}"] = {{ x = {}, y = {}, stuck_ticks = 0, expires_tick = game.tick + 7200, last_x = c.position.x, last_y = c.position.y }}
 {}
+end
 "#,
             resolve,
+            agent_id.as_str(),
+            agent_id.as_str(),
+            position.x,
+            position.y,
+            agent_id.as_str(),
             agent_id.as_str(),
             position.x,
             position.y,
@@ -571,9 +583,13 @@ storage.factorioctl_walk_targets["{}"] = {{ x = {}, y = {}, stuck_ticks = 0, exp
     pub fn clear_walk_target(agent_id: &AgentId) -> String {
         format!(
             r#"
+if remote.interfaces["claude_interface"] and remote.interfaces["claude_interface"]["clear_walk_target"] then
+    remote.call("claude_interface", "clear_walk_target", "{}")
+end
 storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
 storage.factorioctl_walk_targets["{}"] = nil
 "#,
+            agent_id.as_str(),
             agent_id.as_str()
         )
         .trim()
@@ -583,9 +599,14 @@ storage.factorioctl_walk_targets["{}"] = nil
     pub fn walk_target_active(agent_id: &AgentId) -> String {
         format!(
             r#"
+if remote.interfaces["claude_interface"] and remote.interfaces["claude_interface"]["has_walk_target"] then
+    rcon.print(remote.call("claude_interface", "has_walk_target", "{}") and "true" or "false")
+else
 storage.factorioctl_walk_targets = storage.factorioctl_walk_targets or {{}}
 rcon.print(storage.factorioctl_walk_targets["{}"] ~= nil and "true" or "false")
+end
 "#,
+            agent_id.as_str(),
             agent_id.as_str()
         )
         .trim()
@@ -3038,6 +3059,9 @@ rcon.print(helpers.table_to_json(result))
 
 #[cfg(test)]
 mod tests {
+    use crate::client::AgentId;
+    use crate::world::Position;
+
     use super::LuaCommand;
 
     #[test]
@@ -3056,5 +3080,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn named_set_walk_target_routes_to_mod_remote_with_fallback_driver() {
+        let agent = AgentId::new(Some("doug")).expect("named agent id");
+        let lua = LuaCommand::set_walk_target(&agent, Position::new(12.0, 13.0));
+
+        assert!(
+            lua.contains(r#"remote.interfaces["claude_interface"]"#),
+            "set_walk_target should guard the claude-interface remote path"
+        );
+        assert!(
+            lua.contains(r#"remote.call("claude_interface", "set_walk_target", "doug", 12, 13)"#),
+            "set_walk_target should route targets through the mod when available"
+        );
+        assert!(
+            lua.contains(r#"remote.call("claude_interface", "register_character", "doug", c)"#),
+            "set_walk_target should register the resolved factorioctl body with the mod before routing"
+        );
+        let register_call = lua
+            .find(r#"remote.call("claude_interface", "register_character", "doug", c)"#)
+            .expect("mod register_character call should be present");
+        let remote_call = lua
+            .find(r#"remote.call("claude_interface", "set_walk_target", "doug", 12, 13)"#)
+            .expect("mod remote call should be present");
+        assert!(
+            register_call < remote_call,
+            "set_walk_target should register the body before setting the mod target"
+        );
+        let anti_double_drive_clear = lua[remote_call..]
+            .find(r#"storage.factorioctl_walk_targets["doug"] = nil"#)
+            .expect("mod branch should clear the level-script target table");
+        let fallback_target = lua
+            .find(r#"storage.factorioctl_walk_targets["doug"] = { x = 12, y = 13"#)
+            .expect("fallback driver target should be present");
+        assert!(
+            remote_call + anti_double_drive_clear < fallback_target,
+            "mod branch should clear the fallback target before the fallback driver branch"
+        );
+    }
+
+    #[test]
+    fn named_walk_target_active_routes_to_mod_remote_with_fallback_check() {
+        let agent = AgentId::new(Some("doug")).expect("named agent id");
+        let lua = LuaCommand::walk_target_active(&agent);
+
+        assert!(
+            lua.contains(r#"remote.interfaces["claude_interface"]["has_walk_target"]"#),
+            "walk_target_active should guard the mod active-target query"
+        );
+        assert!(
+            lua.contains(r#"remote.call("claude_interface", "has_walk_target", "doug")"#),
+            "walk_target_active should query the mod target state when available"
+        );
+        assert!(
+            lua.contains(r#"storage.factorioctl_walk_targets["doug"] ~= nil"#),
+            "walk_target_active should retain the level-script fallback active check"
+        );
+    }
+
+    #[test]
+    fn legacy_walk_character_still_uses_walking_state() {
+        let agent = AgentId::new(None).expect("legacy agent id");
+        let lua = LuaCommand::walk_character(&agent, Position::new(12.0, 13.0));
+
+        assert!(
+            lua.contains("c.walking_state = { walking = true, direction = dir }"),
+            "legacy/player walking should still use walking_state"
+        );
+        assert!(
+            !lua.contains(r#"remote.call("claude_interface", "set_walk_target""#),
+            "legacy/player walking should not route through the named-agent mod target remote"
+        );
     }
 }
