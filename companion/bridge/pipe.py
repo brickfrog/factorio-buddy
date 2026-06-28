@@ -103,6 +103,7 @@ def setup_logging(log_dir: Path) -> Path | None:
 
 from ledger import (apply_ledger_update, load_ledger, render_ledger,
                     strip_ledger_trailer)
+from planner import build_autonomy_prompt, choose_autonomy_mode
 from rcon import RCONClient, ThreadSafeRCON, lua_long_string
 from paths import find_script_output, find_factorioctl_mcp
 from transport import (InputWatcher, send_response, send_tool_status, set_status,
@@ -557,39 +558,13 @@ def discover_agents(group: str | None = None, names: list[str] | None = None) ->
     return profiles
 
 
-# Self-prompt fed to the agent when it has been idle (no human message) for
-# heartbeat_interval seconds. This is what makes the agent autonomous: it keeps
-# playing on its own initiative between human messages. Injected as
-# player_index=0 so it skips the in-game "Thinking..." GUI status flicker.
-AUTONOMY_PROMPT = (
-    "(autonomy tick — no new messages from the player) "
-    "You're playing Factorio on your own initiative right now. Prioritize "
-    "continuity: continue your current committed objective and plan, then "
-    "execute the next incomplete step with your tools. Do not re-scan areas "
-    "you already inspected, and do not restart the plan. To orient quickly, "
-    "call situation_report once instead of render_map + get_inventory + "
-    "get_resources. Finish before you switch: choose a new objective only "
-    "when the current one is genuinely finished or impossible. Actually do "
-    "things, don't just describe them. "
-    "Narrate as you go with broadcast_thought so the stream stays lively. "
-    "Whenever your objective or plan changes, or after meaningful progress, "
-    "emit exactly one ledger block at the end of your reply in this format:\n"
-    "<ledger>\n"
-    "objective: your current objective\n"
-    "plan:\n"
-    "- next concrete step\n"
-    "- following concrete step\n"
-    "progress: one short note about what changed\n"
-    "</ledger>"
-)
-
-
 class AgentThread:
     """Manages one agent's claude CLI sessions in a dedicated thread."""
 
     def __init__(self, agent: dict, mcp_config: Path | None, rcon,
                  telemetry: 'Telemetry | None', model: str | None,
                  heartbeat_interval: float = 0.0,
+                 planner_interval: int = 5,
                  autonomy_requires_player: bool = True):
         self.agent = agent
         self.agent_name = agent["name"]
@@ -607,6 +582,11 @@ class AgentThread:
         self.heartbeat_interval = float(
             agent.get("heartbeat_interval", heartbeat_interval)
         )
+        self._exec_ticks_since_plan = 0
+        self._planner_interval = int(
+            agent.get("planner_interval", planner_interval)
+        )
+        self._planner_model = agent.get("planner_model")
         # When True, autonomy ticks only fire while a human is connected to the
         # server, so the agent waits to "do its own thing" until you join (and
         # goes back to idle if you leave). Chat is always processed regardless.
@@ -655,15 +635,32 @@ class AgentThread:
             return ""
 
     def _compose_autonomy_prompt(self) -> str:
-        """Assemble the autonomy-tick prompt: the persisted objective ledger and
-        a one-line live state are injected ahead of the continuity instructions.
-        Empty parts (no objective, live state unavailable) are dropped."""
-        parts = [
-            render_ledger(load_ledger(self.agent_name)),
-            self._live_state_line(),
-            AUTONOMY_PROMPT,
-        ]
-        return "\n\n".join(part for part in parts if part)
+        """Assemble the autonomy-tick prompt for the current plan/execute mode."""
+        tick = self._autonomy_tick()
+        return tick["message"]
+
+    def _autonomy_tick(self) -> dict:
+        """Choose plan/execute mode, update cadence state, and build the message."""
+        ledger = load_ledger(self.agent_name)
+        mode = choose_autonomy_mode(
+            ledger, self._exec_ticks_since_plan, self._planner_interval,
+        )
+        if mode == "plan":
+            self._exec_ticks_since_plan = 0
+        else:
+            self._exec_ticks_since_plan += 1
+
+        tick = {
+            "message": build_autonomy_prompt(
+                mode, render_ledger(ledger), self._live_state_line(),
+            ),
+            "player_index": 0,
+            "player_name": "autonomy",
+            "autonomy": True,
+        }
+        if mode == "plan" and self._planner_model:
+            tick["model"] = self._planner_model
+        return tick
 
     def _next_message(self) -> dict:
         """Block for the next human message, or synthesize an autonomy tick if
@@ -683,12 +680,7 @@ class AgentThread:
                         self._waiting_for_player_logged = True
                     continue
                 self._waiting_for_player_logged = False
-                return {
-                    "message": self._compose_autonomy_prompt(),
-                    "player_index": 0,
-                    "player_name": "autonomy",
-                    "autonomy": True,
-                }
+                return self._autonomy_tick()
 
     def _run(self):
         while True:
@@ -723,7 +715,8 @@ class AgentThread:
                 message, self.mcp_config, self.system_prompt, self.session_id,
                 self.rcon, player_index, self.telemetry,
                 agent_name=self.agent_name, telemetry_name=self.telemetry_name,
-                response_to=response_to, model=self.model, max_turns=self.max_turns,
+                response_to=response_to, model=msg.get("model") or self.model,
+                max_turns=self.max_turns,
             )
             if new_session:
                 self.session_id = new_session
@@ -789,6 +782,7 @@ def main_multi(args, agent_profiles: list[dict]):
             )
         at = AgentThread(agent, mcp_config, rcon, telemetry, args.model,
                          heartbeat_interval=args.heartbeat_interval,
+                         planner_interval=args.planner_interval,
                          autonomy_requires_player=args.autonomy_requires_player)
         agents[agent["name"]] = at
 
@@ -889,6 +883,9 @@ def main():
     parser.add_argument("--heartbeat-interval", type=float, default=6.0,
                         help="Autonomy: seconds idle before the agent self-prompts "
                              "to keep playing. 0 disables autonomy (chat-only).")
+    parser.add_argument("--planner-interval", type=int, default=5,
+                        help="Autonomy: execution ticks between deliberative "
+                             "planner ticks.")
     parser.add_argument("--autonomy-requires-player",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="Only run autonomy ticks while a human is connected, "
