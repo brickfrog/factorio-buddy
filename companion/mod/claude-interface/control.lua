@@ -488,6 +488,7 @@ local function process_walk_targets()
         end
         if tgt.expires_tick and game.tick >= tgt.expires_tick then
             storage.walk_targets[agent_id] = nil
+            c.walking_state = {walking = false}
             goto continue
         end
 
@@ -511,13 +512,11 @@ local function process_walk_targets()
                 end
             end
 
-            local dir = 0
-            if math.abs(dx) > math.abs(dy) then
-                dir = dx > 0 and defines.direction.east or defines.direction.west
-            else
-                dir = dy > 0 and defines.direction.south or defines.direction.north
-            end
-            c.walking_state = {walking = true, direction = dir}
+            -- Teleport is the ONLY mover. Never set walking_state.walking = true:
+            -- the engine then physically walks the orphan character cardinally on
+            -- top of the teleport, and on expiry/stuck clears it keeps walking for
+            -- hundreds of tiles (the "positional discontinuity" runaway).
+            c.walking_state = {walking = false}
 
             local moved = math.sqrt((c.position.x - last_x) * (c.position.x - last_x) + (c.position.y - last_y) * (c.position.y - last_y))
             if moved < 0.001 then
@@ -529,6 +528,7 @@ local function process_walk_targets()
             tgt.last_y = c.position.y
             if tgt.stuck_ticks >= 120 then
                 storage.walk_targets[agent_id] = nil
+                c.walking_state = {walking = false}
             end
         end
 
