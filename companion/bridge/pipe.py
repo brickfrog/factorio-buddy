@@ -563,7 +563,8 @@ class AgentThread:
 
     def __init__(self, agent: dict, mcp_config: Path | None, rcon,
                  telemetry: 'Telemetry | None', model: str | None,
-                 heartbeat_interval: float = 0.0):
+                 heartbeat_interval: float = 0.0,
+                 autonomy_requires_player: bool = True):
         self.agent = agent
         self.agent_name = agent["name"]
         self.system_prompt = agent["system_prompt"]
@@ -580,6 +581,13 @@ class AgentThread:
         self.heartbeat_interval = float(
             agent.get("heartbeat_interval", heartbeat_interval)
         )
+        # When True, autonomy ticks only fire while a human is connected to the
+        # server, so the agent waits to "do its own thing" until you join (and
+        # goes back to idle if you leave). Chat is always processed regardless.
+        self.autonomy_requires_player = bool(
+            agent.get("autonomy_requires_player", autonomy_requires_player)
+        )
+        self._waiting_for_player_logged = False
         self.session_id = load_session(self.agent_name)
         self.inbox: queue.Queue = queue.Queue()
         self._thread = threading.Thread(
@@ -592,20 +600,43 @@ class AgentThread:
     def enqueue(self, msg: dict):
         self.inbox.put(msg)
 
+    def _human_connected(self) -> bool:
+        """True if at least one human player is connected. AI agents are orphan
+        character entities (not game.players), so connected_players counts only
+        real human clients. On any RCON error, return False so we don't burn
+        autonomy turns when we can't confirm a human is present."""
+        try:
+            out = self.rcon.execute(
+                "/silent-command rcon.print(#game.connected_players)"
+            )
+            return int(out.strip() or "0") > 0
+        except Exception:
+            return False
+
     def _next_message(self) -> dict:
         """Block for the next human message, or synthesize an autonomy tick if
-        the agent has been idle for heartbeat_interval seconds."""
+        the agent has been idle for heartbeat_interval seconds. When
+        autonomy_requires_player is set, autonomy ticks are suppressed until a
+        human is connected — chat is still delivered immediately regardless."""
         if self.heartbeat_interval <= 0:
             return self.inbox.get()
-        try:
-            return self.inbox.get(timeout=self.heartbeat_interval)
-        except queue.Empty:
-            return {
-                "message": AUTONOMY_PROMPT,
-                "player_index": 0,
-                "player_name": "autonomy",
-                "autonomy": True,
-            }
+        while True:
+            try:
+                return self.inbox.get(timeout=self.heartbeat_interval)
+            except queue.Empty:
+                if self.autonomy_requires_player and not self._human_connected():
+                    if not self._waiting_for_player_logged:
+                        print(f"[{_ts()}] {self.agent_name} idle — waiting for a "
+                              f"player to join before acting")
+                        self._waiting_for_player_logged = True
+                    continue
+                self._waiting_for_player_logged = False
+                return {
+                    "message": AUTONOMY_PROMPT,
+                    "player_index": 0,
+                    "player_name": "autonomy",
+                    "autonomy": True,
+                }
 
     def _run(self):
         while True:
@@ -705,7 +736,8 @@ def main_multi(args, agent_profiles: list[dict]):
                 args.rcon_password, agent_id=agent["name"],
             )
         at = AgentThread(agent, mcp_config, rcon, telemetry, args.model,
-                         heartbeat_interval=args.heartbeat_interval)
+                         heartbeat_interval=args.heartbeat_interval,
+                         autonomy_requires_player=args.autonomy_requires_player)
         agents[agent["name"]] = at
 
     # Resolve paths and start watcher
@@ -805,6 +837,12 @@ def main():
     parser.add_argument("--heartbeat-interval", type=float, default=6.0,
                         help="Autonomy: seconds idle before the agent self-prompts "
                              "to keep playing. 0 disables autonomy (chat-only).")
+    parser.add_argument("--autonomy-requires-player",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Only run autonomy ticks while a human is connected, "
+                             "so the agent waits to act until you join (default). "
+                             "Use --no-autonomy-requires-player to let it play "
+                             "immediately on boot.")
     parser.add_argument("--factorioctl-mcp", default=None)
     parser.add_argument("--sse", action="store_true")
     parser.add_argument("--sse-port", type=int, default=8088)
