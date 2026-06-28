@@ -1,0 +1,20 @@
+# Third-Party Vendored Code
+
+## companion/
+
+The entire `companion/` directory (the Factorio mod `claude-interface`, the
+Python bridge, the server/run scripts, configs, and relay) was vendored from:
+
+    https://github.com/QRY91/claude-in-factorio
+    at commit 55c6020 ("feat: supervisor orchestration + desync-safe character
+    lookups", 2026-02-23), the latest upstream commit at vendoring time.
+
+It is included here under its original license, retained at
+`companion/LICENSE`. Copyright remains with the original author (QRY91) for the
+vendored portions; subsequent modifications in this repository are made by this
+project's authors.
+
+This code was vendored (rather than kept as a separate dependency) to unify the
+factorioctl CLI/MCP server and its companion bridge into a single repository
+with one build, test, and review pipeline. Upstream was inactive at the time of
+vendoring.

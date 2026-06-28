@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "factorioctl": {
+      "type": "stdio",
+      "command": "../target/release/mcp",
+      "args": [],
+      "env": {
+        "FACTORIO_RCON_HOST": "localhost",
+        "FACTORIO_RCON_PORT": "27015",
+        "FACTORIO_RCON_PASSWORD": "factorio"
+      }
+    }
+  }
+}

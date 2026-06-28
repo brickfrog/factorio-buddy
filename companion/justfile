@@ -1,0 +1,91 @@
+# claude-in-factorio — play Factorio with GLM (via z.ai) as a multiplayer buddy
+#
+# Quick start:
+#   just doctor      # check everything is in place
+#   just play        # build + sync mod + fresh world + headless server + bridge
+#   (then in Steam: Multiplayer -> Connect to address -> localhost:34197)
+#
+# Day-to-day:
+#   just resume      # same, but keep the existing save
+#   just stop        # stop the headless server
+#   just logs        # tail the bridge (claude -p) stream
+
+# --- config -----------------------------------------------------------------
+# Your Steam Factorio binary (headless server needs it). Override on the CLI:
+#   just FACTORIO_BIN=/other/path play
+export FACTORIO_BIN := env_var_or_default("FACTORIO_BIN", "/mnt/games/SteamLibrary/steamapps/common/Factorio/bin/x64/factorio")
+
+# Number of agents by planet order: 1=nauvis 2=+vulcanus 3=+fulgora 4=+gleba 5=+aquilo
+scale := "1"
+
+rcon_port := "27015"
+rcon_pw   := "factorio"
+mcp       := "../target/release/mcp"
+ctl       := "../target/release/factorioctl"
+
+# --- default: list recipes --------------------------------------------------
+default:
+    @just --list --unsorted
+
+# --- one-time / occasional --------------------------------------------------
+
+# Build the Rust engine (factorioctl + mcp binaries) at the repo root
+build:
+    cd .. && cargo build --release
+
+# Copy the Lua mod into the headless server's mods dir
+sync:
+    ./run.sh sync
+
+# --- play -------------------------------------------------------------------
+
+# Build engine, sync mod, NEW world, start server + GLM bridge
+play: build sync
+    SCALE={{scale}} ./run.sh fresh
+
+# Same as play but keep the EXISTING save
+resume: build sync
+    SCALE={{scale}} ./run.sh restart
+
+# Start only the headless server (existing save)
+server:
+    ./run.sh server
+
+# Start only the bridge (server must already be running)
+bridge:
+    SCALE={{scale}} ./run.sh bridge
+
+# Stop the headless server
+stop:
+    ./run.sh stop
+
+# --- diagnostics ------------------------------------------------------------
+
+# Tail the bridge log (the live `claude -p` stream + tool calls)
+logs:
+    tail -f logs/bridge-*.log
+
+# Tail the Factorio server log
+logs-server:
+    tail -f logs/server.log
+
+# Verify RCON is alive (prints current game tick)
+rcon:
+    {{ctl}} --port {{rcon_port}} --password {{rcon_pw}} get tick
+
+# Connection reminder
+connect:
+    @echo "In Steam: Multiplayer -> Connect to address -> localhost:34197"
+    @echo "In game:  Ctrl+Shift+C (or the Q shortcut) to chat with GLM"
+
+# Check prerequisites are all in place
+doctor:
+    @echo "== binaries =="
+    @command -v claude  >/dev/null && echo "ok  claude   $(claude --version)"        || echo "!!  claude CLI missing"
+    @command -v python3 >/dev/null && echo "ok  python3  $(python3 --version)"        || echo "!!  python3 missing"
+    @test -x "{{mcp}}" && echo "ok  mcp binary built" || echo "!!  mcp not built  -> run: just build"
+    @echo "== factorio =="
+    @test -x "$FACTORIO_BIN" && echo "ok  FACTORIO_BIN  $FACTORIO_BIN ($($FACTORIO_BIN --version 2>/dev/null | head -1))" || echo "!!  FACTORIO_BIN not found: $FACTORIO_BIN"
+    @echo "== z.ai wiring =="
+    @test -f bridge/.env && grep -q 'api.z.ai' bridge/.env && echo "ok  bridge/.env points at z.ai" || echo "!!  bridge/.env missing z.ai config"
+    @grep -q '^ANTHROPIC_AUTH_TOKEN=.\+' bridge/.env 2>/dev/null && echo "ok  auth token present" || echo "!!  ANTHROPIC_AUTH_TOKEN empty in bridge/.env"
