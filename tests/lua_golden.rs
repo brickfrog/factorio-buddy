@@ -661,14 +661,17 @@ for i, item in pairs(c.crafting_queue) do
     table.insert(queue, { recipe = item.recipe, count = item.count })
 end
 
-rcon.print(helpers.table_to_json({
+local result = {
     success = crafted > 0,
     queued = crafted,
     queue_size = c.crafting_queue_size,
     queue = queue,
-    recipe = recipe_name,
-    error = crafted > 0 and nil or "Crafting did not start; check ingredients, recipe category, or character craftability"
-}))"#,
+    recipe = recipe_name
+}
+if crafted <= 0 then
+    result.error = "Crafting did not start; check ingredients, recipe category, or character craftability"
+end
+rcon.print(helpers.table_to_json(result))"#,
     );
 }
 
@@ -684,7 +687,9 @@ fn placement_diagnostics_are_structured_for_fluid_entities() {
         check.contains("surface.can_place_entity")
             && check.contains("factorio_allowed")
             && check.contains("inventory_count")
-            && check.contains("item_in_inventory"),
+            && check.contains("item_in_inventory")
+            && check.contains("if can_place_or_error ~= true then")
+            && !check.contains("and nil or"),
         "check_entity_placement should report Factorio placement and inventory diagnostics:\n{check}"
     );
 
@@ -811,7 +816,22 @@ rcon.print('{"success": true, "target": "' .. target.name .. '", "position": {\"
 fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
     LuaCase::new("get_recipe", LuaCommand::get_recipe("iron-plate")).assert_snapshot(
         r#"local recipe = prototypes.recipe["iron-plate"]
+local function recipe_unlocks(recipe_name)
+    local unlocks = {}
+    for tech_name, tech in pairs(game.forces.player.technologies) do
+        local effects = tech.prototype and tech.prototype.effects or {}
+        for _, effect in pairs(effects) do
+            if effect.type == "unlock-recipe" and effect.recipe == recipe_name then
+                table.insert(unlocks, tech_name)
+                break
+            end
+        end
+    end
+    table.sort(unlocks)
+    return unlocks
+end
 if recipe then
+    local force_recipe = game.forces.player.recipes[recipe.name]
     local ingredients = {}
     for _, ing in pairs(recipe.ingredients) do
         table.insert(ingredients, {
@@ -833,6 +853,8 @@ if recipe then
         name = recipe.name,
         category = recipe.category,
         energy = recipe.energy,
+        enabled = force_recipe and force_recipe.enabled or false,
+        unlocked_by = recipe_unlocks(recipe.name),
         ingredients = ingredients,
         products = products
     }))
@@ -1195,6 +1217,9 @@ fn static_builder_tests_cover_named_legacy_extract_and_registry_contracts() {
     let extract_lua = LuaCommand::extract_items(&named, 46, "iron-ore", 6, "chest");
     assert!(extract_lua.contains("local player_inv = c.get_main_inventory()"));
     assert!(!extract_lua.contains("game.players[1]"));
+    assert!(extract_lua.contains("extracted = 0"));
+    assert!(extract_lua.contains("available = available"));
+    assert!(!extract_lua.contains("\"error\": \"No items of that type in inventory\""));
 
     for lua in [
         LuaCommand::get_entity_inventory(42),

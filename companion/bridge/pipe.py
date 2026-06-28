@@ -31,7 +31,7 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, ResultMessage, SystemMessage,
     TextBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock,
 )
-from claude_agent_sdk.types import McpStdioServerConfig
+from claude_agent_sdk.types import HookMatcher, McpStdioServerConfig
 from loguru import logger
 
 # Ensure sibling modules are importable
@@ -109,8 +109,10 @@ from telemetry import SSEBroadcaster, start_sse_server, RelayPusher, Telemetry, 
 
 _BRIDGE_DIR = Path(__file__).resolve().parent
 _PLAYER_MESSAGES_MARKER = "\n\n--- Player Messages ---\n"
+DEFAULT_MAX_TURNS = 200
 SESSIONS_FILE = _BRIDGE_DIR / ".sessions.json"
 _RCON_PRINT = "rcon." + "pr" + "int"
+_MCP_TOOL_PREFIX = "mcp__factorioctl__"
 
 # ── Agent profiles ───────────────────────────────────────────
 
@@ -394,14 +396,157 @@ def _result_text_and_player_messages(
     return _json_for_log(stripped), "\n".join(player_messages)
 
 
+_MUTATING_FACTORIO_TOOLS = {
+    "clear_area",
+    "craft",
+    "create_zone",
+    "delete_zone",
+    "extract_items",
+    "insert_items",
+    "mine_at",
+    "place_entity",
+    "remove_entity",
+    "route_belt",
+    "set_recipe",
+    "start_research",
+    "update_zone",
+    "walk_to",
+}
+_PARALLEL_MUTATION_GUARD_PREFIX = (
+    "Factorioctl bridge blocked parallel mutating tool call:"
+)
+
+
+def _short_factorio_tool_name(tool_name: str) -> str:
+    if tool_name.startswith(_MCP_TOOL_PREFIX):
+        return tool_name[len(_MCP_TOOL_PREFIX):]
+    return tool_name
+
+
+def _is_mutating_factorio_tool(tool_name: str) -> bool:
+    return _short_factorio_tool_name(tool_name) in _MUTATING_FACTORIO_TOOLS
+
+
+def _is_operator_only_tool_refusal(text: str) -> bool:
+    stripped = str(text).strip()
+    return (
+        stripped.startswith("Error: execute_lua is disabled.")
+        or stripped.startswith(_PARALLEL_MUTATION_GUARD_PREFIX)
+    )
+
+
+def _is_benign_tool_miss(text: str) -> bool:
+    return str(text).strip().lower() in {
+        "error: no items of that type in inventory",
+        "no items of that type in inventory",
+    }
+
+
+class MutatingToolBatchGate:
+    """Block same-message mutating MCP batches before they race inventory state."""
+
+    def __init__(self, log, window_s: float | None = None):
+        self.log = log
+        self.window_s = float(
+            window_s if window_s is not None else os.environ.get(
+                "BRIDGE_MUTATING_TOOL_BATCH_WINDOW_S", "1.0"
+            )
+        )
+        self._lock = asyncio.Lock()
+        self._last_at = 0.0
+        self._last_tool_use_id: str | None = None
+        self._last_tool_name: str | None = None
+
+    async def hook(
+        self,
+        hook_input: Any,
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        tool_name = _hook_value(hook_input, "tool_name")
+        if not tool_name or not _is_mutating_factorio_tool(tool_name):
+            return {}
+
+        now = time.monotonic()
+        short_name = _short_factorio_tool_name(tool_name)
+        async with self._lock:
+            if (
+                self._last_tool_use_id
+                and tool_use_id != self._last_tool_use_id
+                and now - self._last_at < self.window_s
+            ):
+                previous = _short_factorio_tool_name(self._last_tool_name or "")
+                message = (
+                    f"{_PARALLEL_MUTATION_GUARD_PREFIX} {short_name}. "
+                    "Wait for the previous mutating tool result before issuing "
+                    "another world/inventory-changing command."
+                )
+                self.log.debug(
+                    "blocked parallel mutating tool: {} after {} in {:.3f}s",
+                    short_name,
+                    previous,
+                    now - self._last_at,
+                )
+                return {
+                    "decision": "block",
+                    "reason": message,
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": message,
+                    },
+                }
+
+            self._last_at = now
+            self._last_tool_use_id = tool_use_id
+            self._last_tool_name = tool_name
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+            }
+        }
+
+
+def _hook_value(hook_input: Any, key: str) -> Any:
+    if isinstance(hook_input, dict):
+        return hook_input.get(key)
+    return getattr(hook_input, key, None)
+
+
 def _json_payload_has_error(value: Any) -> bool:
     if isinstance(value, dict):
+        if value.get("success") is True:
+            return False
+        if (
+            value.get("success") is False
+            and value.get("can_place") is False
+            and "entity" in value
+            and "position" in value
+            and "inventory_count" in value
+        ):
+            return False
+        if (
+            "allowed" in value
+            and "policy_allowed" in value
+            and "factorio_allowed" in value
+            and "entity" in value
+            and "position" in value
+        ):
+            return False
         for key, item in value.items():
             key_lower = str(key).lower()
             if key_lower == "error" and item:
                 return True
             if key_lower == "success" and item is False:
-                return True
+                reason = (
+                    value.get("error")
+                    or value.get("message")
+                    or value.get("reason")
+                    or value.get("action_needed")
+                )
+                if reason:
+                    return True
             if key_lower in {"status", "state", "result"}:
                 item_text = str(item).strip().lower()
                 if item_text in {"error", "failed", "failure", "fail"}:
@@ -417,6 +562,10 @@ def _json_text_block_has_error(value: Any) -> bool:
     if isinstance(value, dict):
         if value.get("type") == "text":
             text = str(value.get("text", "")).strip()
+            if _is_operator_only_tool_refusal(text):
+                return False
+            if _is_benign_tool_miss(text):
+                return False
             lowered = text.lower()
             if lowered.startswith("error:") or lowered.startswith("cannot "):
                 return True
@@ -436,6 +585,10 @@ def _looks_like_tool_error(text: str) -> bool:
     strings instead of SDK/CLI tool errors."""
     stripped = text.strip()
     if not stripped:
+        return False
+    if _is_operator_only_tool_refusal(stripped):
+        return False
+    if _is_benign_tool_miss(stripped):
         return False
     try:
         parsed = json.loads(stripped)
@@ -494,6 +647,25 @@ def _is_sdk_terminal_error_echo(text: str) -> bool:
     return "Claude Code returned an error result:" in str(text)
 
 
+def _disallowed_tools_for_env(env: dict[str, str]) -> list[str]:
+    raw_lua = str(env.get("FACTORIOCTL_ALLOW_RAW_LUA", "")).strip().lower()
+    if raw_lua in {"1", "true", "yes", "on"}:
+        return []
+    return ["mcp__factorioctl__execute_lua"]
+
+
+def _resolve_max_turns(value: Any = None) -> int:
+    if value is None:
+        value = os.environ.get("BRIDGE_MAX_TURNS")
+    if value is None:
+        return DEFAULT_MAX_TURNS
+    try:
+        turns = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TURNS
+    return turns if turns > 0 else DEFAULT_MAX_TURNS
+
+
 def _record_anomaly(reply: str, agent_name: str) -> None:
     sections = parse_response(reply)
     data = sections.get("data") if isinstance(sections, dict) else None
@@ -510,7 +682,7 @@ def _record_anomaly(reply: str, agent_name: str) -> None:
 # Hard wall-clock cap on a single agent tick. The SDK's max_turns bounds tool
 # turns, not a stalled TCP connection or a GLM response that never yields, so a
 # tick is also wrapped in asyncio.wait_for. Override via BRIDGE_TICK_TIMEOUT_S.
-_TICK_TIMEOUT_S = float(os.environ.get("BRIDGE_TICK_TIMEOUT_S", "300"))
+_TICK_TIMEOUT_S = float(os.environ.get("BRIDGE_TICK_TIMEOUT_S", "2400"))
 
 
 def _stderr_callback(log):
@@ -548,7 +720,7 @@ async def _run_agent(
                     log.info("text: {}", block.text.strip())
                 elif isinstance(block, ToolUseBlock):
                     display = _short_tool_name(block.name)
-                    log.info("tool: {}({})", display, _json_for_log(block.input))
+                    log.debug("tool: {}({})", display, _json_for_log(block.input))
                     emit_tool_call(telemetry, display, block.input, agent=telemetry_name)
                     if display.endswith("broadcast_thought"):
                         thought = block.input.get("message", "")
@@ -575,18 +747,21 @@ async def _run_agent(
                     log.warning("tool_result ERROR: {}", text)
                     append_event(agent_name, "failure", _short_event_text(text))
                 elif text.strip():
-                    log.info("tool_result: {}", text)
+                    log.debug("tool_result: {}", text)
                 if player_messages:
                     log.info("player_messages: {}", player_messages)
             else:
                 for block in msg.content:
                     if isinstance(block, ToolResultBlock):
                         text, player_messages = _result_text_and_player_messages(block.content)
-                        if block.is_error or _looks_like_tool_error(text):
+                        if (
+                            block.is_error
+                            and not _is_operator_only_tool_refusal(text)
+                        ) or _looks_like_tool_error(text):
                             log.warning("tool_result ERROR: {}", text)
                             append_event(agent_name, "failure", _short_event_text(text))
                         else:
-                            log.info("tool_result: {}", text)
+                            log.debug("tool_result: {}", text)
                         if player_messages:
                             log.info("player_messages: {}", player_messages)
         elif isinstance(msg, ResultMessage):
@@ -654,7 +829,7 @@ def handle_message(
     telemetry_name: str | None = None,
     response_to: str | None = None,
     model: str | None = None,
-    max_turns: int = 15,
+    max_turns: int | None = None,
 ) -> str | None:
     """Pipe a message through the Claude SDK. Returns new session_id.
     agent_name: registered agent name (for RCON/mod).
@@ -668,17 +843,22 @@ def handle_message(
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
+    mutating_tool_gate = MutatingToolBatchGate(log)
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model,
-        max_turns=max_turns,
+        max_turns=_resolve_max_turns(max_turns),
         mcp_servers=mcp_config,
         strict_mcp_config=True,
         tools=[],
+        disallowed_tools=_disallowed_tools_for_env(env),
         permission_mode="bypassPermissions",
         resume=session_id,
         setting_sources=["local"],
         env=env,
+        hooks={
+            "PreToolUse": [HookMatcher(hooks=[mutating_tool_gate.hook])],
+        },
         stderr=_stderr_callback(log),
     )
     try:
@@ -825,7 +1005,8 @@ class AgentThread:
                  telemetry: 'Telemetry | None', model: str | None,
                  heartbeat_interval: float = 0.0,
                  planner_interval: int = 5,
-                 autonomy_requires_player: bool = True):
+                 autonomy_requires_player: bool = True,
+                 max_turns: int | None = None):
         self.agent = agent
         self.agent_name = agent["name"]
         self.system_prompt = agent["system_prompt"]
@@ -833,7 +1014,9 @@ class AgentThread:
         # for the frequent execution/reflection/chat ticks; planner ticks
         # override up to "sonnet" (.env -> glm-5.2) via _planner_model below.
         self.model = model or agent.get("model") or "haiku"
-        self.max_turns = agent.get("max_turns", 15)
+        self.max_turns = _resolve_max_turns(
+            max_turns if max_turns is not None else agent.get("max_turns")
+        )
         self.telemetry_name = agent.get("telemetry_name", self.agent_name)
         self.log = logger.bind(agent=self.telemetry_name)
         self.mcp_config = mcp_config
@@ -1120,7 +1303,8 @@ def main_multi(args, agent_profiles: list[dict]):
         at = AgentThread(agent, mcp_config, rcon, telemetry, args.model,
                          heartbeat_interval=args.heartbeat_interval,
                          planner_interval=args.planner_interval,
-                         autonomy_requires_player=args.autonomy_requires_player)
+                         autonomy_requires_player=args.autonomy_requires_player,
+                         max_turns=args.max_turns)
         agents[agent["name"]] = at
 
     # Resolve paths and start watcher
@@ -1214,7 +1398,12 @@ def main():
     parser.add_argument("--rcon-password", default="factorio")
     parser.add_argument("--script-output", default=None)
     parser.add_argument("--model", default=None, help="Claude model (e.g. sonnet, opus, haiku)")
-    parser.add_argument("--max-turns", type=int, default=None, help="Max tool-use turns per message")
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help=f"Max tool-use turns per message (default: {DEFAULT_MAX_TURNS}; env BRIDGE_MAX_TURNS)",
+    )
     parser.add_argument("--poll-interval", type=float, default=0.5)
     parser.add_argument("--heartbeat-interval", type=float, default=6.0,
                         help="Autonomy: seconds idle before the agent self-prompts "
@@ -1279,7 +1468,9 @@ def main():
     # (.env -> glm-5-turbo) to match the multi-agent path so single-agent runs
     # never fall through to an unintended SDK default model.
     model = args.model or agent.get("model") or "haiku"
-    max_turns = args.max_turns or agent.get("max_turns", 15)
+    max_turns = _resolve_max_turns(
+        args.max_turns if args.max_turns is not None else agent.get("max_turns")
+    )
     telemetry_name = agent.get("telemetry_name", agent_name)
     log = logger.bind(agent=telemetry_name)
 

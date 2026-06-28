@@ -8,6 +8,7 @@ use super::entity::InventoryItem;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Inventory {
     /// Items in the inventory
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub items: Vec<InventoryItem>,
 
     /// Number of free slots

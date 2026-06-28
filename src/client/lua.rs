@@ -1044,14 +1044,17 @@ for i, item in pairs(c.crafting_queue) do
     table.insert(queue, {{ recipe = item.recipe, count = item.count }})
 end
 
-rcon.print(helpers.table_to_json({{
+local result = {{
     success = crafted > 0,
     queued = crafted,
     queue_size = c.crafting_queue_size,
     queue = queue,
-    recipe = recipe_name,
-    error = crafted > 0 and nil or "Crafting did not start; check ingredients, recipe category, or character craftability"
-}}))
+    recipe = recipe_name
+}}
+if crafted <= 0 then
+    result.error = "Crafting did not start; check ingredients, recipe category, or character craftability"
+end
+rcon.print(helpers.table_to_json(result))
 "#,
             resolve, recipe, count
         )
@@ -1300,15 +1303,18 @@ if not ok then
     return
 end
 
-rcon.print(helpers.table_to_json({{
+local result = {{
     factorio_allowed = can_place_or_error == true,
     entity = entity_name,
     position = {{ x = position[1], y = position[2] }},
     direction = direction,
     inventory_count = inventory_count,
-    item_in_inventory = inventory_count > 0,
-    error = can_place_or_error == true and nil or "Factorio cannot place entity here"
-}}))
+    item_in_inventory = inventory_count > 0
+}}
+if can_place_or_error ~= true then
+    result.error = "Factorio cannot place entity here"
+end
+rcon.print(helpers.table_to_json(result))
 "#,
             resolve,
             entity_name,
@@ -1711,7 +1717,7 @@ local available = inv.get_item_count("{}")
 local to_extract = math.min({}, available)
 
 if to_extract == 0 then
-    rcon.print('{{"extracted": 0, "error": "No items of that type in inventory"}}')
+    rcon.print(helpers.table_to_json({{ extracted = 0, available = available, item = "{}" }}))
     return
 end
 
@@ -1728,7 +1734,7 @@ end
 
 rcon.print(helpers.table_to_json({{ extracted = inserted, available = available }}))
 "#,
-            resolve, lookup, inv_define, item, count, item, item, item
+            resolve, lookup, inv_define, item, count, item, item, item, item
         )
         .trim()
         .to_string()
@@ -1772,7 +1778,22 @@ rcon.print(helpers.table_to_json({{ success = true }}))
         format!(
             r#"
 local recipe = prototypes.recipe["{}"]
+local function recipe_unlocks(recipe_name)
+    local unlocks = {{}}
+    for tech_name, tech in pairs(game.forces.player.technologies) do
+        local effects = tech.prototype and tech.prototype.effects or {{}}
+        for _, effect in pairs(effects) do
+            if effect.type == "unlock-recipe" and effect.recipe == recipe_name then
+                table.insert(unlocks, tech_name)
+                break
+            end
+        end
+    end
+    table.sort(unlocks)
+    return unlocks
+end
 if recipe then
+    local force_recipe = game.forces.player.recipes[recipe.name]
     local ingredients = {{}}
     for _, ing in pairs(recipe.ingredients) do
         table.insert(ingredients, {{
@@ -1794,6 +1815,8 @@ if recipe then
         name = recipe.name,
         category = recipe.category,
         energy = recipe.energy,
+        enabled = force_recipe and force_recipe.enabled or false,
+        unlocked_by = recipe_unlocks(recipe.name),
         ingredients = ingredients,
         products = products
     }}))
@@ -1813,12 +1836,29 @@ end
         format!(
             r#"
 local recipes = {{}}
+local function recipe_unlocks(recipe_name)
+    local unlocks = {{}}
+    for tech_name, tech in pairs(game.forces.player.technologies) do
+        local effects = tech.prototype and tech.prototype.effects or {{}}
+        for _, effect in pairs(effects) do
+            if effect.type == "unlock-recipe" and effect.recipe == recipe_name then
+                table.insert(unlocks, tech_name)
+                break
+            end
+        end
+    end
+    table.sort(unlocks)
+    return unlocks
+end
 for name, recipe in pairs(prototypes.recipe) do
     if recipe.category == "{}" then
+        local force_recipe = game.forces.player.recipes[recipe.name]
         table.insert(recipes, {{
             name = recipe.name,
             category = recipe.category,
-            energy = recipe.energy
+            energy = recipe.energy,
+            enabled = force_recipe and force_recipe.enabled or false,
+            unlocked_by = recipe_unlocks(recipe.name)
         }})
     end
 end
@@ -1836,9 +1876,24 @@ rcon.print(helpers.table_to_json(recipes))
         format!(
             r#"
 local recipes = {{}}
+local function recipe_unlocks(recipe_name)
+    local unlocks = {{}}
+    for tech_name, tech in pairs(game.forces.player.technologies) do
+        local effects = tech.prototype and tech.prototype.effects or {{}}
+        for _, effect in pairs(effects) do
+            if effect.type == "unlock-recipe" and effect.recipe == recipe_name then
+                table.insert(unlocks, tech_name)
+                break
+            end
+        end
+    end
+    table.sort(unlocks)
+    return unlocks
+end
 for name, recipe in pairs(prototypes.recipe) do
     for _, product in pairs(recipe.products) do
         if product.name == "{}" then
+            local force_recipe = game.forces.player.recipes[recipe.name]
             local ingredients = {{}}
             for _, ing in pairs(recipe.ingredients) do
                 table.insert(ingredients, {{
@@ -1860,6 +1915,8 @@ for name, recipe in pairs(prototypes.recipe) do
                 name = recipe.name,
                 category = recipe.category,
                 energy = recipe.energy,
+                enabled = force_recipe and force_recipe.enabled or false,
+                unlocked_by = recipe_unlocks(recipe.name),
                 ingredients = ingredients,
                 products = products
             }})

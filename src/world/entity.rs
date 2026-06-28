@@ -91,7 +91,7 @@ pub struct MineResult {
     pub error: Option<String>,
 
     /// Current inventory after mining
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub inventory: Vec<InventoryItem>,
 }
 
@@ -120,7 +120,7 @@ pub struct CraftResult {
     pub queue_size: u32,
 
     /// Full crafting queue (includes auto-queued intermediates)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub queue: Vec<CraftQueueItem>,
 
     /// Error message if failed

@@ -1719,9 +1719,10 @@ impl FactorioMcp {
         let center = Position::new(params.x, params.y);
         let radius = params.radius.clamp(1, 25);
         let limit = params.limit.clamp(1, 100);
+        let candidate_limit = limit.saturating_mul(10).clamp(limit, 500);
 
         let mut result = match client
-            .find_entity_placements(&params.entity_name, center, radius, limit)
+            .find_entity_placements(&params.entity_name, center, radius, candidate_limit)
             .await
         {
             Ok(value) => value,
@@ -1736,7 +1737,7 @@ impl FactorioMcp {
         };
 
         if let Some(placements) = result.get_mut("placements").and_then(|v| v.as_array_mut()) {
-            for placement in placements {
+            for placement in &mut *placements {
                 let Some(position) = placement.get("position") else {
                     continue;
                 };
@@ -1759,6 +1760,52 @@ impl FactorioMcp {
                     obj.insert("errors".to_string(), serde_json::json!(policy.errors));
                 }
             }
+            placements.sort_by(|a, b| {
+                let a_allowed = a.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false);
+                let b_allowed = b.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false);
+                b_allowed
+                    .cmp(&a_allowed)
+                    .then_with(|| {
+                        let a_distance = a
+                            .get("distance")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(f64::INFINITY);
+                        let b_distance = b
+                            .get("distance")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(f64::INFINITY);
+                        a_distance
+                            .partial_cmp(&b_distance)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| {
+                        let a_direction = a.get("direction").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let b_direction = b.get("direction").and_then(|v| v.as_i64()).unwrap_or(0);
+                        a_direction.cmp(&b_direction)
+                    })
+            });
+            placements.truncate(limit as usize);
+        }
+        if let Some(obj) = result.as_object_mut() {
+            let returned = obj
+                .get("placements")
+                .and_then(|v| v.as_array())
+                .map(|placements| placements.len())
+                .unwrap_or(0);
+            let total = obj
+                .get("total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(returned as u64);
+            obj.insert("returned".to_string(), serde_json::json!(returned));
+            obj.insert(
+                "truncated".to_string(),
+                serde_json::json!(total > returned as u64),
+            );
+            obj.insert(
+                "candidate_limit".to_string(),
+                serde_json::json!(candidate_limit),
+            );
+            obj.insert("limit".to_string(), serde_json::json!(limit));
         }
 
         let result =

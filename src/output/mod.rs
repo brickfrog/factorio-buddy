@@ -384,7 +384,14 @@ impl Outputable for crate::world::Recipe {
             format!("Recipe: {}", self.name),
             format!("  Category: {}", self.category),
             format!("  Crafting time: {:.1}s", self.energy),
+            format!(
+                "  Status: {}",
+                if self.enabled { "enabled" } else { "locked" }
+            ),
         ];
+        if !self.unlocked_by.is_empty() {
+            lines.push(format!("  Unlocked by: {}", self.unlocked_by.join(", ")));
+        }
         if !self.ingredients.is_empty() {
             lines.push("  Ingredients:".to_string());
             for ing in &self.ingredients {
@@ -412,9 +419,15 @@ impl Outputable for Vec<crate::world::Recipe> {
         }
         let mut lines = vec![format!("Found {} recipes:", self.len())];
         for recipe in self {
+            let status = if recipe.enabled { "enabled" } else { "locked" };
+            let unlock = if recipe.unlocked_by.is_empty() {
+                String::new()
+            } else {
+                format!("; unlocked by {}", recipe.unlocked_by.join(", "))
+            };
             lines.push(format!(
-                "  {} ({}, {:.1}s)",
-                recipe.name, recipe.category, recipe.energy
+                "  {} ({}, {:.1}s, {}{})",
+                recipe.name, recipe.category, recipe.energy, status, unlock
             ));
         }
         lines.join("\n")
@@ -428,9 +441,15 @@ impl Outputable for Vec<crate::world::RecipeSummary> {
         }
         let mut lines = vec![format!("Found {} recipes:", self.len())];
         for recipe in self {
+            let status = if recipe.enabled { "enabled" } else { "locked" };
+            let unlock = if recipe.unlocked_by.is_empty() {
+                String::new()
+            } else {
+                format!("; unlocked by {}", recipe.unlocked_by.join(", "))
+            };
             lines.push(format!(
-                "  {} ({}, {:.1}s)",
-                recipe.name, recipe.category, recipe.energy
+                "  {} ({}, {:.1}s, {}{})",
+                recipe.name, recipe.category, recipe.energy, status, unlock
             ));
         }
         lines.join("\n")

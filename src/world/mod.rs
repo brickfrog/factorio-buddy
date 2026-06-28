@@ -28,6 +28,19 @@ pub use tile::*;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn deserialize_lua_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Object(map) if map.is_empty() => Ok(Vec::new()),
+        serde_json::Value::Null => Ok(Vec::new()),
+        other => serde_json::from_value(other).map_err(serde::de::Error::custom),
+    }
+}
+
 /// Integer tile coordinates (primary coordinate system for CLI)
 /// In Factorio, tiles are 1x1 squares. Entities are placed at their center.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Default, Serialize, Deserialize)]
@@ -227,8 +240,9 @@ pub fn entity_size(name: &str) -> (u32, u32) {
         n if n.contains("chest") => (1, 1),
         "lamp" | "small-lamp" => (1, 1),
 
-        // 1x2 entities
-        "offshore-pump" => (1, 2),
+        // Shoreline entity; the collision box extends into water but the
+        // prototype tile footprint is 1x1.
+        "offshore-pump" => (1, 1),
         n if n.contains("pump") && !n.contains("offshore") => (1, 2),
 
         // 2x1 entities
@@ -237,7 +251,7 @@ pub fn entity_size(name: &str) -> (u32, u32) {
         // 2x2 entities
         "stone-furnace" | "steel-furnace" | "electric-furnace" => (2, 2),
         "burner-mining-drill" | "electric-mining-drill" => (2, 2),
-        "boiler" => (2, 2),
+        "boiler" => (3, 2),
         "steam-engine" => (3, 5),
         "pumpjack" => (3, 3),
 
@@ -368,5 +382,18 @@ impl Tick {
     /// Convert ticks to seconds (60 ticks per second)
     pub fn to_seconds(&self) -> f64 {
         self.tick as f64 / 60.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn power_entity_tile_footprints_match_factorio_prototypes() {
+        assert_eq!(entity_size("offshore-pump"), (1, 1));
+        assert_eq!(entity_size("boiler"), (3, 2));
+        assert_eq!(entity_size("steam-engine"), (3, 5));
+        assert_eq!(entity_size("small-electric-pole"), (1, 1));
     }
 }

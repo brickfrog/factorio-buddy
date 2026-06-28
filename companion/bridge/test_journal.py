@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -221,6 +222,32 @@ error_tips:
                 self.assertTrue(pipe._looks_like_tool_error(text))
 
         self.assertFalse(pipe._looks_like_tool_error('{"success":true}'))
+        self.assertFalse(pipe._looks_like_tool_error(
+            '{"success":true,"queued":3,"error":"legacy stale error text"}'
+        ))
+        self.assertFalse(pipe._looks_like_tool_error(
+            '{"success":false,"mined_count":0,"error":null,"inventory":[]}'
+        ))
+        self.assertFalse(pipe._looks_like_tool_error(
+            '[{"type":"text","text":"Error: No items of that type in inventory"}]'
+        ))
+        self.assertFalse(pipe._looks_like_tool_error(
+            "Error: No items of that type in inventory"
+        ))
+        self.assertFalse(pipe._looks_like_tool_error(
+            '{"allowed":false,"policy_allowed":true,"factorio_allowed":false,'
+            '"entity":"burner-mining-drill","position":{"x":45,"y":-35},'
+            '"factorio":{"error":"Factorio cannot place entity here"}}'
+        ))
+        self.assertFalse(pipe._looks_like_tool_error(
+            '{"success":false,"can_place":false,"entity":"stone-furnace",'
+            '"error":"Cannot place entity here","inventory_count":1,'
+            '"position":{"x":76,"y":-19}}'
+        ))
+        self.assertFalse(pipe._looks_like_tool_error(
+            "Error: execute_lua is disabled. Raw Lua execution is an "
+            "arbitrary-code-execution surface and is off by default."
+        ))
         self.assertFalse(pipe._looks_like_tool_error("nominal scan complete"))
         self.assertFalse(pipe._looks_like_tool_error(
             '[{"type":"text","text":"{\\"technologies\\":[{\\"ready\\":'
@@ -248,6 +275,74 @@ error_tips:
             "Claude Code returned an error result: Reached maximum number of turns (15)"
         ))
         self.assertFalse(pipe._is_sdk_terminal_error_echo("RCON connection dropped"))
+
+    def test_execute_lua_is_disallowed_unless_operator_enables_raw_lua(self):
+        import pipe
+
+        self.assertEqual(
+            pipe._disallowed_tools_for_env({}),
+            ["mcp__factorioctl__execute_lua"],
+        )
+        self.assertEqual(
+            pipe._disallowed_tools_for_env({"FACTORIOCTL_ALLOW_RAW_LUA": "1"}),
+            [],
+        )
+
+    def test_mutating_tool_batch_gate_denies_fast_second_mutation(self):
+        import pipe
+
+        gate = pipe.MutatingToolBatchGate(
+            pipe.logger.bind(agent="test"), window_s=60
+        )
+
+        first = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__place_entity"}, "tool-1", {}
+        ))
+        second = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__place_entity"}, "tool-2", {}
+        ))
+
+        self.assertEqual(
+            first["hookSpecificOutput"]["permissionDecision"], "allow"
+        )
+        self.assertEqual(second["decision"], "block")
+        self.assertEqual(
+            second["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+        self.assertIn("blocked parallel mutating tool call", second["reason"])
+        self.assertFalse(pipe._looks_like_tool_error(second["reason"]))
+
+    def test_mutating_tool_batch_gate_ignores_read_only_tools(self):
+        import pipe
+
+        gate = pipe.MutatingToolBatchGate(
+            pipe.logger.bind(agent="test"), window_s=60
+        )
+
+        read_only = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__check_placement"}, "tool-1", {}
+        ))
+        mutating = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__place_entity"}, "tool-2", {}
+        ))
+
+        self.assertEqual(read_only, {})
+        self.assertEqual(
+            mutating["hookSpecificOutput"]["permissionDecision"], "allow"
+        )
+
+    def test_max_turn_default_is_raised_and_env_tunable(self):
+        import pipe
+
+        self.assertEqual(pipe.DEFAULT_MAX_TURNS, 200)
+        self.assertEqual(pipe._resolve_max_turns(None), 200)
+        self.assertEqual(pipe._resolve_max_turns(25), 25)
+
+        with mock.patch.dict("os.environ", {"BRIDGE_MAX_TURNS": "80"}):
+            self.assertEqual(pipe._resolve_max_turns(None), 80)
+
+        with mock.patch.dict("os.environ", {"BRIDGE_MAX_TURNS": "nope"}):
+            self.assertEqual(pipe._resolve_max_turns(None), 200)
 
     def test_run_agent_journals_sdk_tool_result_failures(self):
         # The whole point of the SDK migration: tool failures arrive as
@@ -277,6 +372,15 @@ error_tips:
             )]),
             UserMessage(content="Error: invalid type: map, expected a sequence"),
             UserMessage(content="just narrating, nothing wrong here"),
+            UserMessage(content=[ToolResultBlock(
+                tool_use_id="t5",
+                content=(
+                    "Factorioctl bridge blocked parallel mutating tool call: "
+                    "insert_items. Wait for the previous mutating tool result "
+                    "before issuing another world/inventory-changing command."
+                ),
+                is_error=True,
+            )]),
         ]
 
         def scripted_query(*, prompt, options):
@@ -306,6 +410,7 @@ error_tips:
         # success result and benign narration must NOT be journaled
         self.assertFalse(any("ok scan complete" in t for t in texts))
         self.assertFalse(any("narrating" in t for t in texts))
+        self.assertFalse(any("parallel mutating tool call" in t for t in texts))
 
     def test_anomaly_filter_ignores_nominal_variants(self):
         import pipe

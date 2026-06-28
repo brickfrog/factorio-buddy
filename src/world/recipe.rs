@@ -1,5 +1,6 @@
 //! Recipe types for Factorio prototypes
 
+use super::deserialize_lua_empty_vec;
 use serde::{Deserialize, Serialize};
 
 /// A crafting recipe
@@ -11,9 +12,17 @@ pub struct Recipe {
     pub category: String,
     /// Crafting time in seconds (energy / crafting_speed)
     pub energy: f64,
+    /// Whether the player's force can currently craft this recipe.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Technologies that unlock this recipe, if it is not initially enabled.
+    #[serde(default, deserialize_with = "deserialize_lua_empty_vec")]
+    pub unlocked_by: Vec<String>,
     /// Required ingredients
+    #[serde(default, deserialize_with = "deserialize_lua_empty_vec")]
     pub ingredients: Vec<Ingredient>,
     /// Produced items
+    #[serde(default, deserialize_with = "deserialize_lua_empty_vec")]
     pub products: Vec<Product>,
 }
 
@@ -72,4 +81,8 @@ pub struct RecipeSummary {
     pub name: String,
     pub category: String,
     pub energy: f64,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_lua_empty_vec")]
+    pub unlocked_by: Vec<String>,
 }

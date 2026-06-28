@@ -89,6 +89,20 @@ fn ensure_lua_success(response: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_entity_response(response: &str) -> Result<Entity> {
+    let value: serde_json::Value = serde_json::from_str(response)?;
+    match value {
+        serde_json::Value::Null => anyhow::bail!("Entity not found"),
+        serde_json::Value::Object(ref obj) => {
+            if let Some(error) = obj.get("error").and_then(|v| v.as_str()) {
+                anyhow::bail!("{}", error);
+            }
+        }
+        _ => {}
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
 impl FactorioClient {
     /// Connect to a Factorio server
     pub async fn connect(host: &str, port: u16, password: &str) -> Result<Self> {
@@ -189,8 +203,7 @@ impl FactorioClient {
     pub async fn get_entity(&mut self, unit_number: u32) -> Result<Entity> {
         let lua = LuaCommand::get_entity(unit_number);
         let response = self.execute_lua(&lua).await?;
-        let entity: Entity = serde_json::from_str(&response)?;
-        Ok(entity)
+        parse_entity_response(&response)
     }
 
     /// Get an entity's inventories
@@ -1658,6 +1671,7 @@ rcon.print(helpers.table_to_json({{belt_count = #belts, total_items = total_item
         #[derive(serde::Deserialize)]
         struct RawLane {
             lane: u8,
+            #[serde(default, deserialize_with = "crate::world::deserialize_lua_empty_vec")]
             items: Vec<InventoryItem>,
             item_count: u32,
         }
@@ -1771,6 +1785,16 @@ mod tests {
     }
 
     #[test]
+    fn null_entity_lookup_reports_not_found() {
+        let err = parse_entity_response("null").expect_err("Lua null is not an entity");
+        assert!(err.to_string().contains("Entity not found"));
+
+        let err = parse_entity_response(r#"{"error":"Entity not found"}"#)
+            .expect_err("explicit Lua entity errors must stay errors");
+        assert!(err.to_string().contains("Entity not found"));
+    }
+
+    #[test]
     fn empty_lua_table_deserializes_as_empty_vec() {
         // helpers.table_to_json({}) returns "{}" (object), not "[]". The situation
         // report and every find_* query relied on this NOT exploding.
@@ -1783,9 +1807,59 @@ mod tests {
 
     #[test]
     fn populated_lua_array_still_deserializes() {
-        let parsed =
-            parse_lua_array::<serde_json::Value>(r#"[{"name":"grass-1"},{"name":"water"}]"#)
-                .expect("a real array must still deserialize");
+        let parsed = parse_lua_array::<Surface>(
+            r#"[{"name":"nauvis","index":1},{"name":"orbit","index":2}]"#,
+        )
+        .expect("a real array must still deserialize");
         assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "nauvis");
+    }
+
+    #[test]
+    fn lua_empty_object_vec_fields_deserialize_in_result_structs() {
+        let build: BuildResult =
+            serde_json::from_str(r#"{"placed":0,"total":1,"entities":{},"errors":{}}"#)
+                .expect("empty build result lists should accept Lua {}");
+        assert!(build.entities.is_empty());
+        assert!(build.errors.is_empty());
+
+        let belts: BeltContentsResult = serde_json::from_str(
+            r#"{"belt_count":1,"total_items":0,"item_summary":{},"belts":[{"position":{"x":0.5,"y":0.5},"unit_number":7,"items":{}}]}"#,
+        )
+        .expect("empty belt summary lists should accept Lua {}");
+        assert!(belts.item_summary.is_empty());
+        assert!(belts.belts[0].items.is_empty());
+
+        let inventory: Inventory = serde_json::from_str(r#"{"items":{},"free_slots":10}"#)
+            .expect("empty inventory list should accept Lua {}");
+        assert!(inventory.items.is_empty());
+
+        let mined: MineResult =
+            serde_json::from_str(r#"{"success":false,"mined_count":0,"inventory":{}}"#)
+                .expect("empty mine inventory should accept Lua {}");
+        assert!(mined.inventory.is_empty());
+
+        let crafted: CraftResult =
+            serde_json::from_str(r#"{"success":true,"queued":0,"queue_size":0,"queue":{}}"#)
+                .expect("empty crafting queue should accept Lua {}");
+        assert!(crafted.queue.is_empty());
+
+        let recipe: Recipe = serde_json::from_str(
+            r#"{"name":"boiler","category":"crafting","energy":0.5,"enabled":false,"unlocked_by":["steam-power"],"ingredients":{},"products":{}}"#,
+        )
+        .expect("recipe metadata and Lua empty lists should deserialize");
+        assert!(!recipe.enabled);
+        assert_eq!(recipe.unlocked_by, vec!["steam-power"]);
+        assert!(recipe.ingredients.is_empty());
+        assert!(recipe.products.is_empty());
+
+        #[derive(serde::Deserialize)]
+        struct RawLane {
+            #[serde(default, deserialize_with = "crate::world::deserialize_lua_empty_vec")]
+            items: Vec<InventoryItem>,
+        }
+        let lane: RawLane =
+            serde_json::from_str(r#"{"items":{}}"#).expect("raw belt lanes should accept Lua {}");
+        assert!(lane.items.is_empty());
     }
 }

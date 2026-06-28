@@ -14,6 +14,7 @@ pub struct GatherResult {
     pub resource_name: String,
     pub gathered: u32,
     pub distance_walked: f64,
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub inventory: Vec<InventoryItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -34,7 +35,9 @@ pub struct WalkResult {
 pub struct BuildResult {
     pub placed: u32,
     pub total: u32,
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub entities: Vec<Entity>,
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub errors: Vec<String>,
 }
 
@@ -52,6 +55,7 @@ pub struct PlacementSpec {
 pub struct BeltItemSummary {
     pub position: Position,
     pub unit_number: u32,
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub items: Vec<InventoryItem>,
 }
 
@@ -60,7 +64,9 @@ pub struct BeltItemSummary {
 pub struct BeltContentsResult {
     pub belt_count: u32,
     pub total_items: u32,
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub item_summary: Vec<InventoryItem>,
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub belts: Vec<BeltItemSummary>,
 }
 
@@ -70,6 +76,7 @@ pub struct LaneContents {
     /// Lane number: 1=left (line 1), 2=right (line 2)
     pub lane: u8,
     /// Items on this lane
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub items: Vec<InventoryItem>,
     /// Total count of items on this lane
     pub item_count: u32,
@@ -100,7 +107,9 @@ pub struct BeltLaneContentsResult {
     /// Total items across all belts
     pub total_items: u32,
     /// Summary of items by name (combined from both lanes)
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub item_summary: Vec<InventoryItem>,
     /// Per-belt lane information
+    #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub belts: Vec<BeltLaneSummary>,
 }
