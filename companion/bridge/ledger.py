@@ -13,6 +13,11 @@ LEDGER_RE = re.compile(r"<ledger>(.*?)</ledger>", re.DOTALL | re.IGNORECASE)
 STALE_BOOTSTRAP_PROGRESS_PATTERNS = (
     "no infrastructure yet deployed",
 )
+LOW_VALUE_PROGRESS_PATTERNS = (
+    "plan fully validated and awaiting execution",
+    "plan validated and ready for execution",
+    "plan unchanged and ready for execution",
+)
 STALE_BOOTSTRAP_OBJECTIVE_PATTERNS = (
     "establish initial extraction infrastructure",
 )
@@ -30,7 +35,21 @@ def default_ledger() -> dict:
 def _normalize(data: dict) -> dict:
     """Coerce a loaded ledger dict to the canonical schema/types so callers
     never trip over null or wrong-typed fields (e.g. {"plan_steps": null})."""
-    return LedgerState.coerce(data).to_dict()
+    ledger = LedgerState.coerce(data).to_dict()
+    ledger["progress_notes"] = [
+        note for note in ledger.get("progress_notes", [])
+        if not _is_low_value_progress_note(note)
+    ]
+    return ledger
+
+
+def _is_low_value_progress_note(text: str) -> bool:
+    normalized = str(text).lower()
+    if any(pattern in normalized for pattern in LOW_VALUE_PROGRESS_PATTERNS):
+        return True
+    return "planning tick" in normalized and (
+        "no change" in normalized or "state unchanged" in normalized
+    )
 
 
 def _stale_bootstrap_max_age_s() -> float:
@@ -159,7 +178,7 @@ def apply_ledger_update(agent_name: str, text: str) -> dict:
         ledger["plan_steps"] = list(parsed["plan_steps"])
 
     progress = parsed.get("progress", "")
-    if progress:
+    if progress and not _is_low_value_progress_note(progress):
         ledger["progress_notes"].append(progress)
         ledger["progress_notes"] = ledger["progress_notes"][-10:]
 

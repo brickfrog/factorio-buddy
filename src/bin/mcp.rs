@@ -243,12 +243,81 @@ pub struct FindEntityPlacementsParams {
     pub limit: u32,
 }
 
+/// Parameters for build_edge_miner tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BuildEdgeMinerParams {
+    /// Resource type to mine (e.g., 'iron-ore', 'copper-ore', 'coal', 'stone')
+    pub resource_type: String,
+    /// X coordinate of target resource area center
+    pub x: f64,
+    /// Y coordinate of target resource area center
+    pub y: f64,
+    /// Search radius in tiles (default: 25, max: 40)
+    #[serde(default = "default_edge_miner_radius")]
+    pub radius: u32,
+    /// Drill entity name (default: burner-mining-drill)
+    #[serde(default = "default_drill_name")]
+    pub drill_name: String,
+    /// Maximum candidate placements to return (default: 10, max: 50)
+    #[serde(default = "default_edge_miner_limit")]
+    pub limit: u32,
+}
+
+/// Parameters for build_direct_smelter tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BuildDirectSmelterParams {
+    /// Existing drill unit number. If omitted, provide output_x/output_y/output_direction from build_edge_miner or get_machine_belt_positions.
+    pub drill_unit_number: Option<u32>,
+    /// X coordinate of the drill output belt tile.
+    pub output_x: Option<f64>,
+    /// Y coordinate of the drill output belt tile.
+    pub output_y: Option<f64>,
+    /// Direction the output belt should face: north, east, south, west (or 0/4/8/12).
+    pub output_direction: Option<String>,
+    /// Furnace entity name (default: stone-furnace)
+    #[serde(default = "default_furnace_name")]
+    pub furnace_name: String,
+    /// Inserter entity name (default: burner-inserter)
+    #[serde(default = "default_inserter_name")]
+    pub inserter_name: String,
+    /// Belt entity name (default: transport-belt)
+    #[serde(default = "default_belt_type")]
+    pub belt_name: String,
+    /// Search radius for furnace placement around the output tile (default: 6, max: 12)
+    #[serde(default = "default_direct_smelter_radius")]
+    pub radius: u32,
+}
+
 fn default_placement_radius() -> u32 {
     10
 }
 
 fn default_placement_limit() -> u32 {
     20
+}
+
+fn default_edge_miner_radius() -> u32 {
+    25
+}
+
+fn default_drill_name() -> String {
+    "burner-mining-drill".to_string()
+}
+
+fn default_edge_miner_limit() -> u32 {
+    10
+}
+
+fn default_furnace_name() -> String {
+    "stone-furnace".to_string()
+}
+
+fn default_inserter_name() -> String {
+    "burner-inserter".to_string()
+}
+
+fn default_direct_smelter_radius() -> u32 {
+    6
 }
 
 /// Parameters for mine_at tool
@@ -408,6 +477,15 @@ pub struct RemoveEntityParams {
     pub unit_number: u32,
 }
 
+/// Parameters for rotate_entity tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RotateEntityParams {
+    /// Entity unit number to rotate
+    pub unit_number: u32,
+    /// Direction: "north", "east", "south", "west" (or shorthand "n", "e", "s", "w", or numbers 0/4/8/12)
+    pub direction: String,
+}
+
 /// Parameters for get_machine_belt_positions tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MachineBeltPositionsParams {
@@ -476,6 +554,25 @@ pub struct StartResearchParams {
     pub technology: String,
 }
 
+/// Parameters for feed_lab_from_inventory tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct FeedLabFromInventoryParams {
+    /// Target lab unit number
+    pub lab_unit_number: u32,
+    /// Science pack item name to transfer from the agent inventory
+    pub science_pack: String,
+    /// Number of packs to transfer
+    #[serde(default = "default_count")]
+    pub count: u32,
+    /// If true, only validate and return an execution step. Defaults to true.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Parameters for power status tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct PowerStatusParams {
@@ -518,6 +615,38 @@ pub struct PlanSteamPowerParams {
     /// X coordinate that should receive power, such as a lab or factory core
     pub target_x: f64,
     /// Y coordinate that should receive power, such as a lab or factory core
+    pub target_y: f64,
+}
+
+/// Parameters for dry-run steam-power repair planning.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RepairSteamPowerParams {
+    /// X coordinate of repair/diagnostic area center
+    pub x: i32,
+    /// Y coordinate of repair/diagnostic area center
+    pub y: i32,
+    /// Radius around center to diagnose and repair-plan
+    #[serde(default = "default_power_radius")]
+    pub radius: u32,
+    /// X coordinate that should ultimately receive power
+    pub target_x: f64,
+    /// Y coordinate that should ultimately receive power
+    pub target_y: f64,
+}
+
+/// Parameters for dry-run power extension planning.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ExtendPowerToParams {
+    /// X coordinate of the existing grid search area center
+    pub x: i32,
+    /// Y coordinate of the existing grid search area center
+    pub y: i32,
+    /// Radius around center to search for existing electric poles
+    #[serde(default = "default_power_radius")]
+    pub radius: u32,
+    /// X coordinate that should receive power
+    pub target_x: f64,
+    /// Y coordinate that should receive power
     pub target_y: f64,
 }
 
@@ -1668,7 +1797,7 @@ impl FactorioMcp {
 
     /// Find nearby valid placements for an entity.
     #[tool(
-        description = "Find nearby Factorio-valid placements for an entity in all cardinal directions. Use for fussy entities like offshore-pump, boiler, and steam-engine instead of guessing coordinates."
+        description = "Find nearby Factorio-valid placements for an entity in all cardinal directions. Mining-drill results include output belt diagnostics and prefer clear patch-edge outlets. Use for fussy entities like drills, offshore-pump, boiler, and steam-engine instead of guessing coordinates."
     )]
     async fn find_entity_placements(
         &self,
@@ -1727,8 +1856,26 @@ impl FactorioMcp {
             placements.sort_by(|a, b| {
                 let a_allowed = a.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false);
                 let b_allowed = b.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false);
+                let a_output_clear = a
+                    .get("output_clear")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let b_output_clear = b
+                    .get("output_clear")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let a_output_buildable = a
+                    .get("output_buildable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let b_output_buildable = b
+                    .get("output_buildable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 b_allowed
                     .cmp(&a_allowed)
+                    .then_with(|| b_output_clear.cmp(&a_output_clear))
+                    .then_with(|| b_output_buildable.cmp(&a_output_buildable))
                     .then_with(|| {
                         let a_distance = a
                             .get("distance")
@@ -1774,6 +1921,98 @@ impl FactorioMcp {
 
         let result =
             serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(result).await
+    }
+
+    /// Plan an edge mining drill and output belt without mutating the game.
+    #[tool(
+        description = "Plan a patch-edge mining setup without mutating the game. Returns a resource-backed drill placement whose output belt tile is clear/buildable, plus ordered place_entity steps and missing_items. Use before placing burner/electric drills on large ore patches."
+    )]
+    async fn build_edge_miner(
+        &self,
+        Parameters(params): Parameters<BuildEdgeMinerParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let center = Position::new(params.x, params.y);
+        let radius = params.radius.clamp(1, 40);
+        let limit = params.limit.clamp(1, 50);
+        let result = match client
+            .build_edge_miner(
+                &params.resource_type,
+                center,
+                radius,
+                &params.drill_name,
+                limit,
+            )
+            .await
+        {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Plan a direct drill-output smelter without mutating the game.
+    #[tool(
+        description = "Plan a checked direct smelter from a mining drill output without mutating the game. Accepts either drill_unit_number or output_x/output_y/output_direction from build_edge_miner/get_machine_belt_positions. Returns ordered place_entity steps for belt, furnace, inserter, after-place fuel steps, missing_items, and a verify_production step."
+    )]
+    async fn build_direct_smelter(
+        &self,
+        Parameters(params): Parameters<BuildDirectSmelterParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let output = match (params.output_x, params.output_y) {
+            (Some(x), Some(y)) => {
+                let direction_name = params.output_direction.unwrap_or_default();
+                let direction = match Direction::parse(&direction_name) {
+                    Some(direction) => direction,
+                    None => {
+                        return self
+                            .with_player_messages(format!(
+                                "Invalid output_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                                direction_name
+                            ))
+                            .await
+                    }
+                };
+                Some((Position::new(x, y), direction))
+            }
+            (None, None) => None,
+            _ => {
+                return self
+                    .with_player_messages(
+                        "Error: output_x and output_y must be provided together".to_string(),
+                    )
+                    .await
+            }
+        };
+
+        let result = match client
+            .build_direct_smelter(
+                params.drill_unit_number,
+                output,
+                &params.furnace_name,
+                &params.inserter_name,
+                &params.belt_name,
+                params.radius.clamp(2, 12),
+            )
+            .await
+        {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
         self.with_player_messages(result).await
     }
 
@@ -1958,6 +2197,41 @@ impl FactorioMcp {
 
         let result = match client.remove_entity(params.unit_number).await {
             Ok(()) => "Entity removed successfully".to_string(),
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Rotate an existing entity by unit number.
+    #[tool(
+        description = "Rotate an existing entity by unit number. Use when place_entity/check_placement recommends rotate_entity for same-tile belts or other rotatable entities."
+    )]
+    async fn rotate_entity(&self, Parameters(params): Parameters<RotateEntityParams>) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let direction = match Direction::parse(&params.direction) {
+            Some(d) => d,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                    "Invalid direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                    params.direction
+                ))
+                    .await
+            }
+        };
+
+        let lua = LuaCommand::rotate_entity(params.unit_number, direction.to_factorio());
+        let result = match client.execute_lua(&lua).await {
+            Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
+                Ok(value) => {
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+                }
+                Err(_) => response,
+            },
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
@@ -2380,6 +2654,36 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
+    /// Feed science packs from the agent inventory into a lab.
+    #[tool(
+        description = "Validate or execute science-pack transfer from the agent inventory into a lab. Defaults to dry_run=true and returns a guarded feed_lab_from_inventory dry_run=false step. With dry_run=false it removes packs from the character inventory and inserts them into the lab_input inventory, returning explicit expected misses for missing packs or invalid lab inventories."
+    )]
+    async fn feed_lab_from_inventory(
+        &self,
+        Parameters(params): Parameters<FeedLabFromInventoryParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let result = match client
+            .feed_lab_from_inventory(
+                params.lab_unit_number,
+                &params.science_pack,
+                params.count,
+                params.dry_run,
+            )
+            .await
+        {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
     /// Start researching a technology.
     #[tool(
         description = "Queue a technology for research. Uses proper research queue (not cheating). \
@@ -2519,6 +2823,55 @@ impl FactorioMcp {
         );
         let target = Position::new(params.target_x, params.target_y);
         let result = match client.plan_steam_power(water_area, target).await {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Plan dry-run repairs for an existing steam-power plant.
+    #[tool(
+        description = "Plan safe repairs for an existing steam-power plant without mutating the game. Consumes diagnose_steam_power output and returns ordered low-level repair_steps such as insert_items for boiler fuel or place_entity for missing pole reach. Use this before moving or rebuilding pump/boiler/engine layouts."
+    )]
+    async fn repair_steam_power(
+        &self,
+        Parameters(params): Parameters<RepairSteamPowerParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let target = Position::new(params.target_x, params.target_y);
+        let result = match client
+            .repair_steam_power(params.x, params.y, params.radius, target)
+            .await
+        {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Plan dry-run pole placement to extend an existing power grid to a target.
+    #[tool(
+        description = "Plan how to extend an existing electric pole network to a target without mutating the game. Returns ordered place_entity small-electric-pole steps, missing_items, and blockers. Use before hand-placing long power lines."
+    )]
+    async fn extend_power_to(&self, Parameters(params): Parameters<ExtendPowerToParams>) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let target = Position::new(params.target_x, params.target_y);
+        let result = match client
+            .extend_power_to(params.x, params.y, params.radius, target)
+            .await
+        {
             Ok(value) => {
                 serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
             }

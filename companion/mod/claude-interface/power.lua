@@ -43,6 +43,13 @@ local BOILER_FLUID_LAYOUTS = {
     },
 }
 
+local POLE_SUPPLY_AREAS = {
+    ["small-electric-pole"] = 2.5,
+    ["medium-electric-pole"] = 3.5,
+    ["big-electric-pole"] = 2.0,
+    ["substation"] = 9.0,
+}
+
 local function pos_table(position)
     if not position then return nil end
     return pos(position.x, position.y)
@@ -408,8 +415,8 @@ local function build_plan(surface, force, pump, layout, target)
     }
 end
 
-local function append_steam_issue(result, issue_type, severity, entity, message, action)
-    table.insert(result.issues, {
+local function append_steam_issue(result, issue_type, severity, entity, message, action, details)
+    local issue = {
         type = issue_type,
         severity = severity,
         entity = entity and {
@@ -419,8 +426,51 @@ local function append_steam_issue(result, issue_type, severity, entity, message,
         } or nil,
         message = message,
         action = action,
-    })
+    }
+    if details then issue.details = details end
+    table.insert(result.issues, issue)
     if action then table.insert(result.suggested_actions, action) end
+end
+
+local function finish_steam_diagnostic(result)
+    local steam_entity_count = result.summary.offshore_pumps
+        + result.summary.boilers
+        + result.summary.steam_engines
+        + result.summary.pipes
+    local critical_issues = 0
+    local warning_issues = 0
+    for _, issue in ipairs(result.issues) do
+        if issue.severity == "critical" then
+            critical_issues = critical_issues + 1
+        elseif issue.severity == "warning" then
+            warning_issues = warning_issues + 1
+        end
+    end
+
+    result.summary.steam_power_entities = steam_entity_count
+    result.summary.issue_count = #result.issues
+    result.summary.critical_issues = critical_issues
+    result.summary.warning_issues = warning_issues
+    result.has_existing_plant = steam_entity_count > 0
+
+    if steam_entity_count == 0 then
+        result.status = "no_plant"
+        result.next_action = "build_steam_power"
+    elseif critical_issues > 0 then
+        result.status = "critical"
+        result.next_action = "repair_existing_steam_power"
+    elseif warning_issues > 0 then
+        result.status = "warning"
+        result.next_action = "inspect_existing_steam_power"
+    elseif result.summary.offshore_pumps > 0
+        and result.summary.boilers > 0
+        and result.summary.steam_engines > 0 then
+        result.status = "ok"
+        result.next_action = "verify_power_status"
+    else
+        result.status = "incomplete"
+        result.next_action = "complete_existing_steam_power"
+    end
 end
 
 local function fluidbox_neighbours(entity, index)
@@ -578,6 +628,111 @@ local function describe_fluidboxes(entity, result)
     return boxes
 end
 
+local function fluidbox_has_neighbour(item, names)
+    for _, box in ipairs(item.fluidboxes or {}) do
+        for _, neighbour in ipairs(box.neighbours or {}) do
+            if names[neighbour.name] then return true, neighbour end
+        end
+        for _, connection in ipairs(box.pipe_connections or {}) do
+            local target = connection.target
+            if target and names[target.name] then return true, target end
+        end
+    end
+    return false, nil
+end
+
+local function nearest_entity_record(entities, from_position)
+    local from = pos_table(from_position)
+    local best = nil
+    local best_distance_sq = nil
+    for _, entity in pairs(entities or {}) do
+        local candidate = pos_table(entity.position)
+        local candidate_distance_sq = distance_sq(from, candidate)
+        if best_distance_sq == nil or candidate_distance_sq < best_distance_sq then
+            best = entity
+            best_distance_sq = candidate_distance_sq
+        end
+    end
+    if not best then return nil end
+    return {
+        name = best.name,
+        unit_number = best.unit_number,
+        position = pos_table(best.position),
+        distance = math.sqrt(best_distance_sq),
+    }
+end
+
+local function append_repair_step(result, step_type, description, tool_name, tool_args, entity)
+    table.insert(result.repair_steps, {
+        type = step_type,
+        description = description,
+        tool = tool_name,
+        tool_args = tool_args,
+        entity = entity and {
+            unit_number = entity.unit_number,
+            name = entity.name,
+            position = pos_table(entity.position),
+        } or nil,
+    })
+end
+
+local function add_missing_item(result, character, item_name, required)
+    if required <= 0 then return end
+    local available = inventory_count(character, item_name)
+    if available < required then
+        table.insert(result.missing_items, {
+            name = item_name,
+            required = required,
+            available = available,
+        })
+    end
+end
+
+local function pole_repair_path(surface, force, from_position, to_position)
+    local poles = {}
+    local from_pos = pos_table(from_position)
+    local to_pos = pos_table(to_position)
+    if not (from_pos and to_pos) then return poles end
+
+    local dx = to_pos.x - from_pos.x
+    local dy = to_pos.y - from_pos.y
+    local distance = math.sqrt(dx * dx + dy * dy)
+    local step = 6
+    local count = math.max(1, math.ceil(distance / step))
+    for i = 1, count do
+        local t = i / count
+        local ideal = pos(
+            math.floor(from_pos.x + dx * t + 0.5),
+            math.floor(from_pos.y + dy * t + 0.5)
+        )
+        table.insert(poles, find_pole_position(surface, force, ideal))
+    end
+    return poles
+end
+
+local function index_entities_by_unit(entities)
+    local by_unit = {}
+    for _, entity in pairs(entities or {}) do
+        if entity.unit_number then by_unit[tostring(entity.unit_number)] = entity end
+    end
+    return by_unit
+end
+
+local function pole_supply_reaches(pole, target)
+    local supply_dist = POLE_SUPPLY_AREAS[pole.name] or 2.5
+    return math.abs(pole.position.x - target.x) <= supply_dist
+        and math.abs(pole.position.y - target.y) <= supply_dist
+end
+
+local function append_place_pole_step(result, pole, description)
+    table.insert(result.steps, {
+        type = "place_power_pole",
+        description = description,
+        tool = "place_entity",
+        tool_args = pole.place_args,
+    })
+end
+
 function M.diagnose_steam_power(x, y, radius)
     local surface = game.surfaces[1]
     local r = radius or 50
@@ -608,6 +763,11 @@ function M.diagnose_steam_power(x, y, radius)
         force = "player",
         name = {"offshore-pump", "boiler", "steam-engine", "pipe", "pipe-to-ground"},
     }
+
+    local present = {}
+    for _, entity in pairs(steam_entities) do
+        present[entity.name] = (present[entity.name] or 0) + 1
+    end
 
     for _, entity in pairs(steam_entities) do
         if entity.name == "offshore-pump" then result.summary.offshore_pumps = result.summary.offshore_pumps + 1 end
@@ -656,17 +816,58 @@ function M.diagnose_steam_power(x, y, radius)
                 append_steam_issue(result, "boiler_no_fuel", "critical", entity, "Boiler has no fuel.", "Insert coal or another fuel into boiler unit " .. tostring(entity.unit_number) .. ".")
             end
             if item.status == "no_input_fluid" then
-                append_steam_issue(result, "boiler_no_water", "critical", entity, "Boiler is missing water input.", "Connect offshore pump water output to boiler unit " .. tostring(entity.unit_number) .. " water input.")
+                local connected_to_water = fluidbox_has_neighbour(item, {["offshore-pump"] = true, ["pipe"] = true, ["pipe-to-ground"] = true})
+                local has_fluidbox_data = #(item.fluidboxes or {}) > 0
+                if has_fluidbox_data and not connected_to_water and ((present["offshore-pump"] or 0) > 0 or (present["pipe"] or 0) > 0 or (present["pipe-to-ground"] or 0) > 0) then
+                    append_steam_issue(
+                        result,
+                        "boiler_water_alignment_mismatch",
+                        "critical",
+                        entity,
+                        "Boiler is near water infrastructure but no water fluidbox is connected.",
+                        "Rotate or move boiler unit " .. tostring(entity.unit_number) .. " so its water input touches the offshore pump or pipe network.",
+                        {nearby_fluid_infrastructure = true}
+                    )
+                else
+                    append_steam_issue(result, "boiler_no_water", "critical", entity, "Boiler is missing water input.", "Connect offshore pump water output to boiler unit " .. tostring(entity.unit_number) .. " water input.")
+                end
             elseif item.status == "full_output" then
                 append_steam_issue(result, "boiler_steam_output_blocked", "critical", entity, "Boiler has steam but cannot drain it.", "Connect boiler unit " .. tostring(entity.unit_number) .. " steam output to a steam engine input, or move the blocking engine/pipe.")
             end
         elseif entity.name == "steam-engine" then
             if item.status == "no_input_fluid" then
-                append_steam_issue(result, "steam_engine_no_steam", "critical", entity, "Steam engine is missing steam input.", "Connect a boiler steam output to steam engine unit " .. tostring(entity.unit_number) .. ".")
+                local connected_to_steam = fluidbox_has_neighbour(item, {["boiler"] = true, ["pipe"] = true, ["pipe-to-ground"] = true})
+                local has_fluidbox_data = #(item.fluidboxes or {}) > 0
+                if has_fluidbox_data and not connected_to_steam and ((present["boiler"] or 0) > 0 or (present["pipe"] or 0) > 0 or (present["pipe-to-ground"] or 0) > 0) then
+                    append_steam_issue(
+                        result,
+                        "steam_engine_alignment_mismatch",
+                        "critical",
+                        entity,
+                        "Steam engine is near steam infrastructure but no steam fluidbox is connected.",
+                        "Move or rotate steam engine unit " .. tostring(entity.unit_number) .. " so its input touches the boiler steam output or connected pipe.",
+                        {nearby_steam_infrastructure = true}
+                    )
+                else
+                    append_steam_issue(result, "steam_engine_no_steam", "critical", entity, "Steam engine is missing steam input.", "Connect a boiler steam output to steam engine unit " .. tostring(entity.unit_number) .. ".")
+                end
             end
             local nearby_poles = surface.find_entities_filtered{type = "electric-pole", position = entity.position, radius = 8, force = "player", limit = 1}
             if #nearby_poles == 0 then
-                append_steam_issue(result, "steam_engine_not_on_grid", "warning", entity, "Steam engine has no electric pole close enough to receive generated power.", "Place an electric pole within wire reach of steam engine unit " .. tostring(entity.unit_number) .. ".")
+                local nearest_pole = nearest_entity_record(poles, entity.position)
+                if nearest_pole then
+                    append_steam_issue(
+                        result,
+                        "steam_engine_pole_route_incomplete",
+                        "warning",
+                        entity,
+                        "Steam engine has poles in the diagnostic area, but none close enough to receive generated power.",
+                        "Extend the pole line from nearest pole unit " .. tostring(nearest_pole.unit_number) .. " to steam engine unit " .. tostring(entity.unit_number) .. ".",
+                        {nearest_pole = nearest_pole}
+                    )
+                else
+                    append_steam_issue(result, "steam_engine_not_on_grid", "warning", entity, "Steam engine has no electric pole close enough to receive generated power.", "Place an electric pole within wire reach of steam engine unit " .. tostring(entity.unit_number) .. ".")
+                end
             end
         elseif entity.name == "offshore-pump" then
             if item.status == "no_power" then
@@ -687,6 +888,247 @@ function M.diagnose_steam_power(x, y, radius)
         table.insert(result.suggested_actions, "No steam engine in area; build one on boiler steam output.")
     end
 
+    finish_steam_diagnostic(result)
+    return result
+end
+
+function M.extend_power_to(character, x, y, radius, target_x, target_y)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first", blockers = {"no_character"}}
+    end
+
+    local surface = character.surface
+    local force = character.force
+    local r = radius or 50
+    local target = pos(target_x, target_y)
+    local area = {{x - r, y - r}, {x + r, y + r}}
+    local existing_poles = surface.find_entities_filtered{
+        type = "electric-pole",
+        area = area,
+        force = force,
+    }
+    local result = {
+        success = false,
+        dry_run = true,
+        area = {
+            center = {x = x, y = y},
+            radius = r,
+        },
+        target = target,
+        source_pole = nil,
+        steps = {},
+        missing_items = {},
+        blockers = {},
+    }
+
+    if #existing_poles == 0 then
+        table.insert(result.blockers, {
+            type = "no_power_grid_found",
+            message = "No electric poles were found in the extension area.",
+        })
+        result.next_action = "build_power_source_or_expand_search"
+        result.guidance = "Find an existing powered pole or build steam power before extending the grid."
+        return result
+    end
+
+    local nearest = nearest_entity_record(existing_poles, target)
+    result.source_pole = nearest
+
+    for _, pole in pairs(existing_poles) do
+        if pole_supply_reaches(pole, target) then
+            result.success = true
+            result.ready = true
+            result.already_powered = true
+            result.covering_pole = {
+                name = pole.name,
+                unit_number = pole.unit_number,
+                position = pos_table(pole.position),
+            }
+            result.next_action = "verify_power_status"
+            result.guidance = "Target is already inside an electric pole supply area."
+            return result
+        end
+    end
+
+    local pole_plan = pole_repair_path(surface, force, nearest.position, target)
+    for _, pole in ipairs(pole_plan) do
+        if pole.factorio_allowed then
+            append_place_pole_step(
+                result,
+                pole,
+                "Place a small electric pole to extend power toward target (" .. tostring(target_x) .. ", " .. tostring(target_y) .. ")."
+            )
+        else
+            table.insert(result.blockers, {
+                type = "no_pole_placement",
+                message = "Could not find a placeable pole position while extending power.",
+                attempted_position = pole.position,
+                reason = pole.error,
+            })
+        end
+    end
+
+    add_missing_item(result, character, "small-electric-pole", #result.steps)
+    result.ready = #result.steps > 0 and #result.missing_items == 0 and #result.blockers == 0
+    result.success = result.ready
+    if result.ready then
+        result.next_action = "execute_power_extension_steps"
+        result.guidance = "Place steps in order, then call get_power_status or find_power_issues near the target."
+    elseif #result.steps > 0 then
+        result.next_action = "gather_missing_items_or_clear_blockers"
+        result.guidance = "Power extension steps were found, but missing_items or blockers must be resolved first."
+    else
+        result.next_action = "manual_inspection_required"
+        result.guidance = "No safe pole extension steps were found."
+    end
+    return result
+end
+
+function M.repair_steam_power(character, x, y, radius, target_x, target_y)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first", blockers = {"no_character"}}
+    end
+
+    local surface = character.surface
+    local force = character.force
+    local r = radius or 50
+    local area = {{x - r, y - r}, {x + r, y + r}}
+    local diagnostic = M.diagnose_steam_power(x, y, r)
+    local result = {
+        success = false,
+        dry_run = true,
+        status = diagnostic.status,
+        next_action = diagnostic.next_action,
+        diagnostic = diagnostic,
+        repair_steps = {},
+        missing_items = {},
+        blockers = {},
+        notes = {},
+    }
+
+    if target_x ~= nil and target_y ~= nil then
+        result.target = {x = target_x, y = target_y}
+    end
+
+    if not diagnostic.has_existing_plant then
+        table.insert(result.blockers, {
+            type = "no_steam_power_found",
+            message = "No existing steam-power entities were found in the repair area.",
+        })
+        if target_x ~= nil and target_y ~= nil then
+            result.suggested_next_tool = {
+                tool = "plan_steam_power",
+                tool_args = {
+                    water_x1 = x - r,
+                    water_y1 = y - r,
+                    water_x2 = x + r,
+                    water_y2 = y + r,
+                    target_x = target_x,
+                    target_y = target_y,
+                },
+            }
+        end
+        result.guidance = "No plant exists to repair; use suggested_next_tool to plan a new build."
+        result.next_action = "plan_steam_power"
+        return result
+    end
+
+    local entities = surface.find_entities_filtered{
+        area = area,
+        force = force,
+        name = {"offshore-pump", "boiler", "steam-engine", "pipe", "pipe-to-ground", "small-electric-pole", "medium-electric-pole", "big-electric-pole", "substation"},
+    }
+    local by_unit = index_entities_by_unit(entities)
+    local poles = surface.find_entities_filtered{type = "electric-pole", area = area, force = force}
+    local needed = {
+        ["coal"] = 0,
+        ["small-electric-pole"] = 0,
+    }
+
+    local issue_types = {}
+    for _, issue in ipairs(diagnostic.issues or {}) do
+        issue_types[issue.type] = true
+    end
+
+    for _, issue in ipairs(diagnostic.issues or {}) do
+        local entity = issue.entity and by_unit[tostring(issue.entity.unit_number)] or nil
+        if issue.type == "boiler_no_fuel" and entity then
+            local count = 5
+            needed["coal"] = needed["coal"] + count
+            append_repair_step(
+                result,
+                "fuel_boiler",
+                "Insert fuel into boiler unit " .. tostring(entity.unit_number) .. ".",
+                "insert_items",
+                {
+                    unit_number = entity.unit_number,
+                    item = "coal",
+                    count = count,
+                    inventory_type = "fuel",
+                },
+                entity
+            )
+        elseif (issue.type == "steam_engine_pole_route_incomplete" or issue.type == "steam_engine_not_on_grid") and entity then
+            local nearest = nearest_entity_record(poles, entity.position)
+            local pole_plan
+            if nearest then
+                pole_plan = pole_repair_path(surface, force, nearest.position, entity.position)
+            else
+                pole_plan = {find_machine_connection_pole(surface, force, entity.position)}
+            end
+            for _, pole in ipairs(pole_plan) do
+                if pole.factorio_allowed then
+                    needed["small-electric-pole"] = needed["small-electric-pole"] + 1
+                    append_repair_step(
+                        result,
+                        "place_power_pole",
+                        "Place a small electric pole to connect steam engine unit " .. tostring(entity.unit_number) .. " to the grid.",
+                        "place_entity",
+                        pole.place_args,
+                        entity
+                    )
+                else
+                    table.insert(result.blockers, {
+                        type = "no_pole_placement",
+                        message = "Could not find a placeable pole position near steam engine unit " .. tostring(entity.unit_number) .. ".",
+                        attempted_position = pole.position,
+                        reason = pole.error,
+                    })
+                end
+            end
+        elseif issue.type == "steam_engine_no_steam" and issue_types["boiler_no_fuel"] then
+            table.insert(result.notes, {
+                type = "steam_engine_no_steam_may_clear_after_fuel",
+                message = "Steam engine has no steam, but boiler fuel is also missing; fuel the boiler first and re-run diagnostics.",
+            })
+        elseif issue.type == "boiler_no_water"
+            or issue.type == "steam_engine_no_steam"
+            or issue.type == "boiler_water_alignment_mismatch"
+            or issue.type == "steam_engine_alignment_mismatch" then
+            table.insert(result.blockers, {
+                type = issue.type,
+                message = issue.message,
+                action = issue.action,
+                entity = issue.entity,
+            })
+        end
+    end
+
+    add_missing_item(result, character, "coal", needed["coal"])
+    add_missing_item(result, character, "small-electric-pole", needed["small-electric-pole"])
+
+    result.ready = #result.repair_steps > 0 and #result.missing_items == 0 and #result.blockers == 0
+    result.success = result.ready
+    if result.ready then
+        result.next_action = "execute_repair_steps"
+        result.guidance = "Execute repair_steps in order, then call diagnose_steam_power and get_power_status again."
+    elseif #result.repair_steps > 0 then
+        result.next_action = "gather_missing_items_or_clear_blockers"
+        result.guidance = "Repair steps were found, but missing_items or blockers must be resolved before executing them."
+    else
+        result.next_action = "manual_inspection_required"
+        result.guidance = "No safe automatic dry-run repair steps were found; inspect diagnostic issues before moving fluid entities."
+    end
     return result
 end
 
@@ -710,13 +1152,6 @@ local POWER_ISSUE_CONSUMER_TYPES = {
     "radar",
     "lamp",
     "roboport",
-}
-
-local POLE_SUPPLY_AREAS = {
-    ["small-electric-pole"] = 2.5,
-    ["medium-electric-pole"] = 3.5,
-    ["big-electric-pole"] = 2.0,
-    ["substation"] = 9.0,
 }
 
 local function area_around(x, y, radius)
@@ -915,21 +1350,29 @@ function M.get_power_status(x, y, radius)
     if stats then
         local input_flow = {}
         local output_flow = {}
+        local precision = defines.flow_precision_index.five_seconds
+        local function flow_count(name, category)
+            local stat_name = type(name) == "string" and name or name.name
+            if not stat_name then return 0 end
+            local ok, flow = pcall(function()
+                return stats.get_flow_count{
+                    name = stat_name,
+                    category = category,
+                    precision_index = precision,
+                }
+            end)
+            if ok and type(flow) == "number" then return flow end
+            return 0
+        end
         for name, _ in pairs(stats.input_counts) do
-            local flow = stats.get_flow_count{
-                name = name,
-                input = true,
-                precision_index = defines.flow_precision_index.five_seconds,
-            }
-            if flow > 0 then table.insert(input_flow, {name = name, flow = flow}) end
+            local stat_name = type(name) == "string" and name or name.name
+            local flow = flow_count(name, "input")
+            if stat_name and flow > 0 then table.insert(input_flow, {name = stat_name, flow = flow}) end
         end
         for name, _ in pairs(stats.output_counts) do
-            local flow = stats.get_flow_count{
-                name = name,
-                input = false,
-                precision_index = defines.flow_precision_index.five_seconds,
-            }
-            if flow > 0 then table.insert(output_flow, {name = name, flow = flow}) end
+            local stat_name = type(name) == "string" and name or name.name
+            local flow = flow_count(name, "output")
+            if stat_name and flow > 0 then table.insert(output_flow, {name = stat_name, flow = flow}) end
         end
         if #input_flow > 0 then result.input_flow = input_flow end
         if #output_flow > 0 then result.output_flow = output_flow end
@@ -1152,6 +1595,45 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
     local force = character.force
     local water_area = normalize_area(water_x1, water_y1, water_x2, water_y2)
     local target = pos(target_x, target_y)
+    local diagnostic_center = pos(
+        (water_area.left_top.x + water_area.right_bottom.x) / 2,
+        (water_area.left_top.y + water_area.right_bottom.y) / 2
+    )
+    local diagnostic_corner_radius = math.max(
+        math.sqrt(distance_sq(diagnostic_center, water_area.left_top)),
+        math.sqrt(distance_sq(diagnostic_center, water_area.right_bottom))
+    )
+    local diagnostic_radius = math.max(
+        24,
+        math.ceil(diagnostic_corner_radius) + 16,
+        math.ceil(math.sqrt(distance_sq(diagnostic_center, target))) + 16
+    )
+    local existing_diagnostic = M.diagnose_steam_power(
+        diagnostic_center.x,
+        diagnostic_center.y,
+        diagnostic_radius
+    )
+    if existing_diagnostic.has_existing_plant then
+        return {
+            success = false,
+            placement_success = false,
+            water_area = water_area,
+            target = target,
+            checked = 0,
+            pump_candidates = 0,
+            missing_items = {},
+            plan = nil,
+            existing_plant = existing_diagnostic,
+            blockers = {
+                {
+                    type = "existing_steam_power_found",
+                    message = "Existing steam-power entities found in the requested area; diagnose and repair them before planning a rebuild.",
+                },
+            },
+            guidance = "Existing steam power was found. Use existing_plant.issues and suggested_actions, then call diagnose_steam_power and get_power_status again before rebuilding.",
+        }
+    end
+
     local search_pad = 4
     local pump_candidates = {}
     local checked = 0

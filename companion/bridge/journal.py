@@ -12,12 +12,22 @@ from models import JOURNAL_EVENT_KINDS, JournalEvent
 REFLECTION_RE = re.compile(r"<reflection>(.*?)</reflection>", re.DOTALL | re.IGNORECASE)
 EVENT_KINDS = JOURNAL_EVENT_KINDS
 MAX_REFLECTION_ITEMS = 12
+MAX_REFLECTION_ITEM_TEXT = 180
+MAX_RENDERED_EVENTS = 5
+MAX_RENDERED_EVENT_TEXT = 500
+USEFUL_EVENT_KINDS = {"progress", "discovery", "milestone"}
 TRANSIENT_FAILURE_PATTERNS = (
     "usage limit reached",
     "request rejected (429)",
+    "provider usage limit",
     "reached maximum number of turns",
     "expected value at line 1 column 1",
     "stream idle timeout",
+    "tick timeout",
+    "agent tick exceeded",
+    "context window limit",
+    "context-window limit",
+    "context length",
     "no electric poles found in area",
     "missing field `success`",
     "missing field success",
@@ -27,6 +37,16 @@ TRANSIENT_FAILURE_PATTERNS = (
 )
 LOW_VALUE_PROGRESS_PATTERNS = (
     "no infrastructure yet deployed",
+    "plan fully validated and awaiting execution",
+    "plan validated and ready for execution",
+    "plan unchanged and ready for execution",
+)
+LOW_VALUE_REFLECTION_PATTERNS = (
+    "no prior progress",
+    "no infrastructure yet deployed",
+    "fresh deployment",
+    "zero-state",
+    "nothing built",
 )
 
 
@@ -46,11 +66,40 @@ def default_reflection() -> dict:
     }
 
 
+def _compact_reflection_item(text: str) -> str:
+    compact = re.sub(r"\s+", " ", str(text)).strip()
+    if len(compact) <= MAX_REFLECTION_ITEM_TEXT:
+        return compact
+    return compact[:MAX_REFLECTION_ITEM_TEXT].rstrip() + "..."
+
+
+def _should_drop_reflection_item(text: str) -> bool:
+    normalized = str(text).lower()
+    return (
+        _is_transient_failure_text(normalized)
+        or any(pattern in normalized for pattern in LOW_VALUE_REFLECTION_PATTERNS)
+    )
+
+
 def _str_list(value) -> list:
-    """Coerce an on-disk value into a bounded list of non-empty strings."""
+    """Coerce an on-disk value into bounded, prompt-worthy lesson strings."""
     if not isinstance(value, list):
         return []
-    return [str(item) for item in value if isinstance(item, str)][:MAX_REFLECTION_ITEMS]
+    items = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        compact = _compact_reflection_item(item)
+        if not compact or _should_drop_reflection_item(compact):
+            continue
+        if compact in seen:
+            continue
+        seen.add(compact)
+        items.append(compact)
+        if len(items) >= MAX_REFLECTION_ITEMS:
+            break
+    return items
 
 
 def _normalize(data: dict) -> dict:
@@ -77,7 +126,11 @@ def _is_low_value_progress_event(kind: str, text: str) -> bool:
     if kind != "progress":
         return False
     normalized = str(text).lower()
-    return any(pattern in normalized for pattern in LOW_VALUE_PROGRESS_PATTERNS)
+    if any(pattern in normalized for pattern in LOW_VALUE_PROGRESS_PATTERNS):
+        return True
+    return "planning tick" in normalized and (
+        "no change" in normalized or "state unchanged" in normalized
+    )
 
 
 def _should_drop_event(kind: str, text: str) -> bool:
@@ -85,6 +138,66 @@ def _should_drop_event(kind: str, text: str) -> bool:
         _is_transient_failure_event(kind, text)
         or _is_low_value_progress_event(kind, text)
     )
+
+
+def _event_kind(value) -> str:
+    return value if value in EVENT_KINDS else "progress"
+
+
+def _compact_event_text(text: str, limit: int = MAX_RENDERED_EVENT_TEXT) -> str:
+    compact = re.sub(r"\s+", " ", str(text)).strip()
+    if limit <= 0 or len(compact) <= limit:
+        return compact
+    return compact[:limit].rstrip() + "..."
+
+
+def coalesce_events(events: list[dict], max_items: int = MAX_RENDERED_EVENTS) -> list[dict]:
+    """Return prompt-ready events with adjacent identical entries collapsed.
+
+    The journal stays append-only and raw on disk; this compaction is only for
+    prompt injection so repeated failures don't crowd out useful context.
+    """
+    events = events if isinstance(events, list) else []
+    try:
+        max_items = int(max_items)
+    except (TypeError, ValueError):
+        max_items = MAX_RENDERED_EVENTS
+    if max_items <= 0:
+        return []
+
+    compacted: list[dict] = []
+    for raw in events:
+        if not isinstance(raw, dict):
+            continue
+        kind = _event_kind(raw.get("kind"))
+        text = _compact_event_text(raw.get("text", ""))
+        if not text or _should_drop_event(kind, text):
+            continue
+        if compacted and compacted[-1]["kind"] == kind and compacted[-1]["text"] == text:
+            compacted[-1]["count"] += 1
+            compacted[-1]["ts"] = str(raw.get("ts", compacted[-1].get("ts", "")))
+            continue
+        compacted.append({
+            "kind": kind,
+            "text": text,
+            "count": 1,
+            "ts": str(raw.get("ts", "")),
+        })
+
+    rendered = compacted[-max_items:]
+    if any(event["kind"] in USEFUL_EVENT_KINDS for event in rendered):
+        return rendered
+    if max_items <= 1:
+        return rendered
+
+    # A burst of distinct gameplay failures can otherwise hide the last useful
+    # state transition, leaving the next prompt with only "what failed" and no
+    # "what changed." Reserve one slot for the latest non-failure if the final
+    # window would be all failures.
+    for event in reversed(compacted[:-max_items]):
+        if event["kind"] in USEFUL_EVENT_KINDS:
+            return [event] + rendered[-(max_items - 1):]
+    return rendered
 
 
 def append_event(agent_name: str, kind: str, text: str) -> None:
@@ -217,7 +330,7 @@ def parse_reflection(text: str) -> dict | None:
                 parsed[active_key].append(item)
 
     for key in list(parsed.keys()):
-        parsed[key] = parsed[key][:MAX_REFLECTION_ITEMS]
+        parsed[key] = _str_list(parsed[key])
     return parsed
 
 
@@ -233,9 +346,9 @@ def apply_reflection_update(agent_name: str, text: str) -> dict:
         "updated_at": str(current.get("updated_at", "")),
     }
     if "structures" in parsed:
-        reflection["structures"] = list(parsed["structures"])[:MAX_REFLECTION_ITEMS]
+        reflection["structures"] = _str_list(parsed["structures"])
     if "error_tips" in parsed:
-        reflection["error_tips"] = list(parsed["error_tips"])[:MAX_REFLECTION_ITEMS]
+        reflection["error_tips"] = _str_list(parsed["error_tips"])
     reflection["updated_at"] = datetime.now().isoformat()
     save_reflection(agent_name, reflection)
     return reflection
@@ -254,14 +367,7 @@ def strip_reflection_trailer(text: str) -> str:
 def render_memory(events: list[dict], reflection: dict) -> str:
     events = events if isinstance(events, list) else []
     reflection = reflection if isinstance(reflection, dict) else {}
-    recent_events = [e for e in events[-5:] if isinstance(e, dict)]
-    recent_events = [
-        e for e in recent_events
-        if not _is_transient_failure_event(
-            e.get("kind") if e.get("kind") in EVENT_KINDS else "progress",
-            str(e.get("text", "")),
-        )
-    ]
+    recent_events = coalesce_events(events, MAX_RENDERED_EVENTS)
     structures = _str_list(reflection.get("structures", []))
     error_tips = _str_list(reflection.get("error_tips", []))
     if not recent_events and not structures and not error_tips:
@@ -271,8 +377,10 @@ def render_memory(events: list[dict], reflection: dict) -> str:
     if recent_events:
         lines.append("Recent events:")
         for event in recent_events:
-            kind = event.get("kind") if event.get("kind") in EVENT_KINDS else "progress"
-            lines.append(f"- {kind}: {str(event.get('text', '')).strip()}")
+            kind = _event_kind(event.get("kind"))
+            count = event.get("count", 1)
+            repeat = f" (x{count})" if isinstance(count, int) and count > 1 else ""
+            lines.append(f"- {kind}{repeat}: {str(event.get('text', '')).strip()}")
     if structures or error_tips:
         if lines:
             lines.append("")

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -70,6 +71,8 @@ class JournalTests(unittest.TestCase):
             '{"ts": "t2", "kind": "failure", "text": "API Error: Request rejected (429) - Usage limit reached"}\n'
             '{"ts": "t3", "kind": "failure", "text": "[{\\"type\\":\\"text\\",\\"text\\":\\"Error: expected value at line 1 column 1\\"}]"}\n'
             '{"ts": "t4", "kind": "failure", "text": "stream idle timeout after 300s"}\n'
+            '{"ts": "t4b", "kind": "failure", "text": "tick timeout after 2400s"}\n'
+            '{"ts": "t4c", "kind": "failure", "text": "sdk_failure: API Error: The model has reached its context window limit."}\n'
             '{"ts": "t5", "kind": "failure", "text": "{\\"error\\": \\"No electric poles found in area\\"}"}\n'
             '{"ts": "t6", "kind": "progress", "text": "situation assessed; no infrastructure yet deployed"}\n'
             '{"ts": "t7", "kind": "failure", "text": "invalid_request: Error: missing field `success` at line 1 column 135"}\n'
@@ -81,6 +84,8 @@ class JournalTests(unittest.TestCase):
 
         journal.append_event("doug", "failure", "Usage limit reached for 5 hour")
         journal.append_event("doug", "failure", "stream idle timeout after 300s")
+        journal.append_event("doug", "failure", "tick timeout after 2400s")
+        journal.append_event("doug", "failure", "API Error: The model has reached its context window limit.")
         journal.append_event("doug", "failure", '{"error": "No electric poles found in area"}')
         journal.append_event("doug", "progress", "situation assessed; no infrastructure yet deployed")
         events = journal.load_events("doug")
@@ -91,6 +96,8 @@ class JournalTests(unittest.TestCase):
         self.assertNotIn("Usage limit", rendered)
         self.assertNotIn("maximum number of turns", rendered)
         self.assertNotIn("stream idle timeout", rendered)
+        self.assertNotIn("tick timeout", rendered)
+        self.assertNotIn("context window", rendered)
         self.assertNotIn("No electric poles", rendered)
         self.assertNotIn("no infrastructure", rendered)
         self.assertNotIn("missing field", rendered)
@@ -156,6 +163,71 @@ error_tips:
             "Before.\n\nAfter.",
         )
 
+    def test_reflection_update_filters_noise_dedupes_and_caps_items(self):
+        long_tip = "Use route_belt diagnostics before rebuilding " + ("again " * 80)
+
+        updated = journal.apply_reflection_update(
+            "doug",
+            "\n".join([
+                "<reflection>",
+                "structures:",
+                "- Steam power at (-40, 26) feeds the lab bus",
+                "- API Error: The model has reached its context-window limit.",
+                "- no infrastructure yet deployed",
+                "- Steam power at (-40, 26) feeds the lab bus",
+                "error_tips:",
+                "- Provider usage limit active until later",
+                "- Check inserter direction with rotate_entity before rebuilding",
+                f"- {long_tip}",
+                "</reflection>",
+            ]),
+        )
+
+        self.assertEqual(
+            updated["structures"],
+            ["Steam power at (-40, 26) feeds the lab bus"],
+        )
+        self.assertEqual(len(updated["error_tips"]), 2)
+        self.assertIn(
+            "Check inserter direction with rotate_entity before rebuilding",
+            updated["error_tips"],
+        )
+        self.assertTrue(updated["error_tips"][1].endswith("..."))
+        self.assertLessEqual(
+            len(updated["error_tips"][1]),
+            journal.MAX_REFLECTION_ITEM_TEXT + 3,
+        )
+        rendered = journal.render_memory([], journal.load_reflection("doug"))
+        self.assertNotIn("context-window", rendered)
+        self.assertNotIn("Provider usage limit", rendered)
+        self.assertEqual(rendered.count("Steam power at"), 1)
+
+    def test_load_reflection_normalizes_existing_noisy_reflection_file(self):
+        (self.base / ".reflection-doug.json").write_text(json.dumps({
+            "structures": [
+                "Lab and steam power near the west lake",
+                "Lab and steam power near the west lake",
+                "fresh deployment assessment",
+                "API Error: context window limit",
+            ],
+            "error_tips": [
+                "No electric poles found in area",
+                "Use find_entity_placements before placing furnaces on ore",
+            ],
+            "updated_at": "old",
+        }))
+
+        loaded = journal.load_reflection("doug")
+
+        self.assertEqual(
+            loaded["structures"],
+            ["Lab and steam power near the west lake"],
+        )
+        self.assertEqual(
+            loaded["error_tips"],
+            ["Use find_entity_placements before placing furnaces on ore"],
+        )
+
     def test_render_memory_empty_and_populated(self):
         self.assertEqual(journal.render_memory([], journal.default_reflection()), "")
 
@@ -174,6 +246,50 @@ error_tips:
         self.assertIn("Iron smelter at spawn", rendered)
         self.assertIn("ERROR TIPS", rendered)
         self.assertIn("Use rotate_entity after placement", rendered)
+
+    def test_render_memory_coalesces_repeated_events_before_prompt_limit(self):
+        events = [
+            {"kind": "progress", "text": "Coal drill built"},
+            {"kind": "failure", "text": "game_rejected: Cannot place belt at 56,-24"},
+            {"kind": "failure", "text": "game_rejected: Cannot place belt at 56,-24"},
+            {"kind": "failure", "text": "game_rejected: Cannot place belt at 56,-24"},
+            {"kind": "failure", "text": "watchdog_abort: repeated same game rejection"},
+            {"kind": "progress", "text": "Queued logistics research"},
+        ]
+
+        rendered = journal.render_memory(events, journal.default_reflection())
+
+        self.assertIn("progress: Coal drill built", rendered)
+        self.assertIn("failure (x3): game_rejected: Cannot place belt at 56,-24", rendered)
+        self.assertIn("failure: watchdog_abort", rendered)
+        self.assertIn("progress: Queued logistics research", rendered)
+        self.assertEqual(rendered.count("Cannot place belt"), 1)
+
+    def test_render_memory_preserves_progress_when_distinct_failures_fill_window(self):
+        events = [{"kind": "progress", "text": "Lab powered"}]
+        events.extend(
+            {"kind": "failure", "text": f"game_rejected: Cannot place belt {i}"}
+            for i in range(journal.MAX_RENDERED_EVENTS + 1)
+        )
+
+        rendered = journal.render_memory(events, journal.default_reflection())
+
+        self.assertIn("progress: Lab powered", rendered)
+        self.assertIn("failure: game_rejected: Cannot place belt 5", rendered)
+        self.assertNotIn("Cannot place belt 0", rendered)
+        self.assertEqual(
+            len([line for line in rendered.splitlines() if line.startswith("- ")]),
+            journal.MAX_RENDERED_EVENTS,
+        )
+
+    def test_render_memory_truncates_large_events(self):
+        rendered = journal.render_memory(
+            [{"kind": "failure", "text": "x" * (journal.MAX_RENDERED_EVENT_TEXT + 50)}],
+            journal.default_reflection(),
+        )
+
+        self.assertLess(len(rendered), journal.MAX_RENDERED_EVENT_TEXT + 80)
+        self.assertIn("...", rendered)
 
     def test_journal_helpers_are_total_on_bad_input(self):
         # None/non-str/non-dict inputs must never raise (audit round 1).
@@ -257,6 +373,7 @@ error_tips:
                 '"action_needed":"build_lab"}'
             ): pipe.TOOL_RESULT_GAME_REJECTED,
             "Error: missing field `success` at line 1 column 135": pipe.TOOL_RESULT_INVALID_REQUEST,
+            "Error: value for required field 'category' is missing": pipe.TOOL_RESULT_INVALID_REQUEST,
             "Error: Packet too large: 1553350 bytes": pipe.TOOL_RESULT_INVALID_REQUEST,
             (
                 '{"success":false,"can_place":false,"entity":"stone-furnace",'
@@ -293,6 +410,18 @@ error_tips:
         )
         self.assertFalse(pipe._looks_like_tool_error(
             '{"success":false,"mined_count":0,"error":null,"inventory":[]}'
+        ))
+        self.assertEqual(
+            pipe._classify_tool_result(
+                '{"success":false,"expected_miss":true,'
+                '"blockers":[{"type":"missing_science_pack"}]}',
+                sdk_is_error=True,
+            ),
+            pipe.TOOL_RESULT_EXPECTED_MISS,
+        )
+        self.assertFalse(pipe._looks_like_tool_error(
+            '{"success":false,"expected_miss":true,'
+            '"blockers":[{"type":"missing_science_pack"}]}'
         ))
         self.assertEqual(
             pipe._classify_tool_result(
@@ -338,6 +467,23 @@ error_tips:
         self.assertFalse(pipe._looks_like_tool_error(
             '[{"type":"text","text":"{\\"technologies\\":[{\\"ready\\":'
             '\\"blocked\\",\\"blockers\\":[\\"labs have no power\\"]}]}"}]'
+        ))
+        self.assertEqual(
+            pipe._classify_tool_result(
+                '[{"type":"text","text":"{\\"researched_count\\":6,'
+                '\\"total_count\\":275,\\"research_progress\\":0.36,'
+                '\\"research_queue\\":[{\\"name\\":\\"steel-processing\\"}],'
+                '\\"labs\\":{\\"count\\":1,\\"powered\\":0,\\"working\\":0},'
+                '\\"message\\":\\"Labs have no power! Connect labs to the power grid.\\"}"}]'
+            ),
+            pipe.TOOL_RESULT_OK,
+        )
+        self.assertFalse(pipe._looks_like_tool_error(
+            '[{"type":"text","text":"{\\"researched_count\\":6,'
+            '\\"total_count\\":275,\\"research_progress\\":0.36,'
+            '\\"research_queue\\":[{\\"name\\":\\"steel-processing\\"}],'
+            '\\"labs\\":{\\"count\\":1,\\"powered\\":0,\\"working\\":0},'
+            '\\"message\\":\\"Labs have no power! Connect labs to the power grid.\\"}"}]'
         ))
 
     def test_player_message_trailer_is_split_from_tool_result_text(self):
@@ -409,13 +555,88 @@ error_tips:
             {"tool_name": "mcp__factorioctl__check_placement"}, "tool-1", {}
         ))
         mutating = asyncio.run(gate.hook(
-            {"tool_name": "mcp__factorioctl__place_entity"}, "tool-2", {}
+            {"tool_name": "mcp__factorioctl__rotate_entity"}, "tool-2", {}
         ))
 
         self.assertEqual(read_only, {})
         self.assertEqual(
             mutating["hookSpecificOutput"]["permissionDecision"], "allow"
         )
+
+    def test_planner_read_only_gate_blocks_mutations_and_allows_diagnostics(self):
+        import pipe
+
+        gate = pipe.PlannerReadOnlyToolGate(
+            pipe.logger.bind(agent="test"), enabled=True
+        )
+
+        blocked = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__rotate_entity"}, "tool-1", {}
+        ))
+        unknown = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__future_write_tool"}, "tool-2", {}
+        ))
+        diagnostic = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__check_placement"}, "tool-3", {}
+        ))
+        edge_miner_plan = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__build_edge_miner"}, "tool-8", {}
+        ))
+        direct_smelter_plan = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__build_direct_smelter"}, "tool-9", {}
+        ))
+        lab_feed_plan = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
+                "tool_input": {
+                    "lab_unit_number": 42,
+                    "science_pack": "automation-science-pack",
+                    "count": 5,
+                },
+            },
+            "tool-10",
+            {},
+        ))
+        lab_feed_execute = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
+                "tool_input": {
+                    "lab_unit_number": 42,
+                    "science_pack": "automation-science-pack",
+                    "count": 5,
+                    "dry_run": False,
+                },
+            },
+            "tool-11",
+            {},
+        ))
+        repair_plan = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__repair_steam_power"}, "tool-6", {}
+        ))
+        extend_plan = asyncio.run(gate.hook(
+            {"tool_name": "mcp__factorioctl__extend_power_to"}, "tool-7", {}
+        ))
+        skill = asyncio.run(gate.hook({"tool_name": "Skill"}, "tool-4", {}))
+        disabled = asyncio.run(pipe.PlannerReadOnlyToolGate(
+            pipe.logger.bind(agent="test"), enabled=False
+        ).hook(
+            {"tool_name": "mcp__factorioctl__place_entity"}, "tool-5", {}
+        ))
+
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("planner/reflection turn", blocked["reason"])
+        self.assertIn("ledger-only plan", blocked["reason"])
+        self.assertFalse(pipe._looks_like_tool_error(blocked["reason"]))
+        self.assertEqual(unknown["decision"], "block")
+        self.assertEqual(diagnostic, {})
+        self.assertEqual(edge_miner_plan, {})
+        self.assertEqual(direct_smelter_plan, {})
+        self.assertEqual(lab_feed_plan, {})
+        self.assertEqual(lab_feed_execute["decision"], "block")
+        self.assertEqual(repair_plan, {})
+        self.assertEqual(extend_plan, {})
+        self.assertEqual(skill, {})
+        self.assertEqual(disabled, {})
 
     def test_factorio_skill_gate_requires_skill_before_mcp_tools(self):
         import pipe
@@ -489,15 +710,85 @@ error_tips:
 
         valid = asyncio.run(gate.hook(
             {
-                "tool_name": "mcp__factorioctl__place_entity",
+                "tool_name": "mcp__factorioctl__rotate_entity",
                 "tool_input": {
-                    "entity_name": "stone-furnace",
-                    "x": 42.0,
-                    "y": -3,
                     "direction": "south",
+                    "unit_number": 42,
                 },
             },
             "tool-1",
+            {},
+        ))
+        valid_repair = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__repair_steam_power",
+                "tool_input": {
+                    "x": 0,
+                    "y": 0,
+                    "radius": 50,
+                    "target_x": 10.5,
+                    "target_y": -2,
+                },
+            },
+            "tool-repair",
+            {},
+        ))
+        valid_extend = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__extend_power_to",
+                "tool_input": {
+                    "x": 0,
+                    "y": 0,
+                    "radius": 20,
+                    "target_x": 2,
+                    "target_y": 0,
+                },
+            },
+            "tool-extend",
+            {},
+        ))
+        valid_edge_miner = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__build_edge_miner",
+                "tool_input": {
+                    "resource_type": "iron-ore",
+                    "x": 57,
+                    "y": -22,
+                    "radius": 25,
+                    "drill_name": "burner-mining-drill",
+                    "limit": 5,
+                },
+            },
+            "tool-edge-miner",
+            {},
+        ))
+        valid_direct_smelter = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__build_direct_smelter",
+                "tool_input": {
+                    "output_x": 56,
+                    "output_y": -18,
+                    "output_direction": "south",
+                    "furnace_name": "stone-furnace",
+                    "inserter_name": "burner-inserter",
+                    "belt_name": "transport-belt",
+                    "radius": 6,
+                },
+            },
+            "tool-direct-smelter",
+            {},
+        ))
+        valid_lab_feed = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
+                "tool_input": {
+                    "lab_unit_number": 42,
+                    "science_pack": "automation-science-pack",
+                    "count": 5,
+                    "dry_run": True,
+                },
+            },
+            "tool-lab-feed",
             {},
         ))
         unknown = asyncio.run(gate.hook(
@@ -518,6 +809,11 @@ error_tips:
         ))
 
         self.assertEqual(valid, {})
+        self.assertEqual(valid_repair, {})
+        self.assertEqual(valid_extend, {})
+        self.assertEqual(valid_edge_miner, {})
+        self.assertEqual(valid_direct_smelter, {})
+        self.assertEqual(valid_lab_feed, {})
         self.assertEqual(unknown, {})
         self.assertEqual(non_factorio, {})
 
@@ -590,6 +886,47 @@ error_tips:
         self.assertEqual(options.tools, ["Skill"])
         self.assertEqual(options.setting_sources, ["project", "local"])
         self.assertEqual(options.cwd, pipe._PROJECT_ROOT)
+
+    def test_handle_message_installs_read_only_gate_when_requested(self):
+        import pipe
+
+        captured = {}
+
+        def scripted_query(*, prompt, options):
+            captured["options"] = options
+
+            async def gen():
+                if False:
+                    yield None
+
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with mock.patch("pipe.query", scripted_query):
+            pipe.handle_message(
+                "go",
+                {},
+                "system",
+                None,
+                StubRCON(),
+                0,
+                None,
+                agent_name="doug",
+                sdk_skills=["factorio-control"],
+                read_only_tools=True,
+            )
+
+        matcher = captured["options"].hooks["PreToolUse"][0]
+        owners = [getattr(hook, "__self__", None) for hook in matcher.hooks]
+        gates = [
+            owner for owner in owners
+            if isinstance(owner, pipe.PlannerReadOnlyToolGate)
+        ]
+        self.assertEqual(len(gates), 1)
+        self.assertTrue(gates[0].enabled)
 
     def test_sdk_skill_init_and_tool_use_are_observable(self):
         import pipe
@@ -740,6 +1077,324 @@ error_tips:
         self.assertEqual(journal.load_events("doug"), [])
         self.assertIsNotNone(pipe._get_usage_limit_cooldown("doug"))
 
+    def test_handle_message_clears_session_on_context_window_limit(self):
+        import pipe
+        from claude_agent_sdk import ResultMessage
+
+        pipe._CONTEXT_WINDOW_COOLDOWNS.clear()
+        self.addCleanup(pipe._CONTEXT_WINDOW_COOLDOWNS.clear)
+        session_patch = mock.patch(
+            "pipe._session_file",
+            side_effect=lambda agent_name: self.base / f".session-{agent_name}.json",
+        )
+        sessions_patch = mock.patch.object(pipe, "SESSIONS_FILE", self.base / ".sessions.json")
+        session_patch.start()
+        sessions_patch.start()
+        self.addCleanup(session_patch.stop)
+        self.addCleanup(sessions_patch.stop)
+
+        pipe.save_session("doug", "old-session")
+        pipe.SESSIONS_FILE.write_text(json.dumps({
+            "doug": "old-legacy-session",
+            "other": "keep-me",
+        }) + "\n")
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                yield ResultMessage(
+                    subtype="error",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=True,
+                    num_turns=1,
+                    session_id="old-session",
+                    result="API Error: The model has reached its context window limit.",
+                    total_cost_usd=0.0,
+                )
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with mock.patch("pipe.query", scripted_query):
+            new_session = pipe.handle_message(
+                "go", {}, "system", "old-session", StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+            )
+
+        self.assertEqual(new_session, pipe.SESSION_RESET)
+        self.assertIsNone(pipe.load_session("doug"))
+        self.assertIsNone(pipe._get_context_window_cooldown("doug"))
+        self.assertEqual(json.loads(pipe.SESSIONS_FILE.read_text()), {"other": "keep-me"})
+        self.assertEqual(journal.load_events("doug"), [])
+
+    def test_handle_message_backs_off_context_window_after_session_reset(self):
+        import pipe
+        from claude_agent_sdk import ResultMessage
+
+        pipe._CONTEXT_WINDOW_COOLDOWNS.clear()
+        self.addCleanup(pipe._CONTEXT_WINDOW_COOLDOWNS.clear)
+        session_patch = mock.patch(
+            "pipe._session_file",
+            side_effect=lambda agent_name: self.base / f".session-{agent_name}.json",
+        )
+        sessions_patch = mock.patch.object(pipe, "SESSIONS_FILE", self.base / ".sessions.json")
+        session_patch.start()
+        sessions_patch.start()
+        self.addCleanup(session_patch.stop)
+        self.addCleanup(sessions_patch.stop)
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                yield ResultMessage(
+                    subtype="error",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=True,
+                    num_turns=1,
+                    session_id=None,
+                    result="API Error: The model has reached its context window limit.",
+                    total_cost_usd=0.0,
+                )
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with mock.patch("pipe.query", scripted_query):
+            new_session = pipe.handle_message(
+                "go", {}, "system", None, StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+            )
+
+        self.assertEqual(new_session, pipe.SESSION_RESET)
+        self.assertIsNotNone(pipe._get_context_window_cooldown("doug"))
+        self.assertEqual(journal.load_events("doug"), [])
+
+    def test_context_window_cooldown_blocks_human_message_without_model_call(self):
+        import queue as std_queue
+
+        import pipe
+
+        class StubRCON:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, cmd):
+                self.commands.append(cmd)
+                return ""
+
+        reset = datetime.now(timezone.utc) + timedelta(minutes=15)
+        pipe._CONTEXT_WINDOW_COOLDOWNS.clear()
+        pipe._CONTEXT_WINDOW_COOLDOWNS["doug"] = reset
+        self.addCleanup(pipe._CONTEXT_WINDOW_COOLDOWNS.clear)
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.telemetry_name = "doug"
+        thread.telemetry = None
+        thread.rcon = StubRCON()
+        thread.log = pipe.logger.bind(agent="doug")
+        thread.heartbeat_interval = 0
+        thread.inbox = std_queue.Queue()
+        thread.inbox.put({
+            "message": "hi",
+            "player_index": 1,
+            "player_name": "giga",
+        })
+
+        with mock.patch("pipe.handle_message", side_effect=AssertionError("called model")):
+            thread._run_once()
+
+        joined = "\n".join(thread.rcon.commands)
+        self.assertIn("SDK context-window limit repeated", joined)
+        self.assertIn("Ready", joined)
+
+    def test_watchdog_aborts_repeated_same_game_rejection_without_clearing_session(self):
+        import pipe
+        from claude_agent_sdk import AssistantMessage, ToolResultBlock, ToolUseBlock, UserMessage
+
+        messages = []
+        for i in range(3):
+            tool_id = f"tool-{i}"
+            messages.append(AssistantMessage(
+                content=[ToolUseBlock(
+                    id=tool_id,
+                    name="mcp__factorioctl__place_entity",
+                    input={"entity_name": "transport-belt", "x": 0, "y": 0},
+                )],
+                model="test",
+            ))
+            messages.append(UserMessage(content=[ToolResultBlock(
+                tool_use_id=tool_id,
+                content="Error: Cannot place entity here",
+                is_error=False,
+            )]))
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                for msg in messages:
+                    yield msg
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with mock.patch("pipe.query", scripted_query):
+            new_session = pipe.handle_message(
+                "go", {}, "system", "old-session", StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+            )
+
+        self.assertEqual(new_session, "old-session")
+        events = journal.load_events("doug")
+        self.assertTrue(any(
+            "watchdog_abort: repeated same game rejection" in event["text"]
+            for event in events
+        ))
+        self.assertFalse(any("context window" in event["text"].lower() for event in events))
+
+    def test_watchdog_no_progress_timeout_reason_reaches_next_autonomy_prompt(self):
+        import ledger
+        import pipe
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        class ImmediateNoProgressWatchdog:
+            def __init__(self):
+                pass
+
+            def observe_text(self):
+                raise pipe.AgentTickWatchdogAbort(
+                    "no successful mutating progress for 12s during active tick"
+                )
+
+            def record_tool_use(self, *_args):
+                pass
+
+            def observe_tool_result(self, *_args):
+                pass
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                yield AssistantMessage(
+                    content=[TextBlock("still thinking")],
+                    model="test",
+                )
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with (
+            mock.patch("pipe.AgentTickWatchdog", ImmediateNoProgressWatchdog),
+            mock.patch("pipe.query", scripted_query),
+        ):
+            new_session = pipe.handle_message(
+                "go", {}, "system", "kept-session", StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+            )
+
+        self.assertEqual(new_session, "kept-session")
+        ledger.save_ledger("doug", {
+            "objective": "Fix stuck smelter",
+            "plan_steps": ["place_entity transport-belt"],
+            "progress_notes": [],
+            "updated_at": "now",
+        })
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.rcon = StubRCON()
+        thread._exec_ticks_since_plan = 0
+        thread._planner_interval = 5
+        thread._planner_model = None
+        thread._reflect_interval = 99
+
+        prompt = thread._autonomy_tick()["message"]
+
+        self.assertIn("watchdog_abort", prompt)
+        self.assertIn("no successful mutating progress", prompt)
+
+    def test_tick_watchdog_no_progress_timeout_is_tunable(self):
+        import pipe
+
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        watchdog = pipe.AgentTickWatchdog(no_progress_timeout_s=10, clock=clock)
+        now[0] = 9.9
+        watchdog.observe_text()
+        now[0] = 10.0
+
+        with self.assertRaises(pipe.AgentTickWatchdogAbort) as raised:
+            watchdog.observe_text()
+
+        self.assertIn("no successful mutating progress", str(raised.exception))
+
+    def test_tick_watchdog_does_not_count_payload_error_as_progress(self):
+        import pipe
+
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        watchdog = pipe.AgentTickWatchdog(no_progress_timeout_s=10, clock=clock)
+        watchdog.record_tool_use("craft-1", "mcp__factorioctl__craft")
+        watchdog.observe_tool_result(
+            "craft-1",
+            pipe.TOOL_RESULT_OK,
+            '{"success":true,"queued":1,"error":"Crafting did not start"}',
+        )
+        now[0] = 10.0
+
+        with self.assertRaises(pipe.AgentTickWatchdogAbort):
+            watchdog.observe_text()
+
+    def test_agent_thread_drops_in_memory_session_on_context_reset(self):
+        import queue as std_queue
+
+        import pipe
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.telemetry_name = "doug"
+        thread.telemetry = None
+        thread.rcon = StubRCON()
+        thread.log = pipe.logger.bind(agent="doug")
+        thread.heartbeat_interval = 0
+        thread.inbox = std_queue.Queue()
+        thread.inbox.put({
+            "message": "go",
+            "player_index": 0,
+            "player_name": "autonomy",
+        })
+        thread.mcp_config = {"factorioctl": {}}
+        thread.system_prompt = "system"
+        thread.session_id = "old-session"
+        thread.model = "haiku"
+        thread.max_turns = 200
+        thread.sdk_skills = ["factorio-control"]
+
+        with (
+            mock.patch("pipe.handle_message", return_value=pipe.SESSION_RESET),
+            mock.patch("pipe.save_session") as save_session,
+        ):
+            thread._run_once()
+
+        self.assertIsNone(thread.session_id)
+        save_session.assert_not_called()
+
     def test_run_agent_journals_sdk_tool_result_failures(self):
         # The whole point of the SDK migration: tool failures arrive as
         # ToolResultBlocks inside UserMessage.content (list) AND, from some
@@ -869,13 +1524,131 @@ error_tips:
         thread._planner_model = None
         thread._reflect_interval = 2
 
-        prompt = thread._compose_autonomy_prompt()
+        tick = thread._autonomy_tick()
+        prompt = tick["message"]
 
         self.assertIn("failure: failure 1", prompt)
         self.assertIn("Boiler area near water", prompt)
         self.assertIn("ERROR TIPS", prompt)
+        self.assertIn("read-only planning turn", prompt)
         self.assertIn("<reflection>", prompt)
-        self.assertIn("what is built where", prompt)
+        self.assertIn("durable built structures", prompt)
+        self.assertIn("short gameplay mistake-avoidance tips", prompt)
+        self.assertIn("Do not include provider limits", prompt)
+        self.assertIn("what durable structure is built where", prompt)
+        self.assertTrue(tick["read_only_tools"])
+
+    def test_autonomy_tick_coalesces_burst_failures_before_injection(self):
+        import ledger
+        import pipe
+
+        ledger_patch = mock.patch(
+            "ledger._ledger_file",
+            side_effect=lambda agent_name: self.base / f".ledger-{agent_name}.json",
+        )
+        ledger_patch.start()
+        self.addCleanup(ledger_patch.stop)
+        ledger.save_ledger("doug", {
+            "objective": "Fix iron smelting",
+            "plan_steps": ["place_entity transport-belt"],
+            "progress_notes": [],
+            "updated_at": "now",
+        })
+        journal.append_event("doug", "progress", "Lab powered")
+        for _ in range(8):
+            journal.append_event(
+                "doug",
+                "failure",
+                "game_rejected: Cannot place belt at 56,-24",
+            )
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.rcon = StubRCON()
+        thread._exec_ticks_since_plan = 0
+        thread._planner_interval = 5
+        thread._planner_model = None
+        thread._reflect_interval = 99
+
+        prompt = thread._autonomy_tick()["message"]
+
+        self.assertIn("progress: Lab powered", prompt)
+        self.assertIn("failure (x8): game_rejected: Cannot place belt", prompt)
+        self.assertEqual(prompt.count("Cannot place belt"), 1)
+
+    def test_autonomy_tick_replans_when_plan_done_signal_is_followed_by_failures(self):
+        import ledger
+        import pipe
+
+        ledger.save_ledger("doug", {
+            "objective": "Power the lab",
+            "plan_steps": ["insert science packs", "start research"],
+            "progress_notes": [],
+            "updated_at": "now",
+        })
+        journal.append_event("doug", "progress", "objective completed: lab is powered")
+        for i in range(3):
+            journal.append_event("doug", "failure", f"game_rejected: stale action {i}")
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.rcon = StubRCON()
+        thread._exec_ticks_since_plan = 0
+        thread._planner_interval = 5
+        thread._planner_model = None
+        thread._reflect_interval = 99
+
+        tick = thread._autonomy_tick()
+
+        self.assertTrue(tick["read_only_tools"])
+        self.assertIn("(planner tick)", tick["message"])
+        self.assertIn("read-only planning turn", tick["message"])
+        self.assertIn("objective completed: lab is powered", tick["message"])
+
+    def test_autonomy_tick_does_not_treat_awaiting_execution_as_plan_done(self):
+        import ledger
+        import pipe
+
+        ledger.save_ledger("doug", {
+            "objective": "Energize the existing smelting array",
+            "plan_steps": [
+                "walk_to(-41, 26)",
+                "insert_items(unit 49, 'coal', 5, 'fuel')",
+            ],
+            "progress_notes": [],
+            "updated_at": "now",
+        })
+        journal.append_event(
+            "doug",
+            "progress",
+            "no changes across planning ticks; plan validated and ready for execution",
+        )
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.rcon = StubRCON()
+        thread._exec_ticks_since_plan = 0
+        thread._planner_interval = 5
+        thread._planner_model = None
+        thread._reflect_interval = 99
+
+        tick = thread._autonomy_tick()
+
+        self.assertNotIn("read_only_tools", tick)
+        self.assertIn("(execution tick)", tick["message"])
+        self.assertNotIn("no changes across planning ticks", tick["message"])
 
 
 if __name__ == "__main__":

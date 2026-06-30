@@ -48,6 +48,25 @@ pub enum ResearchSubcommand {
         /// Technology name
         tech: String,
     },
+
+    /// Feed science packs from the agent inventory into a lab
+    Feed {
+        /// Target lab unit number
+        #[arg(long)]
+        lab_unit_number: u32,
+
+        /// Science pack item name
+        #[arg(long, default_value = "automation-science-pack")]
+        science_pack: String,
+
+        /// Number of packs to transfer
+        #[arg(long, default_value = "1")]
+        count: u32,
+
+        /// Actually transfer packs. Without this flag the command only plans.
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
@@ -249,6 +268,18 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
                     println!("Action needed: {}", action);
                 }
             }
+        }
+
+        ResearchSubcommand::Feed {
+            lab_unit_number,
+            science_pack,
+            count,
+            execute,
+        } => {
+            let result = client
+                .feed_lab_from_inventory(lab_unit_number, &science_pack, count, !execute)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
 

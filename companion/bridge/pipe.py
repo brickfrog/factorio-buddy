@@ -108,7 +108,11 @@ from models import (
     TOOL_PARAM_STRING,
     ToolCallRequest,
 )
-from planner import build_autonomy_prompt, choose_autonomy_mode
+from planner import (
+    build_autonomy_prompt,
+    choose_autonomy_mode,
+    objective_satisfied_by_live_state,
+)
 from skills import strip_skill_trailer
 from rcon import RCONClient, ThreadSafeRCON, lua_long_string
 from paths import find_script_output, find_factorioctl_mcp
@@ -134,6 +138,8 @@ _USAGE_LIMIT_RESET_RE = re.compile(
 _PROVIDER_TIMESTAMP_RE = re.compile(r"\[(?P<stamp>\d{14})[^\]]*\]")
 _USAGE_LIMIT_COOLDOWNS: dict[str, datetime] = {}
 _USAGE_LIMIT_COOLDOWNS_LOCK = threading.Lock()
+_CONTEXT_WINDOW_COOLDOWNS: dict[str, datetime] = {}
+_CONTEXT_WINDOW_COOLDOWNS_LOCK = threading.Lock()
 
 # ── Agent profiles ───────────────────────────────────────────
 
@@ -257,6 +263,8 @@ def sanitize_response(text: str) -> str:
 
 # ── Session persistence ──────────────────────────────────────
 
+SESSION_RESET = "__factorioctl_session_reset__"
+
 def _session_file(agent_name: str) -> Path:
     return _BRIDGE_DIR / f".session-{agent_name}.json"
 
@@ -285,6 +293,31 @@ def save_session(agent_name: str, session_id: str):
     """Persist session ID for an agent (per-agent file, thread-safe)."""
     f = _session_file(agent_name)
     f.write_text(json.dumps({"session_id": session_id}) + "\n")
+
+
+def clear_session(agent_name: str) -> None:
+    """Forget a stale SDK session ID for an agent."""
+    try:
+        _session_file(agent_name).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+    # Backward compat: older bridge versions stored all agents in one file.
+    if not SESSIONS_FILE.exists():
+        return
+    try:
+        data = json.loads(SESSIONS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(data, dict) or agent_name not in data:
+        return
+    data.pop(agent_name, None)
+    try:
+        SESSIONS_FILE.write_text(json.dumps(data) + "\n")
+    except OSError:
+        pass
 
 
 # ── MCP config ───────────────────────────────────────────────
@@ -324,9 +357,24 @@ _BENIGN_STDERR = (
 # so the next autonomy tick re-plans instead of spinning "plan complete".
 _PLAN_DONE_RE = re.compile(
     r"\b(?:plan|objective)\b.{0,40}\b(?:complete|completed|finished|achieved|done)\b"
-    r"|awaiting new|no changes|no further|nothing (?:to do|left|more)",
+    r"|awaiting new|no further|nothing (?:to do|left|more)",
     re.IGNORECASE,
 )
+_PLAN_DONE_EVENT_KINDS = {"progress", "discovery", "milestone"}
+
+
+def _events_indicate_plan_done(events: list[dict]) -> bool:
+    """True when recent useful journal events say the current plan is done."""
+    if not isinstance(events, list):
+        return False
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        if event.get("kind") not in _PLAN_DONE_EVENT_KINDS:
+            continue
+        if _PLAN_DONE_RE.search(str(event.get("text", ""))):
+            return True
+    return False
 
 
 def _is_benign_stderr(stderr: str) -> bool:
@@ -422,18 +470,65 @@ _MUTATING_FACTORIO_TOOLS = {
     "create_zone",
     "delete_zone",
     "extract_items",
+    "feed_lab_from_inventory",
     "insert_items",
     "mine_at",
     "place_entity",
     "remove_entity",
     "route_belt",
+    "rotate_entity",
     "set_recipe",
     "start_research",
     "update_zone",
     "walk_to",
 }
+_READ_ONLY_FACTORIO_TOOLS = {
+    "analyze_belt_gaps",
+    "analyze_belt_networks",
+    "analyze_belt_reach",
+    "analyze_inserters",
+    "build_direct_smelter",
+    "build_edge_miner",
+    "check_placement",
+    "detect_sushi_belts",
+    "diagnose_steam_power",
+    "extend_power_to",
+    "find_build_area",
+    "find_entity_placements",
+    "find_nearest_resource",
+    "get_alerts",
+    "get_available_research",
+    "get_belt_lane_contents",
+    "get_blank_slate",
+    "get_character",
+    "get_entities",
+    "get_inventory",
+    "get_machine_belt_positions",
+    "get_power_coverage",
+    "get_power_networks",
+    "get_power_status",
+    "get_protected_resources",
+    "get_recipe",
+    "get_recipes_by_category",
+    "get_recipes_for_item",
+    "get_research_status",
+    "get_resources",
+    "get_tick",
+    "get_zone",
+    "list_zones",
+    "plan_steam_power",
+    "repair_steam_power",
+    "render_map",
+    "scan_resources",
+    "situation_report",
+    "trace_belt_sources",
+    "verify_production",
+}
 _PARALLEL_MUTATION_GUARD_PREFIX = (
     "Factorioctl bridge blocked parallel mutating tool call:"
+)
+_READ_ONLY_TURN_GUARD_PREFIX = (
+    "Factorioctl bridge blocked non-read-only tool during planner/reflection turn:"
 )
 _SKILL_REQUIRED_GUARD_PREFIX = (
     "Factorioctl bridge blocked Factorio tool before control skill:"
@@ -496,6 +591,14 @@ _FACTORIO_TOOL_PARAM_SCHEMAS: dict[str, dict[str, dict[str, str]]] = {
         },
         "optional": {"inventory_type": TOOL_PARAM_STRING},
     },
+    "feed_lab_from_inventory": {
+        "required": {
+            "lab_unit_number": TOOL_PARAM_INTEGER,
+            "science_pack": TOOL_PARAM_STRING,
+            "count": TOOL_PARAM_INTEGER,
+        },
+        "optional": {"dry_run": TOOL_PARAM_BOOLEAN},
+    },
     "route_belt": {
         "required": {
             "from_x": TOOL_PARAM_INTEGER,
@@ -550,8 +653,38 @@ _FACTORIO_TOOL_PARAM_SCHEMAS: dict[str, dict[str, dict[str, str]]] = {
     "remove_entity": {
         "required": {"unit_number": TOOL_PARAM_INTEGER},
     },
+    "rotate_entity": {
+        "required": {
+            "unit_number": TOOL_PARAM_INTEGER,
+            "direction": TOOL_PARAM_STRING,
+        },
+    },
     "get_machine_belt_positions": {
         "required": {"unit_number": TOOL_PARAM_INTEGER},
+    },
+    "build_edge_miner": {
+        "required": {
+            "resource_type": TOOL_PARAM_STRING,
+            "x": TOOL_PARAM_NUMBER,
+            "y": TOOL_PARAM_NUMBER,
+        },
+        "optional": {
+            "radius": TOOL_PARAM_INTEGER,
+            "drill_name": TOOL_PARAM_STRING,
+            "limit": TOOL_PARAM_INTEGER,
+        },
+    },
+    "build_direct_smelter": {
+        "optional": {
+            "drill_unit_number": TOOL_PARAM_INTEGER,
+            "output_x": TOOL_PARAM_NUMBER,
+            "output_y": TOOL_PARAM_NUMBER,
+            "output_direction": TOOL_PARAM_STRING,
+            "furnace_name": TOOL_PARAM_STRING,
+            "inserter_name": TOOL_PARAM_STRING,
+            "belt_name": TOOL_PARAM_STRING,
+            "radius": TOOL_PARAM_INTEGER,
+        },
     },
     "plan_steam_power": {
         "required": {
@@ -562,6 +695,24 @@ _FACTORIO_TOOL_PARAM_SCHEMAS: dict[str, dict[str, dict[str, str]]] = {
             "target_x": TOOL_PARAM_NUMBER,
             "target_y": TOOL_PARAM_NUMBER,
         },
+    },
+    "repair_steam_power": {
+        "required": {
+            "x": TOOL_PARAM_INTEGER,
+            "y": TOOL_PARAM_INTEGER,
+            "target_x": TOOL_PARAM_NUMBER,
+            "target_y": TOOL_PARAM_NUMBER,
+        },
+        "optional": {"radius": TOOL_PARAM_INTEGER},
+    },
+    "extend_power_to": {
+        "required": {
+            "x": TOOL_PARAM_INTEGER,
+            "y": TOOL_PARAM_INTEGER,
+            "target_x": TOOL_PARAM_NUMBER,
+            "target_y": TOOL_PARAM_NUMBER,
+        },
+        "optional": {"radius": TOOL_PARAM_INTEGER},
     },
     "diagnose_steam_power": {
         "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
@@ -603,6 +754,20 @@ def _is_mutating_factorio_tool(tool_name: str) -> bool:
     return _short_factorio_tool_name(tool_name) in _MUTATING_FACTORIO_TOOLS
 
 
+def _is_read_only_factorio_tool(tool_name: str) -> bool:
+    return _short_factorio_tool_name(tool_name) in _READ_ONLY_FACTORIO_TOOLS
+
+
+def _is_read_only_dry_run_tool_call(tool_name: str, hook_input: Any) -> bool:
+    if _short_factorio_tool_name(tool_name) != "feed_lab_from_inventory":
+        return False
+    try:
+        request = ToolCallRequest.from_hook_input(hook_input)
+    except BridgeValidationError:
+        return False
+    return request.tool_input.get("dry_run", True) is not False
+
+
 def _is_factorio_mcp_tool(tool_name: str) -> bool:
     return str(tool_name).startswith(_MCP_TOOL_PREFIX)
 
@@ -612,6 +777,7 @@ def _is_operator_only_tool_refusal(text: str) -> bool:
     return (
         stripped.startswith("Error: execute_lua is disabled.")
         or stripped.startswith(_PARALLEL_MUTATION_GUARD_PREFIX)
+        or stripped.startswith(_READ_ONLY_TURN_GUARD_PREFIX)
         or stripped.startswith(_SKILL_REQUIRED_GUARD_PREFIX)
         or stripped.startswith(_PARAM_SCHEMA_GUARD_PREFIX)
     )
@@ -652,7 +818,8 @@ def _classify_text_failure(text: str) -> str | None:
         return TOOL_RESULT_EXPECTED_MISS
     if re.search(
         r"invalid type|invalid json|failed to deserialize|expected .*sequence|"
-        r"missing required|missing field|unknown field|bad request|packet too large",
+        r"missing required|missing field|value for required field\b.{0,80}\bmissing|"
+        r"unknown field|bad request|packet too large",
         lowered,
     ):
         return TOOL_RESULT_INVALID_REQUEST
@@ -682,6 +849,8 @@ def _classify_text_failure(text: str) -> str | None:
 def _classify_json_payload(value: Any) -> str | None:
     if isinstance(value, dict):
         success_false = value.get("success") is False
+        if success_false and value.get("expected_miss") is True:
+            return TOOL_RESULT_EXPECTED_MISS
 
         if value.get("type") == "text":
             text = str(value.get("text", ""))
@@ -732,7 +901,7 @@ def _classify_json_payload(value: Any) -> str | None:
                 if success_false:
                     return TOOL_RESULT_GAME_REJECTED
                 return TOOL_RESULT_SDK_FAILURE
-            if key_lower in {"message", "reason", "action_needed"} and item:
+            if key_lower in {"message", "reason", "action_needed"} and item and success_false:
                 text_class = _classify_text_failure(str(item))
                 if text_class:
                     return text_class
@@ -799,24 +968,25 @@ def _journal_classified_tool_failure(
     )
 
 
-def _log_tool_result(agent_name: str, log, text: str, sdk_is_error: bool = False) -> None:
+def _log_tool_result(agent_name: str, log, text: str, sdk_is_error: bool = False) -> str:
     classification = _classify_tool_result(text, sdk_is_error=sdk_is_error)
     if classification == TOOL_RESULT_OK:
         if text.strip():
             log.debug("tool_result: {}", text)
-        return
+        return classification
     if classification == TOOL_RESULT_EXPECTED_MISS:
         log.debug("tool_result expected_miss: {}", text)
-        return
+        return classification
     if classification == TOOL_RESULT_GAME_REJECTED:
         log.info("tool_result game_rejected: {}", text)
         _journal_classified_tool_failure(agent_name, classification, text)
-        return
+        return classification
     if classification in TOOL_RESULT_FAILURE_CLASSES:
         log.warning("tool_result {}: {}", classification, text)
         _journal_classified_tool_failure(agent_name, classification, text)
-        return
+        return classification
     log.debug("tool_result {}: {}", classification, text)
+    return classification
 
 
 class MutatingToolBatchGate:
@@ -883,6 +1053,43 @@ class MutatingToolBatchGate:
                 "permissionDecision": "allow",
             }
         }
+
+
+class PlannerReadOnlyToolGate:
+    """Block Factorio MCP mutations while the bridge is running a planning turn."""
+
+    def __init__(self, log, enabled: bool = False):
+        self.log = log
+        self.enabled = enabled
+
+    async def hook(
+        self,
+        hook_input: Any,
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            return {}
+
+        tool_name = str(_hook_value(hook_input, "tool_name") or "")
+        if not tool_name or not _is_factorio_mcp_tool(tool_name):
+            return {}
+        if _is_read_only_factorio_tool(tool_name):
+            return {}
+        if _is_read_only_dry_run_tool_call(tool_name, hook_input):
+            return {}
+
+        short_name = _short_factorio_tool_name(tool_name)
+        message = (
+            f"{_READ_ONLY_TURN_GUARD_PREFIX} {short_name}. "
+            "This turn may only use read-only diagnostics; emit a ledger-only "
+            "plan or reflection and stop."
+        )
+        self.log.debug(
+            "blocked non-read-only tool during planner/reflection turn: {}",
+            short_name,
+        )
+        return _deny_pre_tool_use(message)
 
 
 class FactorioToolSchemaGate:
@@ -967,6 +1174,138 @@ class FactorioSkillGate:
                 return _deny_pre_tool_use(message)
 
         return {}
+
+
+class AgentTickWatchdog:
+    """Abort a single SDK tick that is looping without useful game progress."""
+
+    def __init__(
+        self,
+        *,
+        same_failure_limit: int | None = None,
+        no_progress_timeout_s: float | None = None,
+        clock=time.monotonic,
+    ):
+        self.same_failure_limit = (
+            _WATCHDOG_SAME_FAILURE_LIMIT
+            if same_failure_limit is None
+            else int(same_failure_limit)
+        )
+        self.no_progress_timeout_s = (
+            _WATCHDOG_NO_PROGRESS_TIMEOUT_S
+            if no_progress_timeout_s is None
+            else float(no_progress_timeout_s)
+        )
+        self.clock = clock
+        self.started_at = self.clock()
+        self.last_progress_at = self.started_at
+        self._tool_names: dict[str, str] = {}
+        self._last_failure_signature: str | None = None
+        self._same_failure_count = 0
+
+    def record_tool_use(self, tool_use_id: str | None, tool_name: str) -> None:
+        if tool_use_id:
+            self._tool_names[str(tool_use_id)] = str(tool_name)
+        self.check_no_progress()
+
+    def observe_text(self) -> None:
+        self.check_no_progress()
+
+    def observe_tool_result(
+        self,
+        tool_use_id: str | None,
+        classification: str,
+        text: str,
+    ) -> None:
+        tool_name = self._tool_names.get(str(tool_use_id), "") if tool_use_id else ""
+        if classification == TOOL_RESULT_OK:
+            if (
+                _is_mutating_factorio_tool(tool_name)
+                and _tool_result_indicates_progress(text)
+            ):
+                self.mark_progress()
+            self._last_failure_signature = None
+            self._same_failure_count = 0
+            self.check_no_progress()
+            return
+
+        if classification == TOOL_RESULT_EXPECTED_MISS:
+            self.check_no_progress()
+            return
+
+        if classification == TOOL_RESULT_GAME_REJECTED:
+            signature = self._failure_signature(tool_name, classification, text)
+            if signature == self._last_failure_signature:
+                self._same_failure_count += 1
+            else:
+                self._last_failure_signature = signature
+                self._same_failure_count = 1
+            if (
+                self.same_failure_limit > 0
+                and self._same_failure_count >= self.same_failure_limit
+            ):
+                short_tool = _short_factorio_tool_name(tool_name) or "tool"
+                raise AgentTickWatchdogAbort(
+                    "repeated same game rejection "
+                    f"({self._same_failure_count}x) from {short_tool}: "
+                    f"{_short_event_text(text)}"
+                )
+            self.check_no_progress()
+            return
+
+        self.check_no_progress()
+
+    def mark_progress(self) -> None:
+        self.last_progress_at = self.clock()
+
+    def check_no_progress(self) -> None:
+        if self.no_progress_timeout_s <= 0:
+            return
+        elapsed = self.clock() - self.last_progress_at
+        if elapsed >= self.no_progress_timeout_s:
+            raise AgentTickWatchdogAbort(
+                "no successful mutating progress for "
+                f"{elapsed:.0f}s during active tick"
+            )
+
+    def _failure_signature(self, tool_name: str, classification: str, text: str) -> str:
+        return "|".join([
+            _short_factorio_tool_name(tool_name),
+            classification,
+            _short_event_text(text),
+        ])
+
+
+def _tool_result_indicates_progress(text: str) -> bool:
+    stripped = str(text).strip()
+    if not stripped:
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except (TypeError, ValueError):
+        return True
+    return _json_payload_indicates_progress(parsed)
+
+
+def _json_payload_indicates_progress(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("success") is False:
+            return False
+        if value.get("error"):
+            return False
+        if value.get("type") == "text":
+            text = str(value.get("text", "")).strip()
+            if not text:
+                return False
+            try:
+                nested = json.loads(text)
+            except (TypeError, ValueError):
+                return not _looks_like_tool_error(text)
+            return _json_payload_indicates_progress(nested)
+        return True
+    if isinstance(value, list):
+        return any(_json_payload_indicates_progress(item) for item in value)
+    return True
 
 
 def _deny_pre_tool_use(message: str) -> dict[str, Any]:
@@ -1090,6 +1429,47 @@ def _is_meaningful_anomaly(text: str) -> bool:
 
 def _is_sdk_terminal_error_echo(text: str) -> bool:
     return "Claude Code returned an error result:" in str(text)
+
+
+def _is_context_window_limit(text: str) -> bool:
+    lowered = str(text).lower()
+    return (
+        "context window limit" in lowered
+        or "context length" in lowered
+        or "maximum context" in lowered
+    )
+
+
+def _handle_context_window_limit(
+    *,
+    agent_name: str,
+    session_id: str | None,
+    log,
+    telemetry: Telemetry | None,
+    telemetry_name: str,
+    rcon: RCONClient,
+    player_index: int,
+    rcon_target: str,
+) -> str:
+    clear_session(agent_name)
+    if session_id:
+        error_msg = (
+            "Error: SDK context window limit reached; cleared saved session. "
+            "The next tick will start a fresh SDK session."
+        )
+        log.warning("sdk context window limit; cleared session for {}", agent_name)
+    else:
+        cooldown_until = _set_context_window_cooldown(agent_name, log)
+        error_msg = _context_window_message(cooldown_until)
+        log.warning(
+            "sdk context window limit persisted after session reset for {}; backing off",
+            agent_name,
+        )
+    emit_error(telemetry, error_msg, agent=telemetry_name)
+    if player_index > 0:
+        send_response(rcon, player_index, rcon_target, error_msg)
+        set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
+    return SESSION_RESET
 
 
 def _disallowed_tools_for_env(env: dict[str, str]) -> list[str]:
@@ -1237,6 +1617,70 @@ def _usage_limit_message(reset_at: datetime) -> str:
     )
 
 
+def _context_window_backoff_s() -> float:
+    try:
+        return max(
+            1.0,
+            float(os.environ.get("BRIDGE_CONTEXT_WINDOW_BACKOFF_S", "900")),
+        )
+    except (TypeError, ValueError):
+        return 900.0
+
+
+def _context_window_message(reset_at: datetime) -> str:
+    return (
+        "SDK context-window limit repeated after session reset. "
+        f"Agent attempts will resume after {_format_local_time(reset_at)}."
+    )
+
+
+def _set_context_window_cooldown(
+    agent_name: str,
+    log=None,
+    now: datetime | None = None,
+    seconds: float | None = None,
+) -> datetime:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.astimezone()
+    delay_s = seconds if seconds is not None else _context_window_backoff_s()
+    reset_at = now + timedelta(seconds=delay_s)
+
+    changed = False
+    with _CONTEXT_WINDOW_COOLDOWNS_LOCK:
+        existing = _CONTEXT_WINDOW_COOLDOWNS.get(agent_name)
+        if existing is None or reset_at > existing:
+            _CONTEXT_WINDOW_COOLDOWNS[agent_name] = reset_at
+            changed = True
+        else:
+            reset_at = existing
+    if log and changed:
+        log.info(
+            "sdk context-window cooldown active until {}; pausing agent attempts",
+            _format_local_time(reset_at),
+        )
+    return reset_at
+
+
+def _get_context_window_cooldown(
+    agent_name: str,
+    now: datetime | None = None,
+) -> datetime | None:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.astimezone()
+    with _CONTEXT_WINDOW_COOLDOWNS_LOCK:
+        reset_at = _CONTEXT_WINDOW_COOLDOWNS.get(agent_name)
+        if not reset_at:
+            return None
+        if reset_at <= now:
+            _CONTEXT_WINDOW_COOLDOWNS.pop(agent_name, None)
+            return None
+        return reset_at
+
+
 def _set_usage_limit_cooldown(
     agent_name: str,
     text: str,
@@ -1310,8 +1754,18 @@ _TICK_TIMEOUT_S = float(os.environ.get("BRIDGE_TICK_TIMEOUT_S", "2400"))
 # let the bridge resume on the next autonomy tick.
 _STREAM_IDLE_TIMEOUT_S = float(os.environ.get("BRIDGE_STREAM_IDLE_TIMEOUT_S", "300"))
 
+# Abort a single active tick when it is making no useful game progress. This is
+# deliberately separate from session reset: a stuck layout is not a dead SDK
+# session.
+_WATCHDOG_SAME_FAILURE_LIMIT = int(os.environ.get("BRIDGE_WATCHDOG_SAME_FAILURE_LIMIT", "3"))
+_WATCHDOG_NO_PROGRESS_TIMEOUT_S = float(os.environ.get("BRIDGE_WATCHDOG_NO_PROGRESS_TIMEOUT_S", "900"))
+
 
 class AgentStreamIdleTimeout(TimeoutError):
+    pass
+
+
+class AgentTickWatchdogAbort(TimeoutError):
     pass
 
 
@@ -1362,6 +1816,7 @@ async def _run_agent(
 ) -> tuple[list[str], str | None]:
     text_parts: list[str] = []
     new_session_id: str | None = None
+    watchdog = AgentTickWatchdog()
 
     async for msg in _query_with_idle_timeout(prompt=prompt, options=options):
         if isinstance(msg, AssistantMessage):
@@ -1371,8 +1826,11 @@ async def _run_agent(
                 if isinstance(block, TextBlock):
                     text_parts.append(block.text)
                     _set_usage_limit_cooldown(agent_name, block.text, log)
+                    if not _USAGE_LIMIT_RESET_RE.search(block.text):
+                        watchdog.observe_text()
                     log.info("text: {}", block.text.strip())
                 elif isinstance(block, ToolUseBlock):
+                    watchdog.record_tool_use(getattr(block, "id", None), block.name)
                     display = _short_tool_name(block.name)
                     if _is_skill_tool(block):
                         log.info("skill: {}({})", display, _json_for_log(block.input))
@@ -1400,18 +1858,24 @@ async def _run_agent(
             # BOTH so a string-wrapped failure can't vanish unlogged again.
             if isinstance(msg.content, str):
                 text, player_messages = _result_text_and_player_messages(msg.content)
-                _log_tool_result(agent_name, log, text, sdk_is_error=False)
+                classification = _log_tool_result(agent_name, log, text, sdk_is_error=False)
+                watchdog.observe_tool_result(None, classification, text)
                 if player_messages:
                     log.info("player_messages: {}", player_messages)
             else:
                 for block in msg.content:
                     if isinstance(block, ToolResultBlock):
                         text, player_messages = _result_text_and_player_messages(block.content)
-                        _log_tool_result(
+                        classification = _log_tool_result(
                             agent_name,
                             log,
                             text,
                             sdk_is_error=bool(block.is_error),
+                        )
+                        watchdog.observe_tool_result(
+                            getattr(block, "tool_use_id", None),
+                            classification,
+                            text,
                         )
                         if player_messages:
                             log.info("player_messages: {}", player_messages)
@@ -1421,7 +1885,12 @@ async def _run_agent(
                 text_parts.append(msg.result)
             if msg.is_error:
                 detail = msg.result or "; ".join(msg.errors or []) or "agent result marked as error"
-                if not _set_usage_limit_cooldown(agent_name, detail, log):
+                if _is_context_window_limit(detail):
+                    log.warning(
+                        "result sdk_context_window: {}; clearing SDK session before next attempt",
+                        detail,
+                    )
+                elif not _set_usage_limit_cooldown(agent_name, detail, log):
                     classification = TOOL_RESULT_SDK_FAILURE
                     log.warning("result {}: {}", classification, detail)
                     append_event(
@@ -1491,6 +1960,7 @@ def handle_message(
     model: str | None = None,
     max_turns: int | None = None,
     sdk_skills: list[str] | str | None = None,
+    read_only_tools: bool = False,
 ) -> str | None:
     """Pipe a message through the Claude SDK. Returns new session_id.
     agent_name: registered agent name (for RCON/mod).
@@ -1505,6 +1975,7 @@ def handle_message(
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     mutating_tool_gate = MutatingToolBatchGate(log)
+    read_only_tool_gate = PlannerReadOnlyToolGate(log, enabled=read_only_tools)
     resolved_sdk_skills = (
         _resolve_sdk_skills(sdk_skills)
         if sdk_skills is not None
@@ -1532,6 +2003,7 @@ def handle_message(
         hooks={
             "PreToolUse": [
                 HookMatcher(hooks=[
+                    read_only_tool_gate.hook,
                     factorio_skill_gate.hook,
                     factorio_schema_gate.hook,
                     mutating_tool_gate.hook,
@@ -1556,6 +2028,18 @@ def handle_message(
                 timeout=_TICK_TIMEOUT_S,
             )
         )
+        if any(_is_context_window_limit(part) for part in text_parts):
+            return _handle_context_window_limit(
+                agent_name=agent_name,
+                session_id=session_id,
+                log=log,
+                telemetry=telemetry,
+                telemetry_name=tname,
+                rcon=rcon,
+                player_index=player_index,
+                rcon_target=rcon_target,
+            )
+
         cooldown_until = _get_usage_limit_cooldown(agent_name)
         if cooldown_until and any(_USAGE_LIMIT_RESET_RE.search(part) for part in text_parts):
             text_parts = [_usage_limit_message(cooldown_until)]
@@ -1572,6 +2056,16 @@ def handle_message(
             agent_name, "failure",
             _short_event_text(f"stream idle timeout after {_STREAM_IDLE_TIMEOUT_S:.0f}s"),
         )
+        emit_error(telemetry, error_msg, agent=tname)
+        if player_index > 0:
+            send_response(rcon, player_index, rcon_target, error_msg)
+            set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
+        return session_id
+    except AgentTickWatchdogAbort as e:
+        reason = _short_event_text(str(e))
+        error_msg = f"Error: watchdog aborted stuck tick: {reason}"
+        log.warning("watchdog aborted stuck tick: {}", reason)
+        append_event(agent_name, "failure", f"watchdog_abort: {reason}")
         emit_error(telemetry, error_msg, agent=tname)
         if player_index > 0:
             send_response(rcon, player_index, rcon_target, error_msg)
@@ -1603,6 +2097,17 @@ def handle_message(
             _set_usage_limit_cooldown(agent_name, str(e), log)
             or _get_usage_limit_cooldown(agent_name)
         )
+        if _is_context_window_limit(str(e)):
+            return _handle_context_window_limit(
+                agent_name=agent_name,
+                session_id=session_id,
+                log=log,
+                telemetry=telemetry,
+                telemetry_name=tname,
+                rcon=rcon,
+                player_index=player_index,
+                rcon_target=rcon_target,
+            )
         if _is_sdk_terminal_error_echo(str(e)):
             if cooldown_until:
                 log.debug(
@@ -1807,16 +2312,25 @@ class AgentThread:
     def _autonomy_tick(self) -> dict:
         """Choose plan/execute mode, update cadence state, and build the message."""
         ledger = load_ledger(self.agent_name)
-        events = load_events(self.agent_name, 5)
+        events = load_events(self.agent_name, 20)
         memory = render_memory(events, load_reflection(self.agent_name))
         ledger_text = render_ledger(ledger)
         learned_text = render_accepted_learning(load_accepted_learning())
+        live_state = self._live_state_line()
         mode = choose_autonomy_mode(
             ledger, self._exec_ticks_since_plan, self._planner_interval,
         )
+        live_stale_reason = objective_satisfied_by_live_state(ledger, live_state)
+        reflect_due = should_reflect(
+            count_events(self.agent_name), getattr(self, "_reflect_interval", 16),
+        )
         # If the last tick reported the plan/objective finished, re-plan NOW
         # instead of spinning "plan complete" for planner_interval ticks.
-        if mode == "execute" and events and _PLAN_DONE_RE.search(events[-1].get("text", "")):
+        if mode == "execute" and _events_indicate_plan_done(events):
+            mode = "plan"
+        if mode == "execute" and live_stale_reason:
+            mode = "plan"
+        if mode == "execute" and reflect_due:
             mode = "plan"
         if mode == "plan":
             self._exec_ticks_since_plan = 0
@@ -1824,24 +2338,30 @@ class AgentThread:
             self._exec_ticks_since_plan += 1
         parts = [memory, ledger_text, learned_text]
         continuity_parts = [part for part in parts if part]
+        if live_stale_reason:
+            live_state = "\n".join([
+                live_state,
+                f"Live-state completion signal: {live_stale_reason}",
+            ]).strip()
 
         message = build_autonomy_prompt(
-            mode, "\n\n".join(continuity_parts), self._live_state_line(),
+            mode, "\n\n".join(continuity_parts), live_state,
         )
         if mode == "plan":
             message = "\n\n".join([message, learning_proposal_prompt()])
-        if should_reflect(
-            count_events(self.agent_name), getattr(self, "_reflect_interval", 16),
-        ):
+        if reflect_due:
             message = "\n\n".join([
                 message,
                 "This is a reflection turn: emit a hidden <reflection> block "
-                "summarizing durable lessons in exactly this format:\n"
+                "summarizing only durable built structures and short gameplay "
+                "mistake-avoidance tips. Do not include provider limits, SDK "
+                "session failures, timeouts, max-turn failures, or fresh-start "
+                "non-lessons. Use exactly this format:\n"
                 "<reflection>\n"
                 "structures:\n"
-                "- what is built where\n"
+                "- what durable structure is built where\n"
                 "error_tips:\n"
-                "- mistake to avoid next time\n"
+                "- short gameplay mistake to avoid next time\n"
                 "</reflection>",
             ])
 
@@ -1851,6 +2371,8 @@ class AgentThread:
             "player_name": "autonomy",
             "autonomy": True,
         }
+        if mode == "plan" or reflect_due:
+            tick["read_only_tools"] = True
         if mode == "plan" and self._planner_model:
             tick["model"] = self._planner_model
         return tick
@@ -1867,6 +2389,8 @@ class AgentThread:
                 return self.inbox.get(timeout=self.heartbeat_interval)
             except queue.Empty:
                 if _get_usage_limit_cooldown(self.agent_name):
+                    continue
+                if _get_context_window_cooldown(self.agent_name):
                     continue
                 if self.autonomy_requires_player and not self._human_connected():
                     continue
@@ -1925,6 +2449,21 @@ class AgentThread:
                     self.log.debug("rate-limit status reply failed: {}", e)
             return
 
+        context_cooldown_until = _get_context_window_cooldown(self.agent_name)
+        if context_cooldown_until:
+            if player_index > 0:
+                try:
+                    send_response(
+                        self.rcon,
+                        player_index,
+                        response_to or self.agent_name,
+                        _context_window_message(context_cooldown_until),
+                    )
+                    set_status(self.rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
+                except Exception as e:
+                    self.log.debug("context-window cooldown status reply failed: {}", e)
+            return
+
         # player_index=0 means injected message (supervisor/API), skip GUI updates
         if player_index > 0:
             try:
@@ -1946,7 +2485,11 @@ class AgentThread:
             agent_name=self.agent_name, telemetry_name=self.telemetry_name,
             response_to=response_to, model=msg.get("model") or self.model,
             max_turns=self.max_turns, sdk_skills=self.sdk_skills,
+            read_only_tools=bool(msg.get("read_only_tools")),
         )
+        if new_session == SESSION_RESET:
+            self.session_id = None
+            return
         if new_session:
             self.session_id = new_session
             save_session(self.agent_name, self.session_id)
@@ -2278,6 +2821,19 @@ def main():
                 log.info("{} -> {}: {}", player_name, agent_name, message)
                 emit_chat(telemetry, "player", message, agent=telemetry_name)
 
+                cooldown_message = ""
+                cooldown_until = _get_usage_limit_cooldown(agent_name)
+                if cooldown_until:
+                    cooldown_message = _usage_limit_message(cooldown_until)
+                context_cooldown_until = _get_context_window_cooldown(agent_name)
+                if context_cooldown_until:
+                    cooldown_message = _context_window_message(context_cooldown_until)
+                if cooldown_message:
+                    if player_index > 0:
+                        send_response(rcon, player_index, agent_name, cooldown_message)
+                        set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
+                    continue
+
                 if player_index > 0:
                     try:
                         set_status(rcon, player_index, "[color=1,0.8,0.2]Thinking...[/color]")
@@ -2296,7 +2852,11 @@ def main():
                     agent_name=agent_name, telemetry_name=telemetry_name,
                     model=model, max_turns=max_turns,
                     sdk_skills=sdk_skills,
+                    read_only_tools=bool(msg.get("read_only_tools")),
                 )
+                if new_session == SESSION_RESET:
+                    session_id = None
+                    continue
                 if new_session:
                     session_id = new_session
                     save_session(agent_name, session_id)

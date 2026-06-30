@@ -1,133 +1,137 @@
 #!/bin/bash
-# Setup test environment for factorioctl
+# Setup an isolated Factorio server for factorioctl runtime tests.
 #
-# This script:
-# 1. Builds the Rust CLI in release mode
-# 2. Creates a test map (if needed)
-# 3. Starts a headless Factorio server
-#
-# Usage: ./tests/setup.sh [save_path]
-#        SAVE_PATH=saves/mymap.zip ./tests/setup.sh
+# This script deliberately uses a test save, test RCON port, and test
+# write-data directory. It must not touch the companion save used by
+# `just play` / `just resume`.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-# Configuration (can be overridden via environment variables)
 SAVE_NAME="${SAVE_NAME:-test_map}"
 RCON_PORT="${RCON_PORT:-27016}"
 RCON_PASSWORD="${RCON_PASSWORD:-test_password}"
-GAME_PORT="${GAME_PORT:-34197}"
+GAME_PORT="${GAME_PORT:-34198}"
+SERVER_DATA_DIR="${SERVER_DATA_DIR:-$PROJECT_ROOT/.factorio-test-data}"
+CONFIG_FILE="$SERVER_DATA_DIR/config.ini"
+MOD_SRC="$PROJECT_ROOT/companion/mod/claude-interface"
+MOD_DST="$SERVER_DATA_DIR/mods/claude-interface"
 
-# Allow save path via argument or environment variable
-if [ -n "$1" ]; then
+if [ -n "${1:-}" ]; then
     SAVE_PATH="$1"
+else
+    SAVE_PATH="${SAVE_PATH:-$PROJECT_ROOT/saves/${SAVE_NAME}.zip}"
 fi
 
-# Use separate data directory so headless server doesn't conflict with Steam client
-SERVER_DATA_DIR="$PROJECT_ROOT/.factorio-server"
+if [[ "$SAVE_PATH" != /* ]]; then
+    SAVE_PATH="$PROJECT_ROOT/$SAVE_PATH"
+fi
 
-echo "=== factorioctl Test Setup ==="
-echo ""
-
-# Step 1: Build the CLI
-echo "Building factorioctl (release mode)..."
-cargo build --release --quiet
-echo "  Built: ./target/release/factorioctl"
-echo ""
-
-# Step 2: Resolve save path
-if [ -z "$SAVE_PATH" ]; then
-    # No save path provided, use default test map
-    SAVE_PATH="$PROJECT_ROOT/saves/${SAVE_NAME}.zip"
-    if [ ! -f "$SAVE_PATH" ]; then
-        echo "Creating test map..."
-        python3 scripts/create_map.py --name "$SAVE_NAME" --config configs/test-map-gen.json
-        echo "  Created: $SAVE_PATH"
+find_factorio_bin() {
+    if [ -n "${FACTORIO_BIN:-}" ]; then
+        echo "$FACTORIO_BIN"
+    elif [ -n "${FACTORIO_BINARY:-}" ]; then
+        echo "$FACTORIO_BINARY"
+    elif command -v factorio >/dev/null 2>&1; then
+        command -v factorio
+    elif [ -x "/mnt/games/SteamLibrary/steamapps/common/Factorio/bin/x64/factorio" ]; then
+        echo "/mnt/games/SteamLibrary/steamapps/common/Factorio/bin/x64/factorio"
+    elif [ -x "$HOME/.local/share/Steam/steamapps/common/Factorio/bin/x64/factorio" ]; then
+        echo "$HOME/.local/share/Steam/steamapps/common/Factorio/bin/x64/factorio"
+    elif [ -x "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/Factorio/bin/x64/factorio" ]; then
+        echo "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/Factorio/bin/x64/factorio"
+    elif [ -x "$HOME/Library/Application Support/Steam/steamapps/common/Factorio/factorio.app/Contents/MacOS/factorio" ]; then
+        echo "$HOME/Library/Application Support/Steam/steamapps/common/Factorio/factorio.app/Contents/MacOS/factorio"
     else
-        echo "Using existing test map: $SAVE_PATH"
+        return 1
     fi
-else
-    # Convert relative path to absolute if needed
-    if [[ "$SAVE_PATH" != /* ]]; then
-        SAVE_PATH="$PROJECT_ROOT/$SAVE_PATH"
-    fi
-    if [ ! -f "$SAVE_PATH" ]; then
-        echo "ERROR: Save file not found: $SAVE_PATH"
-        exit 1
-    fi
-    echo "Using provided save: $SAVE_PATH"
-fi
-echo ""
+}
 
-# Step 3: Check if server is already running
-SAVE_BASENAME="$(basename "$SAVE_PATH")"
-if pgrep -f "factorio.*--start-server.*${SAVE_BASENAME}" > /dev/null; then
-    echo "Server already running with this save. Stop it with: ./tests/cleanup.sh"
+FACTORIO_BIN="$(find_factorio_bin)" || {
+    echo "ERROR: Factorio binary not found. Set FACTORIO_BIN=/path/to/factorio"
+    exit 1
+}
+
+FACTORIO_DATA="$(dirname "$(dirname "$(dirname "$FACTORIO_BIN")")")/data"
+if [ ! -d "$FACTORIO_DATA" ]; then
+    echo "ERROR: Could not infer Factorio data directory from $FACTORIO_BIN"
+    echo "       Expected: $FACTORIO_DATA"
     exit 1
 fi
 
-# Step 4: Find Factorio binary
-FACTORIO_BIN=""
-STEAM_PATH="$HOME/Library/Application Support/Steam/steamapps/common/Factorio/factorio.app/Contents/MacOS/factorio"
-if [ -f "$STEAM_PATH" ]; then
-    FACTORIO_BIN="$STEAM_PATH"
-elif command -v factorio &> /dev/null; then
-    FACTORIO_BIN="$(which factorio)"
-else
-    echo "ERROR: Factorio not found. Please install Factorio or set FACTORIO_PATH."
+echo "=== factorioctl isolated runtime setup ==="
+echo "  Factorio: $FACTORIO_BIN"
+echo "  Save: $SAVE_PATH"
+echo "  RCON: localhost:$RCON_PORT"
+echo "  Game: localhost:$GAME_PORT"
+echo "  Data: $SERVER_DATA_DIR"
+echo ""
+
+echo "Building factorioctl release binaries..."
+cargo build --release --quiet
+
+mkdir -p "$PROJECT_ROOT/saves" "$PROJECT_ROOT/logs" "$SERVER_DATA_DIR/mods"
+
+cat > "$CONFIG_FILE" << EOF
+; Auto-generated by tests/setup.sh - do not edit by hand
+[path]
+read-data=$FACTORIO_DATA
+write-data=$SERVER_DATA_DIR
+
+[other]
+check-updates=false
+EOF
+
+rm -rf "$MOD_DST"
+cp -R "$MOD_SRC" "$MOD_DST"
+
+if pgrep -f "factorio.*--rcon-port $RCON_PORT" >/dev/null; then
+    echo "ERROR: test server already running on RCON port $RCON_PORT"
+    echo "       Stop it with: ./tests/cleanup.sh"
     exit 1
 fi
-echo "Using Factorio: $FACTORIO_BIN"
-echo ""
 
-# Step 5: Start headless server
-echo "Starting headless server..."
-echo "  RCON port: $RCON_PORT"
-echo "  RCON password: $RCON_PASSWORD"
-echo "  Game port: $GAME_PORT (for spectating)"
-echo "  Data dir: $SERVER_DATA_DIR"
-echo ""
+if [ ! -f "$SAVE_PATH" ]; then
+    echo "Creating isolated test save..."
+    "$FACTORIO_BIN" \
+        --config "$CONFIG_FILE" \
+        --create "$SAVE_PATH" \
+        --map-gen-settings "$PROJECT_ROOT/configs/test-map-gen.json"
+fi
 
-# Create directories
-mkdir -p "$PROJECT_ROOT/logs"
-mkdir -p "$SERVER_DATA_DIR"
-LOG_FILE="$PROJECT_ROOT/logs/server.log"
+echo "Starting isolated headless server..."
+LOG_FILE="$PROJECT_ROOT/logs/test-server.log"
+STDIN_FIFO="$PROJECT_ROOT/logs/test-server.stdin"
+STDIN_KEEPER_PID_FILE="$PROJECT_ROOT/logs/test-server.stdin.pid"
+rm -f "$STDIN_FIFO" "$STDIN_KEEPER_PID_FILE"
+mkfifo "$STDIN_FIFO"
+nohup tail -f /dev/null > "$STDIN_FIFO" 2>/dev/null &
+STDIN_KEEPER_PID=$!
+echo "$STDIN_KEEPER_PID" > "$STDIN_KEEPER_PID_FILE"
 
-# Use --config to specify separate data directory (avoids lock conflict with Steam client)
-"$FACTORIO_BIN" \
-    --config "$SERVER_DATA_DIR/config.ini" \
+setsid "$FACTORIO_BIN" \
+    --config "$CONFIG_FILE" \
     --start-server "$SAVE_PATH" \
     --rcon-port "$RCON_PORT" \
     --rcon-password "$RCON_PASSWORD" \
     --port "$GAME_PORT" \
     --server-settings "$PROJECT_ROOT/configs/test-server.json" \
+    < "$STDIN_FIFO" \
     > "$LOG_FILE" 2>&1 &
 
 SERVER_PID=$!
-echo "$SERVER_PID" > "$PROJECT_ROOT/logs/server.pid"
+echo "$SERVER_PID" > "$PROJECT_ROOT/logs/test-server.pid"
 
-echo "Server starting (PID: $SERVER_PID)..."
+echo "Server starting (PID: $SERVER_PID)"
 echo "Log file: $LOG_FILE"
-echo ""
-
-# Wait for server to be ready
-echo "Waiting for RCON to be available..."
-for i in {1..30}; do
-    if ./target/release/factorioctl --port "$RCON_PORT" --password "$RCON_PASSWORD" get tick 2>/dev/null; then
+echo -n "Waiting for RCON..."
+for _ in $(seq 1 30); do
+    if ./target/release/factorioctl --port "$RCON_PORT" --password "$RCON_PASSWORD" get tick >/dev/null 2>&1; then
         echo ""
-        echo "=== Server Ready ==="
-        echo ""
-        echo "Test with:"
-        echo "  ./target/release/factorioctl --port $RCON_PORT --password $RCON_PASSWORD get tick"
-        echo ""
-        echo "Stop with:"
-        echo "  ./tests/cleanup.sh"
-        echo ""
-        echo "Watch the game:"
-        echo "  See docs/watching.md for instructions"
+        echo "Server ready."
         exit 0
     fi
     sleep 1
@@ -135,5 +139,7 @@ for i in {1..30}; do
 done
 
 echo ""
-echo "ERROR: Server did not start in time. Check $LOG_FILE"
+echo "ERROR: Server did not become ready. Check $LOG_FILE"
+kill "$SERVER_PID" "$STDIN_KEEPER_PID" 2>/dev/null || true
+rm -f "$STDIN_FIFO" "$STDIN_KEEPER_PID_FILE" "$PROJECT_ROOT/logs/test-server.pid"
 exit 1

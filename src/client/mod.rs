@@ -625,12 +625,78 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
+    pub async fn build_edge_miner(
+        &mut self,
+        resource_name: &str,
+        center: Position,
+        radius: u32,
+        drill_name: &str,
+        limit: u32,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::build_edge_miner(
+            &self.agent_id,
+            resource_name,
+            center,
+            radius,
+            drill_name,
+            limit,
+        );
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    pub async fn build_direct_smelter(
+        &mut self,
+        drill_unit_number: Option<u32>,
+        output: Option<(Position, Direction)>,
+        furnace_name: &str,
+        inserter_name: &str,
+        belt_name: &str,
+        radius: u32,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::build_direct_smelter(
+            &self.agent_id,
+            drill_unit_number,
+            output,
+            furnace_name,
+            inserter_name,
+            belt_name,
+            radius,
+        );
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     pub async fn plan_steam_power(
         &mut self,
         water_area: Area,
         target: Position,
     ) -> Result<serde_json::Value> {
         let lua = LuaCommand::plan_steam_power(&self.agent_id, water_area, target);
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    pub async fn repair_steam_power(
+        &mut self,
+        x: i32,
+        y: i32,
+        radius: u32,
+        target: Position,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::repair_steam_power(&self.agent_id, x, y, radius, target);
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    pub async fn extend_power_to(
+        &mut self,
+        x: i32,
+        y: i32,
+        radius: u32,
+        target: Position,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::extend_power_to(&self.agent_id, x, y, radius, target);
         let response = self.execute_lua(&lua).await?;
         Ok(serde_json::from_str(&response)?)
     }
@@ -731,6 +797,24 @@ impl FactorioClient {
         let response = self.execute_lua(&lua).await?;
         ensure_lua_success(&response)?;
         Ok(())
+    }
+
+    pub async fn feed_lab_from_inventory(
+        &mut self,
+        lab_unit_number: u32,
+        science_pack: &str,
+        count: u32,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::feed_lab_from_inventory(
+            &self.agent_id,
+            lab_unit_number,
+            science_pack,
+            count,
+            dry_run,
+        );
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
     }
 
     /// Check if a technology has been researched

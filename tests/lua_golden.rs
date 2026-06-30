@@ -226,6 +226,29 @@ fn all_lua_cases() -> Vec<LuaCase> {
             ),
         ),
         LuaCase::new(
+            "build_edge_miner",
+            LuaCommand::build_edge_miner(
+                &legacy_agent(),
+                "iron-ore",
+                pos(57.0, -22.0),
+                25,
+                "burner-mining-drill",
+                10,
+            ),
+        ),
+        LuaCase::new(
+            "build_direct_smelter",
+            LuaCommand::build_direct_smelter(
+                &legacy_agent(),
+                Some(42),
+                None,
+                "stone-furnace",
+                "burner-inserter",
+                "transport-belt",
+                6,
+            ),
+        ),
+        LuaCase::new(
             "plan_steam_power",
             LuaCommand::plan_steam_power(
                 &named_agent(),
@@ -344,6 +367,16 @@ fn all_lua_cases() -> Vec<LuaCase> {
         LuaCase::new(
             "get_available_research",
             LuaCommand::get_available_research(&legacy_agent()),
+        ),
+        LuaCase::new(
+            "feed_lab_from_inventory",
+            LuaCommand::feed_lab_from_inventory(
+                &legacy_agent(),
+                42,
+                "automation-science-pack",
+                5,
+                true,
+            ),
         ),
         LuaCase::new("start_research", LuaCommand::start_research("automation")),
         LuaCase::new(
@@ -1279,7 +1312,6 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
         "local find_factorioctl_character = characters.find",
         "local function remove_entity_at_impl",
         "local function remove_entity_impl",
-        "local function rotate_entity_impl",
         "local function insert_items_impl",
         "local function extract_items_impl",
         "local function set_recipe_impl",
@@ -1631,6 +1663,31 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             "find_entity_placements",
         ),
         (
+            "build_edge_miner",
+            LuaCommand::build_edge_miner(
+                &named_agent(),
+                "iron-ore",
+                pos(57.0, -22.0),
+                25,
+                "burner-mining-drill",
+                10,
+            ),
+            "build_edge_miner",
+        ),
+        (
+            "build_direct_smelter",
+            LuaCommand::build_direct_smelter(
+                &named_agent(),
+                None,
+                Some((pos(56.0, -18.0), Direction::South)),
+                "stone-furnace",
+                "burner-inserter",
+                "transport-belt",
+                6,
+            ),
+            "build_direct_smelter",
+        ),
+        (
             "place_ghost",
             LuaCommand::place_ghost(
                 &named_agent(),
@@ -1686,12 +1743,18 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "placement.place_underground_belt",
         "placement.check_entity_placement",
         "placement.find_entity_placements",
+        "placement.build_edge_miner",
+        "placement.build_direct_smelter",
         "placement.place_ghost",
+        "placement.rotate_entity",
         "place_entity = function(agent_id, entity_name, x, y, direction)",
         "place_underground_belt = function(agent_id, entity_name, x, y, direction, belt_type)",
         "check_entity_placement = function(agent_id, entity_name, x, y, direction)",
         "find_entity_placements = function(agent_id, entity_name, center_x, center_y, radius, limit)",
+        "build_edge_miner = function(agent_id, resource_name, center_x, center_y, radius, drill_name, limit)",
+        "build_direct_smelter = function(agent_id, drill_unit_number, output_x, output_y, output_direction, furnace_name, inserter_name, belt_name, radius)",
         "place_ghost = function(agent_id, entity_name, x, y, direction)",
+        "rotate_entity = function(unit_number, direction)",
     ] {
         assert!(
             control_lua.contains(required),
@@ -1706,7 +1769,10 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "local function place_underground_belt_impl",
         "local function check_entity_placement_impl",
         "local function find_entity_placements_impl",
+        "local function build_edge_miner_impl",
+        "local function build_direct_smelter_impl",
         "local function place_ghost_impl",
+        "local function rotate_entity_impl",
     ] {
         assert!(
             !control_lua.contains(moved),
@@ -1719,10 +1785,38 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("surface.create_entity{")
             && placement_lua
                 .contains("create_entity returned nil after can_place_entity succeeded")
+            && placement_lua.contains("local function inspect_placement_blockers")
+            && placement_lua.contains("occupied_by = blockers[1]")
+            && placement_lua.contains("bounding_box = bounding_box_table(entity)")
+            && placement_lua.contains("local function belt_alternate_candidates")
+            && placement_lua.contains("alternate_belt_placements")
+            && placement_lua.contains("candidate_alternate_path")
+            && placement_lua.contains("route_belt_around_blocker")
+            && placement_lua.contains("recommended_action = \"rotate_entity\"")
+            && placement_lua.contains("create_entity_nil_after_can_place = true")
+            && placement_lua.contains("local function mining_drill_output_diagnostics")
+            && placement_lua.contains("local function mining_drill_output_tile")
+            && placement_lua.contains("output_buildable = output.belt_can_place")
+            && placement_lua.contains("output_clear = output.output_clear")
+            && placement_lua.contains("Drill output tile overlaps resource")
+            && placement_lua.contains("function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius, drill_name, limit)")
+            && placement_lua.contains("no_clear_output_tile")
+            && placement_lua.contains("execute_edge_miner_steps")
+            && placement_lua.contains("count_matching_resources(surface, resource_name, drill_area)")
+            && placement_lua.contains("selected.output.belt_tile")
+            && placement_lua.contains("function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y, output_direction, furnace_name, inserter_name, belt_name, radius)")
+            && placement_lua.contains("missing_output_reference")
+            && placement_lua.contains("no_direct_smelter_layout")
+            && placement_lua.contains("execute_direct_smelter_steps")
+            && placement_lua.contains("selected.input_inserter")
+            && placement_lua.contains("verify_step")
             && placement_lua.contains("inventory_count = inv.get_item_count(entity_name)")
             && placement_lua.contains("item_in_inventory = inventory_count > 0")
             && placement_lua.contains("type = belt_type")
             && placement_lua.contains("result.belt_to_ground_type = entity.belt_to_ground_type")
+            && placement_lua.contains("function M.rotate_entity(unit_number, direction)")
+            && placement_lua.contains("result.previous_direction = previous_direction")
+            && placement_lua.contains("requested_direction = direction")
             && placement_lua.contains("table.sort(placements")
             && !control_lua.contains("and nil or"),
         "placement.lua should own placement diagnostics, scans, and create_entity contracts"
@@ -1869,6 +1963,62 @@ fn steam_power_planner_uses_mod_remote_not_inline_lua() {
 }
 
 #[test]
+fn steam_power_repair_uses_mod_remote_not_inline_lua() {
+    let lua = LuaCommand::repair_steam_power(&named_agent(), -25, 50, 20, pos(55.0, -2.0));
+
+    assert!(
+        lua.contains(r#"remote.interfaces["claude_interface"]["repair_steam_power"]"#)
+            && lua.contains(
+                r#"remote.call("claude_interface", "repair_steam_power", "doug", -25, 50, 20, 55, -2)"#
+            ),
+        "repair_steam_power should be a small guarded mod remote call:\n{lua}"
+    );
+    assert!(
+        lua.contains("sync_or_restart_mod"),
+        "repair_steam_power should explain an out-of-date mod instead of silently falling back:\n{lua}"
+    );
+    for forbidden in [
+        "surface.find_entities_filtered",
+        "repair_steps",
+        "boiler_no_fuel",
+        "steam_engine_pole_route_incomplete",
+    ] {
+        assert!(
+            !lua.contains(forbidden),
+            "repair_steam_power Rust wrapper should not embed repair Lua {forbidden:?}:\n{lua}"
+        );
+    }
+}
+
+#[test]
+fn power_extension_uses_mod_remote_not_inline_lua() {
+    let lua = LuaCommand::extend_power_to(&named_agent(), 0, 0, 20, pos(2.0, 0.0));
+
+    assert!(
+        lua.contains(r#"remote.interfaces["claude_interface"]["extend_power_to"]"#)
+            && lua.contains(
+                r#"remote.call("claude_interface", "extend_power_to", "doug", 0, 0, 20, 2, 0)"#
+            ),
+        "extend_power_to should be a small guarded mod remote call:\n{lua}"
+    );
+    assert!(
+        lua.contains("sync_or_restart_mod"),
+        "extend_power_to should explain an out-of-date mod instead of silently falling back:\n{lua}"
+    );
+    for forbidden in [
+        "surface.find_entities_filtered",
+        "pole_repair_path",
+        "no_power_grid_found",
+        "place_power_pole",
+    ] {
+        assert!(
+            !lua.contains(forbidden),
+            "extend_power_to Rust wrapper should not embed planner Lua {forbidden:?}:\n{lua}"
+        );
+    }
+}
+
+#[test]
 fn steam_power_planner_lives_in_power_module() {
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
     let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
@@ -1969,6 +2119,69 @@ fn power_diagnostics_use_mod_remote_not_inline_lua() {
 }
 
 #[test]
+fn steam_power_repair_lives_in_power_module() {
+    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
+
+    assert!(
+        control_lua.contains(r#"local power = require("power")"#)
+            && control_lua.contains("local function repair_steam_power_impl")
+            && control_lua.contains(
+                r#"json_remote_call("repair_steam_power", repair_steam_power_impl, agent_id, x, y, radius, target_x, target_y)"#
+            ),
+        "control.lua should expose the steam-power repair planner through the power module"
+    );
+
+    for required in [
+        "function M.repair_steam_power(character, x, y, radius, target_x, target_y)",
+        "diagnostic = M.diagnose_steam_power(x, y, r)",
+        "dry_run = true",
+        "repair_steps = {}",
+        "missing_items = {}",
+        "append_repair_step(",
+        "\"insert_items\"",
+        "\"place_entity\"",
+        "steam_engine_no_steam_may_clear_after_fuel",
+        "manual_inspection_required",
+    ] {
+        assert!(
+            power_lua.contains(required),
+            "power.lua steam repair planner should include {required:?}"
+        );
+    }
+}
+
+#[test]
+fn power_extension_lives_in_power_module() {
+    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
+
+    assert!(
+        control_lua.contains(r#"local power = require("power")"#)
+            && control_lua.contains("local function extend_power_to_impl")
+            && control_lua.contains(
+                r#"json_remote_call("extend_power_to", extend_power_to_impl, agent_id, x, y, radius, target_x, target_y)"#
+            ),
+        "control.lua should expose the power-extension planner through the power module"
+    );
+
+    for required in [
+        "function M.extend_power_to(character, x, y, radius, target_x, target_y)",
+        "dry_run = true",
+        "no_power_grid_found",
+        "pole_supply_reaches(",
+        "pole_repair_path(surface, force, nearest.position, target)",
+        "execute_power_extension_steps",
+        "small-electric-pole",
+    ] {
+        assert!(
+            power_lua.contains(required),
+            "power.lua power-extension planner should include {required:?}"
+        );
+    }
+}
+
+#[test]
 fn steam_power_diagnostic_lives_in_mod_remote_interface() {
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
     let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
@@ -1997,9 +2210,16 @@ fn steam_power_diagnostic_lives_in_mod_remote_interface() {
         "get_fluid_segment_extent_bounding_box",
         "get_fluid_box_neighbours",
         "get_fluid_box_pipe_connections",
+        "finish_steam_diagnostic",
+        "fluidbox_has_neighbour",
+        "existing_steam_power_found",
+        "has_existing_plant",
         "boiler_steam_output_blocked",
+        "boiler_water_alignment_mismatch",
         "steam_engine_no_steam",
+        "steam_engine_alignment_mismatch",
         "steam_engine_not_on_grid",
+        "steam_engine_pole_route_incomplete",
         "offshore-pump",
         "boiler",
         "steam-engine",
@@ -2246,6 +2466,17 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
             "get_available_research",
         ),
         (
+            "feed_lab_from_inventory",
+            LuaCommand::feed_lab_from_inventory(
+                &named_agent(),
+                42,
+                "automation-science-pack",
+                5,
+                true,
+            ),
+            "feed_lab_from_inventory",
+        ),
+        (
             "start_research",
             LuaCommand::start_research("automation"),
             "start_research",
@@ -2327,6 +2558,8 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
         "get_available_research = function(agent_id)",
         "local character = find_factorioctl_character(agent_id)",
         "json_remote_call(\"get_available_research\", research.get_available_research, character)",
+        "feed_lab_from_inventory = function(agent_id, lab_unit_number, science_pack, count, dry_run)",
+        "json_remote_call(\"feed_lab_from_inventory\", research.feed_lab_from_inventory, character, lab_unit_number, science_pack, count, dry_run)",
         "start_research = function(tech_name)",
         "json_remote_call(\"start_research\", research.start_research, tech_name)",
         "is_tech_researched = function(tech_name)",
@@ -2343,6 +2576,7 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
         "local function research_effects",
         "local function science_totals_from_labs",
         "local function count_science_from_inventory",
+        "function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)",
         "function M.get_research_status()",
         "function M.get_available_research(character)",
         "function M.start_research(tech_name)",
@@ -2359,6 +2593,7 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
         "local function research_effects",
         "local function science_totals_from_labs",
         "local function count_science_from_inventory",
+        "function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)",
         "function M.get_research_status()",
         "function M.get_available_research(character)",
         "function M.start_research(tech_name)",
@@ -2376,6 +2611,10 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
                 "local labs = surface.find_entities_filtered{type = \"lab\", force = force}"
             )
             && research_lua.contains("lab.get_inventory(defines.inventory.lab_input)")
+            && research_lua.contains("entities.find_by_unit_number(tonumber(lab_unit_number))")
+            && research_lua.contains("player_inv.remove{name = science_pack, count = count}")
+            && research_lua.contains("lab_inv.insert{name = science_pack, count = removed}")
+            && research_lua.contains("expected_miss")
             && research_lua.contains("local have = science_totals[ing.name] or 0")
             && research_lua.contains("requires_lab = needs_science")
             && research_lua.contains("Free bootstrap technologies need no lab or science packs")
@@ -2396,6 +2635,7 @@ fn research_cli_queries_use_mod_remotes_not_inline_lua() {
     for required in [
         "LuaCommand::get_research_status()",
         "LuaCommand::get_available_research(client.agent_id())",
+        "LuaCommand::feed_lab_from_inventory",
         "LuaCommand::start_research(&tech)",
         "LuaCommand::is_tech_researched(tech_name)",
     ] {

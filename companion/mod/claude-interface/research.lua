@@ -1,4 +1,11 @@
+local entities = require("entities")
+
 local M = {}
+
+local function pos_table(pos)
+    if not pos then return nil end
+    return {x = pos.x, y = pos.y}
+end
 
 local function research_ingredients(tech)
     local ingredients = {}
@@ -87,6 +94,152 @@ local function count_science_from_inventory(inv, science_totals, science_availab
             end
         end
     end
+end
+
+local function lab_summary(lab)
+    return {
+        unit_number = lab.unit_number,
+        name = lab.name,
+        type = lab.type,
+        position = pos_table(lab.position),
+        powered = lab_has_power(lab),
+    }
+end
+
+local function add_blocker(result, blocker_type, message)
+    table.insert(result.blockers, {
+        type = blocker_type,
+        message = message,
+    })
+end
+
+local function expected_miss(result, next_action)
+    result.expected_miss = true
+    result.next_action = next_action
+    return result
+end
+
+function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)
+    count = math.max(1, math.floor(tonumber(count) or 1))
+    local do_dry_run = dry_run ~= false
+    local result = {
+        success = false,
+        dry_run = do_dry_run,
+        lab_unit_number = tonumber(lab_unit_number),
+        science_pack = science_pack,
+        requested_count = count,
+        inserted = 0,
+        missing_items = {},
+        blockers = {},
+        steps = {},
+    }
+
+    if not (character and character.valid) then
+        add_blocker(result, "no_character", "No character for agent; spawn first.")
+        return expected_miss(result, "spawn_character")
+    end
+
+    local lab = entities.find_by_unit_number(tonumber(lab_unit_number))
+    if not (lab and lab.valid) then
+        add_blocker(result, "lab_not_found", "No valid lab entity with unit_number " .. tostring(lab_unit_number) .. ".")
+        return expected_miss(result, "get_entities")
+    end
+    result.lab = lab_summary(lab)
+
+    if lab.type ~= "lab" then
+        add_blocker(result, "not_a_lab", "Entity " .. tostring(lab_unit_number) .. " is " .. tostring(lab.name) .. ", not a lab.")
+        return expected_miss(result, "choose_valid_lab")
+    end
+
+    local lab_inv = lab.get_inventory(defines.inventory.lab_input)
+    if not lab_inv then
+        add_blocker(result, "no_lab_inventory", "Lab has no lab_input inventory.")
+        return expected_miss(result, "choose_valid_lab")
+    end
+
+    local player_inv = character.get_main_inventory()
+    if not player_inv then
+        add_blocker(result, "no_character_inventory", "Character has no main inventory.")
+        return expected_miss(result, "spawn_character")
+    end
+
+    if not prototypes.item[science_pack] then
+        add_blocker(result, "unknown_item", "Unknown item prototype: " .. tostring(science_pack))
+        return expected_miss(result, "choose_valid_science_pack")
+    end
+
+    local can_insert_ok, can_insert_value = pcall(function()
+        return lab_inv.can_insert{name = science_pack, count = math.min(count, 1)}
+    end)
+    if not can_insert_ok or can_insert_value ~= true then
+        add_blocker(result, "lab_rejects_item", "Lab input inventory does not accept " .. tostring(science_pack) .. ".")
+        return expected_miss(result, "choose_valid_science_pack")
+    end
+
+    local available = player_inv.get_item_count(science_pack)
+    local lab_before = lab_inv.get_item_count(science_pack)
+    result.available = available
+    result.lab_before = lab_before
+    if available < count then
+        result.missing_items[science_pack] = {
+            available = available,
+            required = count,
+        }
+        add_blocker(result, "missing_science_pack", "Character inventory has " .. tostring(available) .. " " .. tostring(science_pack) .. ", need " .. tostring(count) .. ".")
+        return expected_miss(result, "craft_science_pack")
+    end
+
+    result.transfer_count = count
+    result.verify_step = {
+        tool = "get_research_status",
+        tool_args = {},
+        description = "After feeding the lab, check current research and science packs in labs.",
+    }
+
+    if do_dry_run then
+        result.steps = {
+            {
+                tool = "feed_lab_from_inventory",
+                tool_args = {
+                    lab_unit_number = tonumber(lab_unit_number),
+                    science_pack = science_pack,
+                    count = count,
+                    dry_run = false,
+                },
+                description = "Transfer science packs from the agent inventory into the target lab.",
+            },
+        }
+        result.success = true
+        result.ready = true
+        result.next_action = "execute_feed_lab_from_inventory"
+        result.guidance = "Call feed_lab_from_inventory again with dry_run=false, then run verify_step."
+        return result
+    end
+
+    local removed = player_inv.remove{name = science_pack, count = count}
+    if removed == 0 then
+        add_blocker(result, "remove_failed", "Could not remove " .. tostring(science_pack) .. " from character inventory.")
+        return expected_miss(result, "refresh_inventory")
+    end
+
+    local inserted = lab_inv.insert{name = science_pack, count = removed}
+    if inserted < removed then
+        player_inv.insert{name = science_pack, count = removed - inserted}
+    end
+
+    result.inserted = inserted
+    result.returned_to_inventory = math.max(0, removed - inserted)
+    result.lab_after = lab_inv.get_item_count(science_pack)
+    result.inventory_after = player_inv.get_item_count(science_pack)
+    if inserted == 0 then
+        add_blocker(result, "lab_inventory_full", "Lab input inventory accepted 0 " .. tostring(science_pack) .. ".")
+        return expected_miss(result, "free_lab_inventory_or_choose_another_lab")
+    end
+
+    result.success = true
+    result.next_action = "get_research_status"
+    result.guidance = "Science packs transferred from character inventory into the lab."
+    return result
 end
 
 function M.get_research_status()

@@ -709,6 +709,30 @@ local function plan_steam_power_impl(agent_id, water_x1, water_y1, water_x2, wat
     return power.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
 end
 
+local function repair_steam_power_impl(agent_id, x, y, radius, target_x, target_y)
+    local character = find_factorioctl_character(agent_id)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+            blockers = {"no_character"},
+        }
+    end
+    return power.repair_steam_power(character, x, y, radius, target_x, target_y)
+end
+
+local function extend_power_to_impl(agent_id, x, y, radius, target_x, target_y)
+    local character = find_factorioctl_character(agent_id)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+            blockers = {"no_character"},
+        }
+    end
+    return power.extend_power_to(character, x, y, radius, target_x, target_y)
+end
+
 local function broadcast_console_impl(message)
     game.print("[Agent] " .. tostring(message or ""))
     return {success = true}
@@ -1530,20 +1554,6 @@ local function remove_entity_impl(agent_id, unit_number)
     return mine_entity_for_agent(agent_id, entity)
 end
 
-local function rotate_entity_impl(unit_number, direction)
-    local entity = entities.find_by_unit_number(unit_number)
-    if not entity then
-        return {error = "Entity not found"}
-    end
-
-    if not entity.supports_direction then
-        return {error = "Entity does not support rotation"}
-    end
-
-    entity.direction = direction
-    return "ok"
-end
-
 local function insert_items_impl(unit_number, item, count, inventory_type)
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
@@ -1880,6 +1890,16 @@ remote.add_interface("claude_interface", {
         return json_remote_call("plan_steam_power", plan_steam_power_impl, agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
     end,
 
+    -- Plan dry-run repairs for an existing steam-power plant.
+    repair_steam_power = function(agent_id, x, y, radius, target_x, target_y)
+        return json_remote_call("repair_steam_power", repair_steam_power_impl, agent_id, x, y, radius, target_x, target_y)
+    end,
+
+    -- Plan dry-run pole placement to extend an existing power grid to a target.
+    extend_power_to = function(agent_id, x, y, radius, target_x, target_y)
+        return json_remote_call("extend_power_to", extend_power_to_impl, agent_id, x, y, radius, target_x, target_y)
+    end,
+
     -- Power diagnostics live in the mod so Rust only emits small remote calls.
     get_power_status = function(x, y, radius)
         return json_remote_call("get_power_status", power.get_power_status, x, y, radius)
@@ -2041,6 +2061,14 @@ remote.add_interface("claude_interface", {
         return json_remote_call("find_entity_placements", placement.find_entity_placements, agent_id, entity_name, center_x, center_y, radius, limit)
     end,
 
+    build_edge_miner = function(agent_id, resource_name, center_x, center_y, radius, drill_name, limit)
+        return json_remote_call("build_edge_miner", placement.build_edge_miner, agent_id, resource_name, center_x, center_y, radius, drill_name, limit)
+    end,
+
+    build_direct_smelter = function(agent_id, drill_unit_number, output_x, output_y, output_direction, furnace_name, inserter_name, belt_name, radius)
+        return json_remote_call("build_direct_smelter", placement.build_direct_smelter, agent_id, drill_unit_number, output_x, output_y, output_direction, furnace_name, inserter_name, belt_name, radius)
+    end,
+
     place_ghost = function(agent_id, entity_name, x, y, direction)
         return json_remote_call("place_ghost", placement.place_ghost, agent_id, entity_name, x, y, direction)
     end,
@@ -2062,7 +2090,7 @@ remote.add_interface("claude_interface", {
     end,
 
     rotate_entity = function(unit_number, direction)
-        return json_remote_call("rotate_entity", rotate_entity_impl, unit_number, direction)
+        return json_remote_call("rotate_entity", placement.rotate_entity, unit_number, direction)
     end,
 
     insert_items = function(unit_number, item, count, inventory_type)
@@ -2104,6 +2132,11 @@ remote.add_interface("claude_interface", {
     get_available_research = function(agent_id)
         local character = find_factorioctl_character(agent_id)
         return json_remote_call("get_available_research", research.get_available_research, character)
+    end,
+
+    feed_lab_from_inventory = function(agent_id, lab_unit_number, science_pack, count, dry_run)
+        local character = find_factorioctl_character(agent_id)
+        return json_remote_call("feed_lab_from_inventory", research.feed_lab_from_inventory, character, lab_unit_number, science_pack, count, dry_run)
     end,
 
     start_research = function(tech_name)

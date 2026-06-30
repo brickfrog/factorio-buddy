@@ -3,10 +3,10 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use super::parsing::parse_tile;
+use super::parsing::{parse_position, parse_tile};
 use super::ResolvedConnectionArgs;
 use crate::output::{Output, OutputFormat};
-use crate::world::entity_size;
+use crate::world::{entity_size, Direction};
 
 #[derive(Args, Debug)]
 pub struct BuildCommand {
@@ -37,6 +37,60 @@ pub enum BuildSubcommand {
         /// Direction drills should face (for output)
         #[arg(long, default_value = "south")]
         direction: String,
+    },
+
+    /// Plan a patch-edge miner and output belt without placing anything
+    EdgeMiner {
+        /// Resource type to mine (iron-ore, copper-ore, coal, stone)
+        #[arg(long)]
+        resource: String,
+
+        /// Target resource area center as x,y
+        #[arg(long, allow_hyphen_values = true)]
+        near: String,
+
+        /// Search radius
+        #[arg(long, default_value = "25")]
+        radius: u32,
+
+        /// Drill type (burner-mining-drill or electric-mining-drill)
+        #[arg(long, default_value = "burner-mining-drill")]
+        drill_type: String,
+
+        /// Maximum candidate placements to return
+        #[arg(long, default_value = "10")]
+        limit: u32,
+    },
+
+    /// Plan a direct drill-output belt/inserter/furnace smelter without placing anything
+    DirectSmelter {
+        /// Existing drill unit number. If omitted, provide --output and --output-direction.
+        #[arg(long)]
+        drill_unit_number: Option<u32>,
+
+        /// Drill output belt tile as x,y from build_edge_miner/get_machine_belt_positions
+        #[arg(long, allow_hyphen_values = true)]
+        output: Option<String>,
+
+        /// Direction the output belt should face
+        #[arg(long, default_value = "south")]
+        output_direction: String,
+
+        /// Furnace type
+        #[arg(long, default_value = "stone-furnace")]
+        furnace_type: String,
+
+        /// Inserter type
+        #[arg(long, default_value = "burner-inserter")]
+        inserter_type: String,
+
+        /// Belt type
+        #[arg(long, default_value = "transport-belt")]
+        belt_type: String,
+
+        /// Search radius for furnace placement around the output tile
+        #[arg(long, default_value = "6")]
+        radius: u32,
     },
 
     /// Place a line of furnaces for smelting
@@ -117,6 +171,52 @@ pub async fn execute(cmd: BuildCommand, conn: &ResolvedConnectionArgs) -> Result
                     );
                 }
             }
+        }
+
+        BuildSubcommand::EdgeMiner {
+            resource,
+            near,
+            radius,
+            drill_type,
+            limit,
+        } => {
+            let center = parse_position(&near)?;
+            let result = client
+                .build_edge_miner(&resource, center, radius, &drill_type, limit)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
+        BuildSubcommand::DirectSmelter {
+            drill_unit_number,
+            output,
+            output_direction,
+            furnace_type,
+            inserter_type,
+            belt_type,
+            radius,
+        } => {
+            let output = match output {
+                Some(value) => {
+                    let position = parse_position(&value)?;
+                    let direction = Direction::parse(&output_direction).ok_or_else(|| {
+                        anyhow::anyhow!("invalid output direction: {}", output_direction)
+                    })?;
+                    Some((position, direction))
+                }
+                None => None,
+            };
+            let result = client
+                .build_direct_smelter(
+                    drill_unit_number,
+                    output,
+                    &furnace_type,
+                    &inserter_type,
+                    &belt_type,
+                    radius,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
 
         BuildSubcommand::SmelterLine {

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
+import journal
 import ledger
 
 
@@ -19,6 +20,18 @@ class LedgerTests(unittest.TestCase):
         )
         self.file_patch.start()
         self.addCleanup(self.file_patch.stop)
+        self.journal_patch = mock.patch(
+            "journal._journal_file",
+            side_effect=lambda agent_name: self.base / f".journal-{agent_name}.jsonl",
+        )
+        self.reflection_patch = mock.patch(
+            "journal._reflection_file",
+            side_effect=lambda agent_name: self.base / f".reflection-{agent_name}.json",
+        )
+        self.journal_patch.start()
+        self.reflection_patch.start()
+        self.addCleanup(self.journal_patch.stop)
+        self.addCleanup(self.reflection_patch.stop)
 
     def test_parse_well_formed_ledger_trailer(self):
         text = """Done.
@@ -64,6 +77,32 @@ progress: Placed the first drill
 
         self.assertEqual(ledger.load_ledger("doug"), saved)
         self.assertTrue((self.base / ".ledger-doug.json").read_text().endswith("\n"))
+
+    def test_load_and_apply_drop_low_value_planning_progress(self):
+        saved = {
+            "objective": "Repair existing power",
+            "plan_steps": ["fuel boiler"],
+            "progress_notes": [
+                "Found boiler unit 49 with no fuel",
+                "no change across fifty-four planning ticks. State stable. "
+                "Plan fully validated and awaiting execution turns.",
+            ],
+            "updated_at": "2026-06-30T04:22:28",
+        }
+
+        ledger.save_ledger("doug", saved)
+
+        loaded = ledger.load_ledger("doug")
+        self.assertEqual(loaded["progress_notes"], ["Found boiler unit 49 with no fuel"])
+
+        updated = ledger.apply_ledger_update(
+            "doug",
+            "<ledger>\n"
+            "progress: no changes across planning ticks; plan validated and ready for execution\n"
+            "</ledger>",
+        )
+
+        self.assertEqual(updated["progress_notes"], ["Found boiler unit 49 with no fuel"])
 
     def test_stale_bootstrap_ledger_returns_default(self):
         stale = {

@@ -101,6 +101,44 @@ pub enum PowerSubcommand {
         #[arg(long, allow_hyphen_values = true)]
         target: String,
     },
+
+    /// Plan dry-run repairs for an existing steam power plant
+    RepairSteam {
+        /// Center X coordinate of the steam plant area
+        #[arg(long, allow_hyphen_values = true)]
+        x: i32,
+
+        /// Center Y coordinate of the steam plant area
+        #[arg(long, allow_hyphen_values = true)]
+        y: i32,
+
+        /// Search radius
+        #[arg(long, default_value = "50")]
+        radius: u32,
+
+        /// Target position that should receive power as x,y
+        #[arg(long, allow_hyphen_values = true)]
+        target: String,
+    },
+
+    /// Plan dry-run pole placement to extend an existing grid to a target
+    ExtendTo {
+        /// Center X coordinate for searching existing poles
+        #[arg(long, allow_hyphen_values = true)]
+        x: i32,
+
+        /// Center Y coordinate for searching existing poles
+        #[arg(long, allow_hyphen_values = true)]
+        y: i32,
+
+        /// Search radius
+        #[arg(long, default_value = "50")]
+        radius: u32,
+
+        /// Target position that should receive power as x,y
+        #[arg(long, allow_hyphen_values = true)]
+        target: String,
+    },
 }
 
 pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
@@ -224,6 +262,28 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
             let water_area = parse_area(&water_area)?;
             let target = parse_position(&target)?;
             let plan = client.plan_steam_power(water_area, target).await?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+
+        PowerSubcommand::RepairSteam {
+            x,
+            y,
+            radius,
+            target,
+        } => {
+            let target = parse_position(&target)?;
+            let plan = client.repair_steam_power(x, y, radius, target).await?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+
+        PowerSubcommand::ExtendTo {
+            x,
+            y,
+            radius,
+            target,
+        } => {
+            let target = parse_position(&target)?;
+            let plan = client.extend_power_to(x, y, radius, target).await?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
     }

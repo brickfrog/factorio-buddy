@@ -9,6 +9,7 @@
 #   just resume      # same, but keep the existing save
 #   just stop        # stop the headless server
 #   just logs        # tail the bridge SDK/tool stream
+#   just report      # summarize the latest bridge run
 
 # --- config -----------------------------------------------------------------
 # Your Steam Factorio binary (headless server needs it). Override on the CLI:
@@ -51,6 +52,10 @@ play: build sync
 resume: build sync
     SCALE={{scale}} ./run.sh restart
 
+# Build engine and run runtime smoke checks against an isolated disposable save
+smoke: build
+    cd .. && FACTORIO_BIN="$FACTORIO_BIN" tests/smoke.sh
+
 # Start only the headless server (existing save)
 server:
     ./run.sh server
@@ -68,6 +73,10 @@ stop:
 # Tail the bridge log (the live SDK stream + tool calls/results)
 logs:
     tail -f logs/bridge-*.log
+
+# Summarize the latest structured bridge log, enriched from live RCON when available
+report *ARGS:
+    cd bridge && ../.venv/bin/python report.py {{ARGS}}
 
 # Tail the Factorio server log
 logs-server:

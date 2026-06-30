@@ -486,6 +486,67 @@ end
         )
     }
 
+    /// Plan an edge mining drill and output belt without mutating the game.
+    pub fn build_edge_miner(
+        agent_id: &AgentId,
+        resource_name: &str,
+        center: Position,
+        radius: u32,
+        drill_name: &str,
+        limit: u32,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "build_edge_miner",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                Self::lua_string_arg(resource_name),
+                center.x.to_string(),
+                center.y.to_string(),
+                radius.to_string(),
+                Self::lua_string_arg(drill_name),
+                limit.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before planning edge miners.",
+        )
+    }
+
+    /// Plan a direct drill-output belt/inserter/furnace smelter without mutating the game.
+    pub fn build_direct_smelter(
+        agent_id: &AgentId,
+        drill_unit_number: Option<u32>,
+        output: Option<(Position, Direction)>,
+        furnace_name: &str,
+        inserter_name: &str,
+        belt_name: &str,
+        radius: u32,
+    ) -> String {
+        let (output_x, output_y, output_direction) = match output {
+            Some((position, direction)) => (
+                position.x.to_string(),
+                position.y.to_string(),
+                direction.to_factorio().to_string(),
+            ),
+            None => ("nil".to_string(), "nil".to_string(), "nil".to_string()),
+        };
+        Self::claude_interface_json_call(
+            "build_direct_smelter",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                drill_unit_number
+                    .map(|unit| unit.to_string())
+                    .unwrap_or_else(|| "nil".to_string()),
+                output_x,
+                output_y,
+                output_direction,
+                Self::lua_string_arg(furnace_name),
+                Self::lua_string_arg(inserter_name),
+                Self::lua_string_arg(belt_name),
+                radius.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before planning direct smelters.",
+        )
+    }
+
     /// Place an underground belt with specified type (input or output)
     pub fn place_underground_belt(
         agent_id: &AgentId,
@@ -838,6 +899,27 @@ end
         )
     }
 
+    /// Feed science packs from the agent inventory into a lab, dry-run by default.
+    pub fn feed_lab_from_inventory(
+        agent_id: &AgentId,
+        lab_unit_number: u32,
+        science_pack: &str,
+        count: u32,
+        dry_run: bool,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "feed_lab_from_inventory",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                lab_unit_number.to_string(),
+                Self::lua_string_arg(science_pack),
+                count.to_string(),
+                dry_run.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before feeding labs.",
+        )
+    }
+
     /// Start researching a technology (queues it properly)
     pub fn start_research(tech_name: &str) -> String {
         Self::claude_interface_json_call(
@@ -908,6 +990,50 @@ end
                 target.y.to_string(),
             ],
             "Run just sync/resume so the updated claude-interface mod is loaded before planning steam power.",
+        )
+    }
+
+    /// Plan dry-run repairs for an existing steam-power plant.
+    pub fn repair_steam_power(
+        agent_id: &AgentId,
+        x: i32,
+        y: i32,
+        radius: u32,
+        target: Position,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "repair_steam_power",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                x.to_string(),
+                y.to_string(),
+                radius.to_string(),
+                target.x.to_string(),
+                target.y.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before planning steam repairs.",
+        )
+    }
+
+    /// Plan dry-run pole placement to extend power to a target.
+    pub fn extend_power_to(
+        agent_id: &AgentId,
+        x: i32,
+        y: i32,
+        radius: u32,
+        target: Position,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "extend_power_to",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                x.to_string(),
+                y.to_string(),
+                radius.to_string(),
+                target.x.to_string(),
+                target.y.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before planning power extensions.",
         )
     }
 
