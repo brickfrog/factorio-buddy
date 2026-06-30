@@ -6,9 +6,11 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from models import JOURNAL_EVENT_KINDS, JournalEvent
+
 
 REFLECTION_RE = re.compile(r"<reflection>(.*?)</reflection>", re.DOTALL | re.IGNORECASE)
-EVENT_KINDS = {"progress", "failure", "discovery", "milestone"}
+EVENT_KINDS = JOURNAL_EVENT_KINDS
 MAX_REFLECTION_ITEMS = 12
 TRANSIENT_FAILURE_PATTERNS = (
     "usage limit reached",
@@ -17,6 +19,11 @@ TRANSIENT_FAILURE_PATTERNS = (
     "expected value at line 1 column 1",
     "stream idle timeout",
     "no electric poles found in area",
+    "missing field `success`",
+    "missing field success",
+    "packet too large",
+    "bad argument #1 of 2 to 'pairs' (table expected, got nil)",
+    "failed to queue research - check if another research is in progress",
 )
 LOW_VALUE_PROGRESS_PATTERNS = (
     "no infrastructure yet deployed",
@@ -81,18 +88,17 @@ def _should_drop_event(kind: str, text: str) -> bool:
 
 
 def append_event(agent_name: str, kind: str, text: str) -> None:
-    kind = kind if kind in EVENT_KINDS else "progress"
-    if _should_drop_event(kind, text):
+    event = JournalEvent.create(
+        ts=datetime.now().isoformat(),
+        kind=kind,
+        text=text,
+    )
+    if _should_drop_event(event.kind, event.text):
         return None
-    event = {
-        "ts": datetime.now().isoformat(),
-        "kind": kind,
-        "text": str(text),
-    }
     path = _journal_file(agent_name)
     try:
         with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
+            f.write(json.dumps(event.to_dict()) + "\n")
     except OSError as e:
         print(f"[journal] WARNING: failed to append journal event for {agent_name}: {e}")
     return None
@@ -112,15 +118,12 @@ def load_events(agent_name: str, limit: int = 20) -> list[dict]:
             continue
         if not isinstance(data, dict):
             continue
-        kind = data.get("kind") if data.get("kind") in EVENT_KINDS else "progress"
-        text = str(data.get("text", ""))
-        if _should_drop_event(kind, text):
+        event = JournalEvent.from_mapping(data)
+        if not event:
             continue
-        events.append({
-            "ts": str(data.get("ts", "")),
-            "kind": kind,
-            "text": text,
-        })
+        if _should_drop_event(event.kind, event.text):
+            continue
+        events.append(event.to_dict())
 
     try:
         limit = int(limit)

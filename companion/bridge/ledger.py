@@ -6,6 +6,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from models import LedgerState
+
 
 LEDGER_RE = re.compile(r"<ledger>(.*?)</ledger>", re.DOTALL | re.IGNORECASE)
 STALE_BOOTSTRAP_PROGRESS_PATTERNS = (
@@ -22,32 +24,13 @@ def _ledger_file(agent_name: str) -> Path:
 
 
 def default_ledger() -> dict:
-    return {
-        "objective": "",
-        "plan_steps": [],
-        "progress_notes": [],
-        "updated_at": "",
-    }
-
-
-def _str_list(value) -> list:
-    """Coerce an on-disk value into a list of non-empty strings."""
-    if not isinstance(value, list):
-        return []
-    return [str(item) for item in value if isinstance(item, str)]
+    return LedgerState.default().to_dict()
 
 
 def _normalize(data: dict) -> dict:
     """Coerce a loaded ledger dict to the canonical schema/types so callers
     never trip over null or wrong-typed fields (e.g. {"plan_steps": null})."""
-    objective = data.get("objective", "")
-    updated_at = data.get("updated_at", "")
-    return {
-        "objective": objective if isinstance(objective, str) else "",
-        "plan_steps": _str_list(data.get("plan_steps", [])),
-        "progress_notes": _str_list(data.get("progress_notes", [])),
-        "updated_at": updated_at if isinstance(updated_at, str) else "",
-    }
+    return LedgerState.coerce(data).to_dict()
 
 
 def _stale_bootstrap_max_age_s() -> float:
@@ -104,7 +87,7 @@ def save_ledger(agent_name: str, ledger: dict) -> None:
     path = _ledger_file(agent_name)
     tmp = path.with_name(path.name + ".tmp")
     try:
-        payload = json.dumps(ledger) + "\n"
+        payload = json.dumps(LedgerState.coerce(ledger).to_dict()) + "\n"
     except TypeError as e:
         print(f"[ledger] WARNING: refusing to save unserializable ledger for "
               f"{agent_name}: {e}")

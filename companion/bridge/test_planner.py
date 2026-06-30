@@ -83,6 +83,11 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("do not re-plan", planner.EXECUTION_PROMPT.lower())
         self.assertIn("committed objective and plan", planner.EXECUTION_PROMPT.lower())
         self.assertIn("stale", planner.EXECUTION_PROMPT.lower())
+        self.assertIn("stop before", planner.EXECUTION_PROMPT.lower())
+        self.assertIn("mutating tool call", planner.EXECUTION_PROMPT.lower())
+        self.assertIn("replacement ledger", planner.EXECUTION_PROMPT.lower())
+        self.assertIn("objective: <updated goal>", planner.EXECUTION_PROMPT)
+        self.assertIn("plan:", planner.EXECUTION_PROMPT)
         self.assertIn("<ledger>", planner.EXECUTION_PROMPT)
 
     def test_build_autonomy_prompt_joins_non_empty_parts(self):

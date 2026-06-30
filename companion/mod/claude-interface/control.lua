@@ -4,6 +4,21 @@
 local GUI_FRAME = "claude_interface_frame"
 local MAX_MESSAGES = 100
 local INPUT_FILE = "claude-chat/input.jsonl"
+local characters = require("characters")
+local diagnostics = require("diagnostics")
+local entities = require("entities")
+local json_remote_call = require("json_response").remote_call
+local inventory = require("inventory")
+local inventory_contents = inventory.contents
+local inventory_define_for = inventory.define_for
+local placement = require("placement")
+local power = require("power")
+local recipes = require("recipes")
+local research = require("research")
+local transport = require("transport")
+local world = require("world")
+local find_factorioctl_character = characters.find
+local remember_factorioctl_character = characters.remember
 
 -- ============================================================
 -- Storage
@@ -682,1255 +697,16 @@ local function pos_table(pos)
     return {x = pos.x, y = pos.y}
 end
 
-local function fluid_table(fluid)
-    if not fluid then return nil end
-    if type(fluid) == "string" then
-        return {name = fluid}
-    end
-    return {
-        name = fluid.name,
-        amount = fluid.amount,
-        temperature = fluid.temperature,
-    }
-end
-
-local function fluid_filter_name(filter)
-    if not filter then return nil end
-    if type(filter) == "string" then return filter end
-    if type(filter) == "table" then
-        if type(filter.name) == "string" then return filter.name end
-        if type(filter.name) == "table" and filter.name.name then return filter.name.name end
-    end
-    return tostring(filter)
-end
-
-local function inventory_contents(inv)
-    local result = {}
-    if not inv then return result end
-    for _, item in pairs(inv.get_contents()) do
-        table.insert(result, {name = item.name, count = item.count})
-    end
-    return result
-end
-
-local function find_entity_by_unit_number(unit_number)
-    storage.factorioctl_entities = storage.factorioctl_entities or {}
-    local registered = storage.factorioctl_entities[unit_number]
-    if registered and registered.valid then return registered end
-    storage.factorioctl_entities[unit_number] = nil
-
-    for _, surface in pairs(game.surfaces) do
-        local entities = surface.find_entities_filtered{area = {{-500, -500}, {500, 500}}}
-        for _, entity in pairs(entities) do
-            if entity.unit_number == unit_number then
-                storage.factorioctl_entities[unit_number] = entity
-                return entity
-            end
-        end
-    end
-    return nil
-end
-
-local function status_name(status_value)
-    if status_value == nil then return nil end
-    for name, value in pairs(defines.entity_status) do
-        if value == status_value then return name end
-    end
-    return tostring(status_value)
-end
-
-local function safe_entity_status(entity)
-    local ok, value = pcall(function() return entity.status end)
-    if ok then return status_name(value) end
-    return nil
-end
-
-local function raw_entity_status(entity)
-    local ok, value = pcall(function() return entity.status end)
-    if ok then return value end
-    return nil
-end
-
-local function append_steam_issue(result, issue_type, severity, entity, message, action)
-    table.insert(result.issues, {
-        type = issue_type,
-        severity = severity,
-        entity = entity and {
-            unit_number = entity.unit_number,
-            name = entity.name,
-            position = pos_table(entity.position),
-        } or nil,
-        message = message,
-        action = action,
-    })
-    if action then table.insert(result.suggested_actions, action) end
-end
-
-local function fluidbox_neighbours(entity, index)
-    local neighbours = {}
-    local ok, records = pcall(function()
-        return entity.get_fluid_box_neighbours(index)
-    end)
-    if ok and type(records) == "table" then
-        for _, record in pairs(records) do
-            if record.entity then
-                table.insert(neighbours, {
-                    name = record.entity.name,
-                    unit_number = record.entity.unit_number,
-                    position = pos_table(record.entity.position),
-                    fluidbox_index = record.index,
-                })
-            end
-        end
-    end
-    return neighbours
-end
-
-local function fluidbox_pipe_connections(entity, index)
-    local connections = {}
-    local ok, records = pcall(function()
-        return entity.get_fluid_box_pipe_connections(index)
-    end)
-    if ok and type(records) == "table" then
-        for _, connection in pairs(records) do
-            local target = connection.target
-            table.insert(connections, {
-                flow_direction = tostring(connection.flow_direction),
-                connection_type = tostring(connection.connection_type),
-                position = pos_table(connection.position),
-                target_position = pos_table(connection.target_position),
-                target = target and {
-                    name = target.name,
-                    unit_number = target.unit_number,
-                    position = pos_table(target.position),
-                } or nil,
-                target_fluidbox_index = connection.target_fluidbox_index,
-                target_pipe_connection_index = connection.target_pipe_connection_index,
-            })
-        end
-    end
-    return connections
-end
-
-local function describe_fluidboxes(entity, result)
-    local boxes = {}
-    for index = 1, 12 do
-        local info = {
-            index = index,
-            neighbours = {},
-            pipe_connections = {},
-        }
-        local has_box = false
-
-        local ok_capacity, capacity = pcall(function()
-            return entity.get_fluid_capacity(index)
-        end)
-        if ok_capacity and capacity ~= nil then
-            info.capacity = capacity
-            has_box = true
-        end
-
-        local ok_filter, filter = pcall(function()
-            return entity.get_fluid_filter(index)
-        end)
-        if ok_filter and filter ~= nil then
-            info.filter = fluid_filter_name(filter)
-            has_box = true
-        end
-
-        local ok_fluid, fluid = pcall(function()
-            return entity.get_fluid(index)
-        end)
-        if ok_fluid and fluid ~= nil then
-            info.fluid = fluid_table(fluid)
-            has_box = true
-        end
-
-        local ok_has_segment, has_segment = pcall(function()
-            return entity.has_fluid_segment(index)
-        end)
-        if ok_has_segment and has_segment then
-            info.has_segment = true
-            has_box = true
-
-            local ok_segment_id, segment_id = pcall(function()
-                return entity.get_fluid_segment_id(index)
-            end)
-            if ok_segment_id and segment_id ~= nil then
-                info.segment_id = segment_id
-            end
-
-            local ok_segment_fluid, segment_fluid = pcall(function()
-                return entity.get_fluid_segment_fluid(index)
-            end)
-            if ok_segment_fluid and segment_fluid ~= nil then
-                info.segment_fluid = fluid_table(segment_fluid)
-            end
-
-            local ok_segment_capacity, segment_capacity = pcall(function()
-                return entity.get_fluid_segment_capacity(index)
-            end)
-            if ok_segment_capacity and segment_capacity ~= nil then
-                info.segment_capacity = segment_capacity
-            end
-
-            local ok_extent, extent = pcall(function()
-                return entity.get_fluid_segment_extent_bounding_box(index)
-            end)
-            if ok_extent and extent then
-                info.segment_extent = {
-                    left_top = pos_table(extent.left_top),
-                    right_bottom = pos_table(extent.right_bottom),
-                }
-            end
-
-            if info.segment_id then
-                local key = tostring(info.segment_id)
-                if not result.fluid_segments[key] then
-                    result.fluid_segments[key] = {
-                        id = info.segment_id,
-                        fluid = info.segment_fluid,
-                        capacity = info.segment_capacity,
-                        members = {},
-                    }
-                end
-                table.insert(result.fluid_segments[key].members, {
-                    unit_number = entity.unit_number,
-                    name = entity.name,
-                    position = pos_table(entity.position),
-                    fluidbox_index = index,
-                })
-                result.fluid_segments[key].member_count = #result.fluid_segments[key].members
-            end
-        end
-
-        local neighbours = fluidbox_neighbours(entity, index)
-        if #neighbours > 0 then
-            info.neighbours = neighbours
-            has_box = true
-        end
-
-        local pipe_connections = fluidbox_pipe_connections(entity, index)
-        if #pipe_connections > 0 then
-            info.pipe_connections = pipe_connections
-            has_box = true
-        end
-
-        if has_box then table.insert(boxes, info) end
-    end
-    return boxes
-end
-
-local function diagnose_steam_power_impl(x, y, radius)
-    local surface = game.surfaces[1]
-    local r = radius or 50
-    local area = {{x - r, y - r}, {x + r, y + r}}
-    local result = {
-        area = {
-            center = {x = x, y = y},
-            radius = r,
-        },
-        summary = {
-            offshore_pumps = 0,
-            boilers = 0,
-            steam_engines = 0,
-            pipes = 0,
-            electric_poles = 0,
-        },
-        entities = {},
-        fluid_segments = {},
-        issues = {},
-        suggested_actions = {},
-    }
-
-    local poles = surface.find_entities_filtered{type = "electric-pole", area = area, force = "player"}
-    result.summary.electric_poles = #poles
-
-    local steam_entities = surface.find_entities_filtered{
-        area = area,
-        force = "player",
-        name = {"offshore-pump", "boiler", "steam-engine", "pipe", "pipe-to-ground"},
-    }
-
-    for _, entity in pairs(steam_entities) do
-        if entity.name == "offshore-pump" then result.summary.offshore_pumps = result.summary.offshore_pumps + 1 end
-        if entity.name == "boiler" then result.summary.boilers = result.summary.boilers + 1 end
-        if entity.name == "steam-engine" then result.summary.steam_engines = result.summary.steam_engines + 1 end
-        if entity.name == "pipe" or entity.name == "pipe-to-ground" then result.summary.pipes = result.summary.pipes + 1 end
-
-        local item = {
-            unit_number = entity.unit_number,
-            name = entity.name,
-            type = entity.type,
-            position = pos_table(entity.position),
-            direction = entity.direction,
-            status = safe_entity_status(entity),
-            fluid_contents = {},
-            fluidboxes = {},
-        }
-
-        local ok_contents, contents = pcall(function()
-            return entity.get_fluid_contents()
-        end)
-        if ok_contents and type(contents) == "table" then
-            for name, amount in pairs(contents) do
-                table.insert(item.fluid_contents, {name = name, amount = amount})
-            end
-        end
-
-        if entity.burner then
-            local fuel_inv = entity.get_fuel_inventory()
-            item.fuel = {
-                total = fuel_inv and fuel_inv.get_item_count() or 0,
-                inventory = inventory_contents(fuel_inv),
-            }
-        end
-
-        local ok_connected, connected = pcall(function()
-            return entity.is_connected_to_electric_network()
-        end)
-        if ok_connected then item.connected_to_electric_network = connected end
-
-        item.fluidboxes = describe_fluidboxes(entity, result)
-        table.insert(result.entities, item)
-
-        if entity.name == "boiler" then
-            if item.fuel and item.fuel.total == 0 then
-                append_steam_issue(result, "boiler_no_fuel", "critical", entity, "Boiler has no fuel.", "Insert coal or another fuel into boiler unit " .. tostring(entity.unit_number) .. ".")
-            end
-            if item.status == "no_input_fluid" then
-                append_steam_issue(result, "boiler_no_water", "critical", entity, "Boiler is missing water input.", "Connect offshore pump water output to boiler unit " .. tostring(entity.unit_number) .. " water input.")
-            elseif item.status == "full_output" then
-                append_steam_issue(result, "boiler_steam_output_blocked", "critical", entity, "Boiler has steam but cannot drain it.", "Connect boiler unit " .. tostring(entity.unit_number) .. " steam output to a steam engine input, or move the blocking engine/pipe.")
-            end
-        elseif entity.name == "steam-engine" then
-            if item.status == "no_input_fluid" then
-                append_steam_issue(result, "steam_engine_no_steam", "critical", entity, "Steam engine is missing steam input.", "Connect a boiler steam output to steam engine unit " .. tostring(entity.unit_number) .. ".")
-            end
-            local nearby_poles = surface.find_entities_filtered{type = "electric-pole", position = entity.position, radius = 8, force = "player", limit = 1}
-            if #nearby_poles == 0 then
-                append_steam_issue(result, "steam_engine_not_on_grid", "warning", entity, "Steam engine has no electric pole close enough to receive generated power.", "Place an electric pole within wire reach of steam engine unit " .. tostring(entity.unit_number) .. ".")
-            end
-        elseif entity.name == "offshore-pump" then
-            if item.status == "no_power" then
-                append_steam_issue(result, "offshore_pump_no_power", "critical", entity, "Offshore pump reports no power.", "Move/rebuild pump at a valid shoreline or inspect modded pump requirements.")
-            elseif item.status == "no_input_fluid" then
-                append_steam_issue(result, "offshore_pump_not_on_water", "critical", entity, "Offshore pump is not receiving water.", "Rebuild offshore pump on a valid shoreline tile.")
-            end
-        end
-    end
-
-    if result.summary.offshore_pumps == 0 then
-        table.insert(result.suggested_actions, "No offshore pump in area; locate shoreline before building steam power.")
-    end
-    if result.summary.boilers == 0 then
-        table.insert(result.suggested_actions, "No boiler in area; build one between pump water output and steam engine input.")
-    end
-    if result.summary.steam_engines == 0 then
-        table.insert(result.suggested_actions, "No steam engine in area; build one on boiler steam output.")
-    end
-
-    return result
-end
-
-local POWER_CONSUMER_TYPES = {
-    "assembling-machine",
-    "furnace",
-    "lab",
-    "mining-drill",
-    "inserter",
-    "beacon",
-    "radar",
-}
-
-local POWER_ISSUE_CONSUMER_TYPES = {
-    "assembling-machine",
-    "furnace",
-    "lab",
-    "mining-drill",
-    "inserter",
-    "beacon",
-    "radar",
-    "lamp",
-    "roboport",
-}
-
-local POLE_SUPPLY_AREAS = {
-    ["small-electric-pole"] = 2.5,
-    ["medium-electric-pole"] = 3.5,
-    ["big-electric-pole"] = 2.0,
-    ["substation"] = 9.0,
-}
-
-local function area_around(x, y, radius)
-    local r = radius or 50
-    return r, {{x - r, y - r}, {x + r, y + r}}
-end
-
-local function entity_uses_electricity(entity)
-    local proto = prototypes.entity[entity.name]
-    if not proto then return false end
-    local ok, uses_electric = pcall(function()
-        return proto.electric_energy_source_prototype ~= nil
-    end)
-    return ok and uses_electric
-end
-
-local function entity_position_record(entity)
-    return {
-        name = entity.name,
-        x = entity.position.x,
-        y = entity.position.y,
-        unit_number = entity.unit_number,
-    }
-end
-
-local function build_power_coverage(surface, area, x, y, radius, display_ids)
-    local poles = surface.find_entities_filtered{
-        type = "electric-pole",
-        area = area,
-        force = "player",
-    }
-    local coverage = {}
-    local network_map = {}
-    local next_display_id = 1
-    local networks = {}
-    local pole_records = {}
-
-    for _, pole in pairs(poles) do
-        local network_id = pole.electric_network_id
-        if display_ids and network_id and not network_map[network_id] then
-            network_map[network_id] = next_display_id
-            networks[tostring(next_display_id)] = network_id
-            next_display_id = next_display_id + 1
-            if next_display_id > 9 then next_display_id = 9 end
-        end
-
-        local supply_dist = POLE_SUPPLY_AREAS[pole.name] or 2.5
-        local coverage_id = display_ids and (network_map[network_id] or 0) or network_id
-        if display_ids then
-            table.insert(pole_records, {
-                name = pole.name,
-                x = pole.position.x,
-                y = pole.position.y,
-                network_id = network_id,
-                display_id = coverage_id,
-                supply_area = supply_dist,
-            })
-        end
-
-        local px, py = math.floor(pole.position.x), math.floor(pole.position.y)
-        local sd = math.ceil(supply_dist)
-        for dx = -sd, sd do
-            for dy = -sd, sd do
-                if dx * dx + dy * dy <= supply_dist * supply_dist then
-                    local tx, ty = px + dx, py + dy
-                    if not display_ids or (tx >= x - radius and tx <= x + radius and ty >= y - radius and ty <= y + radius) then
-                        coverage[tx .. "," .. ty] = coverage_id
-                    end
-                end
-            end
-        end
-    end
-
-    return coverage, poles, pole_records, networks
-end
-
-local function get_power_status_impl(x, y, radius)
-    local surface = game.surfaces[1]
-    local r, area = area_around(x, y, radius)
-    local poles = surface.find_entities_filtered{
-        type = "electric-pole",
-        area = area,
-        force = "player",
-    }
-
-    if #poles == 0 then
-        return {error = "No electric poles found in area"}
-    end
-
-    local pole = poles[1]
-    local network_id = pole.electric_network_id
-    local result = {
-        network_id = network_id,
-        pole_count = #poles,
-        generators = {},
-        consumers = {
-            working = 0,
-            low_power = 0,
-            no_power = 0,
-            total = 0,
-        },
-        production_kw = 0,
-        consumption_kw = 0,
-        satisfaction = "unknown",
-    }
-
-    local generator_counts = {}
-    local total_production = 0
-    local generators = surface.find_entities_filtered{
-        area = area,
-        type = {"generator", "solar-panel", "accumulator"},
-        force = "player",
-    }
-
-    for _, gen in pairs(generators) do
-        local connected_pole = surface.find_entities_filtered{
-            type = "electric-pole",
-            position = gen.position,
-            radius = 10,
-            force = "player",
-            limit = 1,
-        }[1]
-        if connected_pole and connected_pole.electric_network_id == network_id then
-            generator_counts[gen.name] = (generator_counts[gen.name] or 0) + 1
-            if gen.type == "generator" then
-                total_production = total_production + (gen.energy_generated_last_tick or 0) * 60 / 1000
-            elseif gen.type == "solar-panel" then
-                total_production = total_production + 60 * surface.daytime
-            end
-        end
-    end
-
-    for name, count in pairs(generator_counts) do
-        table.insert(result.generators, {name = name, count = count})
-    end
-
-    local total_consumption = 0
-    local consumers_by_status = {working = {}, low_power = {}, no_power = {}}
-    for _, entity_type in pairs(POWER_CONSUMER_TYPES) do
-        local entities = surface.find_entities_filtered{
-            area = area,
-            type = entity_type,
-            force = "player",
-        }
-        for _, ent in pairs(entities) do
-            if entity_uses_electricity(ent) then
-                result.consumers.total = result.consumers.total + 1
-                local status = raw_entity_status(ent)
-                if status == defines.entity_status.no_power then
-                    result.consumers.no_power = result.consumers.no_power + 1
-                    table.insert(consumers_by_status.no_power, entity_position_record(ent))
-                elseif status == defines.entity_status.low_power then
-                    result.consumers.low_power = result.consumers.low_power + 1
-                    table.insert(consumers_by_status.low_power, entity_position_record(ent))
-                elseif status == defines.entity_status.working then
-                    result.consumers.working = result.consumers.working + 1
-                end
-
-                local proto = prototypes.entity[ent.name]
-                pcall(function()
-                    local usage = proto.energy_usage or 0
-                    if status == defines.entity_status.working then
-                        total_consumption = total_consumption + usage * 60 / 1000
-                    end
-                end)
-            end
-        end
-    end
-
-    result.production_kw = math.floor(total_production)
-    result.consumption_kw = math.floor(total_consumption)
-    if result.consumers.no_power > 0 then
-        result.satisfaction = "critical"
-    elseif result.consumers.low_power > 0 then
-        result.satisfaction = "low"
-    elseif result.consumers.working > 0 then
-        result.satisfaction = "ok"
-    else
-        result.satisfaction = "idle"
-    end
-
-    if #consumers_by_status.no_power > 0 then
-        result.no_power_entities = {}
-        for i = 1, math.min(5, #consumers_by_status.no_power) do
-            table.insert(result.no_power_entities, consumers_by_status.no_power[i])
-        end
-    end
-    if #consumers_by_status.low_power > 0 then
-        result.low_power_entities = {}
-        for i = 1, math.min(5, #consumers_by_status.low_power) do
-            table.insert(result.low_power_entities, consumers_by_status.low_power[i])
-        end
-    end
-
-    local stats = pole.electric_network_statistics
-    if stats then
-        local input_flow = {}
-        local output_flow = {}
-        for name, _ in pairs(stats.input_counts) do
-            local flow = stats.get_flow_count{
-                name = name,
-                input = true,
-                precision_index = defines.flow_precision_index.five_seconds,
-            }
-            if flow > 0 then table.insert(input_flow, {name = name, flow = flow}) end
-        end
-        for name, _ in pairs(stats.output_counts) do
-            local flow = stats.get_flow_count{
-                name = name,
-                input = false,
-                precision_index = defines.flow_precision_index.five_seconds,
-            }
-            if flow > 0 then table.insert(output_flow, {name = name, flow = flow}) end
-        end
-        if #input_flow > 0 then result.input_flow = input_flow end
-        if #output_flow > 0 then result.output_flow = output_flow end
-    end
-
-    return result
-end
-
-local function get_power_networks_impl(x, y, radius)
-    local surface = game.surfaces[1]
-    local _, area = area_around(x, y, radius)
-    local poles = surface.find_entities_filtered{
-        type = "electric-pole",
-        area = area,
-        force = "player",
-    }
-    local networks = {}
-    for _, pole in pairs(poles) do
-        local network_id = pole.electric_network_id
-        if network_id then
-            if not networks[network_id] then
-                networks[network_id] = {
-                    network_id = network_id,
-                    pole_count = 0,
-                    poles = {},
-                }
-            end
-            networks[network_id].pole_count = networks[network_id].pole_count + 1
-            if #networks[network_id].poles < 3 then
-                table.insert(networks[network_id].poles, {
-                    name = pole.name,
-                    position = pos_table(pole.position),
-                })
-            end
-        end
-    end
-
-    local result = {}
-    for _, data in pairs(networks) do
-        table.insert(result, data)
-    end
-    return result
-end
-
-local function find_power_issues_impl(x, y, radius)
-    local surface = game.surfaces[1]
-    local r, area = area_around(x, y, radius)
-    local coverage, poles = build_power_coverage(surface, area, x, y, r, false)
-    local result = {
-        unpowered_entities = {},
-        low_power_entities = {},
-        suggested_actions = {},
-    }
-
-    for _, entity_type in pairs(POWER_ISSUE_CONSUMER_TYPES) do
-        local entities = surface.find_entities_filtered{
-            area = area,
-            type = entity_type,
-            force = "player",
-        }
-        for _, ent in pairs(entities) do
-            if entity_uses_electricity(ent) then
-                local status = raw_entity_status(ent)
-                local ex, ey = math.floor(ent.position.x), math.floor(ent.position.y)
-                local key = ex .. "," .. ey
-                if status == defines.entity_status.no_power then
-                    table.insert(result.unpowered_entities, {
-                        unit_number = ent.unit_number,
-                        name = ent.name,
-                        x = ent.position.x,
-                        y = ent.position.y,
-                        in_coverage = coverage[key] ~= nil,
-                    })
-                    if not coverage[key] then
-                        table.insert(result.suggested_actions, "Place pole near (" .. ex .. ", " .. ey .. ") to power " .. ent.name)
-                    else
-                        table.insert(result.suggested_actions, ent.name .. " at (" .. ex .. ", " .. ey .. ") is in coverage but has no power - check generator capacity")
-                    end
-                elseif status == defines.entity_status.low_power then
-                    table.insert(result.low_power_entities, {
-                        unit_number = ent.unit_number,
-                        name = ent.name,
-                        x = ent.position.x,
-                        y = ent.position.y,
-                    })
-                    table.insert(result.suggested_actions, ent.name .. " at (" .. ex .. ", " .. ey .. ") has low power - add more generators")
-                end
-            end
-        end
-    end
-
-    result.summary = {
-        unpowered_count = #result.unpowered_entities,
-        low_power_count = #result.low_power_entities,
-        pole_count = #poles,
-    }
-    local original_action_count = #result.suggested_actions
-    if original_action_count > 10 then
-        local limited = {}
-        for i = 1, 10 do
-            limited[i] = result.suggested_actions[i]
-        end
-        result.suggested_actions = limited
-        result.summary.more_issues = original_action_count - 10
-    end
-    return result
-end
-
-local function get_power_coverage_impl(x, y, radius)
-    local surface = game.surfaces[1]
-    local r, area = area_around(x, y, radius)
-    local coverage, _, poles, networks = build_power_coverage(surface, area, x, y, r, true)
-    return {
-        poles = poles,
-        coverage = coverage,
-        networks = networks,
-    }
-end
-
-local function get_alerts_impl(x, y, radius)
-    local surface = game.surfaces[1]
-    local _, area = area_around(x, y, radius)
-    local alerts = {}
-
-    for _, entity_type in pairs(POWER_ISSUE_CONSUMER_TYPES) do
-        local entities = surface.find_entities_filtered{
-            area = area,
-            type = entity_type,
-            force = "player",
-        }
-        for _, ent in pairs(entities) do
-            if entity_uses_electricity(ent) then
-                local status = raw_entity_status(ent)
-                if status == defines.entity_status.no_power then
-                    table.insert(alerts, {
-                        type = "no_power",
-                        entity_name = ent.name,
-                        position = pos_table(ent.position),
-                        unit_number = ent.unit_number,
-                    })
-                elseif status == defines.entity_status.low_power then
-                    table.insert(alerts, {
-                        type = "low_power",
-                        entity_name = ent.name,
-                        position = pos_table(ent.position),
-                        unit_number = ent.unit_number,
-                    })
-                end
-            end
-        end
-    end
-
-    local drills = surface.find_entities_filtered{type = "mining-drill", area = area, force = "player"}
-    for _, drill in pairs(drills) do
-        if drill.mining_target == nil and raw_entity_status(drill) == defines.entity_status.no_minable_resources then
-            table.insert(alerts, {
-                type = "empty_drill",
-                entity_name = drill.name,
-                position = pos_table(drill.position),
-                unit_number = drill.unit_number,
-            })
-        end
-    end
-
-    local fuel_entities = surface.find_entities_filtered{
-        area = area,
-        force = "player",
-        type = {"furnace", "boiler"},
-    }
-    for _, entity in pairs(fuel_entities) do
-        if entity.burner then
-            local fuel_inv = entity.get_fuel_inventory()
-            if fuel_inv and fuel_inv.is_empty() then
-                table.insert(alerts, {
-                    type = "no_fuel",
-                    entity_name = entity.name,
-                    position = pos_table(entity.position),
-                    unit_number = entity.unit_number,
-                })
-            end
-        end
-    end
-
-    local assemblers = surface.find_entities_filtered{type = "assembling-machine", area = area, force = "player"}
-    for _, assembler in pairs(assemblers) do
-        local status = raw_entity_status(assembler)
-        if status == defines.entity_status.no_ingredients then
-            local recipe = assembler.get_recipe()
-            table.insert(alerts, {
-                type = "no_ingredients",
-                entity_name = assembler.name,
-                position = pos_table(assembler.position),
-                unit_number = assembler.unit_number,
-                recipe = recipe and recipe.name or nil,
-            })
-        end
-    end
-
-    local enemies = surface.find_entities_filtered{
-        force = "enemy",
-        area = area,
-        limit = 10,
-    }
-    for _, enemy in pairs(enemies) do
-        table.insert(alerts, {
-            type = "enemy_nearby",
-            entity_name = enemy.name,
-            position = pos_table(enemy.position),
-            health = enemy.health,
-        })
-    end
-    return alerts
-end
-
-local function get_belt_contents_impl(x1, y1, x2, y2)
-    local surface = game.surfaces[1]
-    local belts = surface.find_entities_filtered{
-        area = {{x1, y1}, {x2, y2}},
-        type = "transport-belt",
-    }
-    local belt_items = {}
-    local item_totals = {}
-    local total_items = 0
-
-    for _, belt in pairs(belts) do
-        local belt_data = {
-            position = pos_table(belt.position),
-            unit_number = belt.unit_number,
-            items = {},
-        }
-        for i = 1, belt.get_max_transport_line_index() do
-            local line = belt.get_transport_line(i)
-            if line then
-                for _, item in pairs(line.get_contents()) do
-                    table.insert(belt_data.items, {name = item.name, count = item.count})
-                    item_totals[item.name] = (item_totals[item.name] or 0) + item.count
-                    total_items = total_items + item.count
-                end
-            end
-        end
-        if #belt_data.items > 0 then
-            table.insert(belt_items, belt_data)
-        end
-    end
-
-    local summary = {}
-    for item_name, count in pairs(item_totals) do
-        table.insert(summary, {name = item_name, count = count})
-    end
-
-    return {
-        belt_count = #belts,
-        total_items = total_items,
-        item_summary = summary,
-        belts = belt_items,
-    }
-end
-
-local function get_belt_lane_contents_impl(x1, y1, x2, y2)
-    local surface = game.surfaces[1]
-    local belts = surface.find_entities_filtered{
-        area = {{x1, y1}, {x2, y2}},
-        type = "transport-belt",
-    }
-    local result = {}
-
-    for _, belt in pairs(belts) do
-        local left_items = {}
-        local right_items = {}
-        local left_count = 0
-        local right_count = 0
-
-        local line1 = belt.get_transport_line(1)
-        if line1 then
-            for _, item in pairs(line1.get_contents()) do
-                table.insert(left_items, {name = item.name, count = item.count})
-                left_count = left_count + item.count
-            end
-        end
-
-        local line2 = belt.get_transport_line(2)
-        if line2 then
-            for _, item in pairs(line2.get_contents()) do
-                table.insert(right_items, {name = item.name, count = item.count})
-                right_count = right_count + item.count
-            end
-        end
-
-        if #left_items > 0 or #right_items > 0 then
-            table.insert(result, {
-                position = {
-                    x = math.floor(belt.position.x),
-                    y = math.floor(belt.position.y),
-                },
-                unit_number = belt.unit_number,
-                direction = belt.direction,
-                belt_type = belt.name,
-                left_lane = {lane = 1, items = left_items, item_count = left_count},
-                right_lane = {lane = 2, items = right_items, item_count = right_count},
-            })
-        end
-    end
-
-    return result
-end
-
-local function area_table(x1, y1, x2, y2)
-    return {{x1, y1}, {x2, y2}}
-end
-
-local function bounding_box_table(bb)
-    if not bb then return nil end
-    return {
-        left_top = pos_table(bb.left_top),
-        right_bottom = pos_table(bb.right_bottom),
-    }
-end
-
-local function entity_summary(entity, include_bounding_box)
-    local result = {
-        unit_number = entity.unit_number,
-        name = entity.name,
-        type = entity.type,
-        position = pos_table(entity.position),
-        direction = entity.direction,
-        health = entity.health,
-        force = entity.force and entity.force.name or nil,
-    }
-
-    if include_bounding_box then
-        result.bounding_box = bounding_box_table(entity.bounding_box)
-    end
-
-    return result
-end
-
-local function get_surfaces_impl()
-    local result = {}
-    for _, surface in pairs(game.surfaces) do
-        table.insert(result, {
-            name = surface.name,
-            index = surface.index,
-            daytime = surface.daytime,
-            darkness = surface.darkness,
-        })
-    end
-    return result
-end
-
-local function find_entities_impl(x1, y1, x2, y2, entity_type, name)
-    local filters = {area = area_table(x1, y1, x2, y2)}
-    if entity_type then filters.type = entity_type end
-    if name then filters.name = name end
-
-    local result = {}
-    for _, entity in pairs(game.surfaces[1].find_entities_filtered(filters)) do
-        table.insert(result, entity_summary(entity, true))
-    end
-    return result
-end
-
-local function verify_production_impl(x1, y1, x2, y2)
-    local result = {}
-    local entities = game.surfaces[1].find_entities_filtered{
-        area = area_table(x1, y1, x2, y2),
-        force = game.forces.player,
-    }
-
-    for _, entity in pairs(entities) do
-        local status_value = raw_entity_status(entity)
-        if status_value ~= nil then
-            local products_finished = nil
-            local products_ok, products_value = pcall(function()
-                return entity.products_finished
-            end)
-            if products_ok then
-                products_finished = products_value
-            end
-
-            table.insert(result, {
-                name = entity.name,
-                position = pos_table(entity.position),
-                status = status_name(status_value),
-                products_finished = products_finished,
-                working = status_value == defines.entity_status.working,
-            })
-        end
-    end
-
-    return result
-end
-
-local function get_entity_impl(unit_number)
-    local entity = find_entity_by_unit_number(unit_number)
-    if not entity then return nil end
-    return entity_summary(entity, false)
-end
-
-local function get_entity_drop_position_impl(unit_number)
-    local entity = find_entity_by_unit_number(unit_number)
-    if not entity then
-        return {error = "Entity not found or has no drop_position"}
-    end
-    if not entity.drop_position then
-        return {error = "Entity not found or has no drop_position"}
-    end
-
-    local drop_position = entity.drop_position
-    local direction = entity.direction
-    return {
-        drop_x = drop_position.x,
-        drop_y = drop_position.y,
-        drill_direction = direction,
-        belt_direction = direction,
-    }
-end
-
-local function resource_patch_result(patch)
-    return {
-        name = patch.name,
-        total_amount = patch.total_amount,
-        tile_count = patch.tile_count,
-        center = {
-            x = (patch.min_x + patch.max_x) / 2,
-            y = (patch.min_y + patch.max_y) / 2,
-        },
-        bounding_box = {
-            left_top = {x = patch.min_x, y = patch.min_y},
-            right_bottom = {x = patch.max_x, y = patch.max_y},
-        },
-    }
-end
-
-local function aggregate_resource_patches(resources)
-    local by_name = {}
-    for _, resource in pairs(resources) do
-        local key = resource.name
-        if not by_name[key] then
-            by_name[key] = {
-                name = resource.name,
-                total_amount = 0,
-                tile_count = 0,
-                min_x = resource.position.x,
-                max_x = resource.position.x,
-                min_y = resource.position.y,
-                max_y = resource.position.y,
-            }
-        end
-
-        local patch = by_name[key]
-        patch.total_amount = patch.total_amount + (resource.amount or 0)
-        patch.tile_count = patch.tile_count + 1
-        patch.min_x = math.min(patch.min_x, resource.position.x)
-        patch.max_x = math.max(patch.max_x, resource.position.x)
-        patch.min_y = math.min(patch.min_y, resource.position.y)
-        patch.max_y = math.max(patch.max_y, resource.position.y)
-    end
-
-    local result = {}
-    for _, patch in pairs(by_name) do
-        table.insert(result, resource_patch_result(patch))
-    end
-    return result
-end
-
-local function find_resources_impl(x1, y1, x2, y2, resource_type)
-    local filters = {
-        type = "resource",
-        area = area_table(x1, y1, x2, y2),
-    }
-    if resource_type then filters.name = resource_type end
-
-    local resources = game.surfaces[1].find_entities_filtered(filters)
-    return aggregate_resource_patches(resources)
-end
-
-local function find_nearest_resource_impl(resource_name, from_x, from_y)
-    local nearest = nil
-    local nearest_dist = math.huge
-    local resources = game.surfaces[1].find_entities_filtered{
-        type = "resource",
-        name = resource_name,
-        position = {from_x, from_y},
-        radius = 200,
-    }
-
-    for _, resource in pairs(resources) do
-        local dx = resource.position.x - from_x
-        local dy = resource.position.y - from_y
-        local dist = dx * dx + dy * dy
-        if dist < nearest_dist then
-            nearest = resource
-            nearest_dist = dist
-        end
-    end
-
-    if not nearest then return nil end
-
-    local patch_resources = game.surfaces[1].find_entities_filtered{
-        type = "resource",
-        name = resource_name,
-        position = nearest.position,
-        radius = 50,
-    }
-    local patches = aggregate_resource_patches(patch_resources)
-    return patches[1]
-end
-
-local function tile_summary(tile, x, y)
-    return {
-        name = tile.name,
-        position = {x = x, y = y},
-        collides_with_player = tile.collides_with("player"),
-    }
-end
-
-local function get_tiles_impl(x1, y1, x2, y2)
-    local result = {}
-    for x = x1, x2 do
-        for y = y1, y2 do
-            local tile = game.surfaces[1].get_tile(x, y)
-            table.insert(result, tile_summary(tile, x, y))
-        end
-    end
-    return result
-end
-
-local function get_tile_impl(x, y)
-    local tile = game.surfaces[1].get_tile(x, y)
-    return tile_summary(tile, x, y)
-end
-
-local function inventory_define_for(inventory_type, default_type)
-    local normalized = inventory_type or default_type
-    if normalized == "fuel" then return defines.inventory.fuel end
-    if normalized == "input" then return defines.inventory.assembling_machine_input end
-    if normalized == "output" then return defines.inventory.assembling_machine_output end
-    if normalized == "chest" then return defines.inventory.chest end
-    if normalized == "furnace_source" then return defines.inventory.furnace_source end
-    if normalized == "furnace_result" then return defines.inventory.furnace_result end
-    if normalized == "lab_input" then return defines.inventory.lab_input end
-    if normalized == "lab_modules" then return defines.inventory.lab_modules end
-    return inventory_define_for(default_type, default_type)
-end
-
-local function find_factorioctl_character(agent_id)
-    if storage.characters then
-        local character = storage.characters[agent_id]
-        if character and character.valid then return character end
-        if agent_id == "default" then
-            character = storage.characters["__player__"]
-            if character and character.valid then return character end
-        elseif agent_id == "__player__" then
-            character = storage.characters["default"]
-            if character and character.valid then return character end
-        end
-    end
-
-    if agent_id == "default" or agent_id == "__player__" then
-        for _, player in pairs(game.connected_players) do
-            if player.character and player.character.valid then
-                return player.character
-            end
-        end
-    end
-
-    return nil
-end
-
-local function remember_factorioctl_character(agent_id, character)
-    storage.characters = storage.characters or {}
-    storage.factorioctl_entities = storage.factorioctl_entities or {}
-    storage.characters[agent_id] = character
-    if agent_id == "__player__" then storage.characters["default"] = character end
-    if agent_id == "default" then storage.characters["__player__"] = character end
-    if character and character.valid and character.unit_number then
-        storage.factorioctl_entities[character.unit_number] = character
-    end
-end
-
-local function ensure_surface_impl(planet_name)
-    local planet = game.planets[planet_name]
-    if not planet then return "no_planet" end
-    if game.surfaces[planet_name] then return "exists" end
-    planet.create_surface()
-    return "created"
-end
-
-local function pre_place_character_impl(agent_id, planet_name, spawn_x)
-    local target_surface = game.surfaces[planet_name]
-    if not target_surface then return "surface_not_found" end
-
-    target_surface.request_to_generate_chunks({spawn_x, 0}, 4)
-    target_surface.force_generate_chunk_requests()
-
-    local status = nil
+local function plan_steam_power_impl(agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
     local character = find_factorioctl_character(agent_id)
-    if character and character.valid then
-        if character.surface.name == planet_name then
-            status = "already_placed"
-        else
-            character.teleport({spawn_x, 0}, target_surface)
-            status = "teleported"
-        end
-    else
-        character = target_surface.create_entity{
-            name = "character",
-            position = {spawn_x, 0},
-            force = game.forces.player,
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+            blockers = {"no_character"},
         }
-        if character then status = "created" end
     end
-
-    if character and character.valid then
-        remember_factorioctl_character(agent_id, character)
-        return status
-    end
-
-    return "creation_failed"
-end
-
-local function live_state_line_impl(agent_id)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then return "" end
-
-    local names = {
-        "burner-mining-drill",
-        "electric-mining-drill",
-        "stone-furnace",
-        "assembling-machine-1",
-        "transport-belt",
-        "burner-inserter",
-        "inserter",
-        "small-electric-pole",
-        "medium-electric-pole",
-        "offshore-pump",
-        "boiler",
-        "steam-engine",
-        "pipe",
-        "lab",
-    }
-    local parts = {}
-    for _, name in ipairs(names) do
-        local count = #character.surface.find_entities_filtered{force = character.force, name = name}
-        if count > 0 then parts[#parts + 1] = name .. "=" .. count end
-    end
-
-    local summary = ""
-    if #parts > 0 then summary = "; player entities: " .. table.concat(parts, ", ") end
-    return "Live state: "
-        .. character.surface.name
-        .. " @ "
-        .. string.format("%.1f,%.1f", character.position.x, character.position.y)
-        .. summary
-end
-
-local function connected_player_count_impl()
-    return #game.connected_players
+    return power.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
 end
 
 local function broadcast_console_impl(message)
@@ -1971,109 +747,6 @@ end
 local function set_game_speed_impl(speed)
     game.speed = tonumber(speed) or game.speed
     return {success = true, speed = game.speed}
-end
-
-local function set_walk_target_impl(agent_id, x, y)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        return {
-            success = false,
-            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
-        }
-    end
-
-    remember_factorioctl_character(agent_id, character)
-    storage.walk_targets = storage.walk_targets or {}
-    if storage.walk_state then storage.walk_state[agent_id] = nil end
-    storage.walk_targets[agent_id] = {
-        x = x,
-        y = y,
-        stuck_ticks = 0,
-        expires_tick = game.tick + 7200,
-        last_x = character.position.x,
-        last_y = character.position.y,
-    }
-    character.walking_state = {walking = false}
-    return {success = true}
-end
-
-local function clear_walk_target_impl(agent_id)
-    if storage.walk_targets then storage.walk_targets[agent_id] = nil end
-    if storage.walk_state then storage.walk_state[agent_id] = nil end
-    local character = find_factorioctl_character(agent_id)
-    if character and character.valid then
-        remember_factorioctl_character(agent_id, character)
-        character.walking_state = {walking = false}
-    end
-    return {success = true}
-end
-
-local function init_character_impl(agent_id, x, y)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        character = game.surfaces[1].create_entity{
-            name = "character",
-            position = {x, y},
-            force = "player",
-        }
-        if not character then
-            return {error = "Failed to create character"}
-        end
-    end
-
-    remember_factorioctl_character(agent_id, character)
-    return entity_summary(character, false)
-end
-
-local function teleport_character_impl(agent_id, x, y)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        return {error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
-    end
-
-    if character.teleport({x, y}) then
-        return "ok"
-    end
-    return {error = "Teleport blocked (target obstructed)"}
-end
-
-local function character_status_impl(agent_id)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        return {valid = false}
-    end
-
-    local walking = false
-    if character.walking_state then walking = character.walking_state.walking end
-    local mining = false
-    if character.mining_state then mining = character.mining_state.mining end
-
-    return {
-        valid = true,
-        unit_number = character.unit_number,
-        position = pos_table(character.position),
-        health = character.health,
-        crafting_queue_size = character.crafting_queue_size,
-        walking = walking,
-        mining = mining,
-    }
-end
-
-local function character_inventory_impl(agent_id)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        return {items = {}, free_slots = 0}
-    end
-
-    local inv = character.get_main_inventory()
-    if not inv then
-        return {items = {}, free_slots = 0}
-    end
-
-    return {
-        items = inventory_contents(inv),
-        free_slots = inv.count_empty_stacks() or 0,
-    }
 end
 
 local function blueprint_scratch_stack(inv)
@@ -2270,7 +943,7 @@ end
 local function crafting_queue_summary(character)
     local queue = {}
     if not character then return queue end
-    for _, item in pairs(character.crafting_queue) do
+    for _, item in pairs(character.crafting_queue or {}) do
         table.insert(queue, {recipe = item.recipe, count = item.count})
     end
     return queue
@@ -2326,7 +999,7 @@ end
 local function wait_for_crafting_impl(agent_id)
     local character = find_factorioctl_character(agent_id)
     if character and character.valid then
-        return tostring(character.crafting_queue_size)
+        return tostring(character.crafting_queue_size or 0)
     end
     return "0"
 end
@@ -2630,372 +1303,6 @@ local function clear_area_impl(agent_id, x1, y1, x2, y2, clear_trees, clear_rock
     return result
 end
 
-local function placement_entity_result(entity)
-    return {
-        unit_number = entity.unit_number,
-        name = entity.name,
-        type = entity.type,
-        entity_type = entity.type,
-        position = pos_table(entity.position),
-        direction = entity.direction,
-        health = entity.health,
-        force = entity.force and entity.force.name or nil,
-    }
-end
-
-local function placement_failure(entity_name, position, direction, inventory_count, can_place, error)
-    return {
-        success = false,
-        error = error,
-        entity = entity_name,
-        position = {x = position[1], y = position[2]},
-        direction = direction,
-        inventory_count = inventory_count,
-        can_place = can_place,
-    }
-end
-
-local function clear_ground_items_for_placement(character, surface, entity_name, position)
-    local proto = prototypes.entity[entity_name]
-    if not (proto and proto.collision_box) then return end
-
-    local cb = proto.collision_box
-    local clear_area = {
-        {position[1] + cb.left_top.x - 0.1, position[2] + cb.left_top.y - 0.1},
-        {position[1] + cb.right_bottom.x + 0.1, position[2] + cb.right_bottom.y + 0.1},
-    }
-    local items_on_ground = surface.find_entities_filtered{
-        area = clear_area,
-        type = "item-entity",
-    }
-    for _, item in pairs(items_on_ground) do
-        local stack = item.stack
-        if stack and stack.valid_for_read then
-            local before_count = stack.count
-            local inserted = character.insert(stack)
-            if inserted > 0 then
-                if inserted >= before_count then
-                    item.destroy()
-                else
-                    stack.count = before_count - inserted
-                end
-            else
-                item.destroy()
-            end
-        else
-            item.destroy()
-        end
-    end
-end
-
-local function place_entity_impl(agent_id, entity_name, x, y, direction)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        return placement_failure(entity_name, {x, y}, direction, 0, false, "no character for agent " .. tostring(agent_id) .. "; spawn first")
-    end
-
-    local inv = character.get_main_inventory()
-    local inventory_count = 0
-    if inv then inventory_count = inv.get_item_count(entity_name) end
-    local position = {x, y}
-    if not inv or inventory_count < 1 then
-        return placement_failure(entity_name, position, direction, inventory_count, false, "Item not in inventory")
-    end
-
-    if not prototypes.entity[entity_name] then
-        return placement_failure(entity_name, position, direction, inventory_count, false, "Unknown entity prototype")
-    end
-
-    local surface = character.surface
-    clear_ground_items_for_placement(character, surface, entity_name, position)
-
-    local can_place_ok, can_place_or_error = pcall(function()
-        return surface.can_place_entity{
-            name = entity_name,
-            position = position,
-            direction = direction,
-            force = character.force,
-            build_check_type = defines.build_check_type.manual,
-        }
-    end)
-
-    if not can_place_ok or can_place_or_error ~= true then
-        return placement_failure(
-            entity_name,
-            position,
-            direction,
-            inventory_count,
-            false,
-            can_place_ok and "Cannot place entity here" or tostring(can_place_or_error)
-        )
-    end
-
-    local create_ok, created_or_error = pcall(function()
-        return surface.create_entity{
-            name = entity_name,
-            position = position,
-            direction = direction,
-            force = character.force,
-        }
-    end)
-
-    if not create_ok then
-        return placement_failure(entity_name, position, direction, inventory_count, true, tostring(created_or_error))
-    end
-
-    local entity = created_or_error
-    if not entity then
-        return placement_failure(
-            entity_name,
-            position,
-            direction,
-            inventory_count,
-            true,
-            "create_entity returned nil after can_place_entity succeeded"
-        )
-    end
-
-    if entity.unit_number then
-        storage.factorioctl_entities = storage.factorioctl_entities or {}
-        storage.factorioctl_entities[entity.unit_number] = entity
-    end
-    inv.remove{name = entity_name, count = 1}
-    return placement_entity_result(entity)
-end
-
-local function place_underground_belt_impl(agent_id, entity_name, x, y, direction, belt_type)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        return {error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
-    end
-
-    local inv = character.get_main_inventory()
-    local inventory_count = 0
-    if inv then inventory_count = inv.get_item_count(entity_name) end
-    if not inv or inventory_count < 1 then
-        return {error = "Item not in inventory"}
-    end
-
-    local position = {x, y}
-    local surface = character.surface
-    local can_place = surface.can_place_entity{
-        name = entity_name,
-        position = position,
-        direction = direction,
-        force = character.force,
-        build_check_type = defines.build_check_type.manual,
-    }
-
-    if not can_place then
-        return {error = "Cannot place underground belt here"}
-    end
-
-    local entity = surface.create_entity{
-        name = entity_name,
-        position = position,
-        direction = direction,
-        type = belt_type,
-        force = character.force,
-    }
-
-    if not entity then
-        return {error = "Failed to create underground belt"}
-    end
-
-    if entity.unit_number then
-        storage.factorioctl_entities = storage.factorioctl_entities or {}
-        storage.factorioctl_entities[entity.unit_number] = entity
-    end
-    inv.remove{name = entity_name, count = 1}
-
-    local result = placement_entity_result(entity)
-    result.belt_to_ground_type = entity.belt_to_ground_type
-    return result
-end
-
-local function check_entity_placement_impl(agent_id, entity_name, x, y, direction)
-    local character = find_factorioctl_character(agent_id)
-    local position = {x, y}
-    if not (character and character.valid) then
-        return {
-            factorio_allowed = false,
-            entity = entity_name,
-            position = {x = x, y = y},
-            direction = direction,
-            inventory_count = 0,
-            item_in_inventory = false,
-            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
-        }
-    end
-
-    if not prototypes.entity[entity_name] then
-        return {
-            factorio_allowed = false,
-            entity = entity_name,
-            position = {x = x, y = y},
-            direction = direction,
-            inventory_count = 0,
-            item_in_inventory = false,
-            error = "Unknown entity prototype",
-        }
-    end
-
-    local inv = character.get_main_inventory()
-    local inventory_count = 0
-    if inv then inventory_count = inv.get_item_count(entity_name) end
-
-    local ok, can_place_or_error = pcall(function()
-        return character.surface.can_place_entity{
-            name = entity_name,
-            position = position,
-            direction = direction,
-            force = character.force,
-            build_check_type = defines.build_check_type.manual,
-        }
-    end)
-
-    if not ok then
-        return {
-            factorio_allowed = false,
-            entity = entity_name,
-            position = {x = x, y = y},
-            direction = direction,
-            inventory_count = inventory_count,
-            item_in_inventory = inventory_count > 0,
-            error = tostring(can_place_or_error),
-        }
-    end
-
-    local result = {
-        factorio_allowed = can_place_or_error == true,
-        entity = entity_name,
-        position = {x = x, y = y},
-        direction = direction,
-        inventory_count = inventory_count,
-        item_in_inventory = inventory_count > 0,
-    }
-    if can_place_or_error ~= true then
-        result.error = "Factorio cannot place entity here"
-    end
-    return result
-end
-
-local function find_entity_placements_impl(agent_id, entity_name, center_x, center_y, radius, limit)
-    local character = find_factorioctl_character(agent_id)
-    local center = {center_x, center_y}
-    if not (character and character.valid) then
-        return {
-            success = false,
-            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
-            entity = entity_name,
-            center = {x = center_x, y = center_y},
-            radius = radius,
-            placements = {},
-        }
-    end
-
-    if not prototypes.entity[entity_name] then
-        return {
-            success = false,
-            error = "Unknown entity prototype",
-            entity = entity_name,
-            center = {x = center_x, y = center_y},
-            radius = radius,
-            placements = {},
-        }
-    end
-
-    local inv = character.get_main_inventory()
-    local inventory_count = 0
-    if inv then inventory_count = inv.get_item_count(entity_name) end
-
-    local directions = {0, 4, 8, 12}
-    local placements = {}
-    local checked = 0
-    local surface = character.surface
-    for dx = -radius, radius do
-        for dy = -radius, radius do
-            local position = {center[1] + dx, center[2] + dy}
-            for _, dir in pairs(directions) do
-                checked = checked + 1
-                local ok, can_place = pcall(function()
-                    return surface.can_place_entity{
-                        name = entity_name,
-                        position = position,
-                        direction = dir,
-                        force = character.force,
-                        build_check_type = defines.build_check_type.manual,
-                    }
-                end)
-                if ok and can_place == true then
-                    local distance = math.sqrt(dx * dx + dy * dy)
-                    table.insert(placements, {
-                        entity = entity_name,
-                        factorio_allowed = true,
-                        position = {x = position[1], y = position[2]},
-                        direction = dir,
-                        distance = distance,
-                        inventory_count = inventory_count,
-                        item_in_inventory = inventory_count > 0,
-                    })
-                end
-            end
-        end
-    end
-
-    table.sort(placements, function(a, b)
-        if a.distance == b.distance then
-            return a.direction < b.direction
-        end
-        return a.distance < b.distance
-    end)
-
-    local returned = {}
-    for i = 1, math.min(#placements, limit) do
-        table.insert(returned, placements[i])
-    end
-
-    return {
-        success = true,
-        entity = entity_name,
-        center = {x = center[1], y = center[2]},
-        radius = radius,
-        checked = checked,
-        total = #placements,
-        returned = #returned,
-        truncated = #placements > #returned,
-        placements = returned,
-    }
-end
-
-local function place_ghost_impl(agent_id, entity_name, x, y, direction)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        return {error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
-    end
-
-    local entity = character.surface.create_entity{
-        name = "entity-ghost",
-        inner_name = entity_name,
-        position = {x, y},
-        direction = direction,
-        force = character.force,
-    }
-
-    if not entity then
-        return {error = "Failed to create ghost"}
-    end
-    if entity.unit_number then
-        storage.factorioctl_entities = storage.factorioctl_entities or {}
-        storage.factorioctl_entities[entity.unit_number] = entity
-    end
-    local result = placement_entity_result(entity)
-    result.name = entity.ghost_name or entity_name
-    result.entity_type = "entity-ghost"
-    result.type = "entity-ghost"
-    return result
-end
-
 local function build_entity_result(entity)
     return {
         unit_number = entity.unit_number,
@@ -3161,7 +1468,43 @@ local function build_smelter_line_impl(agent_id, count, start_x, start_y, furnac
     return build_result(placed, count, entities, errors)
 end
 
-local function remove_entity_at_impl(x, y)
+local function mine_entity_for_agent(agent_id, entity)
+    local character = find_factorioctl_character(agent_id)
+    if not (character and character.valid) then
+        return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
+    end
+
+    if not (entity and entity.valid) then
+        return {success = false, error = "Entity not found"}
+    end
+
+    local inv = character.get_main_inventory()
+    local before_count = inventory_item_total(inv)
+    local name = entity.name
+    local unit_number = entity.unit_number
+
+    if not character.mine_entity(entity, true) then
+        return {
+            success = false,
+            error = "Could not mine entity",
+            name = name,
+            unit_number = unit_number,
+        }
+    end
+
+    if unit_number then storage.factorioctl_entities[unit_number] = nil end
+    local after_count = inventory_item_total(inv)
+    return {
+        success = true,
+        removed = true,
+        name = name,
+        unit_number = unit_number,
+        items_gained = after_count - before_count,
+        inventory = inventory_contents(inv),
+    }
+end
+
+local function remove_entity_at_impl(agent_id, x, y)
     storage.factorioctl_entities = storage.factorioctl_entities or {}
     local entities = game.surfaces[1].find_entities_filtered{
         position = {x, y},
@@ -3169,30 +1512,26 @@ local function remove_entity_at_impl(x, y)
     }
 
     for _, entity in pairs(entities) do
-        if entity.type ~= "character" then
-            if entity.unit_number then storage.factorioctl_entities[entity.unit_number] = nil end
-            entity.destroy()
-            return "ok"
+        if entity.type ~= "character" and entity.type ~= "resource" then
+            return mine_entity_for_agent(agent_id, entity)
         end
     end
 
     return {error = "No entity found"}
 end
 
-local function remove_entity_impl(unit_number)
+local function remove_entity_impl(agent_id, unit_number)
     storage.factorioctl_entities = storage.factorioctl_entities or {}
-    local entity = find_entity_by_unit_number(unit_number)
+    local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
     end
 
-    storage.factorioctl_entities[unit_number] = nil
-    entity.destroy()
-    return "ok"
+    return mine_entity_for_agent(agent_id, entity)
 end
 
 local function rotate_entity_impl(unit_number, direction)
-    local entity = find_entity_by_unit_number(unit_number)
+    local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
     end
@@ -3206,7 +1545,7 @@ local function rotate_entity_impl(unit_number, direction)
 end
 
 local function insert_items_impl(unit_number, item, count, inventory_type)
-    local entity = find_entity_by_unit_number(unit_number)
+    local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
     end
@@ -3230,7 +1569,7 @@ local function extract_items_impl(agent_id, unit_number, item, count, inventory_
         return {error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
 
-    local entity = find_entity_by_unit_number(unit_number)
+    local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
     end
@@ -3261,7 +1600,7 @@ local function extract_items_impl(agent_id, unit_number, item, count, inventory_
 end
 
 local function set_recipe_impl(unit_number, recipe)
-    local entity = find_entity_by_unit_number(unit_number)
+    local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
     end
@@ -3279,7 +1618,7 @@ local function set_recipe_impl(unit_number, recipe)
 end
 
 local function get_entity_inventory_impl(unit_number)
-    local entity = find_entity_by_unit_number(unit_number)
+    local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
     end
@@ -3313,95 +1652,6 @@ local function get_entity_inventory_impl(unit_number)
     end
 
     return result
-end
-
-local function recipe_unlocks(recipe_name)
-    local unlocks = {}
-    for tech_name, tech in pairs(game.forces.player.technologies) do
-        local effects = tech.prototype and tech.prototype.effects or {}
-        for _, effect in pairs(effects) do
-            if effect.type == "unlock-recipe" and effect.recipe == recipe_name then
-                table.insert(unlocks, tech_name)
-                break
-            end
-        end
-    end
-    table.sort(unlocks)
-    return unlocks
-end
-
-local function recipe_ingredients(recipe)
-    local ingredients = {}
-    for _, ingredient in pairs(recipe.ingredients) do
-        table.insert(ingredients, {
-            type = ingredient.type,
-            name = ingredient.name,
-            amount = ingredient.amount,
-        })
-    end
-    return ingredients
-end
-
-local function recipe_products(recipe)
-    local products = {}
-    for _, product in pairs(recipe.products) do
-        table.insert(products, {
-            type = product.type,
-            name = product.name,
-            amount = product.amount,
-            probability = product.probability,
-        })
-    end
-    return products
-end
-
-local function recipe_summary(recipe)
-    local force_recipe = game.forces.player.recipes[recipe.name]
-    return {
-        name = recipe.name,
-        category = recipe.category,
-        energy = recipe.energy,
-        enabled = force_recipe and force_recipe.enabled or false,
-        unlocked_by = recipe_unlocks(recipe.name),
-    }
-end
-
-local function recipe_details(recipe)
-    local result = recipe_summary(recipe)
-    result.ingredients = recipe_ingredients(recipe)
-    result.products = recipe_products(recipe)
-    return result
-end
-
-local function get_recipe_impl(name)
-    local recipe = prototypes.recipe[name]
-    if not recipe then
-        return {error = "Recipe not found"}
-    end
-    return recipe_details(recipe)
-end
-
-local function get_recipes_by_category_impl(category)
-    local recipes = {}
-    for _, recipe in pairs(prototypes.recipe) do
-        if recipe.category == category then
-            table.insert(recipes, recipe_summary(recipe))
-        end
-    end
-    return recipes
-end
-
-local function get_recipes_for_item_impl(item)
-    local recipes = {}
-    for _, recipe in pairs(prototypes.recipe) do
-        for _, product in pairs(recipe.products) do
-            if product.name == item then
-                table.insert(recipes, recipe_details(recipe))
-                break
-            end
-        end
-    end
-    return recipes
 end
 
 local function try_get(fn)
@@ -3475,378 +1725,6 @@ local function get_prototype_impl(name)
     return result
 end
 
-local function research_ingredients(tech)
-    local ingredients = {}
-    for _, ing in pairs(tech.research_unit_ingredients) do
-        table.insert(ingredients, {name = ing.name, amount = ing.amount})
-    end
-    return ingredients
-end
-
-local function research_effects(tech)
-    local effects = {}
-    for _, eff in pairs(tech.prototype.effects) do
-        if eff.type == "unlock-recipe" then
-            table.insert(effects, {
-                type = "unlock-recipe",
-                recipe = eff.recipe,
-            })
-        elseif eff.type == "turret-attack" then
-            table.insert(effects, {
-                type = "turret-attack",
-                turret_id = eff.turret_id,
-                modifier = eff.modifier,
-            })
-        else
-            table.insert(effects, {
-                type = eff.type,
-                modifier = eff.modifier,
-            })
-        end
-    end
-    return effects
-end
-
-local function lab_has_power(lab)
-    local status = lab.status
-    return status ~= defines.entity_status.no_power and status ~= defines.entity_status.low_power
-end
-
-local function science_totals_from_labs(labs)
-    local science_totals = {}
-    for _, lab in pairs(labs) do
-        local inv = lab.get_inventory(defines.inventory.lab_input)
-        if inv then
-            for i = 1, #inv do
-                local stack = inv[i]
-                if stack and stack.valid_for_read then
-                    science_totals[stack.name] = (science_totals[stack.name] or 0) + stack.count
-                end
-            end
-        end
-    end
-    return science_totals
-end
-
-local function science_totals_list(science_totals)
-    local result = {}
-    for name, count in pairs(science_totals) do
-        table.insert(result, {name = name, count = count})
-    end
-    return result
-end
-
-local function count_science_from_inventory(inv, science_totals, science_available)
-    if not inv then return end
-    for _, item in pairs(inv.get_contents()) do
-        if item.name:find("science%-pack") or item.name == "automation-science-pack" or item.name == "logistic-science-pack" then
-            science_totals[item.name] = (science_totals[item.name] or 0) + item.count
-            local found = false
-            for _, sci in pairs(science_available) do
-                if sci.name == item.name then
-                    sci.count = sci.count + item.count
-                    sci.in_inventory = item.count
-                    found = true
-                    break
-                end
-            end
-            if not found then
-                table.insert(science_available, {name = item.name, count = item.count, in_inventory = item.count})
-            end
-        end
-    end
-end
-
-local function get_research_status_impl()
-    local force = game.forces.player
-    local surface = game.surfaces[1]
-    local result = {
-        researched_count = 0,
-        total_count = 0,
-        current_research = nil,
-        research_progress = 0,
-        research_queue = {},
-        labs = {
-            count = 0,
-            powered = 0,
-            working = 0,
-        },
-        science_packs_in_labs = {},
-    }
-
-    for _, tech in pairs(force.technologies) do
-        result.total_count = result.total_count + 1
-        if tech.researched then
-            result.researched_count = result.researched_count + 1
-        end
-    end
-
-    if force.current_research then
-        local tech = force.current_research
-        result.current_research = {
-            name = tech.name,
-            level = tech.level,
-            research_unit_count = tech.research_unit_count,
-            ingredients = research_ingredients(tech),
-        }
-        result.research_progress = force.research_progress
-    end
-
-    if force.research_queue then
-        for _, tech in pairs(force.research_queue) do
-            table.insert(result.research_queue, {
-                name = tech.name,
-                level = tech.level,
-            })
-        end
-    end
-
-    local labs = surface.find_entities_filtered{type = "lab", force = force}
-    result.labs.count = #labs
-
-    local science_totals = science_totals_from_labs(labs)
-    for _, lab in pairs(labs) do
-        local status = lab.status
-        if status == defines.entity_status.working then
-            result.labs.working = result.labs.working + 1
-            result.labs.powered = result.labs.powered + 1
-        elseif lab_has_power(lab) then
-            result.labs.powered = result.labs.powered + 1
-        end
-    end
-
-    result.science_packs_in_labs = science_totals_list(science_totals)
-
-    if result.labs.count == 0 then
-        result.message = "No labs found! Build a lab and insert science packs to research."
-    elseif result.labs.powered == 0 then
-        result.message = "Labs have no power! Connect labs to the power grid."
-    elseif result.current_research and #result.science_packs_in_labs == 0 then
-        result.message = "Labs are empty! Insert science packs into labs to progress research."
-    end
-
-    return result
-end
-
-local function get_available_research_impl(agent_id)
-    local force = game.forces.player
-    local surface = game.surfaces[1]
-    local result = {
-        technologies = {},
-        lab_status = {
-            count = 0,
-            powered = 0,
-        },
-        science_available = {},
-    }
-
-    local labs = surface.find_entities_filtered{type = "lab", force = force}
-    result.lab_status.count = #labs
-
-    local science_totals = science_totals_from_labs(labs)
-    for _, lab in pairs(labs) do
-        if lab_has_power(lab) then
-            result.lab_status.powered = result.lab_status.powered + 1
-        end
-    end
-
-    result.science_available = science_totals_list(science_totals)
-
-    local character = find_factorioctl_character(agent_id)
-    if character and character.valid then
-        count_science_from_inventory(character.get_main_inventory(), science_totals, result.science_available)
-    end
-
-    for _, tech in pairs(force.technologies) do
-        if tech.enabled and not tech.researched then
-            local can_research = true
-            for _, prereq in pairs(tech.prerequisites) do
-                if not prereq.researched then
-                    can_research = false
-                    break
-                end
-            end
-
-            if can_research then
-                local ingredients = {}
-                local has_all_packs = result.lab_status.powered > 0
-                for _, ing in pairs(tech.research_unit_ingredients) do
-                    local have = science_totals[ing.name] or 0
-                    if have < ing.amount then
-                        has_all_packs = false
-                    end
-                    table.insert(ingredients, {
-                        name = ing.name,
-                        amount = ing.amount,
-                        available = have,
-                    })
-                end
-
-                local ready = "ready"
-                local blockers = {}
-                if result.lab_status.count == 0 then
-                    ready = "blocked"
-                    table.insert(blockers, "no labs - build a lab first")
-                elseif result.lab_status.powered == 0 then
-                    ready = "blocked"
-                    table.insert(blockers, "labs have no power")
-                end
-                if not has_all_packs then
-                    ready = "blocked"
-                    table.insert(blockers, "missing science packs in labs")
-                end
-
-                table.insert(result.technologies, {
-                    name = tech.name,
-                    level = tech.level,
-                    research_unit_count = tech.research_unit_count,
-                    ingredients = ingredients,
-                    effects = research_effects(tech),
-                    ready = ready,
-                    blockers = blockers,
-                })
-            end
-        end
-    end
-
-    if result.lab_status.count == 0 then
-        result.guidance = "To research: 1) Craft a lab (requires iron-gear-wheel, electronic-circuit, transport-belt), 2) Place it with power, 3) Craft science packs, 4) Insert science packs into lab"
-    elseif result.lab_status.powered == 0 then
-        result.guidance = "Labs need power! Connect them to your power grid (steam engine -> power poles -> lab)"
-    elseif #result.science_available == 0 then
-        result.guidance = "Craft science packs and insert them into labs. Red science (automation-science-pack) requires iron-gear-wheel + copper-plate"
-    end
-
-    return result
-end
-
-local function start_research_impl(tech_name)
-    local force = game.forces.player
-    local surface = game.surfaces[1]
-    local tech = force.technologies[tech_name]
-
-    if not tech then
-        return {success = false, error = "Technology not found"}
-    end
-
-    if tech.researched then
-        return {success = false, error = "Already researched"}
-    end
-
-    if not tech.enabled then
-        return {success = false, error = "Technology not enabled"}
-    end
-
-    for _, prereq in pairs(tech.prerequisites) do
-        if not prereq.researched then
-            return {success = false, error = "Prerequisites not met: " .. prereq.name}
-        end
-    end
-
-    local labs = surface.find_entities_filtered{type = "lab", force = force}
-    if #labs == 0 then
-        return {
-            success = false,
-            error = "No labs found! Build a lab first (requires: 10 iron-gear-wheel, 10 electronic-circuit, 4 transport-belt)",
-            action_needed = "build_lab",
-        }
-    end
-
-    local powered_labs = 0
-    for _, lab in pairs(labs) do
-        if lab_has_power(lab) then
-            powered_labs = powered_labs + 1
-        end
-    end
-    if powered_labs == 0 then
-        return {
-            success = false,
-            error = "Labs have no power! Connect labs to power grid.",
-            action_needed = "power_labs",
-        }
-    end
-
-    local ingredients = research_ingredients(tech)
-    local missing_packs = {}
-    local science_in_labs = science_totals_from_labs(labs)
-    for _, ing in pairs(tech.research_unit_ingredients) do
-        local have = science_in_labs[ing.name] or 0
-        if have < ing.amount then
-            table.insert(missing_packs, ing.name .. " (need " .. ing.amount .. ", have " .. have .. " in labs)")
-        end
-    end
-
-    if #missing_packs > 0 then
-        return {
-            success = false,
-            error = "Missing science packs in labs: " .. table.concat(missing_packs, ", "),
-            action_needed = "insert_science_packs",
-            required_packs = ingredients,
-            hint = "Craft the required science packs and insert them into your labs",
-        }
-    end
-
-    local added = force.add_research(tech)
-    if added then
-        return {
-            success = true,
-            name = tech.name,
-            research_unit_count = tech.research_unit_count,
-            ingredients = ingredients,
-            message = "Research queued! Labs will now consume science packs to progress.",
-        }
-    end
-
-    return {success = false, error = "Failed to queue research - check if another research is in progress"}
-end
-
-local function is_tech_researched_impl(tech_name)
-    local tech = game.forces.player.technologies[tech_name]
-    if not tech then
-        return {researched = false, error = "Technology not found"}
-    end
-    return {researched = tech.researched == true}
-end
-
-local function eval_production_snapshot_impl(surface_name)
-    local surface = game.surfaces[surface_name or "nauvis"]
-    if not surface then
-        return {produced = {}, rate_per_min = {}}
-    end
-
-    local stats = game.forces.player.get_item_production_statistics(surface)
-    local precision = defines.flow_precision_index.one_minute
-    local produced = {}
-    local rate_per_min = {}
-
-    for item, count in pairs(stats.input_counts or {}) do
-        local name = type(item) == "string" and item or item.name
-        if name then
-            produced[name] = count
-            rate_per_min[name] = stats.get_flow_count{
-                name = name,
-                category = "input",
-                precision_index = precision,
-            }
-        end
-    end
-
-    return {produced = produced, rate_per_min = rate_per_min}
-end
-
-local function json_remote_call(action_name, fn, ...)
-    local ok, result_or_error = pcall(fn, ...)
-    if not ok then
-        return helpers.table_to_json({
-            error = tostring(result_or_error),
-            action_needed = "fix_" .. action_name,
-        })
-    end
-    if result_or_error == nil then return "null" end
-    if type(result_or_error) == "string" then return result_or_error end
-    return helpers.table_to_json(result_or_error)
-end
-
 remote.add_interface("claude_interface", {
     receive_response = function(player_index, agent_name, text)
         table.insert(storage._rcon_queue, {
@@ -3887,19 +1765,19 @@ remote.add_interface("claude_interface", {
     end,
 
     ensure_surface = function(planet_name)
-        return ensure_surface_impl(planet_name)
+        return characters.ensure_surface(planet_name)
     end,
 
     pre_place_character = function(agent_id, planet_name, spawn_x)
-        return pre_place_character_impl(agent_id, planet_name, spawn_x)
+        return characters.pre_place(agent_id, planet_name, spawn_x)
     end,
 
     live_state_line = function(agent_id)
-        return live_state_line_impl(agent_id)
+        return characters.live_state_line(agent_id)
     end,
 
     connected_player_count = function()
-        return connected_player_count_impl()
+        return characters.connected_player_count()
     end,
 
     broadcast_console = function(message)
@@ -3924,8 +1802,7 @@ remote.add_interface("claude_interface", {
 
     -- Register an agent character entity for on_tick walk processing
     register_character = function(agent_id, entity)
-        if not storage.characters then storage.characters = {} end
-        storage.characters[agent_id] = entity
+        return characters.register(agent_id, entity)
     end,
 
     -- Set walking direction for an agent (processed in on_tick)
@@ -3942,14 +1819,14 @@ remote.add_interface("claude_interface", {
 
     -- Set target position for deterministic agent step-walking (processed in on_tick)
     set_walk_target = function(agent_id, x, y)
-        return json_remote_call("set_walk_target", set_walk_target_impl, agent_id, x, y)
+        return json_remote_call("set_walk_target", characters.set_walk_target, agent_id, x, y)
     end,
 
     -- Clear target position AND any leftover walk state for an agent. Must reset
     -- walking_state too, or a stale {walking=true} keeps the orphan character
     -- engine-walking with no target (audit F2 trapdoor).
     clear_walk_target = function(agent_id)
-        return json_remote_call("clear_walk_target", clear_walk_target_impl, agent_id)
+        return json_remote_call("clear_walk_target", characters.clear_walk_target, agent_id)
     end,
 
     -- Report whether an agent has an active deterministic walk target
@@ -3995,88 +1872,93 @@ remote.add_interface("claude_interface", {
 
     -- Diagnose steam-power fluid and electric connectivity near a position.
     diagnose_steam_power = function(x, y, radius)
-        return json_remote_call("diagnose_steam_power", diagnose_steam_power_impl, x, y, radius)
+        return json_remote_call("diagnose_steam_power", power.diagnose_steam_power, x, y, radius)
+    end,
+
+    -- Plan a checked starter steam-power layout before mutating the world.
+    plan_steam_power = function(agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
+        return json_remote_call("plan_steam_power", plan_steam_power_impl, agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
     end,
 
     -- Power diagnostics live in the mod so Rust only emits small remote calls.
     get_power_status = function(x, y, radius)
-        return json_remote_call("get_power_status", get_power_status_impl, x, y, radius)
+        return json_remote_call("get_power_status", power.get_power_status, x, y, radius)
     end,
 
     get_power_networks = function(x, y, radius)
-        return json_remote_call("get_power_networks", get_power_networks_impl, x, y, radius)
+        return json_remote_call("get_power_networks", power.get_power_networks, x, y, radius)
     end,
 
     find_power_issues = function(x, y, radius)
-        return json_remote_call("find_power_issues", find_power_issues_impl, x, y, radius)
+        return json_remote_call("find_power_issues", power.find_power_issues, x, y, radius)
     end,
 
     get_power_coverage = function(x, y, radius)
-        return json_remote_call("get_power_coverage", get_power_coverage_impl, x, y, radius)
+        return json_remote_call("get_power_coverage", power.get_power_coverage, x, y, radius)
     end,
 
     get_alerts = function(x, y, radius)
-        return json_remote_call("get_alerts", get_alerts_impl, x, y, radius)
+        return json_remote_call("get_alerts", power.get_alerts, x, y, radius)
     end,
 
     get_belt_contents = function(x1, y1, x2, y2)
-        return json_remote_call("get_belt_contents", get_belt_contents_impl, x1, y1, x2, y2)
+        return json_remote_call("get_belt_contents", transport.get_belt_contents, x1, y1, x2, y2)
     end,
 
     get_belt_lane_contents = function(x1, y1, x2, y2)
-        return json_remote_call("get_belt_lane_contents", get_belt_lane_contents_impl, x1, y1, x2, y2)
+        return json_remote_call("get_belt_lane_contents", transport.get_belt_lane_contents, x1, y1, x2, y2)
     end,
 
     get_surfaces = function()
-        return json_remote_call("get_surfaces", get_surfaces_impl)
+        return json_remote_call("get_surfaces", entities.get_surfaces)
     end,
 
     find_entities = function(x1, y1, x2, y2, entity_type, name)
-        return json_remote_call("find_entities", find_entities_impl, x1, y1, x2, y2, entity_type, name)
+        return json_remote_call("find_entities", entities.find_entities, x1, y1, x2, y2, entity_type, name)
     end,
 
     verify_production = function(x1, y1, x2, y2)
-        return json_remote_call("verify_production", verify_production_impl, x1, y1, x2, y2)
+        return json_remote_call("verify_production", entities.verify_production, x1, y1, x2, y2)
     end,
 
     get_entity = function(unit_number)
-        return json_remote_call("get_entity", get_entity_impl, unit_number)
+        return json_remote_call("get_entity", entities.get_entity, unit_number)
     end,
 
     get_entity_drop_position = function(unit_number)
-        return json_remote_call("get_entity_drop_position", get_entity_drop_position_impl, unit_number)
+        return json_remote_call("get_entity_drop_position", entities.get_drop_position, unit_number)
     end,
 
     find_resources = function(x1, y1, x2, y2, resource_type)
-        return json_remote_call("find_resources", find_resources_impl, x1, y1, x2, y2, resource_type)
+        return json_remote_call("find_resources", world.find_resources, x1, y1, x2, y2, resource_type)
     end,
 
     find_nearest_resource = function(resource_name, from_x, from_y)
-        return json_remote_call("find_nearest_resource", find_nearest_resource_impl, resource_name, from_x, from_y)
+        return json_remote_call("find_nearest_resource", world.find_nearest_resource, resource_name, from_x, from_y)
     end,
 
     get_tiles = function(x1, y1, x2, y2)
-        return json_remote_call("get_tiles", get_tiles_impl, x1, y1, x2, y2)
+        return json_remote_call("get_tiles", world.get_tiles, x1, y1, x2, y2)
     end,
 
     get_tile = function(x, y)
-        return json_remote_call("get_tile", get_tile_impl, x, y)
+        return json_remote_call("get_tile", world.get_tile, x, y)
     end,
 
     init_character = function(agent_id, x, y)
-        return json_remote_call("init_character", init_character_impl, agent_id, x, y)
+        return json_remote_call("init_character", characters.init, agent_id, x, y)
     end,
 
     teleport_character = function(agent_id, x, y)
-        return json_remote_call("teleport_character", teleport_character_impl, agent_id, x, y)
+        return json_remote_call("teleport_character", characters.teleport, agent_id, x, y)
     end,
 
     character_status = function(agent_id)
-        return json_remote_call("character_status", character_status_impl, agent_id)
+        return json_remote_call("character_status", characters.status, agent_id)
     end,
 
     character_inventory = function(agent_id)
-        return json_remote_call("character_inventory", character_inventory_impl, agent_id)
+        return json_remote_call("character_inventory", characters.inventory, agent_id)
     end,
 
     craft = function(agent_id, recipe_name, count)
@@ -4144,23 +2026,23 @@ remote.add_interface("claude_interface", {
     end,
 
     place_entity = function(agent_id, entity_name, x, y, direction)
-        return json_remote_call("place_entity", place_entity_impl, agent_id, entity_name, x, y, direction)
+        return json_remote_call("place_entity", placement.place_entity, agent_id, entity_name, x, y, direction)
     end,
 
     place_underground_belt = function(agent_id, entity_name, x, y, direction, belt_type)
-        return json_remote_call("place_underground_belt", place_underground_belt_impl, agent_id, entity_name, x, y, direction, belt_type)
+        return json_remote_call("place_underground_belt", placement.place_underground_belt, agent_id, entity_name, x, y, direction, belt_type)
     end,
 
     check_entity_placement = function(agent_id, entity_name, x, y, direction)
-        return json_remote_call("check_entity_placement", check_entity_placement_impl, agent_id, entity_name, x, y, direction)
+        return json_remote_call("check_entity_placement", placement.check_entity_placement, agent_id, entity_name, x, y, direction)
     end,
 
     find_entity_placements = function(agent_id, entity_name, center_x, center_y, radius, limit)
-        return json_remote_call("find_entity_placements", find_entity_placements_impl, agent_id, entity_name, center_x, center_y, radius, limit)
+        return json_remote_call("find_entity_placements", placement.find_entity_placements, agent_id, entity_name, center_x, center_y, radius, limit)
     end,
 
     place_ghost = function(agent_id, entity_name, x, y, direction)
-        return json_remote_call("place_ghost", place_ghost_impl, agent_id, entity_name, x, y, direction)
+        return json_remote_call("place_ghost", placement.place_ghost, agent_id, entity_name, x, y, direction)
     end,
 
     build_drill_array = function(agent_id, count, resource, near_x, near_y, drill_type, direction_name)
@@ -4171,12 +2053,12 @@ remote.add_interface("claude_interface", {
         return json_remote_call("build_smelter_line", build_smelter_line_impl, agent_id, count, start_x, start_y, furnace_type, line_direction, spacing)
     end,
 
-    remove_entity_at = function(x, y)
-        return json_remote_call("remove_entity_at", remove_entity_at_impl, x, y)
+    remove_entity_at = function(agent_id, x, y)
+        return json_remote_call("remove_entity_at", remove_entity_at_impl, agent_id, x, y)
     end,
 
-    remove_entity = function(unit_number)
-        return json_remote_call("remove_entity", remove_entity_impl, unit_number)
+    remove_entity = function(agent_id, unit_number)
+        return json_remote_call("remove_entity", remove_entity_impl, agent_id, unit_number)
     end,
 
     rotate_entity = function(unit_number, direction)
@@ -4200,15 +2082,15 @@ remote.add_interface("claude_interface", {
     end,
 
     get_recipe = function(name)
-        return json_remote_call("get_recipe", get_recipe_impl, name)
+        return json_remote_call("get_recipe", recipes.get_recipe, name)
     end,
 
     get_recipes_by_category = function(category)
-        return json_remote_call("get_recipes_by_category", get_recipes_by_category_impl, category)
+        return json_remote_call("get_recipes_by_category", recipes.get_recipes_by_category, category)
     end,
 
     get_recipes_for_item = function(item)
-        return json_remote_call("get_recipes_for_item", get_recipes_for_item_impl, item)
+        return json_remote_call("get_recipes_for_item", recipes.get_recipes_for_item, item)
     end,
 
     get_prototype = function(name)
@@ -4216,23 +2098,24 @@ remote.add_interface("claude_interface", {
     end,
 
     get_research_status = function()
-        return json_remote_call("get_research_status", get_research_status_impl)
+        return json_remote_call("get_research_status", research.get_research_status)
     end,
 
     get_available_research = function(agent_id)
-        return json_remote_call("get_available_research", get_available_research_impl, agent_id)
+        local character = find_factorioctl_character(agent_id)
+        return json_remote_call("get_available_research", research.get_available_research, character)
     end,
 
     start_research = function(tech_name)
-        return json_remote_call("start_research", start_research_impl, tech_name)
+        return json_remote_call("start_research", research.start_research, tech_name)
     end,
 
     is_tech_researched = function(tech_name)
-        return json_remote_call("is_tech_researched", is_tech_researched_impl, tech_name)
+        return json_remote_call("is_tech_researched", research.is_tech_researched, tech_name)
     end,
 
     eval_production_snapshot = function(surface_name)
-        return json_remote_call("eval_production_snapshot", eval_production_snapshot_impl, surface_name)
+        return json_remote_call("eval_production_snapshot", diagnostics.eval_production_snapshot, surface_name)
     end,
 
     -- Get character position (read-only, safe from any context)

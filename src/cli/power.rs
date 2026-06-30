@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use super::parsing::parse_tile;
+use super::parsing::{parse_area, parse_position, parse_tile};
 use super::ResolvedConnectionArgs;
 use crate::client::lua::LuaCommand;
 use crate::world::Position;
@@ -89,6 +89,17 @@ pub enum PowerSubcommand {
         /// Search radius
         #[arg(long, default_value = "50")]
         radius: u32,
+    },
+
+    /// Plan checked starter steam power without placing anything
+    PlanSteam {
+        /// Water bounding box as x1,y1,x2,y2
+        #[arg(long, allow_hyphen_values = true)]
+        water_area: String,
+
+        /// Target position to power as x,y
+        #[arg(long, allow_hyphen_values = true)]
+        target: String,
     },
 }
 
@@ -207,6 +218,13 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
             let lua = LuaCommand::diagnose_steam_power(x, y, radius);
             let response = client.execute_lua(&lua).await?;
             println!("{}", response);
+        }
+
+        PowerSubcommand::PlanSteam { water_area, target } => {
+            let water_area = parse_area(&water_area)?;
+            let target = parse_position(&target)?;
+            let plan = client.plan_steam_power(water_area, target).await?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
         }
     }
 

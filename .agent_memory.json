@@ -1,0 +1,22 @@
+{
+  "zones": {
+    "iron-mine-alpha": {
+      "id": "iron-mine-alpha",
+      "zone_type": "mining",
+      "bounds": {
+        "left_top": {
+          "x": 44.0,
+          "y": -35.0
+        },
+        "right_bottom": {
+          "x": 75.0,
+          "y": -5.0
+        }
+      },
+      "description": "Primary iron ore extraction site. Iron patch ~378k ore at (57, -22).",
+      "created_tick": 0
+    }
+  },
+  "protected_resources": [],
+  "notes": {}
+}

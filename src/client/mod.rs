@@ -625,6 +625,16 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
+    pub async fn plan_steam_power(
+        &mut self,
+        water_area: Area,
+        target: Position,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::plan_steam_power(&self.agent_id, water_area, target);
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     /// Place a ghost entity (for planning, doesn't require items)
     pub async fn place_ghost(
         &mut self,
@@ -648,7 +658,7 @@ impl FactorioClient {
 
     /// Remove entity at position
     pub async fn remove_entity_at(&mut self, position: Position) -> Result<()> {
-        let lua = LuaCommand::remove_entity_at(position);
+        let lua = LuaCommand::remove_entity_at(&self.agent_id, position);
         let response = self.execute_lua(&lua).await?;
         ensure_lua_success(&response)?;
         Ok(())
@@ -656,7 +666,7 @@ impl FactorioClient {
 
     /// Remove entity by unit number
     pub async fn remove_entity(&mut self, unit_number: u32) -> Result<()> {
-        let lua = LuaCommand::remove_entity(unit_number);
+        let lua = LuaCommand::remove_entity(&self.agent_id, unit_number);
         let response = self.execute_lua(&lua).await?;
         ensure_lua_success(&response)?;
         Ok(())

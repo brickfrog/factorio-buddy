@@ -42,10 +42,10 @@ class SkillTests(unittest.TestCase):
         self.assertGreaterEqual(len(missing["skills"]), 3)
         self.assertIn("build_burner_mining_setup", self._names(missing))
         self.assertIn("build_steam_power", self._names(missing))
-        self.assertIn(
-            "find_entity_placements",
-            " ".join(skills.get_skill(missing, "build_steam_power")["steps"]),
-        )
+        steam_steps = " ".join(skills.get_skill(missing, "build_steam_power")["steps"])
+        self.assertIn("plan_steam_power", steam_steps)
+        self.assertIn("place_args", steam_steps)
+        self.assertIn("diagnose_steam_power", steam_steps)
 
         (self.base / ".skills.json").write_text("{not json")
 

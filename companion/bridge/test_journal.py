@@ -72,6 +72,10 @@ class JournalTests(unittest.TestCase):
             '{"ts": "t4", "kind": "failure", "text": "stream idle timeout after 300s"}\n'
             '{"ts": "t5", "kind": "failure", "text": "{\\"error\\": \\"No electric poles found in area\\"}"}\n'
             '{"ts": "t6", "kind": "progress", "text": "situation assessed; no infrastructure yet deployed"}\n'
+            '{"ts": "t7", "kind": "failure", "text": "invalid_request: Error: missing field `success` at line 1 column 135"}\n'
+            '{"ts": "t8", "kind": "failure", "text": "sdk_failure: Error: Packet too large: 1553350 bytes"}\n'
+            '{"ts": "t9", "kind": "failure", "text": "game_rejected: __claude-interface__/control.lua:946: bad argument #1 of 2 to \'pairs\' (table expected, got nil)"}\n'
+            '{"ts": "t10", "kind": "failure", "text": "game_rejected: Failed to queue research - check if another research is in progress"}\n'
             '{"ts": "t3", "kind": "failure", "text": "Inserter faced the wrong way"}\n'
         )
 
@@ -89,6 +93,10 @@ class JournalTests(unittest.TestCase):
         self.assertNotIn("stream idle timeout", rendered)
         self.assertNotIn("No electric poles", rendered)
         self.assertNotIn("no infrastructure", rendered)
+        self.assertNotIn("missing field", rendered)
+        self.assertNotIn("Packet too large", rendered)
+        self.assertNotIn("bad argument #1", rendered)
+        self.assertNotIn("Failed to queue research", rendered)
 
     def test_should_reflect_only_at_positive_interval_multiples(self):
         self.assertFalse(journal.should_reflect(0, interval=16))
@@ -233,34 +241,85 @@ error_tips:
     def test_tool_error_detection_flags_factorio_failures(self):
         import pipe
 
-        failures = [
-            '{"error":"cannot place stone furnace"}',
-            '{"success":false,"message":"blocked"}',
-            '[{"type":"text","text":"Error: invalid type: map, expected a sequence"}]',
-            "Error: entity not found",
-            "Cannot place entity at target",
-            "Could not route belt to target",
-            "not in inventory",
-            "no power",
-            "route failed",
-        ]
+        classified_failures = {
+            '{"error":"cannot place stone furnace"}': pipe.TOOL_RESULT_GAME_REJECTED,
+            '{"success":false,"message":"blocked"}': pipe.TOOL_RESULT_GAME_REJECTED,
+            '[{"type":"text","text":"Error: invalid type: map, expected a sequence"}]': pipe.TOOL_RESULT_INVALID_REQUEST,
+            "Error: entity not found": pipe.TOOL_RESULT_GAME_REJECTED,
+            "Cannot place entity at target": pipe.TOOL_RESULT_GAME_REJECTED,
+            "Could not route belt to target": pipe.TOOL_RESULT_GAME_REJECTED,
+            "not in inventory": pipe.TOOL_RESULT_GAME_REJECTED,
+            "no power": pipe.TOOL_RESULT_GAME_REJECTED,
+            "route failed": pipe.TOOL_RESULT_GAME_REJECTED,
+            (
+                '{"success":false,"error":"No labs found! Build a lab first '
+                '(requires: 10 iron-gear-wheel, 10 electronic-circuit, 4 transport-belt)",'
+                '"action_needed":"build_lab"}'
+            ): pipe.TOOL_RESULT_GAME_REJECTED,
+            "Error: missing field `success` at line 1 column 135": pipe.TOOL_RESULT_INVALID_REQUEST,
+            "Error: Packet too large: 1553350 bytes": pipe.TOOL_RESULT_INVALID_REQUEST,
+            (
+                '{"success":false,"can_place":false,"entity":"stone-furnace",'
+                '"error":"Cannot place entity here","inventory_count":1,'
+                '"position":{"x":76,"y":-19}}'
+            ): pipe.TOOL_RESULT_GAME_REJECTED,
+            (
+                '[{"type":"text","text":"Error: expected value at line 1 column 1"}]'
+            ): pipe.TOOL_RESULT_INFRASTRUCTURE_FAILURE,
+        }
 
-        for text in failures:
+        for text, expected in classified_failures.items():
             with self.subTest(text=text):
+                self.assertEqual(pipe._classify_tool_result(text), expected)
                 self.assertTrue(pipe._looks_like_tool_error(text))
 
         self.assertFalse(pipe._looks_like_tool_error('{"success":true}'))
+        self.assertEqual(
+            pipe._classify_tool_result(
+                '{"success":true,"queued":3,"error":"legacy stale error text"}',
+                sdk_is_error=True,
+            ),
+            pipe.TOOL_RESULT_OK,
+        )
         self.assertFalse(pipe._looks_like_tool_error(
             '{"success":true,"queued":3,"error":"legacy stale error text"}'
         ))
+        self.assertEqual(
+            pipe._classify_tool_result(
+                '{"success":false,"mined_count":0,"error":null,"inventory":[]}',
+                sdk_is_error=True,
+            ),
+            pipe.TOOL_RESULT_EXPECTED_MISS,
+        )
         self.assertFalse(pipe._looks_like_tool_error(
             '{"success":false,"mined_count":0,"error":null,"inventory":[]}'
         ))
+        self.assertEqual(
+            pipe._classify_tool_result(
+                '[{"type":"text","text":"Error: No items of that type in inventory"}]',
+                sdk_is_error=True,
+            ),
+            pipe.TOOL_RESULT_EXPECTED_MISS,
+        )
         self.assertFalse(pipe._looks_like_tool_error(
             '[{"type":"text","text":"Error: No items of that type in inventory"}]'
         ))
         self.assertFalse(pipe._looks_like_tool_error(
             "Error: No items of that type in inventory"
+        ))
+        self.assertEqual(
+            pipe._classify_tool_result(
+                '[{"type":"text","text":"{\\"success\\":false,'
+                '\\"mined_count\\":0,\\"error\\":\\"No minable entity at position\\",'
+                '\\"inventory\\":[]}"}]',
+                sdk_is_error=True,
+            ),
+            pipe.TOOL_RESULT_EXPECTED_MISS,
+        )
+        self.assertFalse(pipe._looks_like_tool_error(
+            '[{"type":"text","text":"{\\"success\\":false,'
+            '\\"mined_count\\":0,\\"error\\":\\"No minable entity at position\\",'
+            '\\"inventory\\":[]}"}]'
         ))
         self.assertFalse(pipe._looks_like_tool_error(
             '[{"type":"text","text":"{\\"error\\": '
@@ -270,11 +329,6 @@ error_tips:
             '{"allowed":false,"policy_allowed":true,"factorio_allowed":false,'
             '"entity":"burner-mining-drill","position":{"x":45,"y":-35},'
             '"factorio":{"error":"Factorio cannot place entity here"}}'
-        ))
-        self.assertFalse(pipe._looks_like_tool_error(
-            '{"success":false,"can_place":false,"entity":"stone-furnace",'
-            '"error":"Cannot place entity here","inventory_count":1,'
-            '"position":{"x":76,"y":-19}}'
         ))
         self.assertFalse(pipe._looks_like_tool_error(
             "Error: execute_lua is disabled. Raw Lua execution is an "
@@ -401,6 +455,72 @@ error_tips:
             {},
         )
 
+    def test_factorio_tool_schema_gate_blocks_bad_params_before_mcp(self):
+        import pipe
+
+        gate = pipe.FactorioToolSchemaGate(pipe.logger.bind(agent="test"))
+
+        blocked = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__place_entity",
+                "tool_input": {
+                    "entity_name": "stone-furnace",
+                    "x": {"bad": True},
+                    "y": 0,
+                },
+            },
+            "tool-1",
+            {},
+        ))
+
+        self.assertEqual(blocked["decision"], "block")
+        self.assertEqual(
+            blocked["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+        self.assertIn("place_entity: tool_input.x: expected number", blocked["reason"])
+        self.assertIn("invalid Factorio tool parameters", blocked["reason"])
+        self.assertFalse(pipe._looks_like_tool_error(blocked["reason"]))
+
+    def test_factorio_tool_schema_gate_allows_valid_and_unknown_tools(self):
+        import pipe
+
+        gate = pipe.FactorioToolSchemaGate(pipe.logger.bind(agent="test"))
+
+        valid = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__place_entity",
+                "tool_input": {
+                    "entity_name": "stone-furnace",
+                    "x": 42.0,
+                    "y": -3,
+                    "direction": "south",
+                },
+            },
+            "tool-1",
+            {},
+        ))
+        unknown = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__future_tool",
+                "tool_input": {"whatever": {"shape": "kept"}},
+            },
+            "tool-2",
+            {},
+        ))
+        non_factorio = asyncio.run(gate.hook(
+            {
+                "tool_name": "Skill",
+                "tool_input": {"name": "factorio-control"},
+            },
+            "tool-3",
+            {},
+        ))
+
+        self.assertEqual(valid, {})
+        self.assertEqual(unknown, {})
+        self.assertEqual(non_factorio, {})
+
     def test_max_turn_default_is_raised_and_env_tunable(self):
         import pipe
 
@@ -500,6 +620,14 @@ error_tips:
 
         self.assertTrue(logged)
         self.assertIn("sdk init", log.messages[0][0])
+        self.assertFalse(pipe._should_log_system_message(SystemMessage(
+            subtype="thinking_tokens",
+            data={"estimated_tokens": 1},
+        )))
+        self.assertTrue(pipe._should_log_system_message(SystemMessage(
+            subtype="error",
+            data={"message": "visible diagnostic"},
+        )))
         self.assertTrue(pipe._is_skill_tool(ToolUseBlock(
             id="s1",
             name="Skill",
@@ -642,6 +770,21 @@ error_tips:
             UserMessage(content="just narrating, nothing wrong here"),
             UserMessage(content=[ToolResultBlock(
                 tool_use_id="t5",
+                content="Error: No items of that type in inventory",
+                is_error=True,
+            )]),
+            UserMessage(content=[ToolResultBlock(
+                tool_use_id="t6",
+                content='{"success":false,"mined_count":0,"error":null,"inventory":[]}',
+                is_error=True,
+            )]),
+            UserMessage(content=[ToolResultBlock(
+                tool_use_id="t7",
+                content='{"success":true,"queued":1,"error":"Crafting did not start"}',
+                is_error=True,
+            )]),
+            UserMessage(content=[ToolResultBlock(
+                tool_use_id="t8",
                 content=(
                     "Factorioctl bridge blocked parallel mutating tool call: "
                     "insert_items. Wait for the previous mutating tool result "
@@ -670,14 +813,17 @@ error_tips:
         texts = [event["text"] for event in journal.load_events("doug")]
         # is_error=True, error-text list-blocks, and string-wrapped error -> 4 failures
         self.assertEqual(len(texts), 4)
-        self.assertTrue(any("boom" in t for t in texts))
-        self.assertTrue(any("cannot place stone furnace" in t for t in texts))
-        self.assertTrue(any("invalid JSON" in t for t in texts))
-        self.assertTrue(any("invalid type: map" in t for t in texts))
+        self.assertTrue(any(t.startswith("sdk_failure:") and "boom" in t for t in texts))
+        self.assertTrue(any(t.startswith("game_rejected:") and "cannot place stone furnace" in t for t in texts))
+        self.assertTrue(any(t.startswith("invalid_request:") and "invalid JSON" in t for t in texts))
+        self.assertTrue(any(t.startswith("invalid_request:") and "invalid type: map" in t for t in texts))
         self.assertFalse(any("giga" in t for t in texts))
-        # success result and benign narration must NOT be journaled
+        # success result, expected miss, and benign narration must NOT be journaled
         self.assertFalse(any("ok scan complete" in t for t in texts))
         self.assertFalse(any("narrating" in t for t in texts))
+        self.assertFalse(any("No items of that type" in t for t in texts))
+        self.assertFalse(any("mined_count" in t for t in texts))
+        self.assertFalse(any("Crafting did not start" in t for t in texts))
         self.assertFalse(any("parallel mutating tool call" in t for t in texts))
 
     def test_anomaly_filter_ignores_nominal_variants(self):

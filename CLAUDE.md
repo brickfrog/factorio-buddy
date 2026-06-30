@@ -18,7 +18,7 @@ function and call it from Rust through the small wrapper helper.
 
 When changing Lua behavior, verify the Lua itself, not only Rust compilation:
 
-- `luac -p companion/mod/claude-interface/control.lua`
+- `find companion/mod/claude-interface -name '*.lua' -print0 | xargs -0 luac -p`
 - `cargo test --test lua_golden`
 - live Factorio/RCON smoke for any changed remote that touches Factorio state
 

@@ -581,19 +581,23 @@ end
     }
 
     /// Remove entity at position
-    pub fn remove_entity_at(position: Position) -> String {
+    pub fn remove_entity_at(agent_id: &AgentId, position: Position) -> String {
         Self::claude_interface_json_call(
             "remove_entity_at",
-            &[position.x.to_string(), position.y.to_string()],
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                position.x.to_string(),
+                position.y.to_string(),
+            ],
             "Run just sync/resume so the updated claude-interface mod is loaded before removing entities.",
         )
     }
 
     /// Remove entity by unit number
-    pub fn remove_entity(unit_number: u32) -> String {
+    pub fn remove_entity(agent_id: &AgentId, unit_number: u32) -> String {
         Self::claude_interface_json_call(
             "remove_entity",
-            &[unit_number.to_string()],
+            &[Self::lua_string_arg(agent_id.as_str()), unit_number.to_string()],
             "Run just sync/resume so the updated claude-interface mod is loaded before removing entities.",
         )
     }
@@ -887,6 +891,23 @@ end
             "diagnose_steam_power",
             &[x.to_string(), y.to_string(), radius.to_string()],
             "Run just sync/resume so the updated claude-interface mod is loaded before using steam diagnostics.",
+        )
+    }
+
+    /// Plan starter steam power before mutating pump/boiler/engine placement.
+    pub fn plan_steam_power(agent_id: &AgentId, water_area: Area, target: Position) -> String {
+        Self::claude_interface_json_call(
+            "plan_steam_power",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                water_area.left_top.x.to_string(),
+                water_area.left_top.y.to_string(),
+                water_area.right_bottom.x.to_string(),
+                water_area.right_bottom.y.to_string(),
+                target.x.to_string(),
+                target.y.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before planning steam power.",
         )
     }
 

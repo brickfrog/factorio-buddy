@@ -99,6 +99,15 @@ from journal import (append_event, apply_reflection_update, count_events,
 from learning import (apply_learning_update, learning_proposal_prompt,
                       load_accepted_learning, render_accepted_learning,
                       strip_learning_trailers)
+from models import (
+    AgentProfile,
+    BridgeValidationError,
+    TOOL_PARAM_BOOLEAN,
+    TOOL_PARAM_INTEGER,
+    TOOL_PARAM_NUMBER,
+    TOOL_PARAM_STRING,
+    ToolCallRequest,
+)
 from planner import build_autonomy_prompt, choose_autonomy_mode
 from skills import strip_skill_trailer
 from rcon import RCONClient, ThreadSafeRCON, lua_long_string
@@ -137,18 +146,17 @@ def load_agent(agent_name: str) -> dict:
             f"Agent profile not found: {agent_file}\n"
             f"Create it or use --agent default"
         )
-    agent = json.loads(agent_file.read_text())
-    # Validate required fields (per agent.schema.json)
-    if not isinstance(agent.get("name"), str) or not agent["name"]:
-        raise ValueError(f"Agent profile missing 'name': {agent_file}")
-    if not isinstance(agent.get("system_prompt"), str) or not agent["system_prompt"]:
-        raise ValueError(f"Agent profile missing 'system_prompt': {agent_file}")
+    try:
+        raw_agent = json.loads(agent_file.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{agent_file}: invalid JSON: {exc}") from exc
+    profile = AgentProfile.from_mapping(raw_agent)
     # Auto-generate formatting instructions from response_format
-    fmt = agent.get("response_format")
+    fmt = profile.response_format
     if fmt:
         instructions = build_format_instructions(fmt)
-        agent["system_prompt"] = agent["system_prompt"] + "\n\n" + instructions
-    return agent
+        profile = profile.with_system_prompt(profile.system_prompt + "\n\n" + instructions)
+    return profile.to_dict()
 
 
 # ── Response formatting ───────────────────────────────────────
@@ -430,6 +438,159 @@ _PARALLEL_MUTATION_GUARD_PREFIX = (
 _SKILL_REQUIRED_GUARD_PREFIX = (
     "Factorioctl bridge blocked Factorio tool before control skill:"
 )
+_PARAM_SCHEMA_GUARD_PREFIX = (
+    "Factorioctl bridge blocked invalid Factorio tool parameters:"
+)
+_FACTORIO_TOOL_PARAM_SCHEMAS: dict[str, dict[str, dict[str, str]]] = {
+    "walk_to": {
+        "required": {"x": TOOL_PARAM_NUMBER, "y": TOOL_PARAM_NUMBER},
+    },
+    "place_entity": {
+        "required": {
+            "entity_name": TOOL_PARAM_STRING,
+            "x": TOOL_PARAM_NUMBER,
+            "y": TOOL_PARAM_NUMBER,
+        },
+        "optional": {"direction": TOOL_PARAM_STRING},
+    },
+    "check_placement": {
+        "required": {
+            "entity_name": TOOL_PARAM_STRING,
+            "x": TOOL_PARAM_NUMBER,
+            "y": TOOL_PARAM_NUMBER,
+        },
+        "optional": {"direction": TOOL_PARAM_STRING},
+    },
+    "find_entity_placements": {
+        "required": {
+            "entity_name": TOOL_PARAM_STRING,
+            "x": TOOL_PARAM_NUMBER,
+            "y": TOOL_PARAM_NUMBER,
+        },
+        "optional": {
+            "radius": TOOL_PARAM_INTEGER,
+            "limit": TOOL_PARAM_INTEGER,
+        },
+    },
+    "mine_at": {
+        "required": {"x": TOOL_PARAM_NUMBER, "y": TOOL_PARAM_NUMBER},
+        "optional": {"count": TOOL_PARAM_INTEGER},
+    },
+    "craft": {
+        "required": {"recipe": TOOL_PARAM_STRING},
+        "optional": {"count": TOOL_PARAM_INTEGER},
+    },
+    "insert_items": {
+        "required": {
+            "unit_number": TOOL_PARAM_INTEGER,
+            "item": TOOL_PARAM_STRING,
+            "count": TOOL_PARAM_INTEGER,
+        },
+        "optional": {"inventory_type": TOOL_PARAM_STRING},
+    },
+    "extract_items": {
+        "required": {
+            "unit_number": TOOL_PARAM_INTEGER,
+            "item": TOOL_PARAM_STRING,
+            "count": TOOL_PARAM_INTEGER,
+        },
+        "optional": {"inventory_type": TOOL_PARAM_STRING},
+    },
+    "route_belt": {
+        "required": {
+            "from_x": TOOL_PARAM_INTEGER,
+            "from_y": TOOL_PARAM_INTEGER,
+            "to_x": TOOL_PARAM_INTEGER,
+            "to_y": TOOL_PARAM_INTEGER,
+        },
+        "optional": {
+            "belt_type": TOOL_PARAM_STRING,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+        },
+    },
+    "get_entities": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {
+            "radius": TOOL_PARAM_INTEGER,
+            "name": TOOL_PARAM_STRING,
+            "entity_type": TOOL_PARAM_STRING,
+            "limit": TOOL_PARAM_INTEGER,
+        },
+    },
+    "get_resources": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {
+            "radius": TOOL_PARAM_INTEGER,
+            "resource_type": TOOL_PARAM_STRING,
+        },
+    },
+    "find_nearest_resource": {
+        "required": {"resource_type": TOOL_PARAM_STRING},
+        "optional": {"x": TOOL_PARAM_NUMBER, "y": TOOL_PARAM_NUMBER},
+    },
+    "get_recipe": {
+        "required": {"name": TOOL_PARAM_STRING},
+    },
+    "get_recipes_for_item": {
+        "required": {"item": TOOL_PARAM_STRING},
+    },
+    "get_recipes_by_category": {
+        "required": {"category": TOOL_PARAM_STRING},
+    },
+    "set_recipe": {
+        "required": {
+            "unit_number": TOOL_PARAM_INTEGER,
+            "recipe": TOOL_PARAM_STRING,
+        },
+    },
+    "remove_entity": {
+        "required": {"unit_number": TOOL_PARAM_INTEGER},
+    },
+    "get_machine_belt_positions": {
+        "required": {"unit_number": TOOL_PARAM_INTEGER},
+    },
+    "plan_steam_power": {
+        "required": {
+            "water_x1": TOOL_PARAM_NUMBER,
+            "water_y1": TOOL_PARAM_NUMBER,
+            "water_x2": TOOL_PARAM_NUMBER,
+            "water_y2": TOOL_PARAM_NUMBER,
+            "target_x": TOOL_PARAM_NUMBER,
+            "target_y": TOOL_PARAM_NUMBER,
+        },
+    },
+    "diagnose_steam_power": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {"radius": TOOL_PARAM_INTEGER},
+    },
+    "get_power_status": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {"radius": TOOL_PARAM_INTEGER},
+    },
+    "get_power_networks": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {"radius": TOOL_PARAM_INTEGER},
+    },
+    "find_power_issues": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {"radius": TOOL_PARAM_INTEGER},
+    },
+    "get_power_coverage": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {"radius": TOOL_PARAM_INTEGER},
+    },
+    "get_alerts": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {"radius": TOOL_PARAM_INTEGER},
+    },
+    "start_research": {
+        "required": {"technology": TOOL_PARAM_STRING},
+    },
+}
 
 
 def _short_factorio_tool_name(tool_name: str) -> str:
@@ -452,6 +613,7 @@ def _is_operator_only_tool_refusal(text: str) -> bool:
         stripped.startswith("Error: execute_lua is disabled.")
         or stripped.startswith(_PARALLEL_MUTATION_GUARD_PREFIX)
         or stripped.startswith(_SKILL_REQUIRED_GUARD_PREFIX)
+        or stripped.startswith(_PARAM_SCHEMA_GUARD_PREFIX)
     )
 
 
@@ -461,7 +623,200 @@ def _is_benign_tool_miss(text: str) -> bool:
         "no items of that type in inventory",
         "error: no electric poles found in area",
         "no electric poles found in area",
+        "error: no minable entity at position",
+        "no minable entity at position",
     }
+
+
+TOOL_RESULT_OK = "ok"
+TOOL_RESULT_EXPECTED_MISS = "expected_miss"
+TOOL_RESULT_INVALID_REQUEST = "invalid_request"
+TOOL_RESULT_GAME_REJECTED = "game_rejected"
+TOOL_RESULT_SDK_FAILURE = "sdk_failure"
+TOOL_RESULT_INFRASTRUCTURE_FAILURE = "infrastructure_failure"
+TOOL_RESULT_FAILURE_CLASSES = {
+    TOOL_RESULT_INVALID_REQUEST,
+    TOOL_RESULT_GAME_REJECTED,
+    TOOL_RESULT_SDK_FAILURE,
+    TOOL_RESULT_INFRASTRUCTURE_FAILURE,
+}
+
+
+def _classify_text_failure(text: str) -> str | None:
+    lowered = str(text).strip().lower()
+    if not lowered:
+        return None
+    if _is_operator_only_tool_refusal(text):
+        return TOOL_RESULT_OK
+    if _is_benign_tool_miss(text):
+        return TOOL_RESULT_EXPECTED_MISS
+    if re.search(
+        r"invalid type|invalid json|failed to deserialize|expected .*sequence|"
+        r"missing required|missing field|unknown field|bad request|packet too large",
+        lowered,
+    ):
+        return TOOL_RESULT_INVALID_REQUEST
+    if re.search(
+        r"expected value at line \d+ column \d+|exceeds maximum allowed tokens|"
+        r"rcon|connection|timed out|timeout|unavailable|sync_or_restart_mod|"
+        r"mod does not expose|claude-interface mod",
+        lowered,
+    ):
+        return TOOL_RESULT_INFRASTRUCTURE_FAILURE
+    if re.search(
+        r"cannot\b.{0,80}\b(?:place|build|craft|insert|mine|find|reach|connect|route|move|walk|teleport)|"
+        r"could not\b.{0,80}\b(?:place|build|craft|insert|mine|find|reach|connect|route|move|walk|teleport)|"
+        r"not in inventory|no power|not found|no labs found|no .*resource entity found|"
+        r"failed|insufficient\b.{0,40}\b(?:items|resources|inventory|materials)|"
+        r"placement\b.{0,40}\b(?:failed|blocked|invalid)|"
+        r"entity\b.{0,40}\b(?:not found|invalid|missing)|"
+        r"route failed|factorio cannot place|\bblocked\b",
+        lowered,
+    ):
+        return TOOL_RESULT_GAME_REJECTED
+    if lowered.startswith("error:") or lowered.startswith("error "):
+        return TOOL_RESULT_SDK_FAILURE
+    return None
+
+
+def _classify_json_payload(value: Any) -> str | None:
+    if isinstance(value, dict):
+        success_false = value.get("success") is False
+
+        if value.get("type") == "text":
+            text = str(value.get("text", ""))
+            try:
+                parsed_text = json.loads(text)
+            except (TypeError, ValueError):
+                parsed_text = None
+            if parsed_text is not None:
+                parsed_class = _classify_json_payload(parsed_text)
+                if parsed_class:
+                    return parsed_class
+                return None
+            return _classify_text_failure(text)
+
+        if value.get("success") is True:
+            return TOOL_RESULT_OK
+
+        if (
+            value.get("success") is False
+            and value.get("mined_count") == 0
+            and not value.get("error")
+        ):
+            return TOOL_RESULT_EXPECTED_MISS
+
+        if (
+            value.get("success") is False
+            and value.get("can_place") is False
+            and "entity" in value
+            and "position" in value
+        ):
+            return TOOL_RESULT_GAME_REJECTED
+
+        if (
+            "allowed" in value
+            and "policy_allowed" in value
+            and "factorio_allowed" in value
+            and "entity" in value
+            and "position" in value
+        ):
+            return TOOL_RESULT_OK
+
+        for key, item in value.items():
+            key_lower = str(key).lower()
+            if key_lower == "error" and item:
+                text_class = _classify_text_failure(str(item))
+                if text_class:
+                    return text_class
+                if success_false:
+                    return TOOL_RESULT_GAME_REJECTED
+                return TOOL_RESULT_SDK_FAILURE
+            if key_lower in {"message", "reason", "action_needed"} and item:
+                text_class = _classify_text_failure(str(item))
+                if text_class:
+                    return text_class
+            if key_lower in {"status", "state", "result"}:
+                item_text = str(item).strip().lower()
+                if item_text in {"error", "failed", "failure", "fail"}:
+                    return TOOL_RESULT_SDK_FAILURE
+            child_class = _classify_json_payload(item)
+            if child_class and child_class != TOOL_RESULT_OK:
+                return child_class
+    elif isinstance(value, list):
+        saw_explicit_ok = False
+        for item in value:
+            item_class = _classify_json_payload(item)
+            if item_class and item_class != TOOL_RESULT_OK:
+                return item_class
+            if item_class == TOOL_RESULT_OK:
+                saw_explicit_ok = True
+        return TOOL_RESULT_OK if saw_explicit_ok else None
+    return None
+
+
+def _classify_tool_result(text: str, sdk_is_error: bool = False) -> str:
+    stripped = str(text).strip()
+    if not stripped:
+        return TOOL_RESULT_OK
+    if _is_operator_only_tool_refusal(stripped):
+        return TOOL_RESULT_OK
+    if _is_benign_tool_miss(stripped):
+        return TOOL_RESULT_EXPECTED_MISS
+
+    try:
+        parsed = json.loads(stripped)
+    except (TypeError, ValueError):
+        parsed = None
+
+    if parsed is not None:
+        parsed_class = _classify_json_payload(parsed)
+        if parsed_class:
+            if parsed_class == TOOL_RESULT_OK and sdk_is_error:
+                return TOOL_RESULT_OK
+            return parsed_class
+        if sdk_is_error:
+            return TOOL_RESULT_SDK_FAILURE
+        return TOOL_RESULT_OK
+
+    text_class = _classify_text_failure(stripped)
+    if text_class:
+        return text_class
+    if sdk_is_error:
+        return TOOL_RESULT_SDK_FAILURE
+    return TOOL_RESULT_OK
+
+
+def _journal_classified_tool_failure(
+    agent_name: str,
+    classification: str,
+    text: str,
+) -> None:
+    append_event(
+        agent_name,
+        "failure",
+        f"{classification}: {_short_event_text(text)}",
+    )
+
+
+def _log_tool_result(agent_name: str, log, text: str, sdk_is_error: bool = False) -> None:
+    classification = _classify_tool_result(text, sdk_is_error=sdk_is_error)
+    if classification == TOOL_RESULT_OK:
+        if text.strip():
+            log.debug("tool_result: {}", text)
+        return
+    if classification == TOOL_RESULT_EXPECTED_MISS:
+        log.debug("tool_result expected_miss: {}", text)
+        return
+    if classification == TOOL_RESULT_GAME_REJECTED:
+        log.info("tool_result game_rejected: {}", text)
+        _journal_classified_tool_failure(agent_name, classification, text)
+        return
+    if classification in TOOL_RESULT_FAILURE_CLASSES:
+        log.warning("tool_result {}: {}", classification, text)
+        _journal_classified_tool_failure(agent_name, classification, text)
+        return
+    log.debug("tool_result {}: {}", classification, text)
 
 
 class MutatingToolBatchGate:
@@ -530,6 +885,46 @@ class MutatingToolBatchGate:
         }
 
 
+class FactorioToolSchemaGate:
+    """Reject clearly malformed Factorio MCP parameters before Rust deserialization."""
+
+    def __init__(self, log):
+        self.log = log
+
+    async def hook(
+        self,
+        hook_input: Any,
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        try:
+            request = ToolCallRequest.from_hook_input(hook_input)
+        except BridgeValidationError as exc:
+            message = f"{_PARAM_SCHEMA_GUARD_PREFIX} {exc}"
+            self.log.debug("blocked malformed tool call hook input: {}", exc)
+            return _deny_pre_tool_use(message)
+
+        if not _is_factorio_mcp_tool(request.tool_name):
+            return {}
+
+        short_name = _short_factorio_tool_name(request.tool_name)
+        schema = _FACTORIO_TOOL_PARAM_SCHEMAS.get(short_name)
+        if not schema:
+            return {}
+
+        try:
+            request.validate_params(
+                required=schema.get("required", {}),
+                optional=schema.get("optional", {}),
+            )
+        except BridgeValidationError as exc:
+            message = f"{_PARAM_SCHEMA_GUARD_PREFIX} {short_name}: {exc}"
+            self.log.debug("blocked invalid {} params: {}", short_name, exc)
+            return _deny_pre_tool_use(message)
+
+        return {}
+
+
 class FactorioSkillGate:
     """Require the SDK control skill before exposing Factorio MCP actions."""
 
@@ -569,17 +964,21 @@ class FactorioSkillGate:
                     "blocked Factorio MCP tool before skill: {}",
                     short_name,
                 )
-                return {
-                    "decision": "block",
-                    "reason": message,
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": message,
-                    },
-                }
+                return _deny_pre_tool_use(message)
 
         return {}
+
+
+def _deny_pre_tool_use(message: str) -> dict[str, Any]:
+    return {
+        "decision": "block",
+        "reason": message,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": message,
+        },
+    }
 
 
 def _hook_value(hook_input: Any, key: str) -> Any:
@@ -659,37 +1058,7 @@ def _json_text_block_has_error(value: Any) -> bool:
 def _looks_like_tool_error(text: str) -> bool:
     """Detect factorioctl game-logic failures that are returned as success-path
     strings instead of SDK/CLI tool errors."""
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if _is_operator_only_tool_refusal(stripped):
-        return False
-    if _is_benign_tool_miss(stripped):
-        return False
-    try:
-        parsed = json.loads(stripped)
-    except (TypeError, ValueError):
-        parsed = None
-    if _json_payload_has_error(parsed):
-        return True
-    if parsed is not None:
-        return _json_text_block_has_error(parsed)
-
-    lowered = stripped.lower()
-    patterns = (
-        r"^error(?:\s|:)",
-        r"\berror:",
-        r"\bcannot\b.{0,80}\b(?:place|build|craft|insert|mine|find|reach|connect|route|move|walk|teleport)\b",
-        r"\bcould not\b.{0,80}\b(?:place|build|craft|insert|mine|find|reach|connect|route|move|walk|teleport)\b",
-        r"\bnot in inventory\b",
-        r"\bno power\b",
-        r"\bnot found\b",
-        r"\bfailed\b",
-        r"\binsufficient\b.{0,40}\b(?:items|resources|inventory|materials)\b",
-        r"\bplacement\b.{0,40}\b(?:failed|blocked|invalid)\b",
-        r"\bentity\b.{0,40}\b(?:not found|invalid|missing)\b",
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
+    return _classify_tool_result(text) in TOOL_RESULT_FAILURE_CLASSES
 
 
 def _short_event_text(text: str, limit: int = 300) -> str:
@@ -796,6 +1165,10 @@ def _log_sdk_init(msg: SystemMessage, options: ClaudeAgentOptions, log) -> bool:
         _bounded_list_for_log(visible_skills),
     )
     return True
+
+
+def _should_log_system_message(msg: SystemMessage) -> bool:
+    return getattr(msg, "subtype", None) not in {"thinking_tokens"}
 
 
 def _is_skill_tool(block: ToolUseBlock) -> bool:
@@ -1027,25 +1400,19 @@ async def _run_agent(
             # BOTH so a string-wrapped failure can't vanish unlogged again.
             if isinstance(msg.content, str):
                 text, player_messages = _result_text_and_player_messages(msg.content)
-                if _looks_like_tool_error(text):
-                    log.warning("tool_result ERROR: {}", text)
-                    append_event(agent_name, "failure", _short_event_text(text))
-                elif text.strip():
-                    log.debug("tool_result: {}", text)
+                _log_tool_result(agent_name, log, text, sdk_is_error=False)
                 if player_messages:
                     log.info("player_messages: {}", player_messages)
             else:
                 for block in msg.content:
                     if isinstance(block, ToolResultBlock):
                         text, player_messages = _result_text_and_player_messages(block.content)
-                        if (
-                            block.is_error
-                            and not _is_operator_only_tool_refusal(text)
-                        ) or _looks_like_tool_error(text):
-                            log.warning("tool_result ERROR: {}", text)
-                            append_event(agent_name, "failure", _short_event_text(text))
-                        else:
-                            log.debug("tool_result: {}", text)
+                        _log_tool_result(
+                            agent_name,
+                            log,
+                            text,
+                            sdk_is_error=bool(block.is_error),
+                        )
                         if player_messages:
                             log.info("player_messages: {}", player_messages)
         elif isinstance(msg, ResultMessage):
@@ -1055,8 +1422,13 @@ async def _run_agent(
             if msg.is_error:
                 detail = msg.result or "; ".join(msg.errors or []) or "agent result marked as error"
                 if not _set_usage_limit_cooldown(agent_name, detail, log):
-                    log.warning("result ERROR: {}", detail)
-                    append_event(agent_name, "failure", _short_event_text(detail))
+                    classification = TOOL_RESULT_SDK_FAILURE
+                    log.warning("result {}: {}", classification, detail)
+                    append_event(
+                        agent_name,
+                        "failure",
+                        f"{classification}: {_short_event_text(detail)}",
+                    )
             if msg.total_cost_usd is not None:
                 log.info(
                     "done: ${:.4f} | {} turns | {:.1f}s",
@@ -1076,7 +1448,8 @@ async def _run_agent(
                     })
         elif isinstance(msg, SystemMessage):
             if not _log_sdk_init(msg, options, log):
-                log.debug("system: {}", msg)
+                if _should_log_system_message(msg):
+                    log.debug("system: {}", msg)
         else:
             log.debug("stream event: {}", msg)
 
@@ -1141,6 +1514,7 @@ def handle_message(
         log,
         required="factorio-control" in resolved_sdk_skills,
     )
+    factorio_schema_gate = FactorioToolSchemaGate(log)
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model,
@@ -1159,6 +1533,7 @@ def handle_message(
             "PreToolUse": [
                 HookMatcher(hooks=[
                     factorio_skill_gate.hook,
+                    factorio_schema_gate.hook,
                     mutating_tool_gate.hook,
                 ])
             ],
@@ -1322,11 +1697,12 @@ def discover_agents(group: str | None = None, names: list[str] | None = None) ->
     profiles = []
     for f in agents_dir.glob("*.json"):
         try:
-            agent = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
+            raw_agent = json.loads(f.read_text())
+            profile = AgentProfile.from_mapping(raw_agent)
+        except (json.JSONDecodeError, OSError, ValueError):
             continue
-        if agent.get("group") == group:
-            profiles.append(load_agent(agent["name"]))
+        if profile.group == group:
+            profiles.append(load_agent(profile.name))
     if not profiles:
         raise ValueError(f"No agents found with group '{group}'")
     profiles.sort(key=_agent_sort_key)

@@ -14,13 +14,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from models import LEARNING_PROPOSAL_KINDS, LearningProposal
 
-LEARNING_TAGS = (
-    "skill_proposal",
-    "diagnostic_proposal",
-    "script_proposal",
-    "bug_report",
-)
+LEARNING_TAGS = LEARNING_PROPOSAL_KINDS
 LEARNING_RE = re.compile(
     r"<(?P<tag>skill_proposal|diagnostic_proposal|script_proposal|bug_report)>"
     r"(?P<body>.*?)"
@@ -145,65 +141,31 @@ def _parse_proposal_body(kind: str, body: str) -> dict:
 
     for key in list_keys:
         parsed[key] = _str_list(parsed.get(key, []))
-    return parsed
+    return LearningProposal.coerce(parsed).to_dict()
 
 
 def _is_meaningful(candidate: dict) -> bool:
     if not isinstance(candidate, dict):
         return False
-    if not candidate.get("name") and not candidate.get("problem"):
-        return False
-    return bool(
-        candidate.get("steps")
-        or candidate.get("anti_steps")
-        or candidate.get("evidence")
-        or candidate.get("acceptance_tests")
-        or candidate.get("trigger")
-        or candidate.get("problem")
-    )
+    status = candidate.get("status", "pending")
+    return LearningProposal.coerce(candidate, status=status).is_meaningful()
 
 
 def _normalize_candidate(candidate: dict, agent_name: str, status: str = "pending") -> dict | None:
     if not isinstance(candidate, dict):
         return None
-    kind = _normalize_kind(candidate.get("kind", "skill_proposal"))
-    name = str(candidate.get("name", "")).strip()
-    problem = str(candidate.get("problem", "")).strip()
-    if not name:
-        name = problem[:80].strip()
-    normalized = {
-        "schema_version": 1,
-        "status": status,
-        "kind": kind,
-        "agent": str(agent_name or "unknown"),
-        "name": name,
-        "trigger": str(candidate.get("trigger", "")).strip(),
-        "problem": problem,
-        "preconditions": _str_list(candidate.get("preconditions", [])),
-        "steps": _str_list(candidate.get("steps", [])),
-        "anti_steps": _str_list(candidate.get("anti_steps", [])),
-        "evidence": _str_list(candidate.get("evidence", [])),
-        "acceptance_tests": _str_list(candidate.get("acceptance_tests", [])),
-        "raw_body": str(candidate.get("raw_body", "")),
-    }
-    if not _is_meaningful(normalized):
+    proposal = LearningProposal.coerce(candidate, agent_name=agent_name, status=status)
+    if not proposal.is_meaningful():
         return None
+    normalized = proposal.to_dict()
     normalized["content_hash"] = _candidate_hash(normalized)
     return normalized
 
 
-def _hash_payload(candidate: dict) -> dict:
-    return {
-        "kind": candidate.get("kind", ""),
-        "name": candidate.get("name", ""),
-        "trigger": candidate.get("trigger", ""),
-        "problem": candidate.get("problem", ""),
-        "preconditions": candidate.get("preconditions", []),
-        "steps": candidate.get("steps", []),
-        "anti_steps": candidate.get("anti_steps", []),
-        "evidence": candidate.get("evidence", []),
-        "acceptance_tests": candidate.get("acceptance_tests", []),
-    }
+def _hash_payload(candidate: dict | LearningProposal) -> dict:
+    if isinstance(candidate, LearningProposal):
+        return candidate.hash_payload()
+    return LearningProposal.coerce(candidate).hash_payload()
 
 
 def _candidate_hash(candidate: dict) -> str:
@@ -247,7 +209,8 @@ def _candidate_filename(candidate: dict, now: datetime | None = None) -> str:
 
 
 def save_candidate(candidate: dict, status: str = "pending", now: datetime | None = None) -> Path | None:
-    normalized = _normalize_candidate(candidate, candidate.get("agent", "unknown"), status=status)
+    agent_name = candidate.get("agent", "unknown") if isinstance(candidate, dict) else "unknown"
+    normalized = _normalize_candidate(candidate, agent_name, status=status)
     if not normalized:
         return None
     normalized["created_at"] = _iso_utc(now)

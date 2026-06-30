@@ -504,6 +504,23 @@ pub struct FindPowerIssuesParams {
     pub radius: u32,
 }
 
+/// Parameters for steam-power layout planning.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlanSteamPowerParams {
+    /// Left X coordinate of known or suspected water area
+    pub water_x1: f64,
+    /// Top Y coordinate of known or suspected water area
+    pub water_y1: f64,
+    /// Right X coordinate of known or suspected water area
+    pub water_x2: f64,
+    /// Bottom Y coordinate of known or suspected water area
+    pub water_y2: f64,
+    /// X coordinate that should receive power, such as a lab or factory core
+    pub target_x: f64,
+    /// Y coordinate that should receive power, such as a lab or factory core
+    pub target_y: f64,
+}
+
 /// Parameters for alerts tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct AlertsParams {
@@ -2476,6 +2493,35 @@ impl FactorioMcp {
         );
         let result = match client.execute_lua(&lua).await {
             Ok(result) => result,
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Plan a checked steam-power layout before placing fluid entities.
+    #[tool(
+        description = "Plan starter steam power without mutating the game. Given a water bounding box and target position, returns checked offshore-pump, boiler, steam-engine, pipe, fuel, and pole placement arguments plus blockers/missing materials. Use before placing or rebuilding pump/boiler/engine layouts."
+    )]
+    async fn plan_steam_power(
+        &self,
+        Parameters(params): Parameters<PlanSteamPowerParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let water_area = Area::new(
+            params.water_x1,
+            params.water_y1,
+            params.water_x2,
+            params.water_y2,
+        );
+        let target = Position::new(params.target_x, params.target_y);
+        let result = match client.plan_steam_power(water_area, target).await {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
