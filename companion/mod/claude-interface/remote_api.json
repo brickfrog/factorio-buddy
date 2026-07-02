@@ -7,6 +7,7 @@
     "build_drill_array": {"args": ["agent_id", "count", "resource", "near_x", "near_y", "drill_type", "direction_name"], "returns": "json"},
     "build_edge_miner": {"args": ["agent_id", "resource_name", "center_x", "center_y", "radius", "drill_name", "limit"], "returns": "json"},
     "build_smelter_line": {"args": ["agent_id", "count", "start_x", "start_y", "furnace_type", "line_direction", "spacing"], "returns": "json"},
+    "can_stand_at": {"args": ["agent_id", "x", "y", "radius"], "returns": "json"},
     "character_inventory": {"args": ["agent_id"], "returns": "json"},
     "character_status": {"args": ["agent_id"], "returns": "json"},
     "chat_capture_status": {"args": [], "returns": "json"},
@@ -52,6 +53,7 @@
     "import_blueprint": {"args": ["agent_id", "bp_string", "x", "y", "direction"], "returns": "json"},
     "init_character": {"args": ["agent_id", "x", "y"], "returns": "json"},
     "insert_items": {"args": ["unit_number", "item", "count", "inventory_type"], "returns": "json"},
+    "is_player_blocked": {"args": ["agent_id", "radius"], "returns": "json"},
     "is_tech_researched": {"args": ["tech_name"], "returns": "json"},
     "list_blueprints": {"args": [], "returns": "json"},
     "mine_at": {"args": ["agent_id", "x", "y", "count", "radius"], "returns": "json"},
@@ -60,6 +62,7 @@
     "place_entity": {"args": ["agent_id", "entity_name", "x", "y", "direction"], "returns": "json"},
     "place_ghost": {"args": ["agent_id", "entity_name", "x", "y", "direction"], "returns": "json"},
     "place_underground_belt": {"args": ["agent_id", "entity_name", "x", "y", "direction", "belt_type"], "returns": "json"},
+    "plan_entity_placement_near": {"args": ["agent_id", "entity_name", "target_x", "target_y", "radius", "limit"], "returns": "json"},
     "plan_steam_power": {"args": ["agent_id", "water_x1", "water_y1", "water_x2", "water_y2", "target_x", "target_y"], "returns": "json"},
     "repair_steam_power": {"args": ["agent_id", "x", "y", "radius", "target_x", "target_y"], "returns": "json"},
     "remove_entity": {"args": ["agent_id", "unit_number"], "returns": "json"},
@@ -74,6 +77,7 @@
     "start_research": {"args": ["tech_name"], "returns": "json"},
     "stop_mining": {"args": ["agent_id"], "returns": "json"},
     "teleport_character": {"args": ["agent_id", "x", "y"], "returns": "json"},
+    "unstuck": {"args": ["agent_id", "radius", "dry_run"], "returns": "json"},
     "verify_production": {"args": ["x1", "y1", "x2", "y2"], "returns": "json"},
     "wait_for_crafting": {"args": ["agent_id"], "returns": "json"}
   }

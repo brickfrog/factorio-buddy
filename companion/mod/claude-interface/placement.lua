@@ -431,6 +431,64 @@ local function placement_failure(entity_name, position, direction, inventory_cou
     return result
 end
 
+local function placement_candidate(surface, force, entity_name, position, direction, character, target)
+    local character_blocker = character_placement_blocker(character, entity_name, position)
+    local footprint = placement_area(entity_name, position, 0.0)
+    local diagnostic = {
+        entity = entity_name,
+        position = {x = position[1], y = position[2]},
+        direction = direction,
+        direction_name = direction_name(direction),
+        footprint = area_table(footprint),
+        character_overlap = character_blocker ~= nil,
+        avoids_character = character_blocker == nil,
+    }
+    if target then
+        diagnostic.distance = math.sqrt(
+            (position[1] - target[1]) * (position[1] - target[1])
+                + (position[2] - target[2]) * (position[2] - target[2])
+        )
+    end
+    if character and character.valid then
+        diagnostic.distance_from_character = math.sqrt(
+            (position[1] - character.position.x) * (position[1] - character.position.x)
+                + (position[2] - character.position.y) * (position[2] - character.position.y)
+        )
+    end
+    if character_blocker then
+        diagnostic.factorio_allowed = false
+        diagnostic.error = "Placement overlaps agent character"
+        diagnostic.blockers = {character_blocker}
+        diagnostic.occupied_by = character_blocker
+        diagnostic.recommended_action = "walk_to_clear_placement"
+        return diagnostic
+    end
+
+    local ok, can_place_or_error = pcall(function()
+        return surface.can_place_entity{
+            name = entity_name,
+            position = position,
+            direction = direction,
+            force = force,
+            build_check_type = defines.build_check_type.manual,
+        }
+    end)
+    diagnostic.factorio_allowed = ok and can_place_or_error == true
+    if not ok then
+        diagnostic.error = tostring(can_place_or_error)
+    elseif can_place_or_error ~= true then
+        diagnostic.error = "Factorio cannot place entity here"
+        local details = placement_diagnostics(surface, force, entity_name, position, direction, character)
+        if details then
+            diagnostic.blockers = details.blockers
+            diagnostic.occupied_by = details.occupied_by
+            diagnostic.recommended_action = details.recommended_action
+        end
+    end
+
+    return diagnostic
+end
+
 local function clear_ground_items_for_placement(character, surface, entity_name, position)
     local proto = prototypes.entity[entity_name]
     if not (proto and proto.collision_box) then return end
@@ -1441,6 +1499,114 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
         truncated = #placements > #returned,
         placements = returned,
     }
+end
+
+function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y, radius, limit)
+    local character = characters.find(agent_id)
+    radius = math.max(1, math.min(25, math.floor(radius or 8)))
+    limit = math.max(1, math.min(50, math.floor(limit or 10)))
+    local target = {target_x, target_y}
+    local result = {
+        success = false,
+        dry_run = true,
+        entity = entity_name,
+        target = {x = target_x, y = target_y},
+        radius = radius,
+        checked = 0,
+        placements = {},
+        rejected_character_overlap = {},
+        rejected_blocked = {},
+        blockers = {},
+    }
+
+    if not (character and character.valid) then
+        result.error = "no character for agent " .. tostring(agent_id) .. "; spawn first"
+        result.next_action = "spawn_character"
+        return result
+    end
+
+    if not prototypes.entity[entity_name] then
+        result.error = "Unknown entity prototype"
+        result.next_action = "choose_valid_entity"
+        return result
+    end
+
+    result.character_position = pos_table(character.position)
+    local inv = character.get_main_inventory()
+    local inventory_count = inv and inv.get_item_count(entity_name) or 0
+    result.inventory_count = inventory_count
+    result.item_in_inventory = inventory_count > 0
+
+    local directions = {0, 4, 8, 12}
+    local surface = character.surface
+    local force = character.force
+    local accepted = {}
+    for dx = -radius, radius do
+        for dy = -radius, radius do
+            local position = {target[1] + dx, target[2] + dy}
+            for _, dir in pairs(directions) do
+                result.checked = result.checked + 1
+                local candidate = placement_candidate(surface, force, entity_name, position, dir, character, target)
+                if candidate.factorio_allowed and candidate.avoids_character then
+                    candidate.tool = "place_entity"
+                    candidate.tool_args = {
+                        entity_name = entity_name,
+                        x = candidate.position.x,
+                        y = candidate.position.y,
+                        direction = direction_arg_name(dir),
+                    }
+                    candidate.description = "Place " .. entity_name .. " near target without overlapping the agent character."
+                    table.insert(accepted, candidate)
+                elseif candidate.character_overlap then
+                    if #result.rejected_character_overlap < limit then
+                        table.insert(result.rejected_character_overlap, candidate)
+                    end
+                elseif #result.rejected_blocked < limit then
+                    table.insert(result.rejected_blocked, candidate)
+                end
+            end
+        end
+    end
+
+    table.sort(accepted, function(a, b)
+        if a.distance == b.distance then
+            if a.distance_from_character == b.distance_from_character then
+                if a.position.x == b.position.x then
+                    return a.position.y < b.position.y
+                end
+                return a.position.x < b.position.x
+            end
+            return a.distance_from_character > b.distance_from_character
+        end
+        return a.distance < b.distance
+    end)
+
+    for i = 1, math.min(#accepted, limit) do
+        table.insert(result.placements, accepted[i])
+    end
+    result.total = #accepted
+    result.returned = #result.placements
+    result.truncated = #accepted > #result.placements
+
+    if #accepted > 0 then
+        result.success = true
+        result.selected = accepted[1]
+        result.steps = {accepted[1]}
+        result.next_action = "execute_place_entity_step"
+        result.guidance = "Use selected.tool_args with place_entity; selected.footprint shows the exact entity collision footprint and avoids_character confirms it does not overlap the agent."
+        return result
+    end
+
+    if #result.rejected_character_overlap > 0 then
+        result.error = "Only nearby Factorio-valid placements overlap the agent character."
+        result.next_action = "move_agent_or_call_unstuck"
+        result.recommended_action = "walk_to_clear_placement"
+        result.guidance = "Move the agent away from the requested build area, then call plan_entity_placement_near again."
+    else
+        result.error = "No Factorio-valid placement found near target."
+        result.next_action = "expand_radius_or_clear_blockers"
+    end
+    return result
 end
 
 function M.place_ghost(agent_id, entity_name, x, y, direction)

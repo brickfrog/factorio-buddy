@@ -321,6 +321,42 @@ end
         )
     }
 
+    /// Check whether the agent character can stand at a world position.
+    pub fn can_stand_at(agent_id: &AgentId, position: Position, radius: u32) -> String {
+        Self::claude_interface_json_call(
+            "can_stand_at",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                position.x.to_string(),
+                position.y.to_string(),
+                radius.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before checking standability.",
+        )
+    }
+
+    /// Diagnose whether the agent character is currently blocked by placed entities.
+    pub fn is_player_blocked(agent_id: &AgentId, radius: u32) -> String {
+        Self::claude_interface_json_call(
+            "is_player_blocked",
+            &[Self::lua_string_arg(agent_id.as_str()), radius.to_string()],
+            "Run just sync/resume so the updated claude-interface mod is loaded before checking character blockage.",
+        )
+    }
+
+    /// Move a physically blocked agent character to the nearest verified clear standing position.
+    pub fn unstuck(agent_id: &AgentId, radius: u32, dry_run: bool) -> String {
+        Self::claude_interface_json_call(
+            "unstuck",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                radius.to_string(),
+                if dry_run { "true" } else { "false" }.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before unsticking characters.",
+        )
+    }
+
     /// Get character position as "x,y".
     pub fn get_character_position(agent_id: &AgentId) -> String {
         Self::claude_interface_json_call(
@@ -483,6 +519,28 @@ end
                 limit.to_string(),
             ],
             "Run just sync/resume so the updated claude-interface mod is loaded before searching placements.",
+        )
+    }
+
+    /// Plan a Factorio-valid placement near a target while avoiding character overlap.
+    pub fn plan_entity_placement_near(
+        agent_id: &AgentId,
+        entity_name: &str,
+        target: Position,
+        radius: u32,
+        limit: u32,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "plan_entity_placement_near",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                Self::lua_string_arg(entity_name),
+                target.x.to_string(),
+                target.y.to_string(),
+                radius.to_string(),
+                limit.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before planning safe placements.",
         )
     }
 

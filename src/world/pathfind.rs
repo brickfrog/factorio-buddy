@@ -237,6 +237,46 @@ pub struct BeltPlacement {
     pub kind: BeltKind,
 }
 
+/// One validated topology edge in a belt route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeltTopologyStep {
+    /// Zero-based sequence index.
+    pub index: u32,
+    /// Tile coordinate occupied by this belt placement.
+    pub tile: GridPos,
+    /// World-space placement position.
+    pub position: Position,
+    /// Belt direction at this placement.
+    pub direction: Direction,
+    /// Surface/underground placement kind.
+    pub kind: BeltKind,
+    /// Next connected tile in the route, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_tile: Option<GridPos>,
+    /// Whether this step connects to the next step.
+    pub connects_to_next: bool,
+    /// Human-readable connection note.
+    pub connection: String,
+}
+
+/// Machine-checkable connectivity summary for a planned belt route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeltRouteTopology {
+    /// Whether all adjacent route steps connect end-to-end.
+    pub connected: bool,
+    /// First route tile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_tile: Option<GridPos>,
+    /// Last route tile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_tile: Option<GridPos>,
+    /// Per-step topology evidence.
+    pub steps: Vec<BeltTopologyStep>,
+    /// Connectivity errors, if any.
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
 /// Result of belt routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteResult {
@@ -251,6 +291,9 @@ pub struct RouteResult {
     /// Number of underground belt pairs used
     #[serde(default)]
     pub underground_count: u32,
+    /// Machine-checkable connected-route topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<BeltRouteTopology>,
     /// Error message if routing failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -323,6 +366,7 @@ pub fn find_belt_route_with_options(
             belt_count: 0,
             turn_count: 0,
             underground_count: 0,
+            topology: None,
             error: Some("Start position is blocked".to_string()),
         };
     }
@@ -333,6 +377,7 @@ pub fn find_belt_route_with_options(
             belt_count: 0,
             turn_count: 0,
             underground_count: 0,
+            topology: None,
             error: Some("Goal position is blocked".to_string()),
         };
     }
@@ -362,6 +407,7 @@ pub fn find_belt_route_with_options(
                 .iter()
                 .filter(|b| b.kind == BeltKind::UndergroundEntry)
                 .count() as u32;
+            let topology = build_belt_route_topology(&belts);
 
             return RouteResult {
                 success: true,
@@ -369,6 +415,7 @@ pub fn find_belt_route_with_options(
                 belts,
                 turn_count,
                 underground_count,
+                topology: Some(topology),
                 error: None,
             };
         }
@@ -486,7 +533,94 @@ pub fn find_belt_route_with_options(
         belt_count: 0,
         turn_count: 0,
         underground_count: 0,
+        topology: None,
         error: Some("No path found - obstacles may be blocking the route".to_string()),
+    }
+}
+
+/// Build a machine-checkable topology summary for route placements.
+pub fn build_belt_route_topology(belts: &[BeltPlacement]) -> BeltRouteTopology {
+    let mut steps = Vec::new();
+    let mut errors = Vec::new();
+    let start_tile = belts
+        .first()
+        .map(|belt| GridPos::from_position(&belt.position));
+    let goal_tile = belts
+        .last()
+        .map(|belt| GridPos::from_position(&belt.position));
+
+    for (index, belt) in belts.iter().enumerate() {
+        let tile = GridPos::from_position(&belt.position);
+        let next = belts
+            .get(index + 1)
+            .map(|next_belt| GridPos::from_position(&next_belt.position));
+        let (connects_to_next, connection) = match next {
+            Some(next_tile) => {
+                let connected = belt_step_connects(belt, tile, next_tile);
+                if !connected {
+                    errors.push(format!(
+                        "belt step {} at ({},{}) does not connect to next tile ({},{})",
+                        index, tile.x, tile.y, next_tile.x, next_tile.y
+                    ));
+                }
+                (connected, belt_connection_label(belt, tile, next_tile))
+            }
+            None => (true, "terminal".to_string()),
+        };
+        steps.push(BeltTopologyStep {
+            index: index as u32,
+            tile,
+            position: belt.position,
+            direction: belt.direction,
+            kind: belt.kind,
+            next_tile: next,
+            connects_to_next,
+            connection,
+        });
+    }
+
+    BeltRouteTopology {
+        connected: errors.is_empty(),
+        start_tile,
+        goal_tile,
+        steps,
+        errors,
+    }
+}
+
+fn belt_step_connects(belt: &BeltPlacement, tile: GridPos, next: GridPos) -> bool {
+    match belt.kind {
+        BeltKind::Surface => tile.offset(belt.direction, 1) == next,
+        BeltKind::UndergroundEntry => {
+            let dx = next.x - tile.x;
+            let dy = next.y - tile.y;
+            match belt.direction {
+                Direction::North => dx == 0 && dy < -1,
+                Direction::East => dy == 0 && dx > 1,
+                Direction::South => dx == 0 && dy > 1,
+                Direction::West => dy == 0 && dx < -1,
+                _ => false,
+            }
+        }
+        BeltKind::UndergroundExit => tile.offset(belt.direction, 1) == next,
+    }
+}
+
+fn belt_connection_label(belt: &BeltPlacement, tile: GridPos, next: GridPos) -> String {
+    match belt.kind {
+        BeltKind::Surface => format!("surface ({},{}) -> ({},{})", tile.x, tile.y, next.x, next.y),
+        BeltKind::UndergroundEntry => {
+            format!(
+                "underground ({},{}) -> ({},{})",
+                tile.x, tile.y, next.x, next.y
+            )
+        }
+        BeltKind::UndergroundExit => {
+            format!(
+                "underground-exit ({},{}) -> ({},{})",
+                tile.x, tile.y, next.x, next.y
+            )
+        }
     }
 }
 
@@ -827,6 +961,27 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_path_includes_connected_topology() {
+        let bounds = Area {
+            left_top: Position { x: -10.0, y: -10.0 },
+            right_bottom: Position { x: 10.0, y: 10.0 },
+        };
+        let collision_map = CollisionMap::new(bounds);
+
+        let result = find_belt_route(GridPos::new(0, 0), GridPos::new(3, 0), &collision_map);
+
+        let topology = result
+            .topology
+            .expect("successful route should include topology");
+        assert!(topology.connected);
+        assert_eq!(topology.start_tile, Some(GridPos::new(0, 0)));
+        assert_eq!(topology.goal_tile, Some(GridPos::new(3, 0)));
+        assert_eq!(topology.steps.len(), 4);
+        assert!(topology.steps.iter().all(|step| step.connects_to_next));
+        assert_eq!(topology.errors, Vec::<String>::new());
+    }
+
+    #[test]
     fn test_path_with_obstacle() {
         let bounds = Area {
             left_top: Position { x: -10.0, y: -10.0 },
@@ -1023,6 +1178,14 @@ mod tests {
         assert_eq!(result_with_underground.belt_count, 2);
         assert_eq!(result_with_underground.underground_count, 1);
         assert_eq!(result_with_underground.turn_count, 0);
+        let topology = result_with_underground
+            .topology
+            .expect("underground route should include topology");
+        assert!(topology.connected);
+        assert!(topology
+            .steps
+            .iter()
+            .any(|step| step.connection.starts_with("underground ")));
     }
 
     #[test]

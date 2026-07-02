@@ -191,6 +191,37 @@ pub struct PositionParams {
     pub y: f64,
 }
 
+/// Parameters for can_stand_at tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct CanStandAtParams {
+    /// X coordinate to check
+    pub x: f64,
+    /// Y coordinate to check
+    pub y: f64,
+    /// Nearby search radius for suggested clear positions
+    #[serde(default = "default_radius")]
+    pub radius: u32,
+}
+
+/// Parameters for character blockage diagnostics
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlayerBlockedParams {
+    /// Nearby search radius for suggested clear positions
+    #[serde(default = "default_radius")]
+    pub radius: u32,
+}
+
+/// Parameters for unstuck tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct UnstuckParams {
+    /// Nearby search radius for clear standing positions
+    #[serde(default = "default_radius")]
+    pub radius: u32,
+    /// If true, only report the chosen recovery position without moving
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 /// Parameters for tile-based tools
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct TileParams {
@@ -239,6 +270,23 @@ pub struct FindEntityPlacementsParams {
     #[serde(default = "default_placement_radius")]
     pub radius: u32,
     /// Maximum candidate placements to return (default: 20, max: 100)
+    #[serde(default = "default_placement_limit")]
+    pub limit: u32,
+}
+
+/// Parameters for plan_entity_placement_near tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlanEntityPlacementNearParams {
+    /// Entity name to place
+    pub entity_name: String,
+    /// X coordinate of desired target area
+    pub x: f64,
+    /// Y coordinate of desired target area
+    pub y: f64,
+    /// Search radius in tiles (default: 10)
+    #[serde(default = "default_placement_radius")]
+    pub radius: u32,
+    /// Maximum candidate placements to return (default: 20, max: 50)
     #[serde(default = "default_placement_limit")]
     pub limit: u32,
 }
@@ -1476,6 +1524,70 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
+    /// Check whether the character can stand at a position.
+    #[tool(
+        description = "Read-only collision diagnostic: check whether the agent character can stand at a world position. Returns blockers plus nearby clear positions and a walk_to recommendation when blocked. Use before placing entities near the character or when diagnosing wedged/stuck movement."
+    )]
+    async fn can_stand_at(&self, Parameters(params): Parameters<CanStandAtParams>) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let radius = params.radius.clamp(1, 12);
+        let position = Position::new(params.x, params.y);
+        let result = match client.can_stand_at(position, radius).await {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Diagnose whether the current character position is blocked.
+    #[tool(
+        description = "Read-only unstuck diagnostic: report whether the agent character is currently blocked by entity collision, list blockers, and suggest nearby clear walk_to positions. Use when the agent is standing still, placing entities on itself, or movement/placement seems wedged."
+    )]
+    async fn is_player_blocked(
+        &self,
+        Parameters(params): Parameters<PlayerBlockedParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let radius = params.radius.clamp(1, 12);
+        let result = match client.is_player_blocked(radius).await {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Move the character out of a physical collision wedge.
+    #[tool(
+        description = "Recovery action for a physically wedged agent character. If the current character footprint is blocked, moves to the nearest verified clear standing position and clears stale walk/mining state. Use is_player_blocked first when diagnosing; pass dry_run=true to preview."
+    )]
+    async fn unstuck(&self, Parameters(params): Parameters<UnstuckParams>) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let radius = params.radius.clamp(1, 12);
+        let result = match client.unstuck(radius, params.dry_run).await {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
     /// Get character inventory contents.
     #[tool(description = "Get character inventory contents. Returns item names and counts.")]
     async fn get_inventory(&self) -> String {
@@ -1924,6 +2036,34 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
+    /// Plan a safe entity placement near a target.
+    #[tool(
+        description = "Read-only footprint-aware placement planner. Returns concrete place_entity steps near a target while explicitly avoiding the agent character footprint. Use before placing entities near yourself or near crowded builds; selected.footprint shows the collision area and avoids_character confirms Doug is not under it."
+    )]
+    async fn plan_entity_placement_near(
+        &self,
+        Parameters(params): Parameters<PlanEntityPlacementNearParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let target = Position::new(params.x, params.y);
+        let radius = params.radius.clamp(1, 25);
+        let limit = params.limit.clamp(1, 50);
+        let result = match client
+            .plan_entity_placement_near(&params.entity_name, target, radius, limit)
+            .await
+        {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
     /// Plan an edge mining drill and output belt without mutating the game.
     #[tool(
         description = "Plan a patch-edge mining setup without mutating the game. Returns a resource-backed drill placement whose output belt tile is clear/buildable, plus ordered place_entity steps and missing_items. Use before placing burner/electric drills on large ore patches."
@@ -2368,35 +2508,61 @@ impl FactorioMcp {
             .unwrap_or(0);
 
         if params.dry_run {
-            let mut msg = format!(
-                "Dry run - would place {} belts with {} turns",
-                result.belt_count, result.turn_count
-            );
-            if result.underground_count > 0 {
-                msg.push_str(&format!(", {} underground pairs", result.underground_count));
-            }
-            // Show inventory status
-            msg.push_str(&format!(
-                "\nInventory: {} {} (need {})",
-                surface_belts_have, params.belt_type, surface_belts_needed
-            ));
-            if underground_belts_needed > 0 {
-                if let Some(ug_name) = underground_belt_name {
-                    msg.push_str(&format!(
-                        ", {} {} (need {})",
-                        underground_belts_have, ug_name, underground_belts_needed
-                    ));
-                }
-            }
-            if surface_belts_have < surface_belts_needed
-                || underground_belts_have < underground_belts_needed
-            {
-                msg.push_str("\nWARNING: INSUFFICIENT MATERIALS - route will fail");
-            }
-            msg.push_str(&format!(
-                "\n{}",
-                serde_json::to_string_pretty(&result.belts).unwrap_or_default()
-            ));
+            let steps: Vec<serde_json::Value> = result
+                .belts
+                .iter()
+                .map(|belt| {
+                    let entity_name = match belt.kind {
+                        BeltKind::Surface => params.belt_type.as_str(),
+                        BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
+                            underground_belt_name.unwrap_or(params.belt_type.as_str())
+                        }
+                    };
+                    serde_json::json!({
+                        "tool": "place_entity",
+                        "tool_args": {
+                            "entity_name": entity_name,
+                            "x": belt.position.x,
+                            "y": belt.position.y,
+                            "direction": belt.direction.to_factorio()
+                        },
+                        "kind": belt.kind,
+                        "description": format!("Place {} at ({:.1},{:.1}) facing {:?}", entity_name, belt.position.x, belt.position.y, belt.direction)
+                    })
+                })
+                .collect();
+            let plan = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "from": { "x": params.from_x, "y": params.from_y },
+                "to": { "x": params.to_x, "y": params.to_y },
+                "belt_type": params.belt_type,
+                "belt_count": result.belt_count,
+                "turn_count": result.turn_count,
+                "underground_count": result.underground_count,
+                "materials": {
+                    "surface": {
+                        "item": params.belt_type,
+                        "needed": surface_belts_needed,
+                        "available": surface_belts_have,
+                        "sufficient": surface_belts_have >= surface_belts_needed,
+                    },
+                    "underground": {
+                        "item": underground_belt_name,
+                        "needed": underground_belts_needed,
+                        "available": underground_belts_have,
+                        "sufficient": underground_belts_have >= underground_belts_needed,
+                    },
+                },
+                "materials_sufficient": surface_belts_have >= surface_belts_needed
+                    && underground_belts_have >= underground_belts_needed,
+                "topology": result.topology,
+                "steps": steps,
+                "belts": result.belts,
+                "guidance": "If topology.connected is true and materials_sufficient is true, execute steps in order, then analyze_belt_reach or verify_production."
+            });
+            let msg =
+                serde_json::to_string_pretty(&plan).unwrap_or_else(|e| format!("Error: {}", e));
             return self.with_player_messages(msg).await;
         }
 

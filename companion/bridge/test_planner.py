@@ -239,6 +239,49 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(decision.reason, "repeated_plan_progress")
         self.assertTrue(decision.actionable_plan)
 
+    def test_choose_autonomy_decision_executes_after_varied_ready_planner_churn(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "activate second stone-furnace unit 15",
+                "plan_steps": [
+                    "walk_to (42, -21)",
+                    "insert_items coal count=5 into fuel inventory of unit 15",
+                ],
+                "progress_notes": ["plan validated"],
+                "updated_at": "now",
+            },
+            5,
+            5,
+            journal_window=[
+                {
+                    "kind": "progress",
+                    "text": (
+                        "situation_report confirmed stable at tick 4105905. "
+                        "Inventory intact. Plan validated against live state, "
+                        "ready for execution."
+                    ),
+                },
+                {
+                    "kind": "progress",
+                    "text": (
+                        "situation_report confirmed stable at tick 4107121. "
+                        "No state drift. Plan validated, queued for execution."
+                    ),
+                },
+                {
+                    "kind": "progress",
+                    "text": (
+                        "Fourth planning cycle. State unchanged. Plan concrete, "
+                        "executable, pending mutation tick."
+                    ),
+                },
+            ],
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
+        self.assertEqual(decision.reason, "repeated_plan_progress")
+        self.assertTrue(decision.actionable_plan)
+
     def test_choose_autonomy_decision_uses_typed_live_completion_evidence(self):
         decision = planner.choose_autonomy_decision(
             {
@@ -856,6 +899,41 @@ class PlannerTests(unittest.TestCase):
             ],
             "updated_at": "now",
         })
+        thread = self._thread()
+        thread._exec_ticks_since_plan = thread._planner_interval
+
+        tick = thread._autonomy_tick()
+
+        self.assertIn(planner.EXECUTION_PROMPT, tick["message"])
+        self.assertNotIn("read_only_tools", tick)
+        self.assertIn("walk_to (42, -21)", tick["message"])
+        self.assertEqual(thread._exec_ticks_since_plan, thread._planner_interval + 1)
+
+    def test_agent_thread_executes_after_varied_ready_planner_churn(self):
+        ledger.save_ledger("doug", {
+            "objective": "activate second stone-furnace unit 15",
+            "plan_steps": [
+                "walk_to (42, -21)",
+                "insert_items coal count=5 into fuel inventory of unit 15",
+            ],
+            "progress_notes": ["plan validated"],
+            "updated_at": "now",
+        })
+        journal.append_event(
+            "doug",
+            "progress",
+            "Inventory intact. Plan validated against live state, ready for execution.",
+        )
+        journal.append_event(
+            "doug",
+            "progress",
+            "No state drift. Plan validated, queued for execution.",
+        )
+        journal.append_event(
+            "doug",
+            "progress",
+            "Fourth planning cycle. Plan concrete, executable, pending mutation tick.",
+        )
         thread = self._thread()
         thread._exec_ticks_since_plan = thread._planner_interval
 

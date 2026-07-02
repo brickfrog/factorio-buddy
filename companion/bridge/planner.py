@@ -105,8 +105,13 @@ def choose_autonomy_decision(
     repeated_plan_progress = (
         has_plan
         and not actionable_plan
-        and window.has_repeated_unsignaled_progress(
-            min_count=PLANNER_STALL_REPEAT_COUNT,
+        and (
+            window.has_repeated_unsignaled_progress(
+                min_count=PLANNER_STALL_REPEAT_COUNT,
+            )
+            or window.has_repeated_ready_progress(
+                min_count=PLANNER_STALL_REPEAT_COUNT,
+            )
         )
     )
     if not state.objective.strip() or not state.plan_steps:

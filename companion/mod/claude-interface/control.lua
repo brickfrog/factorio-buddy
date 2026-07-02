@@ -1997,6 +1997,18 @@ remote.add_interface("claude_interface", {
         return json_remote_call("character_inventory", characters.inventory, agent_id)
     end,
 
+    can_stand_at = function(agent_id, x, y, radius)
+        return json_remote_call("can_stand_at", characters.can_stand_at, agent_id, x, y, radius)
+    end,
+
+    is_player_blocked = function(agent_id, radius)
+        return json_remote_call("is_player_blocked", characters.is_player_blocked, agent_id, radius)
+    end,
+
+    unstuck = function(agent_id, radius, dry_run)
+        return json_remote_call("unstuck", characters.unstuck, agent_id, radius, dry_run)
+    end,
+
     craft = function(agent_id, recipe_name, count)
         return json_remote_call("craft", craft_impl, agent_id, recipe_name, count)
     end,
@@ -2075,6 +2087,10 @@ remote.add_interface("claude_interface", {
 
     find_entity_placements = function(agent_id, entity_name, center_x, center_y, radius, limit)
         return json_remote_call("find_entity_placements", placement.find_entity_placements, agent_id, entity_name, center_x, center_y, radius, limit)
+    end,
+
+    plan_entity_placement_near = function(agent_id, entity_name, target_x, target_y, radius, limit)
+        return json_remote_call("plan_entity_placement_near", placement.plan_entity_placement_near, agent_id, entity_name, target_x, target_y, radius, limit)
     end,
 
     build_edge_miner = function(agent_id, resource_name, center_x, center_y, radius, drill_name, limit)

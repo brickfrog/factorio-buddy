@@ -1549,6 +1549,21 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
             "character_inventory",
         ),
         (
+            "can_stand_at",
+            LuaCommand::can_stand_at(&named_agent(), pos(10.0, 11.0), 6),
+            "can_stand_at",
+        ),
+        (
+            "is_player_blocked",
+            LuaCommand::is_player_blocked(&named_agent(), 6),
+            "is_player_blocked",
+        ),
+        (
+            "unstuck",
+            LuaCommand::unstuck(&named_agent(), 8, false),
+            "unstuck",
+        ),
+        (
             "get_character_position",
             LuaCommand::get_character_position(&named_agent()),
             "get_character_pos",
@@ -1606,6 +1621,9 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
         "teleport_character = function(agent_id, x, y)",
         "character_status = function(agent_id)",
         "character_inventory = function(agent_id)",
+        "can_stand_at = function(agent_id, x, y, radius)",
+        "is_player_blocked = function(agent_id, radius)",
+        "unstuck = function(agent_id, radius, dry_run)",
         "get_character_pos = function(agent_id)",
         "craft = function(agent_id, recipe_name, count)",
         "wait_for_crafting = function(agent_id)",
@@ -1635,6 +1653,13 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
             && characters_lua.contains("character.teleport({x, y})")
             && characters_lua.contains("items = inventory.contents(inv)")
             && characters_lua.contains("return {items = {}, free_slots = 0}")
+            && characters_lua.contains("function M.can_stand_at(agent_id, x, y, radius)")
+            && characters_lua.contains("function M.is_player_blocked(agent_id, radius)")
+            && characters_lua.contains("function M.unstuck(agent_id, radius, dry_run)")
+            && characters_lua.contains("local function stand_blockers(character, position)")
+            && characters_lua.contains("unstuck_candidates")
+            && characters_lua.contains("walk_to_clear_position")
+            && characters_lua.contains("teleported to nearest verified clear standing position")
             && control_lua.contains("local c = find_factorioctl_character(agent_id)")
             && control_lua.contains("return character.begin_crafting{recipe = recipe_name, count = count}")
             && control_lua.contains("pairs(character.crafting_queue or {})")
@@ -1681,6 +1706,17 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
                 20,
             ),
             "find_entity_placements",
+        ),
+        (
+            "plan_entity_placement_near",
+            LuaCommand::plan_entity_placement_near(
+                &named_agent(),
+                "steam-engine",
+                pos(-37.0, 37.0),
+                8,
+                10,
+            ),
+            "plan_entity_placement_near",
         ),
         (
             "build_edge_miner",
@@ -1763,6 +1799,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "placement.place_underground_belt",
         "placement.check_entity_placement",
         "placement.find_entity_placements",
+        "placement.plan_entity_placement_near",
         "placement.build_edge_miner",
         "placement.build_direct_smelter",
         "placement.place_ghost",
@@ -1771,6 +1808,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "place_underground_belt = function(agent_id, entity_name, x, y, direction, belt_type)",
         "check_entity_placement = function(agent_id, entity_name, x, y, direction)",
         "find_entity_placements = function(agent_id, entity_name, center_x, center_y, radius, limit)",
+        "plan_entity_placement_near = function(agent_id, entity_name, target_x, target_y, radius, limit)",
         "build_edge_miner = function(agent_id, resource_name, center_x, center_y, radius, drill_name, limit)",
         "build_direct_smelter = function(agent_id, drill_unit_number, output_x, output_y, output_direction, furnace_name, inserter_name, belt_name, radius)",
         "place_ghost = function(agent_id, entity_name, x, y, direction)",
@@ -1815,6 +1853,11 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("local function character_placement_blocker")
             && placement_lua.contains("character_overlap = true")
             && placement_lua.contains("walk_to_clear_placement")
+            && placement_lua.contains("local function placement_candidate")
+            && placement_lua.contains("function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y, radius, limit)")
+            && placement_lua.contains("avoids_character = character_blocker == nil")
+            && placement_lua.contains("selected.footprint")
+            && placement_lua.contains("execute_place_entity_step")
             && placement_lua.contains("recommended_action = \"rotate_entity\"")
             && placement_lua.contains("create_entity_nil_after_can_place = true")
             && placement_lua.contains("local function mining_drill_output_diagnostics")

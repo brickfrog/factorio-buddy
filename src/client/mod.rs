@@ -501,6 +501,31 @@ impl FactorioClient {
         Ok(inventory)
     }
 
+    /// Check whether the character can stand at a world position.
+    pub async fn can_stand_at(
+        &mut self,
+        position: Position,
+        radius: u32,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::can_stand_at(&self.agent_id, position, radius);
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Diagnose whether the current character position is blocked and suggest clear positions.
+    pub async fn is_player_blocked(&mut self, radius: u32) -> Result<serde_json::Value> {
+        let lua = LuaCommand::is_player_blocked(&self.agent_id, radius);
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Move a physically blocked character to the nearest verified clear standing position.
+    pub async fn unstuck(&mut self, radius: u32, dry_run: bool) -> Result<serde_json::Value> {
+        let lua = LuaCommand::unstuck(&self.agent_id, radius, dry_run);
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     // --- Mining ---
 
     /// Mine entity at position
@@ -621,6 +646,24 @@ impl FactorioClient {
     ) -> Result<serde_json::Value> {
         let lua =
             LuaCommand::find_entity_placements(&self.agent_id, entity_name, center, radius, limit);
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    pub async fn plan_entity_placement_near(
+        &mut self,
+        entity_name: &str,
+        target: Position,
+        radius: u32,
+        limit: u32,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::plan_entity_placement_near(
+            &self.agent_id,
+            entity_name,
+            target,
+            radius,
+            limit,
+        );
         let response = self.execute_lua(&lua).await?;
         Ok(serde_json::from_str(&response)?)
     }

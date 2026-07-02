@@ -9146,6 +9146,36 @@ class JournalWindow(BridgeModel):
         threshold = max(1, threshold)
         return self.repeated_unsignaled_progress_count() >= threshold
 
+    def repeated_ready_progress_count(self) -> int:
+        newest = self.newest_autonomy_event()
+        if (
+            not newest
+            or newest.kind != "progress"
+            or newest.signal != ProgressSignal.NONE
+            or not LedgerReadinessEvidence.note_indicates_ready(newest.text)
+        ):
+            return 0
+        count = 0
+        for event in reversed(self.events):
+            if event.kind not in _AUTONOMY_EVENT_KINDS:
+                continue
+            if (
+                event.kind != "progress"
+                or event.signal != ProgressSignal.NONE
+                or not LedgerReadinessEvidence.note_indicates_ready(event.text)
+            ):
+                break
+            count += 1
+        return count
+
+    def has_repeated_ready_progress(self, *, min_count: int = 3) -> bool:
+        try:
+            threshold = int(min_count)
+        except (TypeError, ValueError):
+            threshold = 3
+        threshold = max(1, threshold)
+        return self.repeated_ready_progress_count() >= threshold
+
     def newest_event_indicates_plan_done(self) -> bool:
         event = self.newest_autonomy_event()
         if not event:

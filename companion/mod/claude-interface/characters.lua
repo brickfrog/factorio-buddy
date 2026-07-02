@@ -25,6 +25,169 @@ local function pos_table(pos)
     return {x = pos.x, y = pos.y}
 end
 
+local function area_table(area)
+    if not area then return nil end
+    return {
+        left_top = {x = area[1][1], y = area[1][2]},
+        right_bottom = {x = area[2][1], y = area[2][2]},
+    }
+end
+
+local function prototype_collision_area(entity_name, position, margin)
+    local proto = prototypes.entity[entity_name]
+    margin = margin or 0.02
+    if not (proto and proto.collision_box) then
+        return {
+            {position.x - 0.3 - margin, position.y - 0.3 - margin},
+            {position.x + 0.3 + margin, position.y + 0.3 + margin},
+        }
+    end
+
+    local cb = proto.collision_box
+    return {
+        {position.x + cb.left_top.x - margin, position.y + cb.left_top.y - margin},
+        {position.x + cb.right_bottom.x + margin, position.y + cb.right_bottom.y + margin},
+    }
+end
+
+local function boxes_overlap_area(area, box)
+    if not (area and box) then return false end
+    return area[1][1] < box.right_bottom.x
+        and area[2][1] > box.left_top.x
+        and area[1][2] < box.right_bottom.y
+        and area[2][2] > box.left_top.y
+end
+
+local function collision_box_for_entity(entity, margin)
+    if not (entity and entity.valid) then return nil end
+    local proto = prototypes.entity[entity.name]
+    if not (proto and proto.collision_box) then return nil end
+    local cb = proto.collision_box
+    if cb.left_top.x == cb.right_bottom.x or cb.left_top.y == cb.right_bottom.y then
+        return nil
+    end
+    margin = margin or 0.02
+    return {
+        left_top = {
+            x = entity.position.x + cb.left_top.x - margin,
+            y = entity.position.y + cb.left_top.y - margin,
+        },
+        right_bottom = {
+            x = entity.position.x + cb.right_bottom.x + margin,
+            y = entity.position.y + cb.right_bottom.y + margin,
+        },
+    }
+end
+
+local function entity_blocker_summary(entity, box)
+    return {
+        unit_number = entity.unit_number,
+        name = entity.name,
+        type = entity.type,
+        entity_type = entity.type,
+        position = pos_table(entity.position),
+        direction = entity.direction,
+        force = entity.force and entity.force.name or nil,
+        bounding_box = box and {
+            left_top = {x = box.left_top.x, y = box.left_top.y},
+            right_bottom = {x = box.right_bottom.x, y = box.right_bottom.y},
+        } or nil,
+    }
+end
+
+local function stand_blockers(character, position)
+    local area = prototype_collision_area("character", position, 0.02)
+    local blockers = {}
+    for _, entity in pairs(character.surface.find_entities_filtered{area = area}) do
+        if entity.valid
+            and entity ~= character
+            and entity.type ~= "resource"
+            and entity.type ~= "item-entity"
+            and entity.type ~= "entity-ghost"
+            and entity.type ~= "tile-ghost"
+        then
+            local box = collision_box_for_entity(entity, 0.02)
+            if box and boxes_overlap_area(area, box) then
+                table.insert(blockers, entity_blocker_summary(entity, box))
+                if #blockers >= 12 then break end
+            end
+        end
+    end
+    return blockers, area
+end
+
+local function can_stand_result(character, x, y)
+    local position = {x = x, y = y}
+    local blockers, area = stand_blockers(character, position)
+    local current_distance = math.sqrt(
+        (x - character.position.x) * (x - character.position.x)
+            + (y - character.position.y) * (y - character.position.y)
+    )
+    local factorio_ok = true
+    local factorio_error = nil
+    if current_distance > 0.2 then
+        local ok, can_place_or_error = pcall(function()
+            return character.surface.can_place_entity{
+                name = "character",
+                position = {x, y},
+                force = character.force,
+                build_check_type = defines.build_check_type.manual,
+            }
+        end)
+        factorio_ok = ok and can_place_or_error == true
+        if not ok then factorio_error = tostring(can_place_or_error) end
+    end
+    return {
+        can_stand = #blockers == 0 and factorio_ok,
+        factorio_can_place_character = factorio_ok,
+        factorio_error = factorio_error,
+        position = position,
+        checked_area = area_table(area),
+        blockers = blockers,
+        blocker_count = #blockers,
+    }
+end
+
+local function nearby_stand_candidates(character, center, radius, limit)
+    radius = math.max(1, math.min(12, math.floor(radius or 6)))
+    limit = math.max(1, math.min(20, math.floor(limit or 8)))
+    local candidates = {}
+    local seen = {}
+    for r = 1, radius do
+        for dx = -r, r do
+            for dy = -r, r do
+                if math.abs(dx) == r or math.abs(dy) == r then
+                    local x = math.floor(center.x) + dx + 0.5
+                    local y = math.floor(center.y) + dy + 0.5
+                    local key = tostring(x) .. "," .. tostring(y)
+                    if not seen[key] then
+                        seen[key] = true
+                        local result = can_stand_result(character, x, y)
+                        if result.can_stand then
+                            result.distance = math.sqrt((x - center.x) * (x - center.x) + (y - center.y) * (y - center.y))
+                            table.insert(candidates, result)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(candidates, function(a, b)
+        if a.distance == b.distance then
+            if a.position.x == b.position.x then
+                return a.position.y < b.position.y
+            end
+            return a.position.x < b.position.x
+        end
+        return a.distance < b.distance
+    end)
+    local returned = {}
+    for i = 1, math.min(#candidates, limit) do
+        table.insert(returned, candidates[i])
+    end
+    return returned, #candidates
+end
+
 local function live_state_entity_counts(character)
     local counts = {}
     for _, name in ipairs(LIVE_STATE_ENTITY_NAMES) do
@@ -265,6 +428,132 @@ function M.status(agent_id)
         walking = walking,
         mining = mining,
     }
+end
+
+function M.can_stand_at(agent_id, x, y, radius)
+    local character = M.find(agent_id)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+            can_stand = false,
+            blockers = {"no_character"},
+        }
+    end
+
+    local result = can_stand_result(character, x, y)
+    result.success = true
+    result.surface = character.surface.name
+    result.character_position = pos_table(character.position)
+    if not result.can_stand then
+        local candidates, total = nearby_stand_candidates(character, {x = x, y = y}, radius or 6, 8)
+        result.unstuck_candidates = candidates
+        result.total_unstuck_candidates = total
+        if #candidates > 0 then
+            result.recommended_action = "walk_to"
+            result.walk_to_clear_position = candidates[1].position
+        else
+            result.recommended_action = "clear_blockers_or_teleport"
+        end
+    end
+    return result
+end
+
+function M.is_player_blocked(agent_id, radius)
+    local character = M.find(agent_id)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+            blocked = true,
+            blockers = {"no_character"},
+        }
+    end
+
+    local result = can_stand_result(character, character.position.x, character.position.y)
+    local candidates, total = nearby_stand_candidates(character, character.position, radius or 6, 8)
+    return {
+        success = true,
+        surface = character.surface.name,
+        position = pos_table(character.position),
+        checked_area = result.checked_area,
+        blocked = not result.can_stand,
+        can_stand_at_current_position = result.can_stand,
+        blockers = result.blockers,
+        blocker_count = result.blocker_count,
+        unstuck_candidates = candidates,
+        total_unstuck_candidates = total,
+        recommended_action = (not result.can_stand and #candidates > 0) and "walk_to" or nil,
+        walk_to_clear_position = (#candidates > 0) and candidates[1].position or nil,
+    }
+end
+
+function M.unstuck(agent_id, radius, dry_run)
+    local character = M.find(agent_id)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            moved = false,
+            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+            blockers = {"no_character"},
+        }
+    end
+
+    local before = pos_table(character.position)
+    local current = can_stand_result(character, character.position.x, character.position.y)
+    local candidates, total = nearby_stand_candidates(character, character.position, radius or 8, 12)
+    local result = {
+        success = true,
+        moved = false,
+        dry_run = dry_run == true,
+        surface = character.surface.name,
+        from = before,
+        blocked = not current.can_stand,
+        can_stand_at_current_position = current.can_stand,
+        blockers = current.blockers,
+        blocker_count = current.blocker_count,
+        unstuck_candidates = candidates,
+        total_unstuck_candidates = total,
+    }
+
+    if current.can_stand then
+        result.reason = "character already has a clear standing footprint"
+        result.recommended_action = "none"
+        return result
+    end
+
+    if #candidates == 0 then
+        result.success = false
+        result.error = "no nearby clear standing position found"
+        result.recommended_action = "clear_blockers_or_expand_radius"
+        return result
+    end
+
+    local target = candidates[1].position
+    result.to = target
+    result.recommended_action = "teleport_character"
+    if dry_run == true then
+        result.reason = "dry_run"
+        return result
+    end
+
+    if storage.walk_targets then storage.walk_targets[agent_id] = nil end
+    if storage.walk_state then storage.walk_state[agent_id] = nil end
+    character.walking_state = {walking = false}
+    character.mining_state = {mining = false}
+
+    if character.teleport({target.x, target.y}) then
+        M.remember(agent_id, character)
+        result.moved = true
+        result.position = pos_table(character.position)
+        result.reason = "teleported to nearest verified clear standing position"
+        return result
+    end
+
+    result.success = false
+    result.error = "teleport to verified clear standing position was blocked"
+    result.position = pos_table(character.position)
+    return result
 end
 
 function M.inventory(agent_id)
