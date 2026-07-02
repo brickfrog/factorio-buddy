@@ -4936,6 +4936,22 @@ class ToolCallRequest(BridgeModel):
             "electronic-circuit",
         }
 
+    @property
+    def is_bootstrap_infrastructure_craft(self) -> bool:
+        if self.short_name != "craft":
+            return False
+        recipe = str(self.tool_input.get("recipe") or "").strip().lower()
+        return recipe in {
+            "assembling-machine-1",
+            "burner-inserter",
+            "copper-cable",
+            "electronic-circuit",
+            "inserter",
+            "iron-gear-wheel",
+            "small-electric-pole",
+            "transport-belt",
+        }
+
     def validate_params(
         self,
         *,

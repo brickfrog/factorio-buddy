@@ -2,7 +2,7 @@
 //!
 //! Exposes Factorio control as MCP tools for LLM agents.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -1105,6 +1105,17 @@ fn default_belt_type() -> String {
 fn default_search_radius() -> u32 {
     10
 }
+fn is_existing_belt_entity(name: &str) -> bool {
+    matches!(
+        name,
+        "transport-belt"
+            | "fast-transport-belt"
+            | "express-transport-belt"
+            | "underground-belt"
+            | "fast-underground-belt"
+            | "express-underground-belt"
+    )
+}
 
 /// Parameters for build_fuel_supply tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -1565,9 +1576,7 @@ struct MachineSideLayout {
 }
 
 fn machine_side_layout(entity: &Entity, side: &str) -> Result<MachineSideLayout, String> {
-    let bbox = entity
-        .bounding_box
-        .ok_or_else(|| format!("{} has no bounding box", entity.name))?;
+    let bbox = machine_bounding_box(entity)?;
     let center = bbox.center();
     match side.to_lowercase().as_str() {
         "north" | "n" | "up" => Ok(MachineSideLayout {
@@ -1619,6 +1628,31 @@ fn machine_side_layout(entity: &Entity, side: &str) -> Result<MachineSideLayout,
             side
         )),
     }
+}
+
+fn machine_bounding_box(entity: &Entity) -> Result<Area, String> {
+    if let Some(bbox) = entity.bounding_box {
+        return Ok(bbox);
+    }
+    let entity_type = entity.entity_type.as_deref().unwrap_or("");
+    let (width, height) = if entity.name.starts_with("assembling-machine")
+        || entity_type == "assembling-machine"
+        || entity.name == "lab"
+        || entity_type == "lab"
+        || entity.name == "chemical-plant"
+    {
+        (3.0, 3.0)
+    } else if entity.name.contains("furnace") || entity_type == "furnace" {
+        (2.0, 2.0)
+    } else {
+        return Err(format!("{} has no bounding box", entity.name));
+    };
+    Ok(Area::new(
+        entity.position.x - width / 2.0,
+        entity.position.y - height / 2.0,
+        entity.position.x + width / 2.0,
+        entity.position.y + height / 2.0,
+    ))
 }
 
 /// Parameters for remove_entity tool
@@ -3453,11 +3487,41 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
+        let selected = plan
+            .get("selected")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let compact_plan = serde_json::json!({
+            "success": plan.get("success").and_then(|value| value.as_bool()).unwrap_or(false),
+            "dry_run": true,
+            "entity": plan.get("entity"),
+            "target": plan.get("target"),
+            "radius": plan.get("radius"),
+            "checked": plan.get("checked"),
+            "total": plan.get("total"),
+            "returned": plan.get("returned"),
+            "truncated": plan.get("truncated"),
+            "inventory_count": plan.get("inventory_count"),
+            "selected": {
+                "tool": selected.get("tool"),
+                "tool_args": selected.get("tool_args"),
+                "position": selected.get("position"),
+                "direction": selected.get("direction"),
+                "distance": selected.get("distance"),
+                "distance_from_character": selected.get("distance_from_character"),
+                "output_clear": selected.get("output_clear"),
+                "output_buildable": selected.get("output_buildable"),
+                "post_placement": selected.get("post_placement"),
+            },
+            "error": plan.get("error"),
+            "next_action": plan.get("next_action"),
+        });
+
         if params.dry_run {
             let result = serde_json::json!({
                 "success": plan.get("success").and_then(|value| value.as_bool()).unwrap_or(false),
                 "dry_run": true,
-                "plan": plan,
+                "plan": compact_plan,
                 "guidance": "If success is true, call execute_entity_placement_near again with dry_run=false. Use the returned placed_unit_number in follow-up tools.",
             });
             let msg =
@@ -3470,15 +3534,11 @@ impl FactorioMcp {
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
         {
-            let msg =
-                serde_json::to_string_pretty(&plan).unwrap_or_else(|e| format!("Error: {}", e));
+            let msg = serde_json::to_string_pretty(&compact_plan)
+                .unwrap_or_else(|e| format!("Error: {}", e));
             return self.with_player_messages(msg).await;
         }
 
-        let selected = plan
-            .get("selected")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
         let args = selected
             .get("tool_args")
             .cloned()
@@ -3522,12 +3582,13 @@ impl FactorioMcp {
                 "error": e.to_string(),
             }),
         };
+        let compact_selected = compact_plan.get("selected").cloned();
         let result = serde_json::json!({
             "success": placed.is_ok(),
             "placement_success": placed.is_ok(),
             "dry_run": false,
-            "plan": plan,
-            "selected": selected,
+            "plan": compact_plan,
+            "selected": compact_selected,
             "action": {
                 "tool": "place_entity",
                 "args": args,
@@ -4543,9 +4604,36 @@ impl FactorioMcp {
             }
         };
 
+        let mut existing_belt_tiles: HashSet<GridPos> = HashSet::new();
         if params.extend_existing {
             collision_map.unblock(GridPos::new(params.from_x, params.from_y));
             collision_map.unblock(GridPos::new(params.to_x, params.to_y));
+            let entities = client
+                .find_entities(area, None, None)
+                .await
+                .map_err(|e| format!("Error checking existing route entities: {}", e))?;
+            for entity in entities {
+                if !is_existing_belt_entity(&entity.name) {
+                    continue;
+                }
+                if let Some(bb) = &entity.bounding_box {
+                    let min_x = bb.left_top.x.floor() as i32;
+                    let max_x = bb.right_bottom.x.ceil() as i32;
+                    let min_y = bb.left_top.y.floor() as i32;
+                    let max_y = bb.right_bottom.y.ceil() as i32;
+                    for x in min_x..max_x {
+                        for y in min_y..max_y {
+                            let tile = GridPos::new(x, y);
+                            existing_belt_tiles.insert(tile);
+                            collision_map.unblock(tile);
+                        }
+                    }
+                } else {
+                    let tile = GridPos::from_position(&entity.position);
+                    existing_belt_tiles.insert(tile);
+                    collision_map.unblock(tile);
+                }
+            }
         }
 
         if params.respect_zones {
@@ -4618,8 +4706,48 @@ impl FactorioMcp {
             .map(|i| i.count)
             .unwrap_or(0);
 
-        let steps: Vec<serde_json::Value> = result
-            .belts
+        let full_route_belts = result.belts.clone();
+        let mut build_belts = full_route_belts.clone();
+        let mut partial_route = false;
+        let mut partial_reason: Option<String> = None;
+        let materials_sufficient = surface_belts_have >= surface_belts_needed
+            && underground_belts_have >= underground_belts_needed;
+
+        if !materials_sufficient {
+            let underground_short =
+                underground_belts_needed > 0 && underground_belts_have < underground_belts_needed;
+            if underground_short && !params.dry_run {
+                let ug_name = underground_belt_name.unwrap_or("underground-belt");
+                return Err(format!(
+                    "Insufficient materials: need {} {}, have {}. Craft more underground belts first.",
+                    underground_belts_needed, ug_name, underground_belts_have
+                ));
+            }
+            if surface_belts_have == 0 && !params.dry_run {
+                return Err(format!(
+                    "Insufficient materials: need {} {}, have 0. Craft more belts first.",
+                    surface_belts_needed, params.belt_type
+                ));
+            }
+            if !underground_short && surface_belts_have > 0 {
+                let buildable_count = surface_belts_have.min(surface_belts_needed) as usize;
+                build_belts = full_route_belts.into_iter().take(buildable_count).collect();
+                partial_route = !params.dry_run;
+                partial_reason = Some(format!(
+                    "Only {} of {} required {} available; {} buildable prefix.",
+                    surface_belts_have,
+                    surface_belts_needed,
+                    params.belt_type,
+                    if params.dry_run {
+                        "previewing"
+                    } else {
+                        "placing"
+                    }
+                ));
+            }
+        }
+
+        let steps: Vec<serde_json::Value> = build_belts
             .iter()
             .map(|belt| {
                 let entity_name = match belt.kind {
@@ -4659,8 +4787,6 @@ impl FactorioMcp {
                 "sufficient": underground_belts_have >= underground_belts_needed,
             },
         });
-        let materials_sufficient = surface_belts_have >= surface_belts_needed
-            && underground_belts_have >= underground_belts_needed;
 
         if params.dry_run {
             let mut response = serde_json::json!({
@@ -4670,19 +4796,24 @@ impl FactorioMcp {
                 "to": { "x": params.to_x, "y": params.to_y },
                 "belt_type": params.belt_type,
                 "belt_count": result.belt_count,
+                "buildable_belt_count": build_belts.len(),
                 "turn_count": result.turn_count,
                 "underground_count": result.underground_count,
                 "materials": materials,
                 "materials_sufficient": materials_sufficient,
+                "partial_route_available": !materials_sufficient
+                    && underground_belts_needed == 0
+                    && surface_belts_have > 0,
+                "partial_reason": partial_reason,
                 "topology": result.topology,
             });
             if let Some(object) = response.as_object_mut() {
-                if result.belts.len() <= 80 {
+                if build_belts.len() <= 80 {
                     object.insert("steps".to_string(), serde_json::json!(steps));
-                    object.insert("belts".to_string(), serde_json::json!(result.belts));
+                    object.insert("belts".to_string(), serde_json::json!(build_belts));
                 } else {
-                    let first_belts: Vec<_> = result.belts.iter().take(8).collect();
-                    let mut last_belts: Vec<_> = result.belts.iter().rev().take(8).collect();
+                    let first_belts: Vec<_> = build_belts.iter().take(8).collect();
+                    let mut last_belts: Vec<_> = build_belts.iter().rev().take(8).collect();
                     last_belts.reverse();
                     object.insert("steps_truncated".to_string(), serde_json::json!(true));
                     object.insert("belts_truncated".to_string(), serde_json::json!(true));
@@ -4691,7 +4822,7 @@ impl FactorioMcp {
                         serde_json::json!({
                             "first_belts": first_belts,
                             "last_belts": last_belts,
-                            "omitted_belts": result.belts.len().saturating_sub(16),
+                            "omitted_belts": build_belts.len().saturating_sub(16),
                         }),
                     );
                     object.insert(
@@ -4705,25 +4836,17 @@ impl FactorioMcp {
             return Ok(response);
         }
 
-        if surface_belts_have < surface_belts_needed {
-            return Err(format!(
-                "Insufficient materials: need {} {}, have {}. Craft more belts first.",
-                surface_belts_needed, params.belt_type, surface_belts_have
-            ));
-        }
-        if underground_belts_needed > 0 && underground_belts_have < underground_belts_needed {
-            let ug_name = underground_belt_name.unwrap_or("underground-belt");
-            return Err(format!(
-                "Insufficient materials: need {} {}, have {}. Craft more underground belts first.",
-                underground_belts_needed, ug_name, underground_belts_have
-            ));
-        }
-
         let mut placed = 0;
+        let mut skipped_existing = 0;
         let mut errors = Vec::new();
         let underground_entity = underground_config.as_ref().map(|c| c.entity_name.as_str());
 
-        for belt in &result.belts {
+        for belt in &build_belts {
+            let belt_tile = GridPos::from_position(&belt.position);
+            if existing_belt_tiles.contains(&belt_tile) {
+                skipped_existing += 1;
+                continue;
+            }
             let entity_name = match belt.kind {
                 BeltKind::Surface => &params.belt_type,
                 BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
@@ -4758,9 +4881,17 @@ impl FactorioMcp {
             "dry_run": false,
             "from": { "x": params.from_x, "y": params.from_y },
             "to": { "x": params.to_x, "y": params.to_y },
+            "built_to": build_belts.last().map(|belt| serde_json::json!({
+                "x": belt.position.x,
+                "y": belt.position.y,
+            })),
             "belt_type": params.belt_type,
             "belt_count": result.belt_count,
+            "buildable_belt_count": build_belts.len(),
             "placed": placed,
+            "skipped_existing": skipped_existing,
+            "partial_route": partial_route,
+            "partial_reason": partial_reason,
             "turn_count": result.turn_count,
             "underground_count": result.underground_count,
             "materials": materials,
@@ -4773,7 +4904,8 @@ impl FactorioMcp {
     /// Route belts from point A to point B using A* pathfinding.
     #[tool(
         description = "Route belts from one position to another using A* pathfinding to avoid obstacles. \
-        This is the recommended way to create belt connections. Use dry_run=true to preview the path before placing."
+        This is the recommended way to create belt connections. Use dry_run=true to preview the path before placing. \
+        If the full surface-belt route is longer than available belts, this places the buildable prefix and reports built_to."
     )]
     async fn route_belt(&self, Parameters(params): Parameters<RouteBeltParams>) -> String {
         let mut client = match self.connect().await {
@@ -4781,267 +4913,16 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        // Calculate search area
-        let padding = params.search_radius as i32;
-        let area = Area {
-            left_top: Position::new(
-                (params.from_x.min(params.to_x) - padding) as f64,
-                (params.from_y.min(params.to_y) - padding) as f64,
-            ),
-            right_bottom: Position::new(
-                (params.from_x.max(params.to_x) + padding + 1) as f64,
-                (params.from_y.max(params.to_y) + padding + 1) as f64,
-            ),
-        };
-
-        // Build collision map
-        let mut collision_map = match client.build_collision_map(area).await {
-            Ok(cm) => cm,
-            Err(e) => {
-                return self
-                    .with_player_messages(format!("Error building collision map: {}", e))
-                    .await
+        match self.route_belt_core(&mut client, &params).await {
+            Ok(value) => {
+                self.with_player_messages(
+                    serde_json::to_string_pretty(&value)
+                        .unwrap_or_else(|e| format!("Error: {}", e)),
+                )
+                .await
             }
-        };
-
-        // If extend_existing is enabled, unblock start/end positions if they have existing belts
-        if params.extend_existing {
-            let start_grid = GridPos::new(params.from_x, params.from_y);
-            let goal_grid = GridPos::new(params.to_x, params.to_y);
-            // Check if positions are currently blocked (e.g., by existing belts)
-            // If so, unblock them to allow routing to connect to existing belts
-            collision_map.unblock(start_grid);
-            collision_map.unblock(goal_grid);
+            Err(error) => self.with_player_messages(error).await,
         }
-
-        // Apply zone constraints if respect_zones is enabled
-        if params.respect_zones {
-            let memory = AgentMemory::load();
-            for zone in memory.zones.values() {
-                match zone.zone_type.belt_routing() {
-                    BeltRouting::Blocked => collision_map.block_area(&zone.bounds),
-                    BeltRouting::Preferred => collision_map.prefer_area(&zone.bounds),
-                    BeltRouting::Allowed => {} // No change to collision map
-                }
-            }
-        }
-
-        // Determine underground config (only if requested AND tech is researched)
-        let underground_config = if params.allow_underground {
-            if let Some(config) = UndergroundConfig::from_belt_type(&params.belt_type) {
-                // Check if required technology is researched
-                match client.is_tech_researched(&config.required_tech).await {
-                    Ok(true) => Some(config),
-                    Ok(false) => None, // Tech not researched, fall back to surface only
-                    Err(_) => None,    // Error checking tech, fall back to surface only
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Build routing options
-        let routing_options = RoutingOptions {
-            allow_underground: underground_config.is_some(),
-            underground_config: underground_config.clone(),
-            underground_penalty: 0.5,
-            underground_skip_cost: 0.05,
-        };
-
-        // Find path
-        let start = GridPos::new(params.from_x, params.from_y);
-        let goal = GridPos::new(params.to_x, params.to_y);
-        let result = find_belt_route_with_options(start, goal, &collision_map, &routing_options);
-
-        if !result.success {
-            return self
-                .with_player_messages(format!(
-                    "Route failed: {}",
-                    result.error.unwrap_or_else(|| "unknown error".to_string())
-                ))
-                .await;
-        }
-
-        // Check inventory for required materials
-        let inventory = match client.character_inventory().await {
-            Ok(inv) => inv,
-            Err(e) => {
-                return self
-                    .with_player_messages(format!("Error checking inventory: {}", e))
-                    .await
-            }
-        };
-
-        // Count surface belts and underground belts needed
-        let surface_belts_needed = result
-            .belts
-            .iter()
-            .filter(|b| b.kind == BeltKind::Surface)
-            .count() as u32;
-        let underground_belts_needed = result
-            .belts
-            .iter()
-            .filter(|b| b.kind != BeltKind::Surface)
-            .count() as u32;
-
-        // Count belts in inventory
-        let surface_belts_have = inventory
-            .items
-            .iter()
-            .find(|i| i.name == params.belt_type)
-            .map(|i| i.count)
-            .unwrap_or(0);
-
-        let underground_belt_name = underground_config.as_ref().map(|c| c.entity_name.as_str());
-        let underground_belts_have = underground_belt_name
-            .and_then(|name| inventory.items.iter().find(|i| i.name == name))
-            .map(|i| i.count)
-            .unwrap_or(0);
-
-        if params.dry_run {
-            let steps: Vec<serde_json::Value> = result
-                .belts
-                .iter()
-                .map(|belt| {
-                    let entity_name = match belt.kind {
-                        BeltKind::Surface => params.belt_type.as_str(),
-                        BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
-                            underground_belt_name.unwrap_or(params.belt_type.as_str())
-                        }
-                    };
-                    serde_json::json!({
-                        "tool": "place_entity",
-                        "tool_args": {
-                            "entity_name": entity_name,
-                            "x": belt.position.x,
-                            "y": belt.position.y,
-                            "direction": belt.direction.to_factorio()
-                        },
-                        "kind": belt.kind,
-                        "description": format!("Place {} at ({:.1},{:.1}) facing {:?}", entity_name, belt.position.x, belt.position.y, belt.direction)
-                    })
-                })
-                .collect();
-            let plan = serde_json::json!({
-                "success": true,
-                "dry_run": true,
-                "from": { "x": params.from_x, "y": params.from_y },
-                "to": { "x": params.to_x, "y": params.to_y },
-                "belt_type": params.belt_type,
-                "belt_count": result.belt_count,
-                "turn_count": result.turn_count,
-                "underground_count": result.underground_count,
-                "materials": {
-                    "surface": {
-                        "item": params.belt_type,
-                        "needed": surface_belts_needed,
-                        "available": surface_belts_have,
-                        "sufficient": surface_belts_have >= surface_belts_needed,
-                    },
-                    "underground": {
-                        "item": underground_belt_name,
-                        "needed": underground_belts_needed,
-                        "available": underground_belts_have,
-                        "sufficient": underground_belts_have >= underground_belts_needed,
-                    },
-                },
-                "materials_sufficient": surface_belts_have >= surface_belts_needed
-                    && underground_belts_have >= underground_belts_needed,
-                "topology": result.topology,
-                "steps": steps,
-                "belts": result.belts,
-                "guidance": "If topology.connected is true and materials_sufficient is true, execute steps in order, then analyze_belt_reach or verify_production."
-            });
-            let msg =
-                serde_json::to_string_pretty(&plan).unwrap_or_else(|e| format!("Error: {}", e));
-            return self.with_player_messages(msg).await;
-        }
-
-        // Pre-check: fail early if not enough materials
-        if surface_belts_have < surface_belts_needed {
-            return self
-                .with_player_messages(format!(
-                    "Insufficient materials: need {} {}, have {}. Craft more belts first.",
-                    surface_belts_needed, params.belt_type, surface_belts_have
-                ))
-                .await;
-        }
-        if underground_belts_needed > 0 && underground_belts_have < underground_belts_needed {
-            let ug_name = underground_belt_name.unwrap_or("underground-belt");
-            return self
-                .with_player_messages(format!(
-                "Insufficient materials: need {} {}, have {}. Craft more underground belts first.",
-                underground_belts_needed, ug_name, underground_belts_have
-            ))
-                .await;
-        }
-
-        // Place the belts
-        let mut placed = 0;
-        let mut errors = Vec::new();
-
-        // Get underground entity name if available
-        let underground_entity = underground_config.as_ref().map(|c| c.entity_name.as_str());
-
-        for belt in &result.belts {
-            // Determine which entity to place based on belt kind
-            let entity_name = match belt.kind {
-                BeltKind::Surface => &params.belt_type,
-                BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
-                    underground_entity.unwrap_or(&params.belt_type)
-                }
-            };
-
-            // For underground belts, we need to set the type (input vs output)
-            // Factorio uses direction + type to distinguish entry/exit
-            // Entry: direction points in flow direction, type = "input"
-            // Exit: direction points in flow direction, type = "output"
-            let place_result = if belt.kind == BeltKind::UndergroundEntry
-                || belt.kind == BeltKind::UndergroundExit
-            {
-                let ug_type = match belt.kind {
-                    BeltKind::UndergroundEntry => "input",
-                    BeltKind::UndergroundExit => "output",
-                    _ => "input",
-                };
-                // Place underground belt with type
-                client
-                    .place_underground_belt(entity_name, belt.position, belt.direction, ug_type)
-                    .await
-            } else {
-                client
-                    .place_entity(entity_name, belt.position, belt.direction)
-                    .await
-            };
-
-            match place_result {
-                Ok(_) => placed += 1,
-                Err(e) => errors.push(format!("({}, {}): {}", belt.position.x, belt.position.y, e)),
-            }
-        }
-
-        let mut result_msg = if errors.is_empty() {
-            format!(
-                "Successfully placed {} belts with {} turns",
-                placed, result.turn_count
-            )
-        } else {
-            format!(
-                "Placed {}/{} belts. Errors:\n{}",
-                placed,
-                result.belt_count,
-                errors.join("\n")
-            )
-        };
-        if result.underground_count > 0 {
-            result_msg.push_str(&format!(
-                " ({} underground pairs)",
-                result.underground_count
-            ));
-        }
-        self.with_player_messages(result_msg).await
     }
 
     /// Build a coal fuel belt plus inserter feed for one burnable consumer.

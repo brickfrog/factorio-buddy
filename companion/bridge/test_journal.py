@@ -1127,6 +1127,105 @@ progress: plan confirmed; awaiting execution
 
         self.assertEqual(allowed, {})
 
+    def test_manual_automation_drift_gate_allows_bootstrap_infrastructure_craft(self):
+        import pipe
+        from models import LedgerState
+
+        bootstrap_plan = LedgerState(
+            objective="Bootstrap inserter and assembler crafting to enable durable automation pipeline",
+            plan_steps=[
+                "craft burner-inserter count=4 (bootstrap for furnace output connections)",
+                "craft assembling-machine-1 count=1 (bootstrap for recipe assembler cell)",
+                "plan_recipe_assembler_cell assembler=339 recipe=iron-gear-wheel",
+                "build_recipe_assembler_cell",
+                "build_automation_science",
+            ],
+        )
+        automation_capable = LiveState(
+            found=True,
+            surface="nauvis",
+            x=54.1,
+            y=-21.0,
+            entity_counts={
+                "assembling-machine-1": 1,
+                "transport-belt": 16,
+                "lab": 1,
+            },
+        )
+        gate = pipe.ManualAutomationDriftGate(
+            pipe.logger.bind(agent="test"),
+            agent_name="doug",
+            ledger_loader=lambda agent_name: bootstrap_plan,
+            live_state_loader=lambda agent_name: automation_capable,
+        )
+
+        allowed_inserter = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__craft",
+                "tool_input": {
+                    "recipe": "burner-inserter",
+                    "count": 4,
+                },
+            },
+            "tool-1",
+            {},
+        ))
+        allowed_gear = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__craft",
+                "tool_input": {
+                    "recipe": "iron-gear-wheel",
+                    "count": 5,
+                },
+            },
+            "tool-2",
+            {},
+        ))
+        blocked_science = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__craft",
+                "tool_input": {
+                    "recipe": "automation-science-pack",
+                    "count": 12,
+                },
+            },
+            "tool-3",
+            {},
+        ))
+        allowed_furnace_feed = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__hand_feed_furnace",
+                "tool_input": {
+                    "furnace_unit_number": 267,
+                    "source_item": "copper-ore",
+                    "source_count": 5,
+                    "fuel_item": "coal",
+                    "fuel_count": 5,
+                },
+            },
+            "tool-4",
+            {},
+        ))
+        allowed_plate_extract = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__extract_items",
+                "tool_input": {
+                    "unit_number": 267,
+                    "item": "copper-plate",
+                    "count": 15,
+                    "inventory_type": "furnace_result",
+                },
+            },
+            "tool-5",
+            {},
+        ))
+
+        self.assertEqual(allowed_inserter, {})
+        self.assertEqual(allowed_gear, {})
+        self.assertEqual(allowed_furnace_feed, {})
+        self.assertEqual(allowed_plate_extract, {})
+        self.assertEqual(blocked_science["decision"], "block")
+
     def test_manual_automation_drift_gate_blocks_manual_material_flow_after_belts_exist(self):
         import pipe
         from models import LedgerState

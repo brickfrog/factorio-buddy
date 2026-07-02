@@ -902,6 +902,16 @@ class ManualAutomationDriftGate:
             request.is_manual_fuel_transfer or request.is_manual_material_transfer
         ):
             return PreToolUseHookResponse.noop().to_dict()
+        bootstrap_infrastructure_context = self._ledger_has_bootstrap_infrastructure_context(ledger)
+        if bootstrap_infrastructure_context and (
+            request.is_manual_fuel_transfer or request.is_manual_material_transfer
+        ):
+            return PreToolUseHookResponse.noop().to_dict()
+        if (
+            request.is_bootstrap_infrastructure_craft
+            and bootstrap_infrastructure_context
+        ):
+            return PreToolUseHookResponse.noop().to_dict()
         if (
             request.is_manual_fuel_transfer
             and live_state is not None
@@ -983,6 +993,28 @@ class ManualAutomationDriftGate:
             for marker in (
                 "route_belt",
                 "build_fuel_supply",
+            )
+        )
+
+    @staticmethod
+    def _ledger_has_bootstrap_infrastructure_context(ledger: Any) -> bool:
+        try:
+            text = str(ledger.active_text() or "").lower()
+        except Exception:
+            text = ""
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "bootstrap",
+                "build_recipe_assembler_cell",
+                "durable automation",
+                "furnace output",
+                "inserter",
+                "plan_recipe_assembler_cell",
+                "plate output",
+                "recipe assembler",
             )
         )
 
