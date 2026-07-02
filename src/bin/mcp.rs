@@ -843,6 +843,23 @@ pub struct RenderMapParams {
     pub show_power: bool,
 }
 
+/// Parameters for save-state wedged/visual diagnostics
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DebugWedgedStateParams {
+    /// X coordinate of area center (default: character position)
+    pub x: Option<i32>,
+    /// Y coordinate of area center (default: character position)
+    pub y: Option<i32>,
+    /// Map radius in tiles (default: 15)
+    #[serde(default = "default_map_radius")]
+    pub radius: u32,
+    /// Detail level: "minimal", "normal", or "detailed" (default: "detailed")
+    pub detail: Option<String>,
+    /// Show power coverage overlay using network ID numbers (1-9)
+    #[serde(default)]
+    pub show_power: bool,
+}
+
 fn default_map_radius() -> u32 {
     15
 }
@@ -975,6 +992,74 @@ impl FactorioMcp {
             Some(msgs) => format!("{}{}", result, msgs),
             None => result,
         }
+    }
+
+    async fn render_ascii_map_snapshot(
+        &self,
+        client: &mut FactorioClient,
+        center: Position,
+        radius: u32,
+        detail: Option<&str>,
+        show_power: bool,
+    ) -> Result<String, String> {
+        let r = radius as f64;
+        let area = Area {
+            left_top: Position::new(center.x - r, center.y - r),
+            right_bottom: Position::new(center.x + r, center.y + r),
+        };
+
+        let entities = client
+            .find_entities(area, None, None)
+            .await
+            .map_err(|e| format!("Error getting entities: {}", e))?;
+        let tiles = client.get_tiles(area).await.unwrap_or_default();
+        let char_pos = client.get_character_position().await.ok();
+        let detail_level = match detail {
+            Some("minimal") => factorioctl::cli::DetailLevel::Minimal,
+            Some("normal") => factorioctl::cli::DetailLevel::Normal,
+            _ => factorioctl::cli::DetailLevel::Detailed,
+        };
+
+        let power_coverage = if show_power {
+            let lua = LuaCommand::get_power_coverage(center.x as i32, center.y as i32, radius);
+            match client.execute_lua(&lua).await {
+                Ok(result) => serde_json::from_str::<serde_json::Value>(&result)
+                    .ok()
+                    .and_then(|value| value.get("coverage").cloned())
+                    .and_then(|coverage| {
+                        if let serde_json::Value::Object(map) = coverage {
+                            let mut parsed = std::collections::HashMap::new();
+                            for (key, val) in map {
+                                if let Some((x_str, y_str)) = key.split_once(',') {
+                                    if let (Ok(x), Ok(y)) =
+                                        (x_str.parse::<i32>(), y_str.parse::<i32>())
+                                    {
+                                        if let Some(id) = val.as_u64() {
+                                            parsed.insert((x, y), id as u8);
+                                        }
+                                    }
+                                }
+                            }
+                            Some(parsed)
+                        } else {
+                            None
+                        }
+                    }),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        Ok(factorioctl::cli::render_ascii_map(
+            &entities,
+            &tiles,
+            &center,
+            radius,
+            char_pos.as_ref(),
+            detail_level,
+            power_coverage.as_ref(),
+        ))
     }
 }
 
@@ -1317,86 +1402,108 @@ impl FactorioMcp {
             }
         };
 
-        let r = params.radius as f64;
-        let area = Area {
-            left_top: Position::new(center.x - r, center.y - r),
-            right_bottom: Position::new(center.x + r, center.y + r),
+        let map = match self
+            .render_ascii_map_snapshot(
+                &mut client,
+                center,
+                params.radius,
+                params.detail.as_deref(),
+                params.show_power,
+            )
+            .await
+        {
+            Ok(map) => map,
+            Err(e) => e,
+        };
+        self.with_player_messages(map).await
+    }
+
+    /// Capture one read-only visual/collision snapshot for wedged-state debugging.
+    #[tool(
+        description = "Read-only save-state debug probe for stuck agents. Returns current position, is_player_blocked collision diagnostics, dry-run unstuck recommendation, optional can_stand_at for the map center, and a local ASCII map with @ marking the character. Use when Doug is standing still, appears under an entity, or screenshots suggest the character is physically wedged."
+    )]
+    async fn debug_wedged_state(
+        &self,
+        Parameters(params): Parameters<DebugWedgedStateParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        // Query entities in the area
-        let entities = match client.find_entities(area, None, None).await {
-            Ok(e) => e,
+        let character_position = match client.get_character_position().await {
+            Ok(pos) => pos,
             Err(e) => {
                 return self
-                    .with_player_messages(format!("Error getting entities: {}", e))
+                    .with_player_messages(format!("Error getting position: {}", e))
                     .await
             }
         };
-
-        // Query tiles for water/terrain
-        let tiles = client.get_tiles(area).await.unwrap_or_default();
-
-        // Get character position for marking
-        let char_pos = client.get_character_position().await.ok();
-
-        // Parse detail level
-        let detail = match params.detail.as_deref() {
-            Some("minimal") => factorioctl::cli::DetailLevel::Minimal,
-            Some("detailed") => factorioctl::cli::DetailLevel::Detailed,
-            _ => factorioctl::cli::DetailLevel::Normal,
-        };
-
-        // Query power coverage if requested
-        let power_coverage = if params.show_power {
-            let lua = factorioctl::client::lua::LuaCommand::get_power_coverage(
-                center.x as i32,
-                center.y as i32,
-                params.radius,
-            );
-            match client.execute_lua(&lua).await {
-                Ok(result) => {
-                    // Parse the coverage data
-                    serde_json::from_str::<serde_json::Value>(&result)
-                        .ok()
-                        .and_then(|v| v.get("coverage").cloned())
-                        .and_then(|c| {
-                            if let serde_json::Value::Object(map) = c {
-                                let mut coverage: std::collections::HashMap<(i32, i32), u8> =
-                                    std::collections::HashMap::new();
-                                for (key, val) in map {
-                                    if let Some((x_str, y_str)) = key.split_once(',') {
-                                        if let (Ok(x), Ok(y)) =
-                                            (x_str.parse::<i32>(), y_str.parse::<i32>())
-                                        {
-                                            if let Some(id) = val.as_u64() {
-                                                coverage.insert((x, y), id as u8);
-                                            }
-                                        }
-                                    }
-                                }
-                                Some(coverage)
-                            } else {
-                                None
-                            }
-                        })
-                }
-                Err(_) => None,
-            }
+        let center = if let (Some(x), Some(y)) = (params.x, params.y) {
+            Position::new(x as f64 + 0.5, y as f64 + 0.5)
         } else {
-            None
+            character_position
+        };
+        let radius = params.radius.clamp(1, 30);
+
+        let blocked = match client.is_player_blocked(radius.min(12)).await {
+            Ok(value) => value,
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+        let current_stand = match client
+            .can_stand_at(character_position, radius.min(12))
+            .await
+        {
+            Ok(value) => value,
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+        let center_stand = match client.can_stand_at(center, radius.min(12)).await {
+            Ok(value) => value,
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+        let unstuck_preview = match client.unstuck(radius.min(12), true).await {
+            Ok(value) => value,
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+        let map = match self
+            .render_ascii_map_snapshot(
+                &mut client,
+                center,
+                radius,
+                params.detail.as_deref(),
+                params.show_power,
+            )
+            .await
+        {
+            Ok(map) => map,
+            Err(e) => format!("Error rendering map: {}", e),
         };
 
-        // Render the map
-        let map = factorioctl::cli::render_ascii_map(
-            &entities,
-            &tiles,
-            &center,
-            params.radius,
-            char_pos.as_ref(),
-            detail,
-            power_coverage.as_ref(),
-        );
-        self.with_player_messages(map).await
+        let result = serde_json::json!({
+            "success": true,
+            "character_position": {
+                "x": character_position.x,
+                "y": character_position.y,
+            },
+            "map_center": {
+                "x": center.x,
+                "y": center.y,
+            },
+            "radius": radius,
+            "blocked": blocked,
+            "current_stand": current_stand,
+            "center_stand": center_stand,
+            "unstuck_preview": unstuck_preview,
+            "visual": {
+                "format": "ascii_map",
+                "legend": "@=agent, D=drill, F=furnace, i=inserter, P=pole, ^=belt north, >=belt east, v=belt south, <=belt west, I=iron, C=copper, c=coal, S=stone, ~=water",
+                "map": map,
+            },
+            "guidance": "If blocked.blocked is true or blocked.blocker_count > 0, call unstuck with dry_run=false or walk_to the first unstuck_preview candidate before placing more entities nearby."
+        });
+        let rendered =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(rendered).await
     }
 
     /// Get resource patches (ore, oil) in an area.

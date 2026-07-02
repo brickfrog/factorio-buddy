@@ -1674,6 +1674,28 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
 }
 
 #[test]
+fn wedged_debug_probe_combines_collision_diagnostics_and_visual_snapshot() {
+    let mcp_rs = include_str!("../src/bin/mcp.rs");
+    assert!(
+        mcp_rs.contains("async fn debug_wedged_state")
+            && mcp_rs.contains("client.is_player_blocked(radius.min(12))")
+            && mcp_rs.contains(".can_stand_at(character_position, radius.min(12))")
+            && mcp_rs.contains("client.unstuck(radius.min(12), true)")
+            && mcp_rs.contains("render_ascii_map_snapshot(")
+            && mcp_rs.contains("\"format\": \"ascii_map\"")
+            && mcp_rs.contains("\"blocked\": blocked")
+            && mcp_rs.contains("\"unstuck_preview\": unstuck_preview"),
+        "debug_wedged_state should be a one-call save-state visual/collision probe"
+    );
+    assert!(
+        mcp_rs.contains("Read-only save-state debug probe for stuck agents")
+            && mcp_rs.contains("appears under an entity")
+            && mcp_rs.contains("@ marking the character"),
+        "debug_wedged_state tool description should steer agents toward wedged-state diagnosis"
+    );
+}
+
+#[test]
 fn placement_queries_live_in_the_mod_not_rust_strings() {
     for (name, lua, method) in [
         (
