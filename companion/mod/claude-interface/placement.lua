@@ -76,6 +76,39 @@ local function boxes_overlap_area(area, box)
         and area[2][2] > box.left_top.y
 end
 
+local function point_overlaps_area(point, area)
+    if not (point and area) then return false end
+    return point.x > area[1][1]
+        and point.x < area[2][1]
+        and point.y > area[1][2]
+        and point.y < area[2][2]
+end
+
+local function areas_overlap(a, b)
+    if not (a and b) then return false end
+    return a[1][1] < b[2][1]
+        and a[2][1] > b[1][1]
+        and a[1][2] < b[2][2]
+        and a[2][2] > b[1][2]
+end
+
+local function character_standing_area(x, y)
+    return {{x - 0.3, y - 0.3}, {x + 0.3, y + 0.3}}
+end
+
+local function character_can_stand_at(surface, force, x, y)
+    local ok, can_place_or_error = pcall(function()
+        return surface.can_place_entity{
+            name = "character",
+            position = {x, y},
+            force = force,
+            build_check_type = defines.build_check_type.manual,
+        }
+    end)
+    if ok then return can_place_or_error == true, nil end
+    return false, tostring(can_place_or_error)
+end
+
 local function character_placement_blocker(character, entity_name, position)
     if not (character and character.valid and character.bounding_box) then return nil end
     local area = placement_area(entity_name, position, 0.05)
@@ -434,12 +467,15 @@ end
 local function placement_candidate(surface, force, entity_name, position, direction, character, target)
     local character_blocker = character_placement_blocker(character, entity_name, position)
     local footprint = placement_area(entity_name, position, 0.0)
+    local footprint_width = footprint[2][1] - footprint[1][1]
+    local footprint_height = footprint[2][2] - footprint[1][2]
     local diagnostic = {
         entity = entity_name,
         position = {x = position[1], y = position[2]},
         direction = direction,
         direction_name = direction_name(direction),
         footprint = area_table(footprint),
+        footprint_size = {width = footprint_width, height = footprint_height},
         character_overlap = character_blocker ~= nil,
         avoids_character = character_blocker == nil,
     }
@@ -454,6 +490,57 @@ local function placement_candidate(surface, force, entity_name, position, direct
             (position[1] - character.position.x) * (position[1] - character.position.x)
                 + (position[2] - character.position.y) * (position[2] - character.position.y)
         )
+    end
+    local stand_candidates = {}
+    local stand_total = 0
+    if character and character.valid then
+        local center = {x = position[1], y = position[2]}
+        local seen = {}
+        for r = 1, 8 do
+            for dx = -r, r do
+                for dy = -r, r do
+                    if math.abs(dx) == r or math.abs(dy) == r then
+                        local sx = math.floor(center.x) + dx + 0.5
+                        local sy = math.floor(center.y) + dy + 0.5
+                        local point = {x = sx, y = sy}
+                        local key = tostring(sx) .. "," .. tostring(sy)
+                        if not seen[key]
+                            and not point_overlaps_area(point, footprint)
+                            and not areas_overlap(character_standing_area(sx, sy), footprint)
+                        then
+                            seen[key] = true
+                            local can_stand, stand_error = character_can_stand_at(surface, force, sx, sy)
+                            if can_stand then
+                                stand_total = stand_total + 1
+                                if #stand_candidates < 5 then
+                                    table.insert(stand_candidates, {
+                                        position = point,
+                                        distance_from_placement = math.sqrt((sx - center.x) * (sx - center.x) + (sy - center.y) * (sy - center.y)),
+                                        distance_from_character = math.sqrt((sx - character.position.x) * (sx - character.position.x) + (sy - character.position.y) * (sy - character.position.y)),
+                                    })
+                                end
+                            elseif stand_error and not diagnostic.standing_error then
+                                diagnostic.standing_error = stand_error
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        table.sort(stand_candidates, function(a, b)
+            if a.distance_from_placement == b.distance_from_placement then
+                return a.distance_from_character < b.distance_from_character
+            end
+            return a.distance_from_placement < b.distance_from_placement
+        end)
+        diagnostic.post_placement = {
+            has_clear_standing_position = #stand_candidates > 0,
+            would_trap_agent = #stand_candidates == 0,
+            nearest_clear_standing_position = (#stand_candidates > 0) and stand_candidates[1].position or nil,
+            standing_candidates = stand_candidates,
+            total_standing_candidates = stand_total,
+        }
+        diagnostic.can_place_and_keep_working = false
     end
     if character_blocker then
         diagnostic.factorio_allowed = false
@@ -485,6 +572,27 @@ local function placement_candidate(surface, force, entity_name, position, direct
             diagnostic.recommended_action = details.recommended_action
         end
     end
+
+    local output = mining_drill_output_diagnostics(surface, force, entity_name, position, direction, character)
+    if output then
+        diagnostic.output = output
+        diagnostic.output_buildable = output.belt_can_place
+        diagnostic.output_clear = output.output_clear
+        diagnostic.output_blocked = output.belt_can_place ~= true
+        diagnostic.output_usable = output.output_clear == true
+        if output.warning then diagnostic.output_warning = output.warning end
+    else
+        diagnostic.output_usable = true
+    end
+
+    local has_clear_stand = true
+    if diagnostic.post_placement then
+        has_clear_stand = diagnostic.post_placement.has_clear_standing_position == true
+    end
+    diagnostic.can_place_and_keep_working = diagnostic.factorio_allowed == true
+        and diagnostic.avoids_character == true
+        and has_clear_stand
+        and diagnostic.output_usable == true
 
     return diagnostic
 end
@@ -1547,7 +1655,7 @@ function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y,
             for _, dir in pairs(directions) do
                 result.checked = result.checked + 1
                 local candidate = placement_candidate(surface, force, entity_name, position, dir, character, target)
-                if candidate.factorio_allowed and candidate.avoids_character then
+                if candidate.can_place_and_keep_working then
                     candidate.tool = "place_entity"
                     candidate.tool_args = {
                         entity_name = entity_name,
@@ -1555,7 +1663,9 @@ function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y,
                         y = candidate.position.y,
                         direction = direction_arg_name(dir),
                     }
-                    candidate.description = "Place " .. entity_name .. " near target without overlapping the agent character."
+                    candidate.description = "Place "
+                        .. entity_name
+                        .. " near target without trapping the agent and with usable output."
                     table.insert(accepted, candidate)
                 elseif candidate.character_overlap then
                     if #result.rejected_character_overlap < limit then
@@ -1569,6 +1679,17 @@ function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y,
     end
 
     table.sort(accepted, function(a, b)
+        local a_stand = a.post_placement and a.post_placement.has_clear_standing_position == true or false
+        local b_stand = b.post_placement and b.post_placement.has_clear_standing_position == true or false
+        if a_stand ~= b_stand then
+            return a_stand == true
+        end
+        if a.output_clear ~= b.output_clear then
+            return a.output_clear == true
+        end
+        if a.output_buildable ~= b.output_buildable then
+            return a.output_buildable == true
+        end
         if a.distance == b.distance then
             if a.distance_from_character == b.distance_from_character then
                 if a.position.x == b.position.x then
@@ -1593,7 +1714,7 @@ function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y,
         result.selected = accepted[1]
         result.steps = {accepted[1]}
         result.next_action = "execute_place_entity_step"
-        result.guidance = "Use selected.tool_args with place_entity; selected.footprint shows the exact entity collision footprint and avoids_character confirms it does not overlap the agent."
+        result.guidance = "Use selected.tool_args with place_entity; selected.footprint shows the collision footprint, selected.post_placement.nearest_clear_standing_position is the closest work tile, and selected.can_place_and_keep_working confirms the placement avoids trapping/output-blocking the agent."
         return result
     end
 
@@ -1602,6 +1723,10 @@ function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y,
         result.next_action = "move_agent_or_call_unstuck"
         result.recommended_action = "walk_to_clear_placement"
         result.guidance = "Move the agent away from the requested build area, then call plan_entity_placement_near again."
+    elseif #result.rejected_blocked > 0 then
+        result.error = "No nearby placement was both Factorio-valid and operationally safe for the agent."
+        result.next_action = "expand_radius_or_use_edge_planner"
+        result.guidance = "Review rejected_blocked for output_blocked or post_placement.would_trap_agent, then expand radius or choose a patch-edge placement."
     else
         result.error = "No Factorio-valid placement found near target."
         result.next_action = "expand_radius_or_clear_blockers"

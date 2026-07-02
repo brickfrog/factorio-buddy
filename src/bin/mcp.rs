@@ -2208,7 +2208,7 @@ impl FactorioMcp {
 
     /// Plan a safe entity placement near a target.
     #[tool(
-        description = "Read-only footprint-aware placement planner. Returns concrete place_entity steps near a target while explicitly avoiding the agent character footprint. Use before placing entities near yourself or near crowded builds; selected.footprint shows the collision area and avoids_character confirms Doug is not under it."
+        description = "Read-only footprint-aware placement planner. Returns concrete place_entity steps near a target while explicitly avoiding the agent character footprint and placements that trap the agent or block drill output. Use before placing entities near yourself or near crowded builds; selected.footprint shows the collision area, selected.post_placement.nearest_clear_standing_position shows where the agent can stand afterward, and selected.can_place_and_keep_working confirms the placement is operationally safe."
     )]
     async fn plan_entity_placement_near(
         &self,
