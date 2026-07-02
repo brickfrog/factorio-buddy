@@ -98,15 +98,21 @@ def choose_autonomy_decision(
     )
     live_completion_reason = completion_evidence.reason
     has_plan = bool(state.objective.strip()) and bool(state.plan_steps)
+    readiness = state.readiness_evidence()
+    ledger_repeated_ready = (
+        readiness.has_plan
+        and readiness.repeated_ready
+        and not readiness.explicit_ready
+    )
     actionable_plan = has_plan and (
         window.has_actionable_plan_signal()
-        or state.has_execution_ready_plan()
+        or readiness.is_ready
     )
     repeated_plan_progress = (
         has_plan
-        and not actionable_plan
         and (
-            window.has_repeated_unsignaled_progress(
+            ledger_repeated_ready
+            or window.has_repeated_unsignaled_progress(
                 min_count=PLANNER_STALL_REPEAT_COUNT,
             )
             or window.has_repeated_ready_progress(
@@ -139,12 +145,12 @@ def choose_autonomy_decision(
         else AutonomyDecisionReason.WITHIN_INTERVAL
     )
 
-    if mode == AutonomyMode.PLAN and actionable_plan:
-        mode = AutonomyMode.EXECUTE
-        reason = AutonomyDecisionReason.ACTIONABLE_PLAN
-    elif mode == AutonomyMode.PLAN and repeated_plan_progress:
+    if mode == AutonomyMode.PLAN and repeated_plan_progress:
         mode = AutonomyMode.EXECUTE
         reason = AutonomyDecisionReason.REPEATED_PLAN_PROGRESS
+    elif mode == AutonomyMode.PLAN and actionable_plan:
+        mode = AutonomyMode.EXECUTE
+        reason = AutonomyDecisionReason.ACTIONABLE_PLAN
     if (
         mode == AutonomyMode.EXECUTE
         and window.newest_event_indicates_plan_done()

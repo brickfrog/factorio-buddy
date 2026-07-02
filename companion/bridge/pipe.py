@@ -105,6 +105,7 @@ from models import (
     AgentResponseFormat,
     AgentSessionIndex,
     AgentSessionState,
+    AutonomyDecisionReason,
     AutonomyTickMessage,
     BridgeValidationError,
     BridgeInputMessage,
@@ -1839,6 +1840,13 @@ class AgentThread:
         self._exec_ticks_since_plan = decision.next_exec_ticks_since_plan(
             self._exec_ticks_since_plan,
         )
+        if decision.reason == AutonomyDecisionReason.REPEATED_PLAN_PROGRESS:
+            append_event(
+                self.agent_name,
+                "progress",
+                "scheduler override: repeated read-only planning produced no "
+                "mutation; forcing execution tick",
+            )
         include_reflection = decision.is_plan and reflect_due
         message = build_autonomy_prompt_model(
             AutonomyPromptInput(

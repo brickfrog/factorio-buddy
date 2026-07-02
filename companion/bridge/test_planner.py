@@ -171,7 +171,7 @@ class PlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
-        self.assertEqual(decision.reason, "actionable_plan")
+        self.assertEqual(decision.reason, "repeated_plan_progress")
         self.assertTrue(decision.actionable_plan)
         self.assertFalse(decision.read_only_tools)
 
@@ -937,6 +937,12 @@ class PlannerTests(unittest.TestCase):
         self.assertNotIn("read_only_tools", tick)
         self.assertIn("walk_to (42, -21)", tick["message"])
         self.assertEqual(thread._exec_ticks_since_plan, thread._planner_interval + 1)
+        events = journal.load_events("doug", 5)
+        self.assertEqual(events[-1]["kind"], "progress")
+        self.assertIn(
+            "scheduler override: repeated read-only planning produced no mutation",
+            events[-1]["text"],
+        )
 
     def test_agent_thread_executes_after_varied_ready_planner_churn(self):
         ledger.save_ledger("doug", {
