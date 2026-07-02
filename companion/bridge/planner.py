@@ -1,7 +1,21 @@
 """Pure autonomy planner/execution prompt assembly."""
 
-import re
+from typing import Any
 
+from models import (
+    AutonomyDecision,
+    AutonomyDecisionReason,
+    AutonomyMode,
+    AutonomyPromptInput,
+    JournalWindow,
+    LedgerState,
+    LiveCompletionEvidence,
+    LiveState,
+    autonomy_mode,
+)
+
+
+PLANNER_STALL_REPEAT_COUNT = 3
 
 PLANNER_PROMPT = (
     "(planner tick) "
@@ -27,6 +41,7 @@ PLANNER_PROMPT = (
     "- <step>\n"
     "- <step>\n"
     "progress: <what changed>\n"
+    "signal: new_objective|plan_ready|plan_done|none\n"
     "</ledger>"
 )
 
@@ -46,6 +61,7 @@ EXECUTION_PROMPT = (
     "end with one progress-only ledger block:\n"
     "<ledger>\n"
     "progress: <what changed>\n"
+    "signal: none|plan_done\n"
     "</ledger>\n"
     "For stale/finished/wrong plans, end with one replacement ledger block:\n"
     "<ledger>\n"
@@ -54,118 +70,156 @@ EXECUTION_PROMPT = (
     "- <step>\n"
     "- <step>\n"
     "progress: <why the old plan was stale or complete>\n"
+    "signal: new_objective|plan_done|none\n"
     "</ledger>"
 )
 
 
-def choose_autonomy_mode(ledger: dict, exec_ticks_since_plan: int,
+def choose_autonomy_decision(
+    ledger: LedgerState | dict,
+    exec_ticks_since_plan: int,
+    planner_interval: int,
+    *,
+    journal_window: Any = None,
+    live_completion_evidence: Any = None,
+    reflect_due: bool = False,
+) -> AutonomyDecision:
+    """Return the typed autonomy decision for this tick without IO/state."""
+    state = LedgerState.coerce(ledger)
+    window = (
+        journal_window
+        if isinstance(journal_window, JournalWindow)
+        else JournalWindow.coerce(journal_window or [])
+    )
+    completion_evidence = (
+        live_completion_evidence
+        if isinstance(live_completion_evidence, LiveCompletionEvidence)
+        else LiveCompletionEvidence.none()
+    )
+    live_completion_reason = completion_evidence.reason
+    has_plan = bool(state.objective.strip()) and bool(state.plan_steps)
+    actionable_plan = has_plan and (
+        window.has_actionable_plan_signal()
+        or state.has_execution_ready_plan()
+    )
+    repeated_plan_progress = (
+        has_plan
+        and not actionable_plan
+        and window.has_repeated_unsignaled_progress(
+            min_count=PLANNER_STALL_REPEAT_COUNT,
+        )
+    )
+    if not state.objective.strip() or not state.plan_steps:
+        return AutonomyDecision(
+            mode=AutonomyMode.PLAN,
+            reason=AutonomyDecisionReason.MISSING_PLAN,
+        )
+
+    try:
+        interval = int(planner_interval)
+    except (TypeError, ValueError):
+        interval = 0
+    try:
+        exec_ticks = int(exec_ticks_since_plan)
+    except (TypeError, ValueError):
+        exec_ticks = 0
+    mode = (
+        AutonomyMode.PLAN
+        if exec_ticks >= max(0, interval)
+        else AutonomyMode.EXECUTE
+    )
+    reason = (
+        AutonomyDecisionReason.PLANNER_INTERVAL
+        if mode == AutonomyMode.PLAN
+        else AutonomyDecisionReason.WITHIN_INTERVAL
+    )
+
+    if mode == AutonomyMode.PLAN and actionable_plan:
+        mode = AutonomyMode.EXECUTE
+        reason = AutonomyDecisionReason.ACTIONABLE_PLAN
+    elif mode == AutonomyMode.PLAN and repeated_plan_progress:
+        mode = AutonomyMode.EXECUTE
+        reason = AutonomyDecisionReason.REPEATED_PLAN_PROGRESS
+    if (
+        mode == AutonomyMode.EXECUTE
+        and window.newest_event_indicates_plan_done()
+        and not actionable_plan
+        and not repeated_plan_progress
+    ):
+        mode = AutonomyMode.PLAN
+        reason = AutonomyDecisionReason.PLAN_DONE
+    if mode == AutonomyMode.EXECUTE and live_completion_reason:
+        mode = AutonomyMode.PLAN
+        reason = AutonomyDecisionReason.LIVE_STATE_COMPLETION
+    if (
+        mode == AutonomyMode.EXECUTE
+        and reflect_due
+        and not actionable_plan
+        and not repeated_plan_progress
+    ):
+        mode = AutonomyMode.PLAN
+        reason = AutonomyDecisionReason.REFLECTION_DUE
+
+    return AutonomyDecision(
+        mode=mode,
+        reason=reason,
+        actionable_plan=actionable_plan or repeated_plan_progress,
+    )
+
+
+def choose_autonomy_mode(ledger: LedgerState | dict, exec_ticks_since_plan: int,
                          planner_interval: int) -> str:
     """Return the autonomy mode for this tick without touching IO/state."""
-    objective = str(ledger.get("objective", "")).strip()
-    plan_steps = ledger.get("plan_steps", [])
-    if not objective or not plan_steps:
-        return "plan"
-    if exec_ticks_since_plan >= planner_interval:
-        return "plan"
-    return "execute"
+    return choose_autonomy_decision(
+        ledger,
+        exec_ticks_since_plan,
+        planner_interval,
+    ).mode_value
 
 
-_LIVE_ENTITY_RE = re.compile(r"\b([a-z0-9][a-z0-9-]*)=(\d+)\b", re.IGNORECASE)
-_STEAM_BUILD_INTENT_RE = re.compile(
-    r"\b(?:build|deploy|place|set up|setup|construct|create|craft|complete)\b"
-    r".{0,80}\b(?:steam power|steam-power|offshore pump|offshore-pump|boiler|"
-    r"steam engine|steam-engine)\b"
-    r"|\b(?:steam power|steam-power)\b.{0,80}\b"
-    r"(?:build|deployment|setup|set up|complete)\b",
-    re.IGNORECASE | re.DOTALL,
-)
+def _live_state_model(live_state: LiveState | str) -> LiveState:
+    if isinstance(live_state, LiveState):
+        return live_state
+    return LiveState.from_line(live_state)
 
 
-def live_state_entity_counts(live_state: str) -> dict[str, int]:
+def live_state_entity_counts(live_state: LiveState | str) -> dict[str, int]:
     """Parse the compact live-state entity summary into name -> count."""
-    counts: dict[str, int] = {}
-    for name, raw_count in _LIVE_ENTITY_RE.findall(str(live_state)):
-        try:
-            count = int(raw_count)
-        except ValueError:
-            continue
-        key = name.lower()
-        counts[key] = counts.get(key, 0) + count
-    return counts
+    return _live_state_model(live_state).entity_counts
 
 
-def _ledger_objective_text(ledger: dict) -> str:
-    parts = [str(ledger.get("objective", ""))]
-    parts.extend(str(step) for step in ledger.get("plan_steps", []))
-    parts.extend(str(note) for note in ledger.get("progress_notes", []))
-    return "\n".join(parts).lower()
+def objective_completion_evidence(
+    ledger: LedgerState | dict,
+    live_state: LiveState | str,
+) -> LiveCompletionEvidence:
+    """Return typed evidence that live state has completed the ledger objective."""
+    return LedgerState.coerce(ledger).live_state_completion_evidence(live_state)
 
 
-def objective_satisfied_by_live_state(ledger: dict, live_state: str) -> str:
-    """Return a short reason when live state proves the ledger is stale.
-
-    The rules are intentionally conservative: only well-known early-game
-    objectives with direct world evidence trigger an automatic planner tick.
-    """
-    text = _ledger_objective_text(ledger)
-    counts = live_state_entity_counts(live_state)
-    if not text or not counts:
-        return ""
-
-    def has(name: str) -> bool:
-        return counts.get(name, 0) > 0
-
-    has_steam_chain = all(
-        has(name) for name in ("offshore-pump", "boiler", "steam-engine")
-    )
-    has_lab_power_evidence = has("lab") and (
-        has_steam_chain or has("small-electric-pole")
-    )
-
-    mentions_steam_power = (
-        "steam power" in text
-        or "steam-power" in text
-        or "steam engine" in text
-        or "steam-engine" in text
-        or "boiler" in text
-        or "offshore pump" in text
-        or "offshore-pump" in text
-    )
-    mentions_powered_lab = (
-        "power the lab" in text
-        or "powered lab" in text
-        or "lab near power endpoint" in text
-    )
-    steam_build_intent = _STEAM_BUILD_INTENT_RE.search(text) is not None
-    mentions_automation_research = (
-        "automation research" in text
-        or "start automation" in text
-        or "automation-science-pack" in text
-    )
-    progress_says_automation_done = (
-        "automation research completed" in text
-        or "automation+electric-mining-drill research" in text
-    )
-
-    if (
-        steam_build_intent
-        and mentions_steam_power
-        and mentions_powered_lab
-        and has_steam_chain
-        and has_lab_power_evidence
-    ):
-        return "live state already has steam power and a powered-lab footprint"
-    if steam_build_intent and mentions_steam_power and has_steam_chain:
-        return "live state already has offshore-pump, boiler, and steam-engine"
-    if mentions_powered_lab and has_lab_power_evidence:
-        return "live state already has lab plus power-grid evidence"
-    if mentions_automation_research and progress_says_automation_done and has("lab"):
-        return "ledger progress says automation research completed and live state has a lab"
-    return ""
-
-
-def build_autonomy_prompt(mode: str, ledger_text: str, live_state: str) -> str:
+def build_autonomy_prompt(
+    mode: AutonomyMode | str,
+    ledger_text: str,
+    live_state: LiveState | str,
+) -> str:
     """Assemble an autonomy prompt from already-loaded pure inputs."""
-    prompt = PLANNER_PROMPT if mode == "plan" else EXECUTION_PROMPT
-    parts = [ledger_text, live_state, prompt]
+    prompt = (
+        PLANNER_PROMPT
+        if autonomy_mode(mode) == AutonomyMode.PLAN
+        else EXECUTION_PROMPT
+    )
+    live_state_text = live_state.to_line() if isinstance(live_state, LiveState) else live_state
+    parts = [ledger_text, live_state_text, prompt]
     return "\n\n".join(part for part in parts if part)
+
+
+def build_autonomy_prompt_model(source: AutonomyPromptInput | dict) -> str:
+    """Assemble an autonomy prompt from typed context, not pre-rendered text."""
+    prompt_input = (
+        source
+        if isinstance(source, AutonomyPromptInput)
+        else AutonomyPromptInput.model_validate(source)
+    )
+    return prompt_input.render(
+        planner_prompt=PLANNER_PROMPT,
+        execution_prompt=EXECUTION_PROMPT,
+    )

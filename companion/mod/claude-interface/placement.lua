@@ -60,6 +60,38 @@ local function placement_area(entity_name, position, margin)
     }
 end
 
+local function area_table(area)
+    if not area then return nil end
+    return {
+        left_top = {x = area[1][1], y = area[1][2]},
+        right_bottom = {x = area[2][1], y = area[2][2]},
+    }
+end
+
+local function boxes_overlap_area(area, box)
+    if not (area and box) then return false end
+    return area[1][1] < box.right_bottom.x
+        and area[2][1] > box.left_top.x
+        and area[1][2] < box.right_bottom.y
+        and area[2][2] > box.left_top.y
+end
+
+local function character_placement_blocker(character, entity_name, position)
+    if not (character and character.valid and character.bounding_box) then return nil end
+    local area = placement_area(entity_name, position, 0.05)
+    if not boxes_overlap_area(area, character.bounding_box) then return nil end
+
+    local summary = entity_summary(character)
+    if summary then
+        summary.type = "character"
+        summary.entity_type = "character"
+        summary.blocker_type = "agent_character"
+        summary.message = "Requested placement footprint overlaps the agent character."
+        summary.placement_area = area_table(area)
+    end
+    return summary
+end
+
 local function is_mining_drill(entity_name)
     return type(entity_name) == "string" and string.find(entity_name, "mining-drill", 1, true) ~= nil
 end
@@ -240,8 +272,17 @@ local function belt_alternate_candidates(surface, force, position, direction, ra
     return returned
 end
 
-local function placement_diagnostics(surface, force, entity_name, position, direction)
+local function placement_diagnostics(surface, force, entity_name, position, direction, character)
     local details = inspect_placement_blockers(surface, entity_name, position, direction) or {}
+    local character_blocker = character_placement_blocker(character, entity_name, position)
+    if character_blocker then
+        details.blockers = details.blockers or {}
+        table.insert(details.blockers, 1, character_blocker)
+        details.occupied_by = character_blocker
+        details.character_overlap = true
+        details.recommended_action = "walk_to_clear_placement"
+        details.guidance = "Move the agent outside the proposed build footprint before placing this entity."
+    end
     if entity_name == "transport-belt" then
         local alternatives = belt_alternate_candidates(surface, force, position, direction, 3, 5)
         if #alternatives > 0 then
@@ -266,11 +307,12 @@ local function placement_diagnostics(surface, force, entity_name, position, dire
     return nil
 end
 
-local function mining_drill_output_diagnostics(surface, force, entity_name, position, direction)
+local function mining_drill_output_diagnostics(surface, force, entity_name, position, direction, character)
     if not is_mining_drill(entity_name) then return nil end
 
     local tile = mining_drill_output_tile(entity_name, position, direction)
     local belt_position = {tile.x, tile.y}
+    local character_blocker = character_placement_blocker(character, "transport-belt", belt_position)
     local ok, can_place_or_error = pcall(function()
         return surface.can_place_entity{
             name = "transport-belt",
@@ -282,12 +324,14 @@ local function mining_drill_output_diagnostics(surface, force, entity_name, posi
     end)
     local resources = resources_on_tile(surface, tile.x, tile.y)
     local blockers = nil
-    if not ok or can_place_or_error ~= true then
-        local details = placement_diagnostics(surface, force, "transport-belt", belt_position, direction)
+    if character_blocker then
+        blockers = {character_blocker}
+    elseif not ok or can_place_or_error ~= true then
+        local details = placement_diagnostics(surface, force, "transport-belt", belt_position, direction, character)
         if details then blockers = details.blockers end
     end
 
-    local belt_can_place = ok and can_place_or_error == true
+    local belt_can_place = ok and can_place_or_error == true and not character_blocker
     local output_clear = belt_can_place and #resources == 0
     local diagnostic = {
         belt_tile = tile,
@@ -304,7 +348,9 @@ local function mining_drill_output_diagnostics(surface, force, entity_name, posi
             .. direction_name(direction)
             .. " to catch drill output.",
     }
-    if not ok then
+    if character_blocker then
+        diagnostic.error = "Transport belt output tile overlaps the agent character."
+    elseif not ok then
         diagnostic.error = tostring(can_place_or_error)
     elseif can_place_or_error ~= true then
         diagnostic.error = "Transport belt cannot be placed on drill output tile."
@@ -511,6 +557,7 @@ function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius,
             local position = {center_x + dx, center_y + dy}
             for _, dir in pairs(directions) do
                 checked = checked + 1
+                local character_blocker = character_placement_blocker(character, drill_name, position)
                 local can_place_ok, can_place_or_error = pcall(function()
                     return surface.can_place_entity{
                         name = drill_name,
@@ -520,11 +567,11 @@ function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius,
                         build_check_type = defines.build_check_type.manual,
                     }
                 end)
-                if can_place_ok and can_place_or_error == true then
+                if not character_blocker and can_place_ok and can_place_or_error == true then
                     local drill_area = placement_area(drill_name, position, 0.0)
                     local resource_tiles, resource_amount = count_matching_resources(surface, resource_name, drill_area)
                     if resource_tiles > 0 then
-                        local output = mining_drill_output_diagnostics(surface, force, drill_name, position, dir)
+                        local output = mining_drill_output_diagnostics(surface, force, drill_name, position, dir, character)
                         local distance = math.sqrt(dx * dx + dy * dy)
                         table.insert(candidates, {
                             entity = drill_name,
@@ -668,7 +715,17 @@ local function entity_on_tile(surface, entity_name, x, y)
     return nil
 end
 
-local function can_place(surface, force, entity_name, position, direction)
+local function can_place(surface, force, entity_name, position, direction, character)
+    local character_blocker = character_placement_blocker(character, entity_name, position)
+    if character_blocker then
+        return false, "Placement overlaps agent character", {
+            character_overlap = true,
+            blockers = {character_blocker},
+            occupied_by = character_blocker,
+            recommended_action = "walk_to_clear_placement",
+            guidance = "Move the agent outside the proposed build footprint before placing this entity.",
+        }
+    end
     local ok, value = pcall(function()
         return surface.can_place_entity{
             name = entity_name,
@@ -678,8 +735,8 @@ local function can_place(surface, force, entity_name, position, direction)
             build_check_type = defines.build_check_type.manual,
         }
     end)
-    if not ok then return false, tostring(value) end
-    if value ~= true then return false, tostring(value) end
+    if not ok then return false, tostring(value), nil end
+    if value ~= true then return false, tostring(value), nil end
     return true, nil
 end
 
@@ -809,7 +866,7 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
     local belt_tile = output.belt_tile
     local belt_position = {belt_tile.x, belt_tile.y}
     local existing_belt = entity_on_tile(surface, belt_name, belt_tile.x, belt_tile.y)
-    local belt_can_place, belt_error = can_place(surface, force, belt_name, belt_position, output.belt_direction)
+    local belt_can_place, belt_error, belt_details = can_place(surface, force, belt_name, belt_position, output.belt_direction, character)
     local belt_ready = belt_can_place or existing_belt ~= nil
     if not belt_ready then
         table.insert(result.blockers, {
@@ -817,7 +874,7 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
             message = "Cannot place " .. tostring(belt_name) .. " on the drill output tile.",
             position = {x = belt_tile.x, y = belt_tile.y},
             error = belt_error,
-            diagnostics = placement_diagnostics(surface, force, belt_name, belt_position, output.belt_direction),
+            diagnostics = belt_details or placement_diagnostics(surface, force, belt_name, belt_position, output.belt_direction, character),
         })
         result.next_action = "move_drill_to_clear_output"
         return result
@@ -829,14 +886,14 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
         local vec = direction_vector(pickup_dir)
         local inserter_pos = {belt_tile.x - vec.x, belt_tile.y - vec.y}
         local drop_tile = {x = belt_tile.x - (vec.x * 2), y = belt_tile.y - (vec.y * 2)}
-        local inserter_ok, inserter_error = can_place(surface, force, inserter_name, inserter_pos, pickup_dir)
+        local inserter_ok, inserter_error = can_place(surface, force, inserter_name, inserter_pos, pickup_dir, character)
         if inserter_ok then
             for dx = -radius, radius do
                 for dy = -radius, radius do
                     local furnace_pos = {belt_tile.x + dx, belt_tile.y + dy}
                     local furnace_area = placement_area(furnace_name, furnace_pos, 0.0)
                     if area_contains_tile_center(furnace_area, drop_tile) then
-                        local furnace_ok, furnace_error = can_place(surface, force, furnace_name, furnace_pos, 0)
+                        local furnace_ok, furnace_error = can_place(surface, force, furnace_name, furnace_pos, 0, character)
                         local distance = math.sqrt(dx * dx + dy * dy)
                         table.insert(candidates, {
                             distance = distance,
@@ -1045,6 +1102,18 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
     end
 
     local surface = character.surface
+    local character_blocker = character_placement_blocker(character, entity_name, position)
+    if character_blocker then
+        return placement_failure(
+            entity_name,
+            position,
+            direction,
+            inventory_count,
+            false,
+            "Placement overlaps agent character",
+            placement_diagnostics(surface, character.force, entity_name, position, direction, character)
+        )
+    end
     clear_ground_items_for_placement(character, surface, entity_name, position)
 
     local can_place_ok, can_place_or_error = pcall(function()
@@ -1058,7 +1127,7 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
     end)
 
     if not can_place_ok or can_place_or_error ~= true then
-        local blocker_details = placement_diagnostics(surface, character.force, entity_name, position, direction)
+        local blocker_details = placement_diagnostics(surface, character.force, entity_name, position, direction, character)
         return placement_failure(
             entity_name,
             position,
@@ -1087,13 +1156,13 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
             inventory_count,
             true,
             tostring(created_or_error),
-            placement_diagnostics(surface, character.force, entity_name, position, direction)
+            placement_diagnostics(surface, character.force, entity_name, position, direction, character)
         )
     end
 
     local entity = created_or_error
     if not entity then
-        local blocker_details = placement_diagnostics(surface, character.force, entity_name, position, direction) or {}
+        local blocker_details = placement_diagnostics(surface, character.force, entity_name, position, direction, character) or {}
         blocker_details.create_entity_nil_after_can_place = true
         return placement_failure(
             entity_name,
@@ -1129,6 +1198,22 @@ function M.place_underground_belt(agent_id, entity_name, x, y, direction, belt_t
 
     local position = {x, y}
     local surface = character.surface
+    local character_blocker = character_placement_blocker(character, entity_name, position)
+    if character_blocker then
+        return {
+            success = false,
+            error = "Placement overlaps agent character",
+            entity = entity_name,
+            position = {x = x, y = y},
+            direction = direction,
+            inventory_count = inventory_count,
+            character_overlap = true,
+            occupied_by = character_blocker,
+            blockers = {character_blocker},
+            recommended_action = "walk_to_clear_placement",
+            guidance = "Move the agent outside the proposed build footprint before placing this entity.",
+        }
+    end
     local can_place = surface.can_place_entity{
         name = entity_name,
         position = position,
@@ -1195,6 +1280,7 @@ function M.check_entity_placement(agent_id, entity_name, x, y, direction)
     local inventory_count = 0
     if inv then inventory_count = inv.get_item_count(entity_name) end
 
+    local character_blocker = character_placement_blocker(character, entity_name, position)
     local ok, can_place_or_error = pcall(function()
         return character.surface.can_place_entity{
             name = entity_name,
@@ -1204,6 +1290,23 @@ function M.check_entity_placement(agent_id, entity_name, x, y, direction)
             build_check_type = defines.build_check_type.manual,
         }
     end)
+
+    if character_blocker then
+        return {
+            factorio_allowed = false,
+            entity = entity_name,
+            position = {x = x, y = y},
+            direction = direction,
+            inventory_count = inventory_count,
+            item_in_inventory = inventory_count > 0,
+            error = "Placement overlaps agent character",
+            character_overlap = true,
+            occupied_by = character_blocker,
+            blockers = {character_blocker},
+            recommended_action = "walk_to_clear_placement",
+            guidance = "Move the agent outside the proposed build footprint before placing this entity.",
+        }
+    end
 
     if not ok then
         return {
@@ -1227,7 +1330,7 @@ function M.check_entity_placement(agent_id, entity_name, x, y, direction)
     }
     if can_place_or_error ~= true then
         result.error = "Factorio cannot place entity here"
-        local blocker_details = placement_diagnostics(character.surface, character.force, entity_name, position, direction)
+        local blocker_details = placement_diagnostics(character.surface, character.force, entity_name, position, direction, character)
         if blocker_details then
             for key, value in pairs(blocker_details) do
                 result[key] = value
@@ -1275,6 +1378,7 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
             local position = {center[1] + dx, center[2] + dy}
             for _, dir in pairs(directions) do
                 checked = checked + 1
+                local character_blocker = character_placement_blocker(character, entity_name, position)
                 local ok, can_place = pcall(function()
                     return surface.can_place_entity{
                         name = entity_name,
@@ -1284,7 +1388,7 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
                         build_check_type = defines.build_check_type.manual,
                     }
                 end)
-                if ok and can_place == true then
+                if not character_blocker and ok and can_place == true then
                     local distance = math.sqrt(dx * dx + dy * dy)
                     local placement = {
                         entity = entity_name,
@@ -1295,7 +1399,7 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
                         inventory_count = inventory_count,
                         item_in_inventory = inventory_count > 0,
                     }
-                    local output = mining_drill_output_diagnostics(surface, character.force, entity_name, position, dir)
+                    local output = mining_drill_output_diagnostics(surface, character.force, entity_name, position, dir, character)
                     if output then
                         placement.output = output
                         placement.output_buildable = output.belt_can_place

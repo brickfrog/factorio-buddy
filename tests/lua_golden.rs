@@ -971,12 +971,13 @@ fn entity_lookup_and_drop_position_live_in_the_mod_not_rust_strings() {
 fn bridge_bootstrap_gameplay_lives_in_the_mod_not_python_strings() {
     let transport_py = include_str!("../companion/bridge/transport.py");
     for required in [
-        r#"remote.call("claude_interface", "ensure_surface""#,
-        r#"remote.call("claude_interface", "pre_place_character""#,
+        "RconRemoteCall.command",
+        "ensure_surface_result",
+        "pre_place_character_result",
     ] {
         assert!(
             transport_py.contains(required),
-            "bridge transport should call the mod remote {required:?}"
+            "bridge transport should call the mod remote through the RconRemoteCall builder {required:?}"
         );
     }
     for forbidden in [
@@ -1000,9 +1001,13 @@ fn bridge_bootstrap_gameplay_lives_in_the_mod_not_python_strings() {
     for required in [
         "local characters = require(\"characters\")",
         "characters.ensure_surface",
+        "characters.ensure_surface_result",
         "characters.pre_place",
+        "characters.pre_place_result",
         "ensure_surface = function(planet_name)",
+        "ensure_surface_result = function(planet_name)",
         "pre_place_character = function(agent_id, planet_name, spawn_x)",
+        "pre_place_character_result = function(agent_id, planet_name, spawn_x)",
     ] {
         assert!(
             control_lua.contains(required),
@@ -1023,10 +1028,13 @@ fn bridge_bootstrap_gameplay_lives_in_the_mod_not_python_strings() {
     }
     for required in [
         "function M.ensure_surface(planet_name)",
+        "function M.ensure_surface_result(planet_name)",
         "function M.pre_place(agent_id, planet_name, spawn_x)",
+        "function M.pre_place_result(agent_id, planet_name, spawn_x)",
         "target_surface.request_to_generate_chunks({spawn_x, 0}, 4)",
         "character = target_surface.create_entity{",
         "M.remember(agent_id, character)",
+        "helpers.table_to_json",
     ] {
         assert!(
             characters_lua.contains(required),
@@ -1039,12 +1047,16 @@ fn bridge_bootstrap_gameplay_lives_in_the_mod_not_python_strings() {
 fn bridge_live_state_gameplay_lives_in_the_mod_not_python_strings() {
     let pipe_py = include_str!("../companion/bridge/pipe.py");
     assert!(
-        pipe_py.contains(r#"remote.call("claude_interface", "live_state_line""#),
-        "bridge live-state probe should call the mod remote"
+        pipe_py.contains("RconRemoteCall.command")
+            && pipe_py.contains("live_state_result")
+            && pipe_py.contains("LiveState.from_rcon_response"),
+        "bridge live-state probe should call the typed JSON mod remote through the RconRemoteCall builder"
     );
     assert!(
-        pipe_py.contains(r#"remote.call("claude_interface", "connected_player_count""#),
-        "bridge human-connected probe should call the mod remote"
+        pipe_py.contains("RconRemoteCall.command")
+            && pipe_py.contains("connected_player_count_result")
+            && pipe_py.contains("ConnectedPlayerCountResult.from_rcon_response"),
+        "bridge human-connected probe should call the typed JSON mod remote through the RconRemoteCall builder"
     );
     for forbidden in [
         "c.surface.find_entities_filtered",
@@ -1064,9 +1076,13 @@ fn bridge_live_state_gameplay_lives_in_the_mod_not_python_strings() {
     for required in [
         "local characters = require(\"characters\")",
         "characters.live_state_line",
+        "characters.live_state_result",
         "characters.connected_player_count",
+        "characters.connected_player_count_result",
         "live_state_line = function(agent_id)",
+        "live_state_result = function(agent_id)",
         "connected_player_count = function()",
+        "connected_player_count_result = function()",
     ] {
         assert!(
             control_lua.contains(required),
@@ -1088,10 +1104,14 @@ fn bridge_live_state_gameplay_lives_in_the_mod_not_python_strings() {
     }
     for required in [
         "function M.live_state_line(agent_id)",
+        "function M.live_state_result(agent_id)",
         "character.surface.find_entities_filtered{force = character.force, name = name}",
         "\"Live state: \"",
         "\"; player entities: \" .. table.concat(parts, \", \")",
+        "helpers.table_to_json",
+        "entity_counts = live_state_entity_counts(character)",
         "function M.connected_player_count()",
+        "function M.connected_player_count_result()",
         "return #game.connected_players",
     ] {
         assert!(
@@ -1792,6 +1812,9 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("alternate_belt_placements")
             && placement_lua.contains("candidate_alternate_path")
             && placement_lua.contains("route_belt_around_blocker")
+            && placement_lua.contains("local function character_placement_blocker")
+            && placement_lua.contains("character_overlap = true")
+            && placement_lua.contains("walk_to_clear_placement")
             && placement_lua.contains("recommended_action = \"rotate_entity\"")
             && placement_lua.contains("create_entity_nil_after_can_place = true")
             && placement_lua.contains("local function mining_drill_output_diagnostics")
@@ -2665,8 +2688,9 @@ fn eval_harness_production_snapshot_lives_in_mod_remote_not_python_lua() {
     let diagnostics_lua = include_str!("../companion/mod/claude-interface/diagnostics.lua");
 
     assert!(
-        eval_py.contains(r#"remote.call("claude_interface", "eval_production_snapshot""#),
-        "eval harness should query production stats via a mod remote"
+        eval_py.contains("RconRemoteCall.command")
+            && eval_py.contains("eval_production_snapshot"),
+        "eval harness should query production stats via a mod remote through the RconRemoteCall builder"
     );
     for forbidden in [
         "game.surfaces",

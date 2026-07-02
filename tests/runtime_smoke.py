@@ -17,7 +17,8 @@ import selectors
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ MOD_SOURCE = REPO_ROOT / "companion" / "mod" / "claude-interface"
 DEFAULT_SYNCED_MOD = Path.home() / ".factorio" / "mods" / "claude-interface"
 DEFAULT_CLI = REPO_ROOT / "target" / "release" / "factorioctl"
 DEFAULT_MCP = REPO_ROOT / "target" / "release" / "mcp"
+_JSON_MISSING = object()
 
 
 class SmokeError(Exception):
@@ -41,6 +43,347 @@ class StepResult:
     tool_call: str
     classification: str
     result: str
+
+
+@dataclass(frozen=True)
+class JsonRpcResponse:
+    id: int | str | None = None
+    result: Any = None
+    error: Any = None
+
+
+@dataclass(frozen=True)
+class McpContentItem:
+    type: str = ""
+    text: str = ""
+
+
+@dataclass(frozen=True)
+class McpToolResult:
+    content: list[McpContentItem] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SmokeResultPayload:
+    success: bool | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class SmokeBlocker:
+    type: str = ""
+    name: str = ""
+    bounding_box: Any = None
+
+
+@dataclass(frozen=True)
+class PlacementCheckPayload:
+    allowed: bool | None = None
+
+
+@dataclass(frozen=True)
+class PlacedEntityPayload:
+    unit_number: int | None = None
+
+
+@dataclass(frozen=True)
+class PlacementFailurePayload:
+    blockers: list[SmokeBlocker] = field(default_factory=list)
+    alternate_belt_placements: Any = None
+    candidate_alternate_path: Any = None
+    recommended_action: str = ""
+    rotate_entity: Any = None
+    unit_number: int | None = None
+
+
+@dataclass(frozen=True)
+class RotateEntityPayload:
+    success: bool = False
+    direction: int | None = None
+
+
+@dataclass(frozen=True)
+class SmokeSuggestedTool:
+    tool: str = ""
+
+
+@dataclass(frozen=True)
+class SmokeToolStep:
+    tool: str = ""
+    tool_args: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SteamNoPlantDiagnostic:
+    status: str = ""
+    next_action: str = ""
+
+
+@dataclass(frozen=True)
+class SteamNoPlantRepair:
+    blockers: list[SmokeBlocker] = field(default_factory=list)
+    suggested_next_tool: SmokeSuggestedTool | None = None
+
+
+@dataclass(frozen=True)
+class PowerExtensionPlan:
+    dry_run: bool = False
+    steps: list[SmokeToolStep] = field(default_factory=list)
+    missing_items: list[Any] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class LabFeedPlan:
+    dry_run: bool = False
+    success: bool | None = None
+    ready: bool | None = None
+    inserted: int = 0
+    lab_after: int = 0
+    steps: list[SmokeToolStep] = field(default_factory=list)
+    blockers: list[SmokeBlocker] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SmokePosition:
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
+class SteamPlannerResult:
+    placement_success: bool = False
+    target: SmokePosition | None = None
+    blockers: list[SmokeBlocker] = field(default_factory=list)
+    existing_plant: Any = None
+
+
+@dataclass(frozen=True)
+class ExistingPlantSummary:
+    offshore_pumps: int = 0
+    boilers: int = 0
+    steam_engines: int = 0
+
+
+@dataclass(frozen=True)
+class ExistingPlantDiagnostic:
+    has_existing_plant: bool = False
+    summary: ExistingPlantSummary = field(default_factory=ExistingPlantSummary)
+    issues: list[SmokeBlocker] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SteamRepairPlan:
+    dry_run: bool = False
+    repair_steps: list[SmokeToolStep] = field(default_factory=list)
+    missing_items: list[Any] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SmokePlacement:
+    position: SmokePosition
+
+
+@dataclass(frozen=True)
+class FindPlacementsPayload:
+    placements: list[SmokePlacement] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class NearestResourcePayload:
+    center_x: float
+    center_y: float
+
+
+@dataclass(frozen=True)
+class DrillOutputDiagnostics:
+    belt_tile: SmokePosition | None = None
+    belt_direction: int | str | None = 8
+
+
+@dataclass(frozen=True)
+class DrillPlacement:
+    output: DrillOutputDiagnostics | None = None
+    output_buildable: bool = False
+    output_clear: bool = False
+    resource_tiles: int = 0
+
+
+@dataclass(frozen=True)
+class DrillPlacementsPayload:
+    placements: list[DrillPlacement] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class EdgeMinerPlan:
+    dry_run: bool = False
+    success: bool | None = None
+    ready: bool | None = None
+    selected: DrillPlacement | None = None
+    steps: list[SmokeToolStep] = field(default_factory=list)
+    missing_items: list[Any] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DirectSmelterSelection:
+    input_inserter: Any = None
+
+
+@dataclass(frozen=True)
+class DirectSmelterPlan:
+    dry_run: bool = False
+    success: bool | None = None
+    ready: bool | None = None
+    selected: DirectSmelterSelection | None = None
+    steps: list[SmokeToolStep] = field(default_factory=list)
+    missing_items: list[Any] = field(default_factory=list)
+    verify_step: SmokeToolStep | None = None
+
+
+@dataclass(frozen=True)
+class MineAtPayload:
+    mined_count: int | None = None
+
+
+@dataclass(frozen=True)
+class LabFixturePayload:
+    lab_unit_number: int
+    chest_unit_number: int
+
+
+@dataclass(frozen=True)
+class SteamPlaceArgs:
+    entity_name: str
+    x: float
+    y: float
+    direction: str = "north"
+
+
+@dataclass(frozen=True)
+class SteamPlannedEntity:
+    place_args: SteamPlaceArgs
+
+
+@dataclass(frozen=True)
+class SteamPlan:
+    offshore_pump: SteamPlannedEntity
+    boiler: SteamPlannedEntity
+    steam_engine: SteamPlannedEntity
+    pipes: list[SteamPlannedEntity] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SteamPlanPayload:
+    plan: SteamPlan
+
+
+@lru_cache(maxsize=1)
+def _pydantic_runtime() -> tuple[Any, type[Exception]]:
+    try:
+        from pydantic import TypeAdapter, ValidationError
+    except ModuleNotFoundError as exc:
+        raise SmokeError(
+            "runtime smoke JSON validation requires pydantic; run tests/smoke.sh "
+            "or invoke this script with companion/.venv/bin/python after "
+            "`cd companion && just install`",
+            "smoke-runner",
+        ) from exc
+    return TypeAdapter, ValidationError
+
+
+@lru_cache(maxsize=None)
+def _adapter(schema: Any) -> Any:
+    TypeAdapter, _ = _pydantic_runtime()
+    return TypeAdapter(schema)
+
+
+def _json_value_or_missing(text: Any) -> Any:
+    _, ValidationError = _pydantic_runtime()
+    try:
+        return _adapter(Any).validate_json(str(text if text is not None else ""))
+    except (TypeError, ValueError, ValidationError):
+        return _JSON_MISSING
+
+
+def _json_value(
+    text: Any,
+    *,
+    classification: str,
+    context: str,
+) -> Any:
+    parsed = _json_value_or_missing(text)
+    if parsed is _JSON_MISSING:
+        raise SmokeError(
+            f"{context}: expected JSON value: {_clip(str(text if text is not None else ''))}",
+            classification,
+        )
+    return parsed
+
+
+def _validated(
+    schema: Any,
+    value: Any,
+    *,
+    classification: str,
+    context: str,
+) -> Any:
+    _, ValidationError = _pydantic_runtime()
+    try:
+        return _adapter(schema).validate_python(value)
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise SmokeError(
+            f"{context}: payload shape mismatch: {value}",
+            classification,
+        ) from exc
+
+
+def _json_dataclass(
+    schema: Any,
+    text: Any,
+    *,
+    classification: str,
+    context: str,
+) -> Any:
+    value = _json_value(text, classification=classification, context=context)
+    return _validated(schema, value, classification=classification, context=context)
+
+
+def _payload(schema: Any, value: Any, *, context: str) -> Any:
+    return _validated(schema, value, classification="mod-lua", context=context)
+
+
+def _has_blocker(blockers: list[SmokeBlocker], *types: str) -> bool:
+    expected = set(types)
+    return any(blocker.type in expected for blocker in blockers)
+
+
+def _has_named_blocker_with_footprint(blockers: list[SmokeBlocker], name: str) -> bool:
+    return any(blocker.name == name and blocker.bounding_box for blocker in blockers)
+
+
+def _has_entity_step(steps: list[SmokeToolStep], *, tool: str, entity_name: str) -> bool:
+    return any(
+        step.tool == tool and step.tool_args.get("entity_name") == entity_name
+        for step in steps
+    )
+
+
+def _has_execute_lab_feed_step(steps: list[SmokeToolStep]) -> bool:
+    return any(
+        step.tool == "feed_lab_from_inventory"
+        and step.tool_args.get("dry_run") is False
+        for step in steps
+    )
+
+
+def _has_tool_step(steps: list[SmokeToolStep], tool: str) -> bool:
+    return any(step.tool == tool for step in steps)
+
+
+def _target_args(target: SmokePosition) -> dict[str, int]:
+    return {
+        "x": int(round(float(target.x))),
+        "y": int(round(float(target.y))),
+    }
 
 
 def _clip(text: str, limit: int = 4000) -> str:
@@ -216,8 +559,12 @@ class CliRunner:
         parsed: Any = None
         if json_output and proc.stdout.strip():
             try:
-                parsed = json.loads(proc.stdout)
-            except json.JSONDecodeError as exc:
+                parsed = _json_value(
+                    proc.stdout,
+                    classification="rust-wrapper",
+                    context=f"{name} stdout",
+                )
+            except SmokeError as exc:
                 raise SmokeError(
                     _format_failure(name, cmd, "rust-wrapper", f"{proc.stdout}\n{exc}"),
                     "rust-wrapper",
@@ -329,15 +676,23 @@ class McpClient:
             line = self.proc.stdout.readline()
             if not line:
                 break
+            parsed = _json_value_or_missing(line)
+            if parsed is _JSON_MISSING:
+                continue
             try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
+                payload = _validated(
+                    JsonRpcResponse,
+                    parsed,
+                    classification="bridge",
+                    context=f"MCP {method} response",
+                )
+            except SmokeError:
                 continue
-            if payload.get("id") != request_id:
+            if payload.id != request_id:
                 continue
-            if "error" in payload:
-                raise SmokeError(json.dumps(payload["error"]), "bridge")
-            return payload.get("result")
+            if payload.error is not None:
+                raise SmokeError(json.dumps(payload.error), "bridge")
+            return payload.result
         stderr = self.proc.stderr.read() if self.proc.stderr else ""
         raise SmokeError(f"MCP request timed out: {method}\n{stderr}", "bridge")
 
@@ -366,8 +721,12 @@ class McpClient:
         parsed: Any = None
         if require_json and text.strip():
             try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as exc:
+                parsed = _json_value(
+                    text,
+                    classification="mod-lua",
+                    context=f"{name} MCP text",
+                )
+            except SmokeError as exc:
                 raise SmokeError(
                     _format_failure(name, [f"mcp:{name}", json.dumps(arguments)], "mod-lua", text),
                     "mod-lua",
@@ -398,22 +757,30 @@ class McpClient:
 
 
 def _mcp_text(result: Any) -> str:
-    if not isinstance(result, dict):
+    try:
+        payload = _validated(
+            McpToolResult,
+            result,
+            classification="bridge",
+            context="MCP tool result",
+        )
+    except SmokeError:
         return json.dumps(result)
-    parts: list[str] = []
-    for item in result.get("content", []):
-        if isinstance(item, dict) and item.get("type") == "text":
-            parts.append(str(item.get("text", "")))
-    return "\n".join(parts)
+    return "\n".join(item.text for item in payload.content if item.type == "text")
 
 
 def _json_error_text(value: Any) -> str | None:
-    if isinstance(value, dict):
-        error = value.get("error")
-        if isinstance(error, str) and error:
-            return error
-        if value.get("success") is False and isinstance(error, str):
-            return error
+    try:
+        payload = _validated(
+            SmokeResultPayload,
+            value,
+            classification="mod-lua",
+            context="result error payload",
+        )
+    except SmokeError:
+        return None
+    if payload.error:
+        return payload.error
     return None
 
 
@@ -432,11 +799,16 @@ def _format_failure(
 
 
 def _position_from_find_result(value: Any) -> tuple[int, int]:
-    placements = value.get("placements") if isinstance(value, dict) else None
-    if not placements:
+    payload = _validated(
+        FindPlacementsPayload,
+        value,
+        classification="mod-lua",
+        context="find_entity_placements payload",
+    )
+    if not payload.placements:
         raise SmokeError(f"no placements returned: {value}", "factorio-game-rejection")
-    pos = placements[0].get("position", {})
-    return int(round(pos["x"])), int(round(pos["y"]))
+    pos = payload.placements[0].position
+    return int(round(pos.x)), int(round(pos.y))
 
 
 def _seed_inventory(cli: CliRunner) -> StepResult:
@@ -462,7 +834,7 @@ rcon.print('{"success":true}')
     return result
 
 
-def _seed_lab_fixture(cli: CliRunner) -> tuple[StepResult, dict[str, Any]]:
+def _seed_lab_fixture(cli: CliRunner) -> tuple[StepResult, LabFixturePayload]:
     lua = r'''
 local surface = game.surfaces[1]
 local function create_first(name, candidates)
@@ -504,9 +876,15 @@ rcon.print(
         json_output=False,
     )
     try:
-        payload = json.loads(result.result.splitlines()[-1])
-    except (IndexError, json.JSONDecodeError) as exc:
+        text = result.result.splitlines()[-1]
+    except IndexError as exc:
         raise SmokeError(f"failed to parse seeded lab fixture: {result.result}", "mod-lua") from exc
+    payload = _json_dataclass(
+        LabFixturePayload,
+        text,
+        classification="mod-lua",
+        context="seed lab fixture",
+    )
     return result, payload
 
 
@@ -538,24 +916,20 @@ rcon.print('{"success":true,"unit_number":' .. tostring(pole.unit_number) .. '}'
     return result
 
 
-def _steam_plan_entries(plan_result: Any) -> list[dict[str, Any]]:
-    plan = plan_result.get("plan") if isinstance(plan_result, dict) else None
-    if not isinstance(plan, dict):
-        raise SmokeError(f"steam plan missing plan object: {plan_result}", "mod-lua")
-
-    entries: list[dict[str, Any]] = []
-    for key in ["offshore_pump", "boiler", "steam_engine"]:
-        entity = plan.get(key)
-        place_args = entity.get("place_args") if isinstance(entity, dict) else None
-        if not isinstance(place_args, dict):
-            raise SmokeError(f"steam plan missing {key}.place_args: {plan}", "mod-lua")
-        entries.append(place_args)
-    for pipe in plan.get("pipes", []):
-        place_args = pipe.get("place_args") if isinstance(pipe, dict) else None
-        if not isinstance(place_args, dict):
-            raise SmokeError(f"steam plan has malformed pipe entry: {pipe}", "mod-lua")
-        entries.append(place_args)
-    return entries
+def _steam_plan_entries(plan_result: Any) -> list[SteamPlaceArgs]:
+    payload = _validated(
+        SteamPlanPayload,
+        plan_result,
+        classification="mod-lua",
+        context="steam plan payload",
+    )
+    plan = payload.plan
+    return [
+        plan.offshore_pump.place_args,
+        plan.boiler.place_args,
+        plan.steam_engine.place_args,
+        *(pipe.place_args for pipe in plan.pipes),
+    ]
 
 
 def _build_existing_steam_plant(cli: CliRunner, plan_result: Any) -> StepResult:
@@ -564,10 +938,10 @@ def _build_existing_steam_plant(cli: CliRunner, plan_result: Any) -> StepResult:
     for entry in entries:
         lua_entries.append(
             "{{name={name}, x={x}, y={y}, direction={direction}}}".format(
-                name=json.dumps(str(entry["entity_name"])),
-                x=float(entry["x"]),
-                y=float(entry["y"]),
-                direction=json.dumps(str(entry.get("direction", "north"))),
+                name=json.dumps(entry.entity_name),
+                x=entry.x,
+                y=entry.y,
+                direction=json.dumps(entry.direction or "north"),
             )
         )
 
@@ -651,6 +1025,50 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
         result, _ = cli.run("situation_report", ["situation", "--radius", "20"])
         steps.append(result)
 
+        result, character_overlap_check = mcp.call_tool(
+            "check_placement",
+            {"entity_name": "wooden-chest", "x": 0, "y": 0, "direction": "north"},
+            allow_factorio_rejection=True,
+        )
+        steps.append(result)
+        check_text = (
+            json.dumps(character_overlap_check, sort_keys=True)
+            if character_overlap_check is not None
+            else result.result
+        )
+        if "character_overlap" not in check_text or "walk_to_clear_placement" not in check_text:
+            raise SmokeError(
+                _format_failure(
+                    "character-overlap check_placement",
+                    ["mcp:check_placement", json.dumps({"x": 0, "y": 0})],
+                    "mod-lua",
+                    check_text,
+                ),
+                "mod-lua",
+            )
+
+        result, character_overlap_place = mcp.call_tool(
+            "place_entity",
+            {"entity_name": "wooden-chest", "x": 0, "y": 0, "direction": "north"},
+            allow_factorio_rejection=True,
+        )
+        steps.append(result)
+        place_text = (
+            json.dumps(character_overlap_place, sort_keys=True)
+            if character_overlap_place is not None
+            else result.result
+        )
+        if "Placement overlaps agent character" not in place_text or "character_overlap" not in place_text:
+            raise SmokeError(
+                _format_failure(
+                    "character-overlap place_entity",
+                    ["mcp:place_entity", json.dumps({"x": 0, "y": 0})],
+                    "mod-lua",
+                    place_text,
+                ),
+                "mod-lua",
+            )
+
         result, _ = mcp.call_tool(
             "get_power_status",
             {"x": 0, "y": 0, "radius": 50},
@@ -663,9 +1081,14 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             allow_expected_miss=True,
         )
         steps.append(result)
-        if not isinstance(no_plant_diag, dict) or no_plant_diag.get("status") != "no_plant":
+        no_plant_diag = _payload(
+            SteamNoPlantDiagnostic,
+            no_plant_diag,
+            context="no-plant diagnostic",
+        )
+        if no_plant_diag.status != "no_plant":
             raise SmokeError(f"no-plant diagnostic missing status=no_plant: {no_plant_diag}", "mod-lua")
-        if no_plant_diag.get("next_action") != "build_steam_power":
+        if no_plant_diag.next_action != "build_steam_power":
             raise SmokeError(f"no-plant diagnostic missing build action: {no_plant_diag}", "mod-lua")
         result, no_plant_repair = mcp.call_tool(
             "repair_steam_power",
@@ -673,15 +1096,15 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             allow_expected_miss=True,
         )
         steps.append(result)
-        blockers = no_plant_repair.get("blockers") if isinstance(no_plant_repair, dict) else []
-        if not any(
-            isinstance(blocker, dict)
-            and blocker.get("type") == "no_steam_power_found"
-            for blocker in blockers
-        ):
+        no_plant_repair = _payload(
+            SteamNoPlantRepair,
+            no_plant_repair,
+            context="no-plant repair",
+        )
+        if not _has_blocker(no_plant_repair.blockers, "no_steam_power_found"):
             raise SmokeError(f"repair helper did not report no-plant blocker: {no_plant_repair}", "mod-lua")
-        suggested = no_plant_repair.get("suggested_next_tool") if isinstance(no_plant_repair, dict) else None
-        if not isinstance(suggested, dict) or suggested.get("tool") != "plan_steam_power":
+        suggested = no_plant_repair.suggested_next_tool
+        if not suggested or suggested.tool != "plan_steam_power":
             raise SmokeError(f"repair helper missing plan-steam fallback: {no_plant_repair}", "mod-lua")
         result, no_grid_extension = mcp.call_tool(
             "extend_power_to",
@@ -689,12 +1112,12 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             allow_expected_miss=True,
         )
         steps.append(result)
-        blockers = no_grid_extension.get("blockers") if isinstance(no_grid_extension, dict) else []
-        if not any(
-            isinstance(blocker, dict)
-            and blocker.get("type") == "no_power_grid_found"
-            for blocker in blockers
-        ):
+        no_grid_extension = _payload(
+            SteamNoPlantRepair,
+            no_grid_extension,
+            context="no-grid extension",
+        )
+        if not _has_blocker(no_grid_extension.blockers, "no_power_grid_found"):
             raise SmokeError(f"extend helper did not report no-grid blocker: {no_grid_extension}", "mod-lua")
         steps.append(_seed_existing_power_pole(cli))
         result, extension_plan = mcp.call_tool(
@@ -702,21 +1125,24 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             {"x": 0, "y": 0, "radius": 20, "target_x": 2, "target_y": 0},
         )
         steps.append(result)
-        if not isinstance(extension_plan, dict) or not extension_plan.get("dry_run"):
+        extension_plan = _payload(
+            PowerExtensionPlan,
+            extension_plan,
+            context="power extension plan",
+        )
+        if not extension_plan.dry_run:
             raise SmokeError(f"extend helper did not return dry_run plan: {extension_plan}", "mod-lua")
-        extension_steps = extension_plan.get("steps") if isinstance(extension_plan, dict) else []
-        if not any(
-            isinstance(step, dict)
-            and step.get("tool") == "place_entity"
-            and step.get("tool_args", {}).get("entity_name") == "small-electric-pole"
-            for step in extension_steps
+        if not _has_entity_step(
+            extension_plan.steps,
+            tool="place_entity",
+            entity_name="small-electric-pole",
         ):
             raise SmokeError(f"extend helper missing pole placement step: {extension_plan}", "mod-lua")
-        if extension_plan.get("missing_items"):
+        if extension_plan.missing_items:
             raise SmokeError(f"extend helper unexpectedly missing seeded pole item: {extension_plan}", "mod-lua")
 
-        lab_unit = lab_fixture.get("lab_unit_number")
-        chest_unit = lab_fixture.get("chest_unit_number")
+        lab_unit = lab_fixture.lab_unit_number
+        chest_unit = lab_fixture.chest_unit_number
         if not isinstance(lab_unit, int) or not isinstance(chest_unit, int):
             raise SmokeError(f"lab fixture missing unit numbers: {lab_fixture}", "mod-lua")
         result, lab_feed_plan = mcp.call_tool(
@@ -728,17 +1154,16 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             },
         )
         steps.append(result)
-        if not isinstance(lab_feed_plan, dict) or not lab_feed_plan.get("dry_run"):
+        lab_feed_plan = _payload(
+            LabFeedPlan,
+            lab_feed_plan,
+            context="lab feed dry-run",
+        )
+        if not lab_feed_plan.dry_run:
             raise SmokeError(f"lab feed helper did not default to dry_run: {lab_feed_plan}", "mod-lua")
-        if lab_feed_plan.get("success") is not True or lab_feed_plan.get("ready") is not True:
+        if lab_feed_plan.success is not True or lab_feed_plan.ready is not True:
             raise SmokeError(f"lab feed dry-run was not ready with seeded packs: {lab_feed_plan}", "mod-lua")
-        feed_steps = lab_feed_plan.get("steps") if isinstance(lab_feed_plan, dict) else []
-        if not any(
-            isinstance(step, dict)
-            and step.get("tool") == "feed_lab_from_inventory"
-            and step.get("tool_args", {}).get("dry_run") is False
-            for step in feed_steps
-        ):
+        if not _has_execute_lab_feed_step(lab_feed_plan.steps):
             raise SmokeError(f"lab feed helper missing guarded execute step: {lab_feed_plan}", "mod-lua")
 
         result, lab_feed_exec = mcp.call_tool(
@@ -751,9 +1176,14 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             },
         )
         steps.append(result)
-        if not isinstance(lab_feed_exec, dict) or lab_feed_exec.get("inserted") != 3:
+        lab_feed_exec = _payload(
+            LabFeedPlan,
+            lab_feed_exec,
+            context="lab feed execute",
+        )
+        if lab_feed_exec.inserted != 3:
             raise SmokeError(f"lab feed execute did not insert 3 packs: {lab_feed_exec}", "mod-lua")
-        if lab_feed_exec.get("lab_after", 0) < 3:
+        if lab_feed_exec.lab_after < 3:
             raise SmokeError(f"lab feed execute did not update lab inventory: {lab_feed_exec}", "mod-lua")
 
         result, missing_lab_feed = mcp.call_tool(
@@ -766,12 +1196,12 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             allow_expected_miss=True,
         )
         steps.append(result)
-        blockers = missing_lab_feed.get("blockers") if isinstance(missing_lab_feed, dict) else []
-        if not any(
-            isinstance(blocker, dict)
-            and blocker.get("type") == "missing_science_pack"
-            for blocker in blockers
-        ):
+        missing_lab_feed = _payload(
+            LabFeedPlan,
+            missing_lab_feed,
+            context="lab feed missing-pack",
+        )
+        if not _has_blocker(missing_lab_feed.blockers, "missing_science_pack"):
             raise SmokeError(f"lab feed missing-pack path missing blocker: {missing_lab_feed}", "mod-lua")
 
         result, wrong_lab_feed = mcp.call_tool(
@@ -784,12 +1214,12 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             allow_expected_miss=True,
         )
         steps.append(result)
-        blockers = wrong_lab_feed.get("blockers") if isinstance(wrong_lab_feed, dict) else []
-        if not any(
-            isinstance(blocker, dict)
-            and blocker.get("type") in {"not_a_lab", "no_lab_inventory"}
-            for blocker in blockers
-        ):
+        wrong_lab_feed = _payload(
+            LabFeedPlan,
+            wrong_lab_feed,
+            context="lab feed wrong-entity",
+        )
+        if not _has_blocker(wrong_lab_feed.blockers, "not_a_lab", "no_lab_inventory"):
             raise SmokeError(f"lab feed wrong-entity path missing blocker: {wrong_lab_feed}", "mod-lua")
 
         result, steam_plan = cli.run(
@@ -798,30 +1228,37 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             allow_factorio_rejection=True,
         )
         steps.append(result)
-        if not isinstance(steam_plan, dict) or not steam_plan.get("placement_success"):
+        steam_plan_result = _payload(
+            SteamPlannerResult,
+            steam_plan,
+            context="steam planner result",
+        )
+        if not steam_plan_result.placement_success:
             raise SmokeError(f"steam planner did not find a placeable layout: {steam_plan}", "mod-lua")
+        if steam_plan_result.target is None:
+            raise SmokeError(f"steam planner missing target: {steam_plan}", "mod-lua")
 
         steps.append(_build_existing_steam_plant(cli, steam_plan))
-        target = steam_plan.get("target") if isinstance(steam_plan, dict) else {}
+        target = steam_plan_result.target
         result, existing_diag = mcp.call_tool(
             "diagnose_steam_power",
             {
-                "x": int(round(float(target.get("x", 0)))),
-                "y": int(round(float(target.get("y", 0)))),
+                **_target_args(target),
                 "radius": 80,
             },
         )
         steps.append(result)
-        if not isinstance(existing_diag, dict) or not existing_diag.get("has_existing_plant"):
+        existing_diag = _payload(
+            ExistingPlantDiagnostic,
+            existing_diag,
+            context="existing plant diagnostic",
+        )
+        if not existing_diag.has_existing_plant:
             raise SmokeError(f"existing-plant diagnostic did not detect plant: {existing_diag}", "mod-lua")
-        summary = existing_diag.get("summary", {})
-        if summary.get("offshore_pumps", 0) < 1 or summary.get("boilers", 0) < 1 or summary.get("steam_engines", 0) < 1:
+        summary = existing_diag.summary
+        if summary.offshore_pumps < 1 or summary.boilers < 1 or summary.steam_engines < 1:
             raise SmokeError(f"existing-plant diagnostic missing steam entities: {existing_diag}", "mod-lua")
-        issue_types = {
-            issue.get("type")
-            for issue in existing_diag.get("issues", [])
-            if isinstance(issue, dict)
-        }
+        issue_types = {issue.type for issue in existing_diag.issues}
         if "boiler_no_fuel" not in issue_types:
             raise SmokeError(f"existing-plant diagnostic missing boiler_no_fuel: {existing_diag}", "mod-lua")
         if "steam_engine_pole_route_incomplete" not in issue_types:
@@ -832,25 +1269,26 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
         result, repair_plan = mcp.call_tool(
             "repair_steam_power",
             {
-                "x": int(round(float(target.get("x", 0)))),
-                "y": int(round(float(target.get("y", 0)))),
+                **_target_args(target),
                 "radius": 80,
                 "target_x": 0,
                 "target_y": 0,
             },
         )
         steps.append(result)
-        if not isinstance(repair_plan, dict) or not repair_plan.get("dry_run"):
+        repair_plan = _payload(
+            SteamRepairPlan,
+            repair_plan,
+            context="steam repair plan",
+        )
+        if not repair_plan.dry_run:
             raise SmokeError(f"repair helper did not return dry_run plan: {repair_plan}", "mod-lua")
-        repair_steps = repair_plan.get("repair_steps") if isinstance(repair_plan, dict) else []
-        repair_tools = {
-            step.get("tool")
-            for step in repair_steps
-            if isinstance(step, dict)
-        }
-        if "insert_items" not in repair_tools or "place_entity" not in repair_tools:
+        if not _has_tool_step(repair_plan.repair_steps, "insert_items") or not _has_tool_step(
+            repair_plan.repair_steps,
+            "place_entity",
+        ):
             raise SmokeError(f"repair helper missing fuel or pole steps: {repair_plan}", "mod-lua")
-        if repair_plan.get("missing_items"):
+        if repair_plan.missing_items:
             raise SmokeError(f"repair helper unexpectedly missing seeded materials: {repair_plan}", "mod-lua")
 
         result, existing_plan = cli.run(
@@ -859,14 +1297,14 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             allow_factorio_rejection=True,
         )
         steps.append(result)
-        blockers = existing_plan.get("blockers") if isinstance(existing_plan, dict) else []
-        if not any(
-            isinstance(blocker, dict)
-            and blocker.get("type") == "existing_steam_power_found"
-            for blocker in blockers
-        ):
+        existing_plan = _payload(
+            SteamPlannerResult,
+            existing_plan,
+            context="existing steam planner result",
+        )
+        if not _has_blocker(existing_plan.blockers, "existing_steam_power_found"):
             raise SmokeError(f"steam planner did not prefer existing diagnostic: {existing_plan}", "mod-lua")
-        if "existing_plant" not in existing_plan:
+        if existing_plan.existing_plant is None:
             raise SmokeError(f"steam planner missing existing_plant diagnostic: {existing_plan}", "mod-lua")
 
         result, chest_plan = mcp.call_tool(
@@ -880,7 +1318,12 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             {"entity_name": "wooden-chest", "x": chest_x, "y": chest_y, "direction": "north"},
         )
         steps.append(result)
-        if not isinstance(check, dict) or "allowed" not in check:
+        check = _payload(
+            PlacementCheckPayload,
+            check,
+            context="check_placement payload",
+        )
+        if check.allowed is None:
             raise SmokeError(f"check_placement returned no allowed field: {check}", "mod-lua")
 
         result, placed_chest = cli.run(
@@ -888,7 +1331,12 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             ["place", "wooden-chest", "--at", f"{chest_x},{chest_y}"],
         )
         steps.append(result)
-        unit_number = placed_chest.get("unit_number") if isinstance(placed_chest, dict) else None
+        placed_chest = _payload(
+            PlacedEntityPayload,
+            placed_chest,
+            context="wooden chest placement",
+        )
+        unit_number = placed_chest.unit_number
         if not unit_number:
             raise SmokeError(f"place result missing unit_number: {placed_chest}", "rust-wrapper")
         result, _ = cli.run(
@@ -909,7 +1357,12 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             {"entity_name": "stone-furnace", "x": furnace_x, "y": furnace_y, "direction": "north"},
         )
         steps.append(result)
-        if not isinstance(placed_furnace, dict) or not placed_furnace.get("unit_number"):
+        placed_furnace = _payload(
+            PlacedEntityPayload,
+            placed_furnace,
+            context="stone furnace placement",
+        )
+        if not placed_furnace.unit_number:
             raise SmokeError(f"furnace place result missing unit_number: {placed_furnace}", "mod-lua")
         result, belt_on_furnace = mcp.call_tool(
             "place_entity",
@@ -922,27 +1375,27 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             allow_factorio_rejection=True,
         )
         steps.append(result)
-        text = json.dumps(belt_on_furnace, sort_keys=True) if belt_on_furnace is not None else result.result
-        if "alternate_belt_placements" not in text or "candidate_alternate_path" not in text:
+        belt_on_furnace = _payload(
+            PlacementFailurePayload,
+            belt_on_furnace,
+            context="belt blocked by furnace payload",
+        )
+        if (
+            belt_on_furnace.alternate_belt_placements is None
+            or belt_on_furnace.candidate_alternate_path is None
+        ):
             raise SmokeError(
                 _format_failure(
                     "belt blocked by furnace footprint",
                     ["mcp:place_entity", json.dumps({"x": furnace_x, "y": furnace_y})],
                     "mod-lua",
-                    text,
+                    str(belt_on_furnace),
                 ),
                 "mod-lua",
             )
-        blockers = (
-            belt_on_furnace.get("blockers")
-            if isinstance(belt_on_furnace, dict)
-            else None
-        )
-        if not any(
-            isinstance(blocker, dict)
-            and blocker.get("name") == "stone-furnace"
-            and blocker.get("bounding_box")
-            for blocker in (blockers or [])
+        if not _has_named_blocker_with_footprint(
+            belt_on_furnace.blockers,
+            "stone-furnace",
         ):
             raise SmokeError(f"belt failure missing blocker footprint: {belt_on_furnace}", "mod-lua")
 
@@ -957,7 +1410,12 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             {"entity_name": "transport-belt", "x": belt_x, "y": belt_y, "direction": "east"},
         )
         steps.append(result)
-        belt_unit_number = placed_belt.get("unit_number") if isinstance(placed_belt, dict) else None
+        placed_belt = _payload(
+            PlacedEntityPayload,
+            placed_belt,
+            context="belt placement",
+        )
+        belt_unit_number = placed_belt.unit_number
         if not belt_unit_number:
             raise SmokeError(f"belt place result missing unit_number: {placed_belt}", "mod-lua")
         result, same_tile = mcp.call_tool(
@@ -965,14 +1423,22 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             {"entity_name": "transport-belt", "x": belt_x, "y": belt_y, "direction": "north"},
             allow_factorio_rejection=True,
         )
-        text = json.dumps(same_tile, sort_keys=True) if same_tile is not None else result.result
-        if "rotate_entity" not in text and "unit_number" not in text:
+        same_tile = _payload(
+            PlacementFailurePayload,
+            same_tile,
+            context="same-tile belt placement",
+        )
+        if (
+            same_tile.recommended_action != "rotate_entity"
+            and same_tile.rotate_entity is None
+            and same_tile.unit_number is None
+        ):
             raise SmokeError(
                 _format_failure(
                     "same-tile belt placement",
                     ["mcp:place_entity", json.dumps({"x": belt_x, "y": belt_y})],
                     "mod-lua",
-                    text,
+                    str(same_tile),
                 ),
                 "mod-lua",
             )
@@ -982,9 +1448,14 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             {"unit_number": belt_unit_number, "direction": "north"},
         )
         steps.append(result)
-        if not isinstance(rotated, dict) or rotated.get("success") is not True:
+        rotated = _payload(
+            RotateEntityPayload,
+            rotated,
+            context="rotate entity payload",
+        )
+        if rotated.success is not True:
             raise SmokeError(f"rotate_entity returned failure: {rotated}", "mod-lua")
-        if rotated.get("direction") != 0:
+        if rotated.direction != 0:
             raise SmokeError(f"rotate_entity did not set north direction: {rotated}", "mod-lua")
 
         result, resource = mcp.call_tool(
@@ -992,118 +1463,130 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
             {"resource_type": "iron-ore", "x": 0, "y": 0},
         )
         steps.append(result)
-        if isinstance(resource, dict) and "center_x" in resource and "center_y" in resource:
-            drill_center_x = int(round(resource["center_x"]))
-            drill_center_y = int(round(resource["center_y"]))
-            result, drill_plan = mcp.call_tool(
-                "find_entity_placements",
-                {
-                    "entity_name": "burner-mining-drill",
-                    "x": drill_center_x,
-                    "y": drill_center_y,
-                    "radius": 25,
-                    "limit": 5,
-                },
-            )
-            steps.append(result)
-            placements = (
-                drill_plan.get("placements")
-                if isinstance(drill_plan, dict)
-                else None
-            )
-            if not placements:
-                raise SmokeError(f"drill placement search returned no placements: {drill_plan}", "mod-lua")
-            first = placements[0]
-            output = first.get("output") if isinstance(first, dict) else None
-            if not isinstance(output, dict):
-                raise SmokeError(f"drill placement missing output diagnostics: {first}", "mod-lua")
-            if first.get("output_buildable") is not True:
-                raise SmokeError(f"drill placement output is not buildable: {first}", "mod-lua")
-            if first.get("output_clear") is not True:
-                raise SmokeError(f"drill placement did not prefer a clear output tile: {first}", "mod-lua")
-            if "belt_tile" not in output:
-                raise SmokeError(f"drill output diagnostics missing belt_tile: {output}", "mod-lua")
+        resource = _payload(
+            NearestResourcePayload,
+            resource,
+            context="nearest resource payload",
+        )
+        drill_center_x = int(round(resource.center_x))
+        drill_center_y = int(round(resource.center_y))
+        result, drill_plan = mcp.call_tool(
+            "find_entity_placements",
+            {
+                "entity_name": "burner-mining-drill",
+                "x": drill_center_x,
+                "y": drill_center_y,
+                "radius": 25,
+                "limit": 5,
+            },
+        )
+        steps.append(result)
+        drill_plan = _payload(
+            DrillPlacementsPayload,
+            drill_plan,
+            context="drill placement payload",
+        )
+        if not drill_plan.placements:
+            raise SmokeError(f"drill placement search returned no placements: {drill_plan}", "mod-lua")
+        first = drill_plan.placements[0]
+        if first.output is None:
+            raise SmokeError(f"drill placement missing output diagnostics: {first}", "mod-lua")
+        if first.output_buildable is not True:
+            raise SmokeError(f"drill placement output is not buildable: {first}", "mod-lua")
+        if first.output_clear is not True:
+            raise SmokeError(f"drill placement did not prefer a clear output tile: {first}", "mod-lua")
+        if first.output.belt_tile is None:
+            raise SmokeError(f"drill output diagnostics missing belt_tile: {first.output}", "mod-lua")
 
-            result, edge_miner = mcp.call_tool(
-                "build_edge_miner",
-                {
-                    "resource_type": "iron-ore",
-                    "x": drill_center_x,
-                    "y": drill_center_y,
-                    "radius": 25,
-                    "drill_name": "burner-mining-drill",
-                    "limit": 5,
-                },
-            )
-            steps.append(result)
-            if not isinstance(edge_miner, dict) or not edge_miner.get("dry_run"):
-                raise SmokeError(f"edge miner helper did not return dry_run plan: {edge_miner}", "mod-lua")
-            if edge_miner.get("success") is not True or edge_miner.get("ready") is not True:
-                raise SmokeError(f"edge miner helper was not ready with seeded inventory: {edge_miner}", "mod-lua")
-            selected = edge_miner.get("selected") if isinstance(edge_miner, dict) else None
-            if not isinstance(selected, dict):
-                raise SmokeError(f"edge miner helper missing selected candidate: {edge_miner}", "mod-lua")
-            if selected.get("output_buildable") is not True or selected.get("output_clear") is not True:
-                raise SmokeError(f"edge miner did not select a clear buildable output: {edge_miner}", "mod-lua")
-            if selected.get("resource_tiles", 0) < 1:
-                raise SmokeError(f"edge miner selected candidate not backed by resource tiles: {edge_miner}", "mod-lua")
-            edge_steps = edge_miner.get("steps") if isinstance(edge_miner, dict) else []
-            edge_tools = [
-                step.get("tool_args", {}).get("entity_name")
-                for step in edge_steps
-                if isinstance(step, dict)
-            ]
-            if "burner-mining-drill" not in edge_tools or "transport-belt" not in edge_tools:
-                raise SmokeError(f"edge miner helper missing drill or belt step: {edge_miner}", "mod-lua")
-            if edge_miner.get("missing_items"):
-                raise SmokeError(f"edge miner unexpectedly missing seeded items: {edge_miner}", "mod-lua")
+        result, edge_miner = mcp.call_tool(
+            "build_edge_miner",
+            {
+                "resource_type": "iron-ore",
+                "x": drill_center_x,
+                "y": drill_center_y,
+                "radius": 25,
+                "drill_name": "burner-mining-drill",
+                "limit": 5,
+            },
+        )
+        steps.append(result)
+        edge_miner = _payload(
+            EdgeMinerPlan,
+            edge_miner,
+            context="edge miner helper payload",
+        )
+        if not edge_miner.dry_run:
+            raise SmokeError(f"edge miner helper did not return dry_run plan: {edge_miner}", "mod-lua")
+        if edge_miner.success is not True or edge_miner.ready is not True:
+            raise SmokeError(f"edge miner helper was not ready with seeded inventory: {edge_miner}", "mod-lua")
+        selected = edge_miner.selected
+        if selected is None:
+            raise SmokeError(f"edge miner helper missing selected candidate: {edge_miner}", "mod-lua")
+        if selected.output_buildable is not True or selected.output_clear is not True:
+            raise SmokeError(f"edge miner did not select a clear buildable output: {edge_miner}", "mod-lua")
+        if selected.resource_tiles < 1:
+            raise SmokeError(f"edge miner selected candidate not backed by resource tiles: {edge_miner}", "mod-lua")
+        if not _has_entity_step(
+            edge_miner.steps,
+            tool="place_entity",
+            entity_name="burner-mining-drill",
+        ) or not _has_entity_step(
+            edge_miner.steps,
+            tool="place_entity",
+            entity_name="transport-belt",
+        ):
+            raise SmokeError(f"edge miner helper missing drill or belt step: {edge_miner}", "mod-lua")
+        if edge_miner.missing_items:
+            raise SmokeError(f"edge miner unexpectedly missing seeded items: {edge_miner}", "mod-lua")
 
-            selected_output = selected.get("output") if isinstance(selected, dict) else None
-            output_tile = selected_output.get("belt_tile") if isinstance(selected_output, dict) else None
-            if not isinstance(output_tile, dict):
-                raise SmokeError(f"edge miner selected output missing belt_tile: {edge_miner}", "mod-lua")
-            result, direct_smelter = mcp.call_tool(
-                "build_direct_smelter",
-                {
-                    "output_x": output_tile.get("x"),
-                    "output_y": output_tile.get("y"),
-                    "output_direction": str(selected_output.get("belt_direction", 8)),
-                    "furnace_name": "stone-furnace",
-                    "inserter_name": "burner-inserter",
-                    "belt_name": "transport-belt",
-                    "radius": 6,
-                },
-            )
-            steps.append(result)
-            if not isinstance(direct_smelter, dict) or not direct_smelter.get("dry_run"):
-                raise SmokeError(f"direct smelter helper did not return dry_run plan: {direct_smelter}", "mod-lua")
-            if direct_smelter.get("success") is not True or direct_smelter.get("ready") is not True:
-                raise SmokeError(f"direct smelter helper was not ready with seeded inventory: {direct_smelter}", "mod-lua")
-            smelter_steps = direct_smelter.get("steps") if isinstance(direct_smelter, dict) else []
-            smelter_tools = [
-                step.get("tool_args", {}).get("entity_name")
-                for step in smelter_steps
-                if isinstance(step, dict)
-            ]
-            for expected in ["transport-belt", "stone-furnace", "burner-inserter"]:
-                if expected not in smelter_tools:
-                    raise SmokeError(f"direct smelter helper missing {expected} step: {direct_smelter}", "mod-lua")
-            if direct_smelter.get("missing_items"):
-                raise SmokeError(f"direct smelter unexpectedly missing seeded items: {direct_smelter}", "mod-lua")
-            selected_smelter = direct_smelter.get("selected")
-            if not isinstance(selected_smelter, dict) or "input_inserter" not in selected_smelter:
-                raise SmokeError(f"direct smelter missing selected inserter geometry: {direct_smelter}", "mod-lua")
-            verify_step = direct_smelter.get("verify_step") if isinstance(direct_smelter, dict) else None
-            if not isinstance(verify_step, dict) or verify_step.get("tool") != "verify_production":
-                raise SmokeError(f"direct smelter missing verify_production step: {direct_smelter}", "mod-lua")
+        selected_output = selected.output
+        if selected_output is None or selected_output.belt_tile is None:
+            raise SmokeError(f"edge miner selected output missing belt_tile: {edge_miner}", "mod-lua")
+        output_tile = selected_output.belt_tile
+        result, direct_smelter = mcp.call_tool(
+            "build_direct_smelter",
+            {
+                "output_x": output_tile.x,
+                "output_y": output_tile.y,
+                "output_direction": str(selected_output.belt_direction or 8),
+                "furnace_name": "stone-furnace",
+                "inserter_name": "burner-inserter",
+                "belt_name": "transport-belt",
+                "radius": 6,
+            },
+        )
+        steps.append(result)
+        direct_smelter = _payload(
+            DirectSmelterPlan,
+            direct_smelter,
+            context="direct smelter helper payload",
+        )
+        if not direct_smelter.dry_run:
+            raise SmokeError(f"direct smelter helper did not return dry_run plan: {direct_smelter}", "mod-lua")
+        if direct_smelter.success is not True or direct_smelter.ready is not True:
+            raise SmokeError(f"direct smelter helper was not ready with seeded inventory: {direct_smelter}", "mod-lua")
+        for expected in ["transport-belt", "stone-furnace", "burner-inserter"]:
+            if not _has_entity_step(direct_smelter.steps, tool="place_entity", entity_name=expected):
+                raise SmokeError(f"direct smelter helper missing {expected} step: {direct_smelter}", "mod-lua")
+        if direct_smelter.missing_items:
+            raise SmokeError(f"direct smelter unexpectedly missing seeded items: {direct_smelter}", "mod-lua")
+        if direct_smelter.selected is None or direct_smelter.selected.input_inserter is None:
+            raise SmokeError(f"direct smelter missing selected inserter geometry: {direct_smelter}", "mod-lua")
+        if direct_smelter.verify_step is None or direct_smelter.verify_step.tool != "verify_production":
+            raise SmokeError(f"direct smelter missing verify_production step: {direct_smelter}", "mod-lua")
 
-            result, mined = mcp.call_tool(
-                "mine_at",
-                {"x": resource["center_x"], "y": resource["center_y"], "count": 3},
-            )
-            steps.append(result)
-            if isinstance(mined, dict) and "mined_count" not in mined:
-                raise SmokeError(f"mine_at result missing mined_count: {mined}", "mod-lua")
+        result, mined = mcp.call_tool(
+            "mine_at",
+            {"x": resource.center_x, "y": resource.center_y, "count": 3},
+        )
+        steps.append(result)
+        mined = _payload(
+            MineAtPayload,
+            mined,
+            context="mine_at payload",
+        )
+        if mined.mined_count is None:
+            raise SmokeError(f"mine_at result missing mined_count: {mined}", "mod-lua")
     finally:
         mcp.close()
 

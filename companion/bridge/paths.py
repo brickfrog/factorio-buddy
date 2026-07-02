@@ -4,12 +4,18 @@ import os
 import shutil
 from pathlib import Path
 
+from models import FactorioPathSettings
+
+
+def _path_settings() -> FactorioPathSettings:
+    return FactorioPathSettings.from_env(os.environ)
+
 
 def find_script_output() -> Path:
     """Find the Factorio script-output directory."""
-    env_val = os.environ.get("FACTORIO_SERVER_DATA")
-    if env_val:
-        p = Path(env_val) / "script-output"
+    configured = _path_settings().script_output_dir
+    if configured:
+        p = configured
         p.mkdir(parents=True, exist_ok=True)
         return p
 
@@ -22,11 +28,11 @@ def find_script_output() -> Path:
         search = search.parent
 
     fallback_candidates = [
-        Path(os.path.expanduser("~/.factorio/script-output")),
-        Path(os.path.expanduser(
+        Path("~/.factorio/script-output").expanduser(),
+        Path(
             "~/.var/app/com.valvesoftware.Steam/.local/share/Steam/"
             "steamapps/common/Factorio/script-output"
-        )),
+        ).expanduser(),
     ]
     for c in fallback_candidates:
         if c.parent.exists():
@@ -55,22 +61,22 @@ def find_mod_source() -> Path:
 def find_mods_dir() -> Path:
     """Find the Factorio mods directory for deployment.
     Checks FACTORIO_MODS_DIR env var, then common locations."""
-    env_val = os.environ.get("FACTORIO_MODS_DIR")
-    if env_val:
-        p = Path(env_val)
+    configured = _path_settings().mods_dir_path
+    if configured:
+        p = configured
         if p.is_dir():
             return p
-        raise FileNotFoundError(f"FACTORIO_MODS_DIR={env_val} does not exist")
+        raise FileNotFoundError(f"FACTORIO_MODS_DIR={configured} does not exist")
 
     candidates = [
-        Path(os.path.expanduser("~/.factorio/mods")),
-        Path(os.path.expanduser(
+        Path("~/.factorio/mods").expanduser(),
+        Path(
             "~/.var/app/com.valvesoftware.Steam/.factorio/mods"
-        )),
-        Path(os.path.expanduser(
+        ).expanduser(),
+        Path(
             "~/Library/Application Support/factorio/mods"
-        )),
-        Path(os.path.expanduser("~/AppData/Roaming/Factorio/mods")),
+        ).expanduser(),
+        Path("~/AppData/Roaming/Factorio/mods").expanduser(),
     ]
     for c in candidates:
         if c.is_dir():
@@ -84,9 +90,9 @@ def find_mods_dir() -> Path:
 
 def find_factorioctl_mcp() -> str | None:
     """Find the factorioctl MCP server binary."""
-    env_val = os.environ.get("FACTORIOCTL_MCP_BIN")
-    if env_val and os.path.isfile(env_val):
-        return env_val
+    configured = _path_settings().mcp_bin_path
+    if configured and configured.is_file():
+        return str(configured)
 
     # Walk up looking for the built mcp binary. Supports both the monorepo
     # layout (<repo>/target/release/mcp, with the bridge under <repo>/companion)

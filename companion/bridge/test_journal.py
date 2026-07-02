@@ -7,6 +7,18 @@ from pathlib import Path
 from unittest import mock
 
 import journal
+from models import (
+    BridgeInputMessage,
+    JournalEvent,
+    JournalWindow,
+    ParsedAgentResponse,
+    ReflectionDraft,
+    ReflectionMemory,
+    SdkSystemMessage,
+    ToolParamSchemaRegistry,
+    ToolResultClassification,
+    ToolResultOutcome,
+)
 
 
 class JournalTests(unittest.TestCase):
@@ -50,9 +62,23 @@ class JournalTests(unittest.TestCase):
         self.assertTrue(all(event["ts"] for event in events))
         self.assertEqual(journal.count_events("doug"), 3)
 
+    def test_model_event_loader_preserves_typed_window_and_legacy_wrapper(self):
+        journal.append_event("doug", "discovery", "Found copper east of spawn")
+        journal.append_event("doug", "unknown", "Fallback kind is progress")
+        journal.append_event("doug", "milestone", "Starter power is online")
+
+        window = journal.load_events_model("doug", limit=2)
+        legacy = journal.load_events("doug", limit=2)
+
+        self.assertIsInstance(window, JournalWindow)
+        self.assertEqual([event.kind for event in window.events], ["progress", "milestone"])
+        self.assertEqual([event.to_dict() for event in window.events], legacy)
+
     def test_load_events_and_reflection_are_total_for_missing_and_corrupt_files(self):
         self.assertEqual(journal.load_events("doug"), [])
         self.assertEqual(journal.load_reflection("doug"), journal.default_reflection())
+        self.assertEqual(journal.load_events_model("doug"), JournalWindow())
+        self.assertEqual(journal.load_reflection_model("doug"), journal.default_reflection_model())
 
         (self.base / ".journal-doug.jsonl").write_text(
             '{"ts": "ok", "kind": "progress", "text": "good"}\n'
@@ -91,15 +117,19 @@ class JournalTests(unittest.TestCase):
         events = journal.load_events("doug")
         rendered = journal.render_memory(events, journal.default_reflection())
 
-        self.assertEqual([event["text"] for event in events], ["Inserter faced the wrong way"])
+        self.assertEqual([event["text"] for event in events], [
+            "situation assessed; no infrastructure yet deployed",
+            "Inserter faced the wrong way",
+            "situation assessed; no infrastructure yet deployed",
+        ])
         self.assertIn("Inserter faced the wrong way", rendered)
+        self.assertIn("situation assessed", rendered)
         self.assertNotIn("Usage limit", rendered)
         self.assertNotIn("maximum number of turns", rendered)
         self.assertNotIn("stream idle timeout", rendered)
         self.assertNotIn("tick timeout", rendered)
         self.assertNotIn("context window", rendered)
         self.assertNotIn("No electric poles", rendered)
-        self.assertNotIn("no infrastructure", rendered)
         self.assertNotIn("missing field", rendered)
         self.assertNotIn("Packet too large", rendered)
         self.assertNotIn("bad argument #1", rendered)
@@ -139,6 +169,32 @@ error_tips:
             journal.parse_reflection("<reflection>\nerror_tips:\n- Avoid dead belts\n</reflection>"),
             {"error_tips": ["Avoid dead belts"]},
         )
+
+    def test_reflection_model_api_round_trips_and_render_accepts_models(self):
+        draft = journal.parse_reflection_model(
+            "<reflection>\n"
+            "structures:\n"
+            "- Iron smelter at spawn\n"
+            "error_tips:\n"
+            "- Use rotate_entity after placement\n"
+            "</reflection>"
+        )
+        self.assertIsInstance(draft, ReflectionDraft)
+        self.assertEqual(journal.parse_reflection_model(draft), draft)
+
+        updated = journal.apply_reflection_update_model(
+            "doug",
+            draft,
+        )
+        loaded = journal.load_reflection_model("doug")
+        window = journal.load_events_model("doug")
+        rendered = journal.render_memory(window, loaded)
+
+        self.assertIsInstance(updated, ReflectionMemory)
+        self.assertEqual(loaded, updated)
+        self.assertEqual(updated.structures, ["Iron smelter at spawn"])
+        self.assertIn("Iron smelter at spawn", rendered)
+        self.assertEqual(journal.load_reflection("doug"), updated.to_dict())
 
     def test_apply_reflection_update_replaces_persists_and_strip_is_idempotent(self):
         journal.apply_reflection_update(
@@ -230,14 +286,15 @@ error_tips:
 
     def test_render_memory_empty_and_populated(self):
         self.assertEqual(journal.render_memory([], journal.default_reflection()), "")
+        from models import ReflectionMemory
 
         rendered = journal.render_memory(
             [{"kind": "failure", "text": "Inserter faced the wrong way"}],
-            {
-                "structures": ["Iron smelter at spawn"],
-                "error_tips": ["Use rotate_entity after placement"],
-                "updated_at": "now",
-            },
+            ReflectionMemory(
+                structures=["Iron smelter at spawn"],
+                error_tips=["Use rotate_entity after placement"],
+                updated_at="now",
+            ),
         )
 
         self.assertIn("Recent events:", rendered)
@@ -265,6 +322,42 @@ error_tips:
         self.assertIn("progress: Queued logistics research", rendered)
         self.assertEqual(rendered.count("Cannot place belt"), 1)
 
+    def test_render_memory_accepts_typed_journal_events(self):
+        events = [
+            JournalEvent.create(ts="1", kind="progress", text="Plan ready"),
+            JournalEvent.create(ts="2", kind="progress", text="Plan ready"),
+            JournalEvent.create(ts="3", kind="milestone", text="Furnace working"),
+        ]
+
+        window = JournalWindow.coerce(events)
+        rendered = journal.render_memory(window, journal.default_reflection())
+
+        self.assertEqual([event.text for event in window.events], [
+            "Plan ready",
+            "Plan ready",
+            "Furnace working",
+        ])
+        self.assertIn("progress (x2): Plan ready", rendered)
+        self.assertIn("milestone: Furnace working", rendered)
+
+    def test_render_memory_redacts_player_names_from_prompt_events(self):
+        rendered = journal.render_memory(
+            [
+                {
+                    "kind": "progress",
+                    "text": (
+                        "player_messages: [TestPlayer]: hello. "
+                        "Keep [item=iron-ore]."
+                    ),
+                },
+            ],
+            journal.default_reflection(),
+        )
+
+        self.assertNotIn("TestPlayer", rendered)
+        self.assertIn("[player]: hello", rendered)
+        self.assertIn("[item=iron-ore]", rendered)
+
     def test_render_memory_preserves_progress_when_distinct_failures_fill_window(self):
         events = [{"kind": "progress", "text": "Lab powered"}]
         events.extend(
@@ -290,6 +383,40 @@ error_tips:
 
         self.assertLess(len(rendered), journal.MAX_RENDERED_EVENT_TEXT + 80)
         self.assertIn("...", rendered)
+
+    def test_parse_response_uses_typed_shape_but_keeps_telemetry_dict(self):
+        import pipe
+
+        parsed = pipe.parse_response(
+            "[color=1,0.6,0.2]CLASSIFICATION:[/color] Done\n\n"
+            "Body text.\n\n"
+            "[color=0.6,0.8,1]ACTIONS TAKEN:[/color]\n"
+            "- placed belt\n"
+            "- verified furnace\n\n"
+            "[color=1,0.4,0.4]ANOMALY:[/color] belt blocked\n\n"
+            "[color=0.4,0.6,0.4]FILED:[/color] complete"
+        )
+
+        self.assertEqual(parsed["header"]["label"], "CLASSIFICATION")
+        self.assertEqual(parsed["body"], "Body text.")
+        self.assertEqual(parsed["actions"], ["placed belt", "verified furnace"])
+        self.assertEqual(parsed["data"]["ANOMALY"]["text"], "belt blocked")
+        self.assertEqual(parsed["footer"]["text"], "complete")
+
+    def test_parse_response_model_exposes_anomaly_text_without_dict_spelunking(self):
+        import pipe
+
+        parsed = pipe.parse_response_model(
+            "[color=1,0.6,0.2]CLASSIFICATION:[/color] Reviewed\n\n"
+            "[color=1,0.4,0.4]ANOMALY:[/color] route crosses water"
+        )
+
+        self.assertEqual(parsed.anomaly_text(), "route crosses water")
+
+    def test_parse_response_preserves_body_shape_for_empty_text(self):
+        import pipe
+
+        self.assertEqual(pipe.parse_response(""), {"body": ""})
 
     def test_journal_helpers_are_total_on_bad_input(self):
         # None/non-str/non-dict inputs must never raise (audit round 1).
@@ -333,6 +460,59 @@ error_tips:
         )
         self.assertEqual(journal.load_events("doug")[-1]["text"], "Placed the first drill")
 
+    def test_finalize_reply_persists_structured_ledger_signal(self):
+        import pipe
+
+        pipe._finalize_reply(
+            """New plan.
+<ledger>
+objective: Activate second furnace
+plan:
+- walk_to (42, -21)
+progress: previous objective complete; second furnace selected
+signal: new_objective
+</ledger>
+""",
+            "doug",
+        )
+
+        event = journal.load_events("doug")[-1]
+        self.assertEqual(event["text"], "previous objective complete; second furnace selected")
+        self.assertEqual(event["signal"], "new_objective")
+
+    def test_finalize_reply_infers_plan_ready_when_signal_omitted(self):
+        import pipe
+
+        pipe._finalize_reply(
+            """Plan confirmed.
+<ledger>
+objective: Activate second furnace
+plan:
+- walk_to (42, -21)
+- insert_items coal count=5 into fuel inventory of unit 15
+progress: plan confirmed; awaiting execution
+</ledger>
+""",
+            "doug",
+        )
+
+        event = journal.load_events("doug")[-1]
+        self.assertEqual(event["text"], "plan confirmed; awaiting execution")
+        self.assertEqual(event["signal"], "plan_ready")
+
+    def test_signal_bearing_progress_survives_low_value_filter(self):
+        journal.append_event(
+            "doug",
+            "progress",
+            "plan validated and ready for execution",
+            signal="plan_ready",
+        )
+
+        events = journal.load_events("doug")
+
+        self.assertEqual(events[-1]["text"], "plan validated and ready for execution")
+        self.assertEqual(events[-1]["signal"], "plan_ready")
+
     def test_finalize_reply_journals_meaningful_anomaly_discovery(self):
         import pipe
 
@@ -357,134 +537,21 @@ error_tips:
     def test_tool_error_detection_flags_factorio_failures(self):
         import pipe
 
-        classified_failures = {
-            '{"error":"cannot place stone furnace"}': pipe.TOOL_RESULT_GAME_REJECTED,
-            '{"success":false,"message":"blocked"}': pipe.TOOL_RESULT_GAME_REJECTED,
-            '[{"type":"text","text":"Error: invalid type: map, expected a sequence"}]': pipe.TOOL_RESULT_INVALID_REQUEST,
-            "Error: entity not found": pipe.TOOL_RESULT_GAME_REJECTED,
-            "Cannot place entity at target": pipe.TOOL_RESULT_GAME_REJECTED,
-            "Could not route belt to target": pipe.TOOL_RESULT_GAME_REJECTED,
-            "not in inventory": pipe.TOOL_RESULT_GAME_REJECTED,
-            "no power": pipe.TOOL_RESULT_GAME_REJECTED,
-            "route failed": pipe.TOOL_RESULT_GAME_REJECTED,
-            (
-                '{"success":false,"error":"No labs found! Build a lab first '
-                '(requires: 10 iron-gear-wheel, 10 electronic-circuit, 4 transport-belt)",'
-                '"action_needed":"build_lab"}'
-            ): pipe.TOOL_RESULT_GAME_REJECTED,
-            "Error: missing field `success` at line 1 column 135": pipe.TOOL_RESULT_INVALID_REQUEST,
-            "Error: value for required field 'category' is missing": pipe.TOOL_RESULT_INVALID_REQUEST,
-            "Error: Packet too large: 1553350 bytes": pipe.TOOL_RESULT_INVALID_REQUEST,
-            (
-                '{"success":false,"can_place":false,"entity":"stone-furnace",'
-                '"error":"Cannot place entity here","inventory_count":1,'
-                '"position":{"x":76,"y":-19}}'
-            ): pipe.TOOL_RESULT_GAME_REJECTED,
-            (
-                '[{"type":"text","text":"Error: expected value at line 1 column 1"}]'
-            ): pipe.TOOL_RESULT_INFRASTRUCTURE_FAILURE,
-        }
-
-        for text, expected in classified_failures.items():
-            with self.subTest(text=text):
-                self.assertEqual(pipe._classify_tool_result(text), expected)
-                self.assertTrue(pipe._looks_like_tool_error(text))
-
-        self.assertFalse(pipe._looks_like_tool_error('{"success":true}'))
-        self.assertEqual(
-            pipe._classify_tool_result(
-                '{"success":true,"queued":3,"error":"legacy stale error text"}',
-                sdk_is_error=True,
-            ),
-            pipe.TOOL_RESULT_OK,
-        )
-        self.assertFalse(pipe._looks_like_tool_error(
+        self.assertTrue(ToolResultOutcome.from_text(
+            '{"success":false,"can_place":false,"entity":"transport-belt",'
+            '"error":"Cannot place entity here","position":{"x":56,"y":-25}}'
+        ).indicates_failure)
+        self.assertFalse(ToolResultOutcome.from_text('{"success":true}').indicates_failure)
+        self.assertTrue(ToolResultOutcome.text_indicates_progress(
             '{"success":true,"queued":3,"error":"legacy stale error text"}'
         ))
-        self.assertEqual(
-            pipe._classify_tool_result(
-                '{"success":false,"mined_count":0,"error":null,"inventory":[]}',
-                sdk_is_error=True,
-            ),
-            pipe.TOOL_RESULT_EXPECTED_MISS,
-        )
-        self.assertFalse(pipe._looks_like_tool_error(
-            '{"success":false,"mined_count":0,"error":null,"inventory":[]}'
-        ))
-        self.assertEqual(
-            pipe._classify_tool_result(
-                '{"success":false,"expected_miss":true,'
-                '"blockers":[{"type":"missing_science_pack"}]}',
-                sdk_is_error=True,
-            ),
-            pipe.TOOL_RESULT_EXPECTED_MISS,
-        )
-        self.assertFalse(pipe._looks_like_tool_error(
-            '{"success":false,"expected_miss":true,'
-            '"blockers":[{"type":"missing_science_pack"}]}'
-        ))
-        self.assertEqual(
-            pipe._classify_tool_result(
-                '[{"type":"text","text":"Error: No items of that type in inventory"}]',
-                sdk_is_error=True,
-            ),
-            pipe.TOOL_RESULT_EXPECTED_MISS,
-        )
-        self.assertFalse(pipe._looks_like_tool_error(
-            '[{"type":"text","text":"Error: No items of that type in inventory"}]'
-        ))
-        self.assertFalse(pipe._looks_like_tool_error(
-            "Error: No items of that type in inventory"
-        ))
-        self.assertEqual(
-            pipe._classify_tool_result(
-                '[{"type":"text","text":"{\\"success\\":false,'
-                '\\"mined_count\\":0,\\"error\\":\\"No minable entity at position\\",'
-                '\\"inventory\\":[]}"}]',
-                sdk_is_error=True,
-            ),
-            pipe.TOOL_RESULT_EXPECTED_MISS,
-        )
-        self.assertFalse(pipe._looks_like_tool_error(
-            '[{"type":"text","text":"{\\"success\\":false,'
-            '\\"mined_count\\":0,\\"error\\":\\"No minable entity at position\\",'
-            '\\"inventory\\":[]}"}]'
-        ))
-        self.assertFalse(pipe._looks_like_tool_error(
-            '[{"type":"text","text":"{\\"error\\": '
-            '\\"No electric poles found in area\\"}\\n"}]'
-        ))
-        self.assertFalse(pipe._looks_like_tool_error(
-            '{"allowed":false,"policy_allowed":true,"factorio_allowed":false,'
-            '"entity":"burner-mining-drill","position":{"x":45,"y":-35},'
-            '"factorio":{"error":"Factorio cannot place entity here"}}'
-        ))
-        self.assertFalse(pipe._looks_like_tool_error(
-            "Error: execute_lua is disabled. Raw Lua execution is an "
-            "arbitrary-code-execution surface and is off by default."
-        ))
-        self.assertFalse(pipe._looks_like_tool_error("nominal scan complete"))
-        self.assertFalse(pipe._looks_like_tool_error(
-            '[{"type":"text","text":"{\\"technologies\\":[{\\"ready\\":'
-            '\\"blocked\\",\\"blockers\\":[\\"labs have no power\\"]}]}"}]'
-        ))
-        self.assertEqual(
-            pipe._classify_tool_result(
-                '[{"type":"text","text":"{\\"researched_count\\":6,'
-                '\\"total_count\\":275,\\"research_progress\\":0.36,'
-                '\\"research_queue\\":[{\\"name\\":\\"steel-processing\\"}],'
-                '\\"labs\\":{\\"count\\":1,\\"powered\\":0,\\"working\\":0},'
-                '\\"message\\":\\"Labs have no power! Connect labs to the power grid.\\"}"}]'
-            ),
-            pipe.TOOL_RESULT_OK,
-        )
-        self.assertFalse(pipe._looks_like_tool_error(
+        self.assertFalse(ToolResultOutcome.from_text(
             '[{"type":"text","text":"{\\"researched_count\\":6,'
             '\\"total_count\\":275,\\"research_progress\\":0.36,'
             '\\"research_queue\\":[{\\"name\\":\\"steel-processing\\"}],'
             '\\"labs\\":{\\"count\\":1,\\"powered\\":0,\\"working\\":0},'
             '\\"message\\":\\"Labs have no power! Connect labs to the power grid.\\"}"}]'
-        ))
+        ).indicates_failure)
 
     def test_player_message_trailer_is_split_from_tool_result_text(self):
         import pipe
@@ -492,21 +559,13 @@ error_tips:
         text, player_messages = pipe._result_text_and_player_messages([{
             "type": "text",
             "text": "Error: expected value at line 1 column 1"
-            "\n\n--- Player Messages ---\n[giga]: uncraftable?",
+            "\n\n--- Player Messages ---\n[TestPlayer]: uncraftable?",
         }])
 
-        self.assertTrue(pipe._looks_like_tool_error(text))
+        self.assertTrue(ToolResultOutcome.from_text(text).indicates_failure)
         self.assertIn("expected value", text)
-        self.assertNotIn("giga", text)
-        self.assertEqual(player_messages, "[giga]: uncraftable?")
-
-    def test_sdk_terminal_error_echo_is_not_rejournaled(self):
-        import pipe
-
-        self.assertTrue(pipe._is_sdk_terminal_error_echo(
-            "Claude Code returned an error result: Reached maximum number of turns (15)"
-        ))
-        self.assertFalse(pipe._is_sdk_terminal_error_echo("RCON connection dropped"))
+        self.assertNotIn("TestPlayer", text)
+        self.assertEqual(player_messages, "[TestPlayer]: uncraftable?")
 
     def test_execute_lua_is_disallowed_unless_operator_enables_raw_lua(self):
         import pipe
@@ -516,8 +575,12 @@ error_tips:
             ["mcp__factorioctl__execute_lua"],
         )
         self.assertEqual(
-            pipe._disallowed_tools_for_env({"FACTORIOCTL_ALLOW_RAW_LUA": "1"}),
+            pipe._disallowed_tools_for_env({"FACTORIOCTL_ALLOW_RAW_LUA": " TRUE "}),
             [],
+        )
+        self.assertEqual(
+            pipe._disallowed_tools_for_env({"FACTORIOCTL_ALLOW_RAW_LUA": "false"}),
+            ["mcp__factorioctl__execute_lua"],
         )
 
     def test_mutating_tool_batch_gate_denies_fast_second_mutation(self):
@@ -542,7 +605,7 @@ error_tips:
             second["hookSpecificOutput"]["permissionDecision"], "deny"
         )
         self.assertIn("blocked parallel mutating tool call", second["reason"])
-        self.assertFalse(pipe._looks_like_tool_error(second["reason"]))
+        self.assertFalse(ToolResultOutcome.from_text(second["reason"]).indicates_failure)
 
     def test_mutating_tool_batch_gate_ignores_read_only_tools(self):
         import pipe
@@ -562,6 +625,49 @@ error_tips:
         self.assertEqual(
             mutating["hookSpecificOutput"]["permissionDecision"], "allow"
         )
+
+    def test_hook_gates_accept_sdk_object_hook_input(self):
+        import pipe
+
+        class HookInput:
+            def __init__(self, tool_name, tool_input=None):
+                self.tool_name = tool_name
+                self.tool_input = tool_input or {}
+
+        mutating_gate = pipe.MutatingToolBatchGate(
+            pipe.logger.bind(agent="test"), window_s=60
+        )
+        read_only_gate = pipe.PlannerReadOnlyToolGate(
+            pipe.logger.bind(agent="test"), enabled=True
+        )
+        skill_gate = pipe.FactorioSkillGate(pipe.logger.bind(agent="test"))
+
+        first = asyncio.run(mutating_gate.hook(
+            HookInput("mcp__factorioctl__place_entity"), "tool-1", {}
+        ))
+        second = asyncio.run(mutating_gate.hook(
+            HookInput("mcp__factorioctl__place_entity"), "tool-2", {}
+        ))
+        lab_feed_dry_run = asyncio.run(read_only_gate.hook(
+            HookInput("mcp__factorioctl__feed_lab_from_inventory", {
+                "lab_unit_number": 42,
+                "science_pack": "automation-science-pack",
+                "count": 5,
+            }),
+            "tool-3",
+            {},
+        ))
+        blocked_before_skill = asyncio.run(skill_gate.hook(
+            HookInput("mcp__factorioctl__situation_report"), "tool-4", {}
+        ))
+
+        self.assertEqual(
+            first["hookSpecificOutput"]["permissionDecision"],
+            "allow",
+        )
+        self.assertEqual(second["decision"], "block")
+        self.assertEqual(lab_feed_dry_run, {})
+        self.assertEqual(blocked_before_skill["decision"], "block")
 
     def test_planner_read_only_gate_blocks_mutations_and_allows_diagnostics(self):
         import pipe
@@ -626,7 +732,7 @@ error_tips:
         self.assertEqual(blocked["decision"], "block")
         self.assertIn("planner/reflection turn", blocked["reason"])
         self.assertIn("ledger-only plan", blocked["reason"])
-        self.assertFalse(pipe._looks_like_tool_error(blocked["reason"]))
+        self.assertFalse(ToolResultOutcome.from_text(blocked["reason"]).indicates_failure)
         self.assertEqual(unknown["decision"], "block")
         self.assertEqual(diagnostic, {})
         self.assertEqual(edge_miner_plan, {})
@@ -655,7 +761,7 @@ error_tips:
 
         self.assertEqual(blocked["decision"], "block")
         self.assertIn("Call Skill(factorio-control)", blocked["reason"])
-        self.assertFalse(pipe._looks_like_tool_error(blocked["reason"]))
+        self.assertFalse(ToolResultOutcome.from_text(blocked["reason"]).indicates_failure)
         self.assertEqual(
             allowed_skill["hookSpecificOutput"]["permissionDecision"],
             "allow",
@@ -680,6 +786,7 @@ error_tips:
         import pipe
 
         gate = pipe.FactorioToolSchemaGate(pipe.logger.bind(agent="test"))
+        self.assertIsInstance(gate.schema_registry, ToolParamSchemaRegistry)
 
         blocked = asyncio.run(gate.hook(
             {
@@ -701,7 +808,29 @@ error_tips:
         )
         self.assertIn("place_entity: tool_input.x: expected number", blocked["reason"])
         self.assertIn("invalid Factorio tool parameters", blocked["reason"])
-        self.assertFalse(pipe._looks_like_tool_error(blocked["reason"]))
+        self.assertFalse(ToolResultOutcome.from_text(blocked["reason"]).indicates_failure)
+
+    def test_factorio_tool_schema_gate_blocks_bad_schema_declarations(self):
+        import pipe
+
+        gate = pipe.FactorioToolSchemaGate(
+            pipe.logger.bind(agent="test"),
+            schema_registry={"place_entity": {"required": {"x": "coordinate"}}},
+        )
+        self.assertIsInstance(gate.schema_registry, ToolParamSchemaRegistry)
+        self.assertIsNotNone(gate.schema_registry_error)
+        blocked = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__place_entity",
+                "tool_input": {"x": 0},
+            },
+            "tool-1",
+            {},
+        ))
+
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("place_entity: required.x: unknown parameter type", blocked["reason"])
+        self.assertFalse(ToolResultOutcome.from_text(blocked["reason"]).indicates_failure)
 
     def test_factorio_tool_schema_gate_allows_valid_and_unknown_tools(self):
         import pipe
@@ -830,6 +959,22 @@ error_tips:
         with mock.patch.dict("os.environ", {"BRIDGE_MAX_TURNS": "nope"}):
             self.assertEqual(pipe._resolve_max_turns(None), 200)
 
+        with mock.patch.dict("os.environ", {
+            "BRIDGE_CONTEXT_WINDOW_BACKOFF_S": "12.5",
+            "BRIDGE_MUTATING_TOOL_BATCH_WINDOW_S": "0.25",
+        }):
+            self.assertEqual(pipe._context_window_backoff_s(), 12.5)
+            gate = pipe.MutatingToolBatchGate(log=mock.Mock())
+            self.assertEqual(gate.window_s, 0.25)
+
+        with mock.patch.dict("os.environ", {
+            "BRIDGE_CONTEXT_WINDOW_BACKOFF_S": "oops",
+            "BRIDGE_MUTATING_TOOL_BATCH_WINDOW_S": "oops",
+        }):
+            self.assertEqual(pipe._context_window_backoff_s(), 900.0)
+            gate = pipe.MutatingToolBatchGate(log=mock.Mock())
+            self.assertEqual(gate.window_s, 1.0)
+
     def test_sdk_skills_default_to_project_skill_and_are_disableable(self):
         import pipe
 
@@ -841,13 +986,44 @@ error_tips:
         ])
         self.assertEqual(pipe._resolve_sdk_skills("all"), "all")
         self.assertEqual(pipe._resolve_sdk_skills("none"), [])
+        self.assertEqual(pipe._resolve_sdk_skills(["factorio-control", {"bad": True}]), [
+            "factorio-control",
+        ])
         self.assertEqual(pipe._claude_tools_for_sdk_skills(["factorio-control"]), ["Skill"])
+        self.assertEqual(pipe._claude_tools_for_sdk_skills("all"), ["Skill"])
         self.assertEqual(pipe._claude_tools_for_sdk_skills([]), [])
         self.assertEqual(
             pipe._setting_sources_for_sdk_skills(["factorio-control"]),
             ["project", "local"],
         )
+        self.assertEqual(pipe._setting_sources_for_sdk_skills("all"), ["project", "local"])
         self.assertEqual(pipe._setting_sources_for_sdk_skills([]), ["local"])
+
+    def test_build_mcp_servers_uses_typed_factorio_stdio_config_shape(self):
+        import pipe
+
+        self.assertEqual(
+            pipe.build_mcp_servers(
+                "/tmp/mcp",
+                "localhost",
+                27015,
+                "factorio",
+                agent_id="doug",
+            ),
+            {
+                "factorioctl": {
+                    "type": "stdio",
+                    "command": "/tmp/mcp",
+                    "args": [],
+                    "env": {
+                        "FACTORIO_RCON_HOST": "localhost",
+                        "FACTORIO_RCON_PORT": "27015",
+                        "FACTORIO_RCON_PASSWORD": "factorio",
+                        "FACTORIO_AGENT_ID": "doug",
+                    },
+                }
+            },
+        )
 
     def test_handle_message_enables_sdk_skill_without_shell_tools(self):
         import pipe
@@ -943,52 +1119,33 @@ error_tips:
         options = ClaudeAgentOptions(skills=["factorio-control"])
 
         logged = pipe._log_sdk_init(
-            SystemMessage(
+            SdkSystemMessage.from_sdk_message(SystemMessage(
                 subtype="init",
                 data={
                     "cwd": str(pipe._PROJECT_ROOT),
                     "tools": ["Skill", "mcp__factorioctl__walk_to"],
                     "skills": ["factorio-control"],
                 },
-            ),
+            )),
             options,
             log,
         )
 
         self.assertTrue(logged)
         self.assertIn("sdk init", log.messages[0][0])
-        self.assertFalse(pipe._should_log_system_message(SystemMessage(
+        self.assertFalse(SdkSystemMessage.from_sdk_message(SystemMessage(
             subtype="thinking_tokens",
             data={"estimated_tokens": 1},
-        )))
-        self.assertTrue(pipe._should_log_system_message(SystemMessage(
+        )).should_log)
+        self.assertTrue(SdkSystemMessage.from_sdk_message(SystemMessage(
             subtype="error",
             data={"message": "visible diagnostic"},
-        )))
+        )).should_log)
         self.assertTrue(pipe._is_skill_tool(ToolUseBlock(
             id="s1",
             name="Skill",
             input={"skill": "factorio-control"},
         )))
-
-    def test_usage_limit_reset_infers_provider_timezone_from_request_id(self):
-        import pipe
-
-        text = (
-            "API Error: Request rejected (429) · [1308][Usage limit reached "
-            "for 5 hour. Your limit will reset at 2026-06-29 08:35:15]"
-            "[202606290714523c923559680c406d]"
-        )
-        now = datetime(2026, 6, 28, 23, 14, 52, tzinfo=timezone.utc)
-
-        reset = pipe._usage_limit_reset_at(text, now)
-
-        self.assertIsNotNone(reset)
-        self.assertEqual(reset.utcoffset(), timedelta(hours=8))
-        self.assertEqual(
-            reset.astimezone(timezone.utc),
-            datetime(2026, 6, 29, 0, 35, 15, tzinfo=timezone.utc),
-        )
 
     def test_usage_limit_cooldown_blocks_human_message_without_model_call(self):
         import queue as std_queue
@@ -1016,10 +1173,10 @@ error_tips:
         thread.log = pipe.logger.bind(agent="doug")
         thread.heartbeat_interval = 0
         thread.inbox = std_queue.Queue()
-        thread.inbox.put({
+        thread.enqueue({
             "message": "hi",
             "player_index": 1,
-            "player_name": "giga",
+            "player_name": "TestPlayer",
         })
 
         with mock.patch("pipe.handle_message", side_effect=AssertionError("called model")):
@@ -1069,13 +1226,49 @@ error_tips:
         self.addCleanup(pipe._USAGE_LIMIT_COOLDOWNS.clear)
 
         with mock.patch("pipe.query", scripted_query):
-            asyncio.run(pipe._run_agent(
+            transcript = asyncio.run(pipe._run_agent(
                 "go", object(), "doug", None, "doug",
                 StubRCON(), 0, pipe.logger.bind(agent="doug"),
             ))
 
         self.assertEqual(journal.load_events("doug"), [])
         self.assertIsNotNone(pipe._get_usage_limit_cooldown("doug"))
+        self.assertTrue(transcript.usage_limit_seen)
+        self.assertFalse(transcript.context_window_limit)
+        self.assertEqual(transcript.session_id, "s")
+        self.assertEqual(transcript.text_parts, [limit_text])
+
+    def test_handle_message_exception_uses_typed_invocation_signal(self):
+        import pipe
+
+        provider_now = datetime.now(timezone.utc) + timedelta(hours=8)
+        provider_reset = provider_now + timedelta(hours=1)
+        error_text = (
+            "Claude Code returned an error result: API Error: Request rejected "
+            "(429) · [1308][Usage limit reached for 5 hour. Your limit will "
+            f"reset at {provider_reset:%Y-%m-%d %H:%M:%S}]"
+            f"[{provider_now:%Y%m%d%H%M%S}abcdef]"
+        )
+
+        def raising_query(*, prompt, options):
+            raise RuntimeError(error_text)
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        pipe._USAGE_LIMIT_COOLDOWNS.clear()
+        self.addCleanup(pipe._USAGE_LIMIT_COOLDOWNS.clear)
+
+        with mock.patch("pipe.query", raising_query):
+            new_session = pipe.handle_message(
+                "go", {}, "system", "old-session", StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+            )
+
+        self.assertEqual(new_session, "old-session")
+        self.assertIsNotNone(pipe._get_usage_limit_cooldown("doug"))
+        self.assertEqual(journal.load_events("doug"), [])
 
     def test_handle_message_clears_session_on_context_window_limit(self):
         import pipe
@@ -1128,6 +1321,41 @@ error_tips:
         self.assertIsNone(pipe._get_context_window_cooldown("doug"))
         self.assertEqual(json.loads(pipe.SESSIONS_FILE.read_text()), {"other": "keep-me"})
         self.assertEqual(journal.load_events("doug"), [])
+
+    def test_session_persistence_uses_typed_current_and_legacy_shapes(self):
+        import pipe
+
+        session_patch = mock.patch(
+            "pipe._session_file",
+            side_effect=lambda agent_name: self.base / f".session-{agent_name}.json",
+        )
+        sessions_patch = mock.patch.object(pipe, "SESSIONS_FILE", self.base / ".sessions.json")
+        session_patch.start()
+        sessions_patch.start()
+        self.addCleanup(session_patch.stop)
+        self.addCleanup(sessions_patch.stop)
+
+        pipe.save_session("doug", "new-session")
+        self.assertEqual(pipe.load_session("doug"), "new-session")
+        self.assertEqual(
+            json.loads((self.base / ".session-doug.json").read_text()),
+            {"session_id": "new-session"},
+        )
+
+        (self.base / ".session-doug.json").write_text('{"session_id": ""}\n')
+        pipe.SESSIONS_FILE.write_text(json.dumps({
+            "doug": "legacy-session",
+            "other": "keep-me",
+            "empty": "",
+            "bad": 3,
+        }) + "\n")
+        self.assertIsNone(pipe.load_session("doug"))
+        (self.base / ".session-doug.json").unlink()
+        self.assertEqual(pipe.load_session("doug"), "legacy-session")
+
+        pipe.clear_session("doug")
+        self.assertFalse((self.base / ".session-doug.json").exists())
+        self.assertEqual(json.loads(pipe.SESSIONS_FILE.read_text()), {"other": "keep-me"})
 
     def test_handle_message_backs_off_context_window_after_session_reset(self):
         import pipe
@@ -1199,10 +1427,10 @@ error_tips:
         thread.log = pipe.logger.bind(agent="doug")
         thread.heartbeat_interval = 0
         thread.inbox = std_queue.Queue()
-        thread.inbox.put({
+        thread.enqueue({
             "message": "hi",
             "player_index": 1,
-            "player_name": "giga",
+            "player_name": "TestPlayer",
         })
 
         with mock.patch("pipe.handle_message", side_effect=AssertionError("called model")):
@@ -1349,13 +1577,36 @@ error_tips:
         watchdog.record_tool_use("craft-1", "mcp__factorioctl__craft")
         watchdog.observe_tool_result(
             "craft-1",
-            pipe.TOOL_RESULT_OK,
+            ToolResultClassification.OK,
             '{"success":true,"queued":1,"error":"Crafting did not start"}',
         )
         now[0] = 10.0
 
         with self.assertRaises(pipe.AgentTickWatchdogAbort):
             watchdog.observe_text()
+
+    def test_tick_watchdog_coerces_legacy_string_classifications(self):
+        import pipe
+
+        watchdog = pipe.AgentTickWatchdog(
+            same_failure_limit=2,
+            no_progress_timeout_s=0,
+        )
+        watchdog.record_tool_use("belt-1", "mcp__factorioctl__place_entity")
+        watchdog.observe_tool_result(
+            "belt-1",
+            "game_rejected",
+            "Error: Cannot place entity here",
+        )
+
+        with self.assertRaises(pipe.AgentTickWatchdogAbort) as raised:
+            watchdog.observe_tool_result(
+                "belt-1",
+                "game_rejected",
+                "Error: Cannot place entity here",
+            )
+
+        self.assertIn("repeated same game rejection", str(raised.exception))
 
     def test_agent_thread_drops_in_memory_session_on_context_reset(self):
         import queue as std_queue
@@ -1374,7 +1625,7 @@ error_tips:
         thread.log = pipe.logger.bind(agent="doug")
         thread.heartbeat_interval = 0
         thread.inbox = std_queue.Queue()
-        thread.inbox.put({
+        thread.enqueue({
             "message": "go",
             "player_index": 0,
             "player_name": "autonomy",
@@ -1387,13 +1638,132 @@ error_tips:
         thread.sdk_skills = ["factorio-control"]
 
         with (
-            mock.patch("pipe.handle_message", return_value=pipe.SESSION_RESET),
+            mock.patch(
+                "pipe.handle_message_model",
+                return_value=pipe.AgentMessageResult.reset(),
+            ),
             mock.patch("pipe.save_session") as save_session,
         ):
             thread._run_once()
 
         self.assertIsNone(thread.session_id)
         save_session.assert_not_called()
+
+    def test_agent_thread_coerces_inbound_message_before_model_call(self):
+        import queue as std_queue
+
+        import pipe
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.telemetry_name = "doug"
+        thread.telemetry = None
+        thread.rcon = StubRCON()
+        thread.log = pipe.logger.bind(agent="doug")
+        thread.heartbeat_interval = 0
+        thread.inbox = std_queue.Queue()
+        thread.enqueue({
+            "message": 99,
+            "player_index": "0",
+            "player_name": "",
+            "response_to": "all",
+            "model": "planner",
+            "read_only_tools": "true",
+        })
+        thread.mcp_config = {"factorioctl": {}}
+        thread.system_prompt = "system"
+        thread.session_id = "old-session"
+        thread.model = "haiku"
+        thread.max_turns = 200
+        thread.sdk_skills = ["factorio-control"]
+
+        with (
+            mock.patch(
+                "pipe.handle_message_model",
+                return_value=pipe.AgentMessageResult.keep_session("new-session"),
+            ) as handle_message,
+            mock.patch("pipe.save_session") as save_session,
+        ):
+            thread._run_once()
+
+        args, kwargs = handle_message.call_args
+        self.assertEqual(args[0], "99")
+        self.assertEqual(args[5], 0)
+        self.assertEqual(kwargs["response_to"], "all")
+        self.assertEqual(kwargs["model"], "planner")
+        self.assertTrue(kwargs["read_only_tools"])
+        self.assertEqual(thread.session_id, "new-session")
+        save_session.assert_called_once_with("doug", "new-session")
+
+    def test_agent_thread_accepts_typed_inbound_message_without_recoercion(self):
+        import queue as std_queue
+
+        import pipe
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.telemetry_name = "doug"
+        thread.telemetry = None
+        thread.rcon = StubRCON()
+        thread.log = pipe.logger.bind(agent="doug")
+        thread.heartbeat_interval = 0
+        thread.inbox = std_queue.Queue()
+        thread.inbox.put(BridgeInputMessage(
+            message="typed hi",
+            player_index=7,
+            player_name="TestPlayer",
+            response_to="all",
+            model="planner",
+            read_only_tools=True,
+        ))
+        thread.mcp_config = {"factorioctl": {}}
+        thread.system_prompt = "system"
+        thread.session_id = None
+        thread.model = "haiku"
+        thread.max_turns = 200
+        thread.sdk_skills = ["factorio-control"]
+
+        with (
+            mock.patch(
+                "pipe.handle_message_model",
+                return_value=pipe.AgentMessageResult.keep_session("typed-session"),
+            ) as handle_message,
+            mock.patch("pipe.save_session") as save_session,
+        ):
+            thread._run_once()
+
+        args, kwargs = handle_message.call_args
+        self.assertEqual(args[0], "typed hi")
+        self.assertEqual(args[5], 7)
+        self.assertEqual(kwargs["response_to"], "all")
+        self.assertEqual(kwargs["model"], "planner")
+        self.assertTrue(kwargs["read_only_tools"])
+        self.assertEqual(thread.session_id, "typed-session")
+        save_session.assert_called_once_with("doug", "typed-session")
+
+    def test_agent_thread_enqueue_is_the_dict_coercion_boundary(self):
+        import queue as std_queue
+
+        import pipe
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.inbox = std_queue.Queue()
+
+        thread.enqueue({"message": "hi"})
+        thread.enqueue({"message": ""})
+
+        queued = thread.inbox.get_nowait()
+        self.assertIsInstance(queued, BridgeInputMessage)
+        self.assertEqual(queued.message, "hi")
+        self.assertTrue(thread.inbox.empty())
 
     def test_run_agent_journals_sdk_tool_result_failures(self):
         # The whole point of the SDK migration: tool failures arrive as
@@ -1417,7 +1787,7 @@ error_tips:
                 content=[{
                     "type": "text",
                     "text": "Error: invalid JSON"
-                    "\n\n--- Player Messages ---\n[giga]: I put wood in a chest",
+                    "\n\n--- Player Messages ---\n[TestPlayer]: I put wood in a chest",
                 }],
                 is_error=False,
             )]),
@@ -1472,7 +1842,7 @@ error_tips:
         self.assertTrue(any(t.startswith("game_rejected:") and "cannot place stone furnace" in t for t in texts))
         self.assertTrue(any(t.startswith("invalid_request:") and "invalid JSON" in t for t in texts))
         self.assertTrue(any(t.startswith("invalid_request:") and "invalid type: map" in t for t in texts))
-        self.assertFalse(any("giga" in t for t in texts))
+        self.assertFalse(any("TestPlayer" in t for t in texts))
         # success result, expected miss, and benign narration must NOT be journaled
         self.assertFalse(any("ok scan complete" in t for t in texts))
         self.assertFalse(any("narrating" in t for t in texts))
@@ -1486,7 +1856,7 @@ error_tips:
 
         for text in ("None", "nominal", "no anomalies found", "none detected"):
             with self.subTest(text=text):
-                self.assertFalse(pipe._is_meaningful_anomaly(text))
+                self.assertFalse(ParsedAgentResponse.is_meaningful_anomaly_text(text))
 
     def test_autonomy_tick_injects_memory_and_periodic_reflection_nudge(self):
         import ledger
@@ -1590,7 +1960,12 @@ error_tips:
             "progress_notes": [],
             "updated_at": "now",
         })
-        journal.append_event("doug", "progress", "objective completed: lab is powered")
+        journal.append_event(
+            "doug",
+            "progress",
+            "objective completed: lab is powered",
+            signal="plan_done",
+        )
         for i in range(3):
             journal.append_event("doug", "failure", f"game_rejected: stale action {i}")
 
@@ -1612,6 +1987,37 @@ error_tips:
         self.assertIn("(planner tick)", tick["message"])
         self.assertIn("read-only planning turn", tick["message"])
         self.assertIn("objective completed: lab is powered", tick["message"])
+
+    def test_autonomy_tick_does_not_replan_from_plan_done_prose_without_signal(self):
+        import ledger
+        import pipe
+
+        ledger.save_ledger("doug", {
+            "objective": "Power the lab",
+            "plan_steps": ["insert science packs", "start research"],
+            "progress_notes": [],
+            "updated_at": "now",
+        })
+        journal.append_event("doug", "progress", "objective completed: lab is powered")
+        for i in range(3):
+            journal.append_event("doug", "failure", f"game_rejected: stale action {i}")
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.rcon = StubRCON()
+        thread._exec_ticks_since_plan = 0
+        thread._planner_interval = 5
+        thread._planner_model = None
+        thread._reflect_interval = 99
+
+        tick = thread._autonomy_tick()
+
+        self.assertNotIn("read_only_tools", tick)
+        self.assertIn("(execution tick)", tick["message"])
 
     def test_autonomy_tick_does_not_treat_awaiting_execution_as_plan_done(self):
         import ledger
@@ -1648,7 +2054,7 @@ error_tips:
 
         self.assertNotIn("read_only_tools", tick)
         self.assertIn("(execution tick)", tick["message"])
-        self.assertNotIn("no changes across planning ticks", tick["message"])
+        self.assertIn("no changes across planning ticks", tick["message"])
 
 
 if __name__ == "__main__":

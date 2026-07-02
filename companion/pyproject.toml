@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "claude-agent-sdk>=0.2.110",
     "loguru>=0.7.2",
+    "pydantic>=2.13.4",
 ]
 
 # Flat-script application (bridge/*.py imported by path), not an installable

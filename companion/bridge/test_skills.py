@@ -62,6 +62,42 @@ class SkillTests(unittest.TestCase):
         self.assertIn("lay_smelting_line", self._names(corrupt))
         self.assertIn("build_steam_power", self._names(corrupt))
 
+    def test_load_library_model_merges_saved_skills_and_helpers_accept_typed_library(self):
+        (self.base / ".skills.json").write_text(
+            '{"skills": ['
+            '{"name": "feed_lab", "params": ["lab"], "outcome": "custom feed"},'
+            '{"name": "repair_belt", "steps": ["rotate belt"], "outcome": "ore flows"}'
+            ']}\n'
+        )
+
+        library = skills.load_library_model()
+        rendered = skills.render_skills(library)
+
+        self.assertIn("custom feed", skills.get_skill(library, "feed_lab")["outcome"])
+        self.assertEqual(
+            skills.get_skill(library, "repair_belt")["steps"],
+            ["rotate belt"],
+        )
+        self.assertIn("feed_lab(lab)", rendered)
+        self.assertIn("repair_belt()", rendered)
+
+    def test_save_library_model_and_get_skill_model_keep_typed_boundary(self):
+        library = skills.load_library_model().replace_or_append(
+            skills.SkillDefinition(
+                name="repair_belt",
+                steps=["rotate belt"],
+                outcome="ore flows",
+            )
+        )
+
+        skills.save_library_model(library)
+
+        loaded = skills.load_library_model()
+        skill = skills.get_skill_model(loaded, "repair_belt")
+        self.assertIsInstance(loaded, skills.SkillLibrary)
+        self.assertIsInstance(skill, skills.SkillDefinition)
+        self.assertEqual(skill.steps, ["rotate belt"])
+
     def test_parse_skill_trailer_extracts_well_formed_block(self):
         parsed = skills.parse_skill_trailer(
             """Visible text.
@@ -82,6 +118,34 @@ outcome: lab consumes automation science packs
         self.assertEqual(parsed["params"], ["lab_pos", "science_belt_pos"])
         self.assertEqual(len(parsed["steps"]), 4)
         self.assertEqual(parsed["outcome"], "lab consumes automation science packs")
+
+    def test_parse_skill_trailer_model_accepts_typed_sources(self):
+        typed = skills.SkillDefinition(
+            name="repair_belt",
+            params=["belt_pos"],
+            steps=["rotate belt"],
+            outcome="ore flows",
+        )
+        draft = skills.SkillDefinitionDraft(
+            name="feed_lab_fast",
+            params=["lab_pos"],
+            steps=["insert science"],
+            outcome="research advances",
+        )
+
+        self.assertIs(skills.parse_skill_trailer_model(typed), typed)
+        parsed_draft = skills.parse_skill_trailer_model(draft)
+        self.assertIsInstance(parsed_draft, skills.SkillDefinition)
+        self.assertEqual(parsed_draft.name, "feed_lab_fast")
+        self.assertEqual(
+            skills.parse_skill_trailer(typed),
+            {
+                "name": "repair_belt",
+                "params": ["belt_pos"],
+                "steps": ["rotate belt"],
+                "outcome": "ore flows",
+            },
+        )
 
     def test_parse_skill_trailer_none_without_block_or_name_and_partial_ok(self):
         self.assertIsNone(skills.parse_skill_trailer("Plain narration only."))
@@ -140,6 +204,36 @@ outcome: verified starter steam power online
         self.assertEqual(skill["params"], ["water_pos"])
         self.assertEqual(skill["outcome"], "verified starter steam power online")
         self.assertEqual(len([s for s in replaced["skills"] if s["name"] == "build_power_pair"]), 1)
+
+    def test_apply_skill_update_model_adds_replaces_and_persists(self):
+        library = skills.apply_skill_update_model(
+            """<skill>
+name: build_power_pair
+params: water_pos, coal_belt_pos
+steps:
+- place_entity offshore-pump at water_pos
+- place_entity boiler next to the pump
+outcome: starter steam power online
+</skill>"""
+        )
+
+        skill = skills.get_skill_model(library, "build_power_pair")
+        persisted_skill = skills.get_skill_model(skills.load_library_model(), "build_power_pair")
+        self.assertIsInstance(library, skills.SkillLibrary)
+        self.assertEqual(skill.params, ["water_pos", "coal_belt_pos"])
+        self.assertEqual(persisted_skill.outcome, "starter steam power online")
+
+        replaced = skills.apply_skill_update_model(skills.SkillDefinition(
+            name="build_power_pair",
+            params=["typed_water_pos"],
+            steps=["use typed placement plan"],
+            outcome="typed starter steam power online",
+        ))
+
+        typed_skill = skills.get_skill_model(replaced, "build_power_pair")
+        typed_persisted = skills.get_skill_model(skills.load_library_model(), "build_power_pair")
+        self.assertEqual(typed_skill.params, ["typed_water_pos"])
+        self.assertEqual(typed_persisted.outcome, "typed starter steam power online")
 
     def test_apply_skill_update_noops_without_valid_block(self):
         before = skills.load_library()

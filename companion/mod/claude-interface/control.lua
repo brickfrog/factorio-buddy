@@ -1778,16 +1778,32 @@ remote.add_interface("claude_interface", {
         return characters.ensure_surface(planet_name)
     end,
 
+    ensure_surface_result = function(planet_name)
+        return characters.ensure_surface_result(planet_name)
+    end,
+
     pre_place_character = function(agent_id, planet_name, spawn_x)
         return characters.pre_place(agent_id, planet_name, spawn_x)
+    end,
+
+    pre_place_character_result = function(agent_id, planet_name, spawn_x)
+        return characters.pre_place_result(agent_id, planet_name, spawn_x)
     end,
 
     live_state_line = function(agent_id)
         return characters.live_state_line(agent_id)
     end,
 
+    live_state_result = function(agent_id)
+        return characters.live_state_result(agent_id)
+    end,
+
     connected_player_count = function()
         return characters.connected_player_count()
+    end,
+
+    connected_player_count_result = function()
+        return characters.connected_player_count_result()
     end,
 
     broadcast_console = function(message)

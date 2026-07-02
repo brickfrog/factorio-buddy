@@ -1,38 +1,43 @@
 """Telemetry bus: local SSE server and remote relay pusher."""
 
-import json
 import queue
 import threading
-from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Any
+
+from models import (
+    TelemetryEvent,
+    TelemetryEventBatch,
+    TelemetryHealthStatus,
+    TelemetrySseMessage,
+    TelemetryStatusData,
+)
 
 
 class SSEBroadcaster:
     """Manages SSE client connections and broadcasts events."""
 
     def __init__(self):
-        self._clients: list[queue.Queue] = []
+        self._clients: list[queue.Queue[TelemetrySseMessage]] = []
         self._lock = threading.Lock()
 
-    def add_client(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=200)
+    def add_client(self) -> queue.Queue[TelemetrySseMessage]:
+        q: queue.Queue[TelemetrySseMessage] = queue.Queue(maxsize=200)
         with self._lock:
             self._clients.append(q)
         return q
 
-    def remove_client(self, q: queue.Queue):
+    def remove_client(self, q: queue.Queue[TelemetrySseMessage]):
         with self._lock:
             self._clients = [c for c in self._clients if c is not q]
 
-    def broadcast(self, event: dict):
-        if "timestamp" not in event:
-            event["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-        data = json.dumps(event, separators=(",", ":"))
+    def broadcast(self, event: dict | TelemetryEvent):
+        message = TelemetrySseMessage.coerce(event)
         with self._lock:
             dead = []
             for q in self._clients:
                 try:
-                    q.put_nowait(data)
+                    q.put_nowait(message)
                 except queue.Full:
                     dead.append(q)
             for q in dead:
@@ -59,8 +64,8 @@ def _make_sse_handler(broadcaster: SSEBroadcaster):
                 try:
                     while True:
                         try:
-                            data = q.get(timeout=15)
-                            self.wfile.write(f"data: {data}\n\n".encode())
+                            message = q.get(timeout=15)
+                            self.wfile.write(message.to_bytes())
                             self.wfile.flush()
                         except queue.Empty:
                             self.wfile.write(b": keepalive\n\n")
@@ -74,8 +79,9 @@ def _make_sse_handler(broadcaster: SSEBroadcaster):
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                resp = json.dumps({"status": "ok", "clients": broadcaster.client_count})
-                self.wfile.write(resp.encode())
+                self.wfile.write(
+                    TelemetryHealthStatus.ok(broadcaster.client_count).to_json_bytes()
+                )
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -108,20 +114,20 @@ class RelayPusher:
     def __init__(self, relay_url: str, token: str):
         self.ingest_url = relay_url.rstrip("/") + "/ingest"
         self.token = token
-        self._queue: queue.Queue = queue.Queue(maxsize=500)
+        self._queue: queue.Queue[TelemetryEvent] = queue.Queue(maxsize=500)
         self._thread = threading.Thread(target=self._push_loop, daemon=True)
         self._thread.start()
 
-    def push(self, event: dict):
+    def push(self, event: dict | TelemetryEvent):
         try:
-            self._queue.put_nowait(event)
+            self._queue.put_nowait(TelemetryEvent.coerce(event))
         except queue.Full:
             pass
 
     def _push_loop(self):
         import urllib.request as urlreq
         while True:
-            batch: list[dict] = []
+            batch: list[TelemetryEvent] = []
             try:
                 batch.append(self._queue.get(timeout=2))
                 while len(batch) < 20:
@@ -132,7 +138,7 @@ class RelayPusher:
             if not batch:
                 continue
 
-            data = json.dumps(batch).encode()
+            data = TelemetryEventBatch(events=batch).to_json_bytes()
             req = urlreq.Request(
                 self.ingest_url,
                 data=data,
@@ -156,13 +162,12 @@ class Telemetry:
         self.sse = sse
         self.relay = relay
 
-    def emit(self, event: dict):
-        if "timestamp" not in event:
-            event["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    def emit(self, event: dict | TelemetryEvent):
+        payload = TelemetryEvent.coerce(event)
         if self.sse:
-            self.sse.broadcast(dict(event))
+            self.sse.broadcast(payload)
         if self.relay:
-            self.relay.push(dict(event))
+            self.relay.push(payload)
 
 
 # Telemetry helpers — all safe to call with telemetry=None
@@ -171,51 +176,44 @@ def emit_chat(telemetry: Telemetry | None, role: str, message: str,
               agent: str = "BORE-01", tick: int | None = None,
               sections: dict | None = None):
     if telemetry:
-        data = {"role": role, "message": message}
-        if sections:
-            data["sections"] = sections
-        telemetry.emit({
-            "type": "chat",
-            "data": data,
-            "agent": agent, "tick": tick,
-        })
+        telemetry.emit(TelemetryEvent.chat(
+            role,
+            message,
+            agent=agent,
+            tick=tick,
+            sections=sections,
+        ))
 
 
-def emit_tool_call(telemetry: Telemetry | None, tool: str, input_data: dict,
+def emit_tool_call(telemetry: Telemetry | None, tool: str, input_data: Any,
                    agent: str = "BORE-01", tick: int | None = None):
     if telemetry:
-        telemetry.emit({
-            "type": "tool_call",
-            "data": {"tool": tool, "input": input_data},
-            "agent": agent, "tick": tick,
-        })
+        telemetry.emit(TelemetryEvent.tool_call(
+            tool,
+            input_data,
+            agent=agent,
+            tick=tick,
+        ))
 
 
 def emit_tool_result(telemetry: Telemetry | None, tool: str, output: str,
                      agent: str = "BORE-01", tick: int | None = None):
     if telemetry:
-        telemetry.emit({
-            "type": "tool_result",
-            "data": {"tool": tool, "output": output[:200]},
-            "agent": agent, "tick": tick,
-        })
+        telemetry.emit(TelemetryEvent.tool_result(
+            tool,
+            output,
+            agent=agent,
+            tick=tick,
+        ))
 
 
 def emit_error(telemetry: Telemetry | None, message: str,
                agent: str = "BORE-01", tick: int | None = None):
     if telemetry:
-        telemetry.emit({
-            "type": "error",
-            "data": {"message": message},
-            "agent": agent, "tick": tick,
-        })
+        telemetry.emit(TelemetryEvent.error(message, agent=agent, tick=tick))
 
 
-def emit_status(telemetry: Telemetry | None, data: dict,
+def emit_status(telemetry: Telemetry | None, data: dict | TelemetryStatusData,
                 agent: str = "BORE-01", tick: int | None = None):
     if telemetry:
-        telemetry.emit({
-            "type": "status",
-            "data": data,
-            "agent": agent, "tick": tick,
-        })
+        telemetry.emit(TelemetryEvent.status(data, agent=agent, tick=tick))

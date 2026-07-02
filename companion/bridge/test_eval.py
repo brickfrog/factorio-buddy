@@ -1,6 +1,7 @@
 import unittest
 
 import eval as eval_harness
+from models import EvalMilestoneSpec, EvalProductionSnapshot, EvalResult
 
 
 class FakeRcon:
@@ -30,6 +31,17 @@ class ProductionScoreTest(unittest.TestCase):
         )
         self.assertEqual(eval_harness.production_score(produced), expected)
 
+    def test_production_score_accepts_typed_snapshot(self):
+        snapshot = EvalProductionSnapshot(
+            produced={"iron-plate": 1000},
+            rate_per_min={"iron-plate": 2},
+        )
+
+        self.assertEqual(
+            eval_harness.production_score(snapshot),
+            2 * eval_harness.VALUES["iron-plate"],
+        )
+
     def test_unknown_items_are_ignored(self):
         produced = {
             "iron-plate": 5,
@@ -42,6 +54,51 @@ class ProductionScoreTest(unittest.TestCase):
 
 
 class EvaluateTest(unittest.TestCase):
+    def test_milestone_specs_are_typed_source_of_truth(self):
+        self.assertTrue(eval_harness.MILESTONE_SPECS)
+        self.assertTrue(all(
+            isinstance(spec, EvalMilestoneSpec)
+            for spec in eval_harness.MILESTONE_SPECS
+        ))
+        self.assertEqual(
+            [spec.name for spec in eval_harness.MILESTONE_SPECS],
+            [name for name, _ in eval_harness.MILESTONES],
+        )
+
+    def test_eval_milestone_spec_evaluates_typed_snapshot(self):
+        produced = EvalMilestoneSpec.any_produced(
+            "starter_ore",
+            ("iron-ore", "coal"),
+        )
+        throughput = EvalMilestoneSpec.rate_at_least(
+            "iron_plate_fast",
+            "iron-plate",
+            16,
+        )
+        snapshot = EvalProductionSnapshot(
+            produced={"coal": 1},
+            rate_per_min={"iron-plate": 16},
+        )
+
+        self.assertTrue(produced.reached(snapshot))
+        self.assertTrue(throughput.reached(snapshot))
+
+    def test_evaluate_model_returns_typed_result_and_accepts_typed_snapshot(self):
+        snapshot = EvalProductionSnapshot(
+            produced={"iron-plate": 1},
+            rate_per_min={"iron-plate": 16},
+        )
+
+        result = eval_harness.evaluate_model(snapshot)
+
+        self.assertIsInstance(result, EvalResult)
+        self.assertTrue(result.milestones["automated_smelting"])
+        self.assertTrue(result.milestones["iron_plate_16_pm"])
+        self.assertEqual(result.milestones_reached, 2)
+
+        legacy = eval_harness.evaluate(snapshot)
+        self.assertEqual(legacy, result.to_dict())
+
     def test_basic_milestones_use_totals(self):
         snapshot = {
             "produced": {
@@ -125,19 +182,35 @@ class EvaluateTest(unittest.TestCase):
 
 
 class QuerySnapshotTest(unittest.TestCase):
-    def test_query_snapshot_uses_mod_remote_not_inline_world_lua(self):
+    def test_query_snapshot_model_returns_typed_snapshot(self):
         rcon = FakeRcon(
             '{"produced":{"iron-plate":12},"rate_per_min":{"iron-plate":16}}\n'
         )
 
-        snapshot = eval_harness.query_snapshot(rcon, surface="nauvis")
+        snapshot = eval_harness.query_snapshot_model(rcon)
+
+        self.assertIsInstance(snapshot, EvalProductionSnapshot)
+        self.assertEqual(snapshot.produced, {"iron-plate": 12.0})
+        self.assertEqual(snapshot.rate_per_min, {"iron-plate": 16.0})
+
+    def test_query_snapshot_uses_validated_mod_remote_not_inline_world_lua(self):
+        rcon = FakeRcon(
+            '{"produced":{"iron-plate":12},"rate_per_min":{"iron-plate":16}}\n'
+        )
+
+        snapshot = eval_harness.query_snapshot(
+            rcon,
+            surface='nauvis") game.print("oops ]]',
+        )
 
         self.assertEqual(snapshot["produced"], {"iron-plate": 12.0})
         self.assertEqual(snapshot["rate_per_min"], {"iron-plate": 16.0})
         self.assertEqual(len(rcon.commands), 1)
         command = rcon.commands[0]
-        self.assertIn(
-            'remote.call("claude_interface", "eval_production_snapshot"', command
+        self.assertEqual(
+            command,
+            '/silent-command rcon.print(remote.call("claude_interface", '
+            '"eval_production_snapshot", [=[nauvis") game.print("oops ]]]=]))',
         )
         for forbidden in [
             "game.surfaces",
@@ -163,6 +236,27 @@ class QuerySnapshotTest(unittest.TestCase):
         snapshot = eval_harness.query_snapshot(BrokenRcon())
 
         self.assertEqual(snapshot, {"produced": {}, "rate_per_min": {}})
+
+
+class RunTest(unittest.TestCase):
+    def test_run_model_returns_typed_result_and_legacy_run_returns_dict(self):
+        rcon = FakeRcon(
+            '{"produced":{"iron-plate":1},"rate_per_min":{"iron-plate":16}}\n'
+        )
+
+        typed = eval_harness.run_model(rcon, duration_s=0, interval_s=1)
+
+        self.assertIsInstance(typed, EvalResult)
+        self.assertTrue(typed.milestones["automated_smelting"])
+        self.assertTrue(typed.milestones["iron_plate_16_pm"])
+
+        legacy_rcon = FakeRcon(
+            '{"produced":{"iron-plate":1},"rate_per_min":{"iron-plate":16}}\n'
+        )
+        self.assertEqual(
+            eval_harness.run(legacy_rcon, duration_s=0, interval_s=1),
+            typed.to_dict(),
+        )
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 import learning
+from models import LearningProposal, LearningProposalDraft
 
 
 class LearningTests(unittest.TestCase):
@@ -12,9 +13,9 @@ class LearningTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.base = Path(self.tempdir.name)
-        self.dir_patch = mock.patch(
-            "learning._learning_dir",
-            side_effect=lambda: self.base / ".factorioctl" / "learned",
+        self.env_patch = mock.patch.dict(
+            "os.environ",
+            {"BRIDGE_LEARNING_DIR": str(self.base / ".factorioctl" / "learned")},
         )
         self.ledger_patch = mock.patch(
             "ledger._ledger_file",
@@ -28,11 +29,11 @@ class LearningTests(unittest.TestCase):
             "journal._reflection_file",
             side_effect=lambda agent_name: self.base / f".reflection-{agent_name}.json",
         )
-        self.dir_patch.start()
+        self.env_patch.start()
         self.ledger_patch.start()
         self.journal_patch.start()
         self.reflection_patch.start()
-        self.addCleanup(self.dir_patch.stop)
+        self.addCleanup(self.env_patch.stop)
         self.addCleanup(self.ledger_patch.stop)
         self.addCleanup(self.journal_patch.stop)
         self.addCleanup(self.reflection_patch.stop)
@@ -65,6 +66,57 @@ evidence:
         self.assertEqual(proposal["steps"][0], "fix water path before steam path")
         self.assertEqual(proposal["anti_steps"], ["do not place duplicate offshore pumps"])
 
+    def test_parse_learning_trailer_models_returns_typed_proposals(self):
+        parsed = learning.parse_learning_trailer_models(
+            """Visible.
+<bug_report>
+name: belt_gap
+problem: route_belt cannot bridge the drill output
+steps:
+- run analyze_belt_gaps before rotating belts
+</bug_report>
+"""
+        )
+
+        self.assertEqual(len(parsed), 1)
+        self.assertIsInstance(parsed[0], LearningProposal)
+        self.assertEqual(parsed[0].kind, "bug_report")
+        self.assertEqual(parsed[0].name, "belt_gap")
+        self.assertEqual(
+            parsed[0].steps,
+            ["run analyze_belt_gaps before rotating belts"],
+        )
+
+        typed = LearningProposal.coerce({
+            "agent": "doug",
+            "kind": "bug_report",
+            "name": "typed_gap",
+            "problem": "typed proposal path",
+            "steps": ["keep proposal typed"],
+        })
+        draft = LearningProposalDraft(
+            kind="diagnostic_proposal",
+            name="typed_diagnostic",
+            problem="draft proposal path",
+            steps=["convert draft"],
+        )
+
+        self.assertEqual(learning.parse_learning_trailer_models(typed), [typed])
+        parsed_draft = learning.parse_learning_trailer_models(draft)
+        self.assertEqual(len(parsed_draft), 1)
+        self.assertIsInstance(parsed_draft[0], LearningProposal)
+        self.assertEqual(parsed_draft[0].kind, "diagnostic_proposal")
+        self.assertEqual(parsed_draft[0].name, "typed_diagnostic")
+        self.assertEqual(
+            [proposal.name for proposal in learning.parse_learning_trailer_models([
+                typed,
+                draft,
+                "bad input",
+                {"name": "dict_gap", "steps": ["coerce mapping"]},
+            ])],
+            ["typed_gap", "typed_diagnostic", "dict_gap"],
+        )
+
     def test_apply_learning_update_persists_pending_and_strip_hides_block(self):
         text = """Done.
 
@@ -91,6 +143,32 @@ evidence:
         self.assertEqual(data["kind"], "diagnostic_proposal")
         self.assertEqual(data["agent"], "doug")
         self.assertIn("offshore pumps", data["acceptance_tests"][0])
+
+    def test_apply_learning_update_accepts_typed_proposals(self):
+        proposal = LearningProposal.coerce({
+            "agent": "old-agent",
+            "kind": "script_proposal",
+            "name": "route_belt_debugger",
+            "problem": "belt routing keeps looping",
+            "steps": ["call analyze_belt_gaps first"],
+        })
+        draft = LearningProposalDraft(
+            kind="bug_report",
+            name="stale_planner_loop",
+            problem="planner keeps validating instead of executing",
+            steps=["preserve plan_ready signal"],
+        )
+
+        saved = learning.apply_learning_update("doug", (proposal, draft))
+
+        self.assertEqual(len(saved), 2)
+        loaded = [json.loads(path.read_text()) for path in saved]
+        self.assertEqual([item["agent"] for item in loaded], ["doug", "doug"])
+        self.assertEqual([item["status"] for item in loaded], ["pending", "pending"])
+        self.assertEqual(
+            [item["name"] for item in loaded],
+            ["route_belt_debugger", "stale_planner_loop"],
+        )
 
     def test_finalize_reply_persists_proposal_without_showing_player(self):
         import pipe
@@ -155,6 +233,70 @@ evidence:
         self.assertNotIn("pending_noise", rendered)
         self.assertNotIn("connect poles", rendered)
         self.assertNotIn("do not rebuild whole plant", rendered)
+
+    def test_load_accepted_learning_ignores_corrupt_candidate_files(self):
+        accepted_dir = self.base / ".factorioctl" / "learned" / "accepted"
+        accepted_dir.mkdir(parents=True)
+        (accepted_dir / "bad.json").write_text("{not json")
+        learning.save_candidate({
+            "agent": "doug",
+            "kind": "bug_report",
+            "name": "belt_gap",
+            "steps": ["run analyze_belt_gaps"],
+        }, status="accepted")
+
+        loaded = learning.load_accepted_learning()
+        loaded_models = learning.load_accepted_learning_model()
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["name"], "belt_gap")
+        self.assertEqual(len(loaded_models), 1)
+        self.assertIsInstance(loaded_models[0], LearningProposal)
+        self.assertEqual(loaded_models[0].name, "belt_gap")
+        self.assertEqual([model.to_dict() for model in loaded_models], loaded)
+
+    def test_render_accepted_learning_accepts_typed_proposals(self):
+        candidates = (
+            candidate
+            for candidate in [
+            "bad input",
+            LearningProposal.coerce({
+                "agent": "doug",
+                "kind": "diagnostic_proposal",
+                "name": "repair_power",
+                "trigger": "lab has no power",
+                "steps": ["inspect poles", "fuel boiler", "verify production"],
+                "anti_steps": ["do not rebuild known-good pump"],
+            }, status="accepted"),
+            ]
+        )
+        rendered = learning.render_accepted_learning(candidates)
+
+        self.assertIn("repair_power", rendered)
+        self.assertIn("when lab has no power", rendered)
+        self.assertIn("do inspect poles; fuel boiler; verify production", rendered)
+        self.assertIn("avoid do not rebuild known-good pump", rendered)
+        self.assertNotIn("bad input", rendered)
+
+    def test_save_candidate_accepts_typed_proposal_and_preserves_json_shape(self):
+        proposal = LearningProposal.coerce({
+            "agent": "doug",
+            "kind": "bug_report",
+            "name": "belt_direction_mismatch",
+            "problem": "belts face the wrong way near drill output",
+            "steps": ["analyze_belt_reach before rotating belts"],
+        })
+
+        path = learning.save_candidate(proposal, status="accepted")
+
+        self.assertIsNotNone(path)
+        data = json.loads(path.read_text())
+        self.assertEqual(data["status"], "accepted")
+        self.assertEqual(data["kind"], "bug_report")
+        self.assertEqual(data["name"], "belt_direction_mismatch")
+        self.assertEqual(data["agent"], "doug")
+        self.assertEqual(data["content_hash"], proposal.stable_content_hash())
+        self.assertIn("created_at", data)
 
     def test_promote_candidate_moves_pending_to_accepted_memory(self):
         source = learning.save_candidate({

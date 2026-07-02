@@ -3,8 +3,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import report as bridge_report
+from models import BridgeLogMessage, BridgeLogRecord, McpTextPayload, RconJsonResponse
 
 
 class FakeRCON:
@@ -13,11 +15,18 @@ class FakeRCON:
 
     def execute(self, command):
         self.commands.append(command)
-        if "live_state_line" in command:
-            return (
-                "Live state: nauvis @ 46.7,-15.6; player entities: "
-                "electric-mining-drill=1, stone-furnace=2, lab=1"
-            )
+        if "live_state_result" in command:
+            return json.dumps({
+                "found": True,
+                "surface": "nauvis",
+                "x": 46.7,
+                "y": -15.6,
+                "entity_counts": {
+                    "electric-mining-drill": 1,
+                    "stone-furnace": 2,
+                    "lab": 1,
+                },
+            })
         if "get_power_status" in command:
             return json.dumps({
                 "network_id": 7,
@@ -41,6 +50,28 @@ class BrokenRCON:
         raise ConnectionError("server down")
 
 
+class DiagnosticPowerRCON:
+    def execute(self, command):
+        if "live_state_result" in command:
+            return json.dumps({
+                "found": True,
+                "surface": "nauvis",
+                "x": 46.7,
+                "y": -15.6,
+                "entity_counts": {"boiler": 1},
+            })
+        if "get_power_status" in command:
+            return json.dumps({
+                "next_action": "repair_existing_steam_power",
+                "existing_plant": {
+                    "summary": {"issue_count": 1, "critical_issues": 1},
+                    "issues": [{"type": "boiler_no_fuel"}],
+                    "status": "critical",
+                },
+            })
+        raise AssertionError(command)
+
+
 def log_line(message, ts, *, agent="DOUG-NAUVIS", level="INFO"):
     return json.dumps({
         "record": {
@@ -56,6 +87,36 @@ def log_line(message, ts, *, agent="DOUG-NAUVIS", level="INFO"):
 
 
 class BridgeReportTest(unittest.TestCase):
+    def test_iter_records_uses_typed_loguru_model_and_skips_bad_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge-test.jsonl"
+            path.write_text(
+                "\n".join([
+                    "not json",
+                    json.dumps({"record": "bad"}),
+                    json.dumps({
+                        "record": {
+                            "message": {"shape": "coerced"},
+                            "extra": {"agent": "doug-nauvis"},
+                            "level": {"name": "WARNING"},
+                            "time": {
+                                "repr": "2026-06-30 13:00:00.000000-05:00",
+                                "timestamp": "12.5",
+                            },
+                        },
+                    }),
+                ]) + "\n"
+            )
+
+            records = list(bridge_report.iter_records(path))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].message, "{'shape': 'coerced'}")
+        self.assertEqual(records[0].timestamp, 12.5)
+        self.assertEqual(records[0].time, "2026-06-30 13:00:00.000000-05:00")
+        self.assertEqual(records[0].level, "WARNING")
+        self.assertEqual(records[0].agent, "doug-nauvis")
+
     def test_analyze_log_summarizes_attempts_progress_failures_and_provider_pause(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bridge-test.jsonl"
@@ -119,8 +180,55 @@ class BridgeReportTest(unittest.TestCase):
         )
         self.assertIn("provider paused", report.verdict)
 
+    def test_analyze_records_accepts_typed_records_without_file_roundtrip(self):
+        done_line = json.dumps({
+            "record": {
+                "message": "done: $1.0000 | 10 turns | 60.0s",
+                "time": {"timestamp": 1020, "repr": "end"},
+                "level": {"name": "INFO"},
+                "extra": {"agent": "DOUG-NAUVIS"},
+            },
+        })
+        records = (
+            BridgeLogRecord(
+                message="spawning claude sdk [model=haiku] (new session)",
+                timestamp=1000,
+                time="start",
+                agent="DOUG-NAUVIS",
+            ),
+            BridgeLogRecord(
+                message=(
+                    "autonomy -> doug-nauvis: <ledger>\n"
+                    "objective: Build automation\n"
+                    "progress: typed records analyzed\n"
+                    "</ledger>"
+                ),
+                timestamp=1010,
+                time="middle",
+                agent="DOUG-NAUVIS",
+            ),
+            done_line,
+            "{bad json}",
+        )
+
+        report = bridge_report.analyze_records(
+            records,
+            log_path="typed-memory",
+            recent_progress_window_s=60,
+        )
+
+        self.assertEqual(report.log_path, "typed-memory")
+        self.assertEqual(report.started_at, "start")
+        self.assertEqual(report.ended_at, "end")
+        self.assertEqual(report.duration_s, 20)
+        self.assertEqual(report.sdk_attempts, 1)
+        self.assertEqual(report.sdk_done, 1)
+        self.assertEqual(report.latest_objective, "Build automation")
+        self.assertEqual(report.latest_progress, "typed records analyzed")
+        self.assertEqual(report.recent_progress_events, 1)
+
     def test_game_rejection_signature_unwraps_nested_mcp_text_payload(self):
-        signature = bridge_report._game_rejection_signature(
+        signature = BridgeLogMessage.first_gameplay_rejection_signature_from_text(
             'tool_result game_rejected: [{"type":"text","text":"{'
             '\\"success\\": false, \\"queued\\": 0, '
             '\\"error\\": \\"Crafting did not start\\", '
@@ -129,8 +237,41 @@ class BridgeReportTest(unittest.TestCase):
 
         self.assertEqual(signature, "Crafting did not start | recipe=transport-belt")
 
+    def test_report_mcp_payload_parser_uses_shared_unwrapper(self):
+        payload = json.dumps([{
+            "type": "text",
+            "text": json.dumps({
+                "success": False,
+                "error": "Cannot place entity here",
+            }),
+        }])
+        malformed = json.dumps([{
+            "type": "text",
+            "text": '{"success":false,"error":"truncated',
+        }])
+
+        self.assertEqual(
+            McpTextPayload.from_text(payload).value,
+            {"success": False, "error": "Cannot place entity here"},
+        )
+        self.assertEqual(
+            McpTextPayload.from_text(malformed).value,
+            '{"success":false,"error":"truncated',
+        )
+
+    def test_report_json_response_parser_uses_typed_rcon_response(self):
+        self.assertEqual(
+            RconJsonResponse.parse_value(
+                "Factorio says hello\n"
+                '{"network_id": 7, "pole_count": 15}\n'
+            ),
+            {"network_id": 7, "pole_count": 15},
+        )
+        with self.assertRaisesRegex(ValueError, "rcon_response: did not contain JSON"):
+            RconJsonResponse.parse_value("nope")
+
     def test_research_status_payload_is_not_a_gameplay_rejection_signature(self):
-        signature = bridge_report._game_rejection_signature(
+        signature = BridgeLogMessage.first_gameplay_rejection_signature_from_text(
             'tool_result game_rejected: [{"type":"text","text":"{'
             '\\"researched_count\\":6,\\"total_count\\":275,'
             '\\"research_progress\\":0.36,'
@@ -142,7 +283,7 @@ class BridgeReportTest(unittest.TestCase):
         self.assertEqual(signature, "")
 
     def test_truncated_research_status_text_is_not_a_rejection_signature(self):
-        signature = bridge_report._game_rejection_signature(
+        signature = BridgeLogMessage.first_gameplay_rejection_signature_from_text(
             '- failure: game_rejected: [{"type":"text","text":"{'
             '\\"researched_count\\":6,\\"total_count\\":275,'
             '\\"research_progress\\":0.36,\\"research_queue\\":[{\\"name\\":\\"stee'
@@ -160,10 +301,10 @@ class BridgeReportTest(unittest.TestCase):
             }),
         }])
 
-        signature = bridge_report._game_rejection_signature(
+        signature = BridgeLogMessage.first_gameplay_rejection_signature_from_text(
             f"tool_result game_rejected: {payload}"
         )
-        truncated_signature = bridge_report._game_rejection_signature(
+        truncated_signature = BridgeLogMessage.first_gameplay_rejection_signature_from_text(
             "- failure: game_rejected: "
             "[{\"type\":\"text\",\"text\":\"{\\\"success\\\":false,"
             "\\\"error\\\":\\\"value for required field 'category' is missing"
@@ -201,7 +342,26 @@ class BridgeReportTest(unittest.TestCase):
             [("Cannot place entity here | entity=transport-belt", 1)],
         )
 
-    def test_analyze_log_ignores_low_value_planning_progress(self):
+    def test_analyze_log_uses_typed_entity_summary_parser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge-test.jsonl"
+            path.write_text("\n".join([
+                log_line("Logging to logs/bridge-test.log", 1000, agent="system"),
+                log_line(
+                    "Live state: nauvis @ 1,2; player entities: "
+                    "stone-furnace=2, transport-belt=16, stone-furnace=1",
+                    1010,
+                ),
+            ]) + "\n")
+
+            report = bridge_report.analyze_log(path)
+
+        self.assertEqual(
+            report.latest_entities,
+            "stone-furnace=3, transport-belt=16",
+        )
+
+    def test_analyze_log_preserves_planning_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bridge-test.jsonl"
             path.write_text("\n".join([
@@ -224,8 +384,13 @@ class BridgeReportTest(unittest.TestCase):
 
             report = bridge_report.analyze_log(path, recent_progress_window_s=60)
 
-        self.assertEqual(report.latest_progress, "diagnosed boiler_no_fuel and pole gap")
+        self.assertEqual(
+            report.latest_progress,
+            "no change across fifty-four planning ticks. "
+            "State stable. Plan fully validated and awaiting execution turns.",
+        )
         self.assertEqual(report.recent_progress_events, 0)
+        self.assertIn("no recent progress", report.verdict)
 
     def test_analyze_log_compacts_power_tool_results_and_ignores_prompt_noise(self):
         diagnose_payload = json.dumps([{
@@ -303,13 +468,66 @@ class BridgeReportTest(unittest.TestCase):
 
         self.assertEqual(report.latest_power, "text: Power grid operational.")
 
+    def test_power_compaction_uses_typed_remote_payload_models(self):
+        self.assertEqual(
+            BridgeLogMessage.power_summary_from_payload({
+                "network_id": 7,
+                "pole_count": 15,
+                "generators": [
+                    {"name": "steam-engine", "count": 1},
+                    "not a generator",
+                ],
+                "consumers": {
+                    "working": 3,
+                    "low_power": 0,
+                    "no_power": 0,
+                    "total": 3,
+                },
+                "production_kw": 900,
+                "consumption_kw": 120,
+                "satisfaction": "ok",
+            }),
+            "network=7; poles=15; generators=steam-engine=1; "
+            "consumers=3 working/0 low/0 none/3 total; "
+            "production_kw=900; consumption_kw=120; satisfaction=ok",
+        )
+        self.assertEqual(
+            BridgeLogMessage.power_summary_from_payload({"error": "server down"}),
+            "unavailable: server down",
+        )
+        self.assertEqual(
+            BridgeLogMessage.power_summary_from_payload({
+                "next_action": "repair_existing_steam_power",
+                "existing_plant": {
+                    "summary": {"issue_count": 1, "critical_issues": 1},
+                    "issues": [{"type": "boiler_no_fuel"}],
+                    "status": "critical",
+                },
+            }),
+            "steam_power status=critical; issues=1; critical=1; "
+            "types=boiler_no_fuel; next=repair_existing_steam_power",
+        )
+
+    def test_message_predicate_helpers_use_typed_log_models(self):
+        self.assertTrue(BridgeLogMessage.from_text(
+            "<ledger>\nprogress: belts fixed\n</ledger>",
+        ).progress_event)
+        self.assertFalse(BridgeLogMessage.from_text("ordinary line").progress_event)
+
+        self.assertTrue(BridgeLogMessage.from_text(
+            "text: Power layout: steam engine sits north of the boiler.",
+        ).power_evidence.is_power)
+        self.assertFalse(BridgeLogMessage.from_text(
+            "autonomy -> doug: Power layout: steam engine sits north of the boiler.",
+        ).power_evidence.is_power)
+
     def test_game_rejection_lines_extracts_prompt_embedded_entries(self):
-        lines = bridge_report._game_rejection_lines(
+        lines = BridgeLogMessage.from_text(
             "autonomy -> doug:\n"
             "- failure: game_rejected: one\n"
             "- progress: ok\n"
             "- failure: game_rejected: two\n"
-        )
+        ).gameplay_rejection_lines
 
         self.assertEqual(lines, [
             "- failure: game_rejected: one",
@@ -360,13 +578,23 @@ class BridgeReportTest(unittest.TestCase):
         self.assertIn("steam-engine=1", report.live_power)
         self.assertIn("satisfaction=ok", report.live_power)
         command_text = "\n".join(fake.commands)
-        self.assertIn('remote.call("claude_interface", "live_state_line"', command_text)
+        self.assertIn('remote.call("claude_interface", "live_state_result"', command_text)
         self.assertIn('remote.call("claude_interface", "get_power_status"', command_text)
         self.assertNotIn("game.surfaces", command_text)
 
         formatted = bridge_report.format_report(report)
         self.assertIn("live_state: Live state: nauvis", formatted)
         self.assertIn("live_power: network=7", formatted)
+
+    def test_enrich_live_state_compacts_power_diagnostic_payload(self):
+        report = bridge_report.BridgeRunReport()
+
+        bridge_report.enrich_live_state(report, DiagnosticPowerRCON())
+
+        self.assertTrue(report.live_connected)
+        self.assertIn("steam_power status=critical", report.live_power)
+        self.assertIn("types=boiler_no_fuel", report.live_power)
+        self.assertIn("next=repair_existing_steam_power", report.live_power)
 
     def test_enrich_live_state_records_nonfatal_rcon_errors(self):
         report = bridge_report.BridgeRunReport()
@@ -377,6 +605,18 @@ class BridgeReportTest(unittest.TestCase):
         self.assertFalse(report.live_connected)
         self.assertIn("server down", report.live_error)
         self.assertIn("live: unavailable", bridge_report.format_report(report))
+
+    def test_parse_args_uses_typed_rcon_env_defaults_without_bad_env_crash(self):
+        with mock.patch.dict(os.environ, {
+            "FACTORIO_RCON_HOST": "rcon.local",
+            "FACTORIO_RCON_PORT": "bad",
+            "FACTORIO_RCON_PASSWORD": "secret",
+        }):
+            args = bridge_report.parse_args(["--no-live"])
+
+        self.assertEqual(args.rcon_host, "rcon.local")
+        self.assertEqual(args.rcon_port, 27015)
+        self.assertEqual(args.rcon_password, "secret")
 
     def test_latest_log_returns_newest_jsonl_log(self):
         with tempfile.TemporaryDirectory() as tmp:

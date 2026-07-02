@@ -14,15 +14,14 @@ reached.
 from __future__ import annotations
 
 import argparse
-import json
 import time
 from typing import Any, Callable
 
+from models import EvalMilestoneSpec, EvalProductionSnapshot, EvalResult, RconRemoteCall
 from rcon import RCONClient, lua_long_string
 
 
-Snapshot = dict[str, dict[str, float]]
-Milestone = tuple[str, Callable[[dict[str, Any]], bool]]
+Milestone = tuple[str, Callable[[Any], bool]]
 
 
 VALUES: dict[str, float] = {
@@ -41,199 +40,150 @@ VALUES: dict[str, float] = {
 }
 
 
-def _number(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+def _eval_result(value: Any) -> EvalResult:
+    return EvalResult.coerce(
+        value,
+        milestone_names=tuple(spec.name for spec in MILESTONE_SPECS),
+    )
 
 
-def _bucket(snapshot: dict[str, Any], key: str) -> dict[str, Any]:
-    value = snapshot.get(key)
-    if isinstance(value, dict):
-        return value
-    return {}
-
-
-def _any_positive(values: dict[str, Any], items: tuple[str, ...]) -> bool:
-    return any(_number(values.get(item)) > 0 for item in items)
-
-
-def _rate_at_least(snapshot: dict[str, Any], item: str, threshold: float) -> bool:
-    return _number(_bucket(snapshot, "rate_per_min").get(item)) >= threshold
-
-
-def production_score(produced: dict[str, float]) -> float:
+def production_score(produced: dict[str, float] | EvalProductionSnapshot) -> float:
     """Return the weighted value of known early-game items; unknowns are ignored."""
-    if not isinstance(produced, dict):
-        return 0.0
-    return sum(_number(produced.get(item)) * value for item, value in VALUES.items())
+    snapshot = (
+        produced
+        if isinstance(produced, EvalProductionSnapshot)
+        else EvalProductionSnapshot(produced=EvalProductionSnapshot.as_float_map(produced))
+    )
+    return snapshot.production_score(VALUES)
 
 
-MILESTONES: list[Milestone] = [
-    (
+MILESTONE_SPECS: list[EvalMilestoneSpec] = [
+    EvalMilestoneSpec.any_produced(
         "burner_mining",
-        lambda snapshot: _any_positive(
-            _bucket(snapshot, "produced"),
-            ("iron-ore", "copper-ore", "coal"),
-        ),
+        ("iron-ore", "copper-ore", "coal"),
     ),
-    (
+    EvalMilestoneSpec.any_produced(
         "automated_smelting",
-        lambda snapshot: _any_positive(
-            _bucket(snapshot, "produced"),
-            ("iron-plate", "copper-plate"),
-        ),
+        ("iron-plate", "copper-plate"),
     ),
-    (
+    EvalMilestoneSpec.any_produced(
         "green_circuits",
-        lambda snapshot: _any_positive(
-            _bucket(snapshot, "produced"),
-            ("electronic-circuit",),
-        ),
+        ("electronic-circuit",),
     ),
-    (
+    EvalMilestoneSpec.any_produced(
         "red_science",
-        lambda snapshot: _any_positive(
-            _bucket(snapshot, "produced"),
-            ("automation-science-pack",),
-        ),
+        ("automation-science-pack",),
     ),
-    (
+    EvalMilestoneSpec.rate_at_least(
         "iron_plate_16_pm",
-        lambda snapshot: _rate_at_least(snapshot, "iron-plate", 16.0),
+        "iron-plate",
+        16.0,
     ),
-    (
+    EvalMilestoneSpec.rate_at_least(
         "red_science_16_pm",
-        lambda snapshot: _rate_at_least(snapshot, "automation-science-pack", 16.0),
+        "automation-science-pack",
+        16.0,
     ),
+]
+MILESTONES: list[Milestone] = [
+    (spec.name, spec.reached)
+    for spec in MILESTONE_SPECS
 ]
 
 
-def evaluate(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate a production snapshot.
+def evaluate_model(snapshot: EvalProductionSnapshot | dict[str, Any]) -> EvalResult:
+    """Evaluate a production snapshot and return the typed result.
 
     production_score uses rate_per_min when present, because that mirrors FLE's
     throughput/open-play yardstick better than cumulative totals. If no rate
     table is available, it falls back to produced totals so partial/offline
     snapshots remain useful.
     """
-    if not isinstance(snapshot, dict):
-        snapshot = {}
-
-    rate_per_min = _bucket(snapshot, "rate_per_min")
-    produced = _bucket(snapshot, "produced")
-    score_source = rate_per_min if rate_per_min else produced
+    typed_snapshot = EvalProductionSnapshot.coerce(snapshot)
 
     milestones: dict[str, bool] = {}
-    for name, predicate in MILESTONES:
+    for spec in MILESTONE_SPECS:
         try:
-            milestones[name] = bool(predicate(snapshot))
+            milestones[spec.name] = spec.reached(typed_snapshot)
         except Exception:
-            milestones[name] = False
+            milestones[spec.name] = False
 
-    return {
-        "production_score": production_score(score_source),
-        "milestones": milestones,
-        "milestones_reached": sum(1 for reached in milestones.values() if reached),
-    }
-
-
-def _as_float_map(value: Any) -> dict[str, float]:
-    if not isinstance(value, dict):
-        return {}
-    result: dict[str, float] = {}
-    for key, raw in value.items():
-        amount = _number(raw)
-        if amount:
-            result[str(key)] = amount
-    return result
+    return EvalResult.create(
+        production_score=typed_snapshot.production_score(VALUES),
+        milestones=milestones,
+    )
 
 
-def _last_json_object(text: str) -> dict[str, Any] | None:
-    for line in reversed(text.splitlines()):
-        candidate = line.strip()
-        if not candidate:
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
+def evaluate(snapshot: EvalProductionSnapshot | dict[str, Any]) -> dict[str, Any]:
+    """Evaluate a production snapshot and return the legacy dict shape."""
+    return evaluate_model(snapshot).to_dict()
 
 
-def query_snapshot(rcon: Any, surface: str = "nauvis") -> Snapshot:
+def query_snapshot_model(rcon: Any, surface: str = "nauvis") -> EvalProductionSnapshot:
     """Read force item production statistics over RCON.
 
     Errors return an empty snapshot so the benchmark can keep running and report
     a zero score instead of crashing on transient RCON or Lua issues.
     """
-    empty: Snapshot = {"produced": {}, "rate_per_min": {}}
     surface_literal = lua_long_string(surface)
-    lua = (
-        'rcon.print(remote.call("claude_interface", "eval_production_snapshot", '
-        f"{surface_literal}))"
-    )
     try:
-        response = rcon.execute("/silent-command " + lua)
-        parsed = _last_json_object(response)
-        if parsed is None:
-            return empty
-        return {
-            "produced": _as_float_map(parsed.get("produced")),
-            "rate_per_min": _as_float_map(parsed.get("rate_per_min")),
-        }
+        response = rcon.execute(RconRemoteCall.command(
+            "eval_production_snapshot",
+            surface_literal,
+        ))
+        return EvalProductionSnapshot.from_rcon_text(response)
     except Exception:
-        return empty
+        return EvalProductionSnapshot()
+
+
+def query_snapshot(rcon: Any, surface: str = "nauvis") -> dict[str, dict[str, float]]:
+    """Read production stats and return the legacy snapshot dict shape."""
+    return query_snapshot_model(rcon, surface=surface).to_dict()
 
 
 def _format_report(
     elapsed_s: float,
-    result: dict[str, Any],
+    result: EvalResult | dict[str, Any],
     first_reached: dict[str, float],
 ) -> str:
-    milestones = result.get("milestones", {})
+    evaluation = _eval_result(result)
     lines = [
-        f"[eval] elapsed={elapsed_s:.0f}s score={result.get('production_score', 0.0):.2f} "
-        f"milestones={result.get('milestones_reached', 0)}/{len(MILESTONES)}",
+        f"[eval] elapsed={elapsed_s:.0f}s score={evaluation.production_score:.2f} "
+        f"milestones={evaluation.milestones_reached}/{len(MILESTONE_SPECS)}",
     ]
-    for name, _ in MILESTONES:
-        reached = bool(milestones.get(name))
+    for spec in MILESTONE_SPECS:
+        name = spec.name
+        reached = bool(evaluation.milestones.get(name))
         first = first_reached.get(name)
         suffix = f" at {first:.0f}s" if first is not None else ""
         lines.append(f"  [{'x' if reached else ' '}] {name}{suffix}")
     return "\n".join(lines)
 
 
-def run(
+def run_model(
     rcon: Any,
     duration_s: float,
     interval_s: float,
     surface: str = "nauvis",
-) -> dict[str, Any]:
-    """Sample production stats for duration_s and print a readable report."""
+) -> EvalResult:
+    """Sample production stats for duration_s and return the typed result."""
     duration_s = max(0.0, float(duration_s))
     interval_s = max(1.0, float(interval_s))
     started = time.monotonic()
     deadline = started + duration_s
-    best_result: dict[str, Any] | None = None
-    final_result: dict[str, Any] = evaluate({})
+    best_result: EvalResult | None = None
+    final_result = _eval_result(evaluate_model(EvalProductionSnapshot()))
     first_reached: dict[str, float] = {}
 
     while True:
         elapsed = time.monotonic() - started
-        snapshot = query_snapshot(rcon, surface=surface)
-        final_result = evaluate(snapshot)
+        snapshot = query_snapshot_model(rcon, surface=surface)
+        final_result = _eval_result(evaluate_model(snapshot))
 
-        if (
-            best_result is None
-            or final_result["production_score"] > best_result["production_score"]
-        ):
-            best_result = dict(final_result)
+        if final_result.is_better_than(best_result):
+            best_result = final_result
 
-        for name, reached in final_result["milestones"].items():
+        for name, reached in final_result.milestones.items():
             if reached and name not in first_reached:
                 first_reached[name] = elapsed
 
@@ -245,11 +195,26 @@ def run(
 
     if best_result is not None:
         print(
-            f"[eval] best_score={best_result['production_score']:.2f} "
-            f"final_score={final_result['production_score']:.2f}",
+            f"[eval] best_score={best_result.production_score:.2f} "
+            f"final_score={final_result.production_score:.2f}",
             flush=True,
         )
     return final_result
+
+
+def run(
+    rcon: Any,
+    duration_s: float,
+    interval_s: float,
+    surface: str = "nauvis",
+) -> dict[str, Any]:
+    """Sample production stats for duration_s and return the legacy dict shape."""
+    return run_model(
+        rcon,
+        duration_s,
+        interval_s,
+        surface=surface,
+    ).to_dict()
 
 
 def main() -> int:

@@ -7,6 +7,7 @@ from unittest import mock
 
 import journal
 import ledger
+from models import LedgerState, LedgerUpdate, ProgressSignal
 
 
 class LedgerTests(unittest.TestCase):
@@ -50,20 +51,75 @@ progress: Placed the first drill
         self.assertEqual(parsed["plan_steps"], ["Mine iron ore", "Feed a furnace"])
         self.assertEqual(parsed["progress"], "Placed the first drill")
 
+    def test_parse_ledger_trailer_model_returns_typed_update(self):
+        parsed = ledger.parse_ledger_trailer_model(
+            "<ledger>\n"
+            "objective: Activate second furnace\n"
+            "plan:\n"
+            "- walk_to (42, -21)\n"
+            "progress: previous objective complete; new objective selected\n"
+            "signal: new_objective\n"
+            "</ledger>"
+        )
+
+        self.assertIsInstance(parsed, LedgerUpdate)
+        self.assertEqual(parsed.objective, "Activate second furnace")
+        self.assertEqual(parsed.plan_steps, ["walk_to (42, -21)"])
+        self.assertEqual(parsed.progress, "previous objective complete; new objective selected")
+        self.assertEqual(parsed.signal, ProgressSignal.NEW_OBJECTIVE)
+
+        typed = LedgerUpdate(
+            objective="Typed objective",
+            plan_steps=["typed step"],
+            progress="typed progress",
+            signal=ProgressSignal.PLAN_DONE,
+        )
+        self.assertIs(ledger.parse_ledger_trailer_model(typed), typed)
+
     def test_parse_returns_none_without_ledger_block(self):
         self.assertIsNone(ledger.parse_ledger_trailer("Plain narration only."))
+        self.assertIsNone(ledger.parse_ledger_trailer_model("Plain narration only."))
 
     def test_parse_tolerates_missing_keys(self):
         parsed = ledger.parse_ledger_trailer("<ledger>\nprogress: Checked the belt.\n</ledger>")
 
         self.assertEqual(parsed, {"progress": "Checked the belt."})
 
+    def test_parse_ledger_trailer_carries_structured_signal(self):
+        parsed = ledger.parse_ledger_trailer(
+            "<ledger>\n"
+            "objective: Activate second furnace\n"
+            "plan:\n"
+            "- walk_to (42, -21)\n"
+            "progress: previous objective complete; new objective selected\n"
+            "signal: new_objective\n"
+            "</ledger>"
+        )
+
+        self.assertEqual(parsed["objective"], "Activate second furnace")
+        self.assertEqual(parsed["signal"], "new_objective")
+
+    def test_parse_ledger_trailer_infers_plan_ready_for_omitted_signal(self):
+        parsed = ledger.parse_ledger_trailer(
+            "<ledger>\n"
+            "objective: Activate second furnace\n"
+            "plan:\n"
+            "- walk_to (42, -21)\n"
+            "- insert_items coal count=5 into fuel inventory of unit 15\n"
+            "progress: plan confirmed; awaiting execution\n"
+            "</ledger>"
+        )
+
+        self.assertEqual(parsed["signal"], "plan_ready")
+
     def test_load_returns_default_for_missing_and_corrupt_file(self):
         self.assertEqual(ledger.load_ledger("doug"), ledger.default_ledger())
+        self.assertIsInstance(ledger.load_ledger_model("doug"), LedgerState)
 
         (self.base / ".ledger-doug.json").write_text("{not json")
 
         self.assertEqual(ledger.load_ledger("doug"), ledger.default_ledger())
+        self.assertEqual(ledger.load_ledger_model("doug"), ledger.default_ledger_model())
 
     def test_save_then_load_round_trips(self):
         saved = {
@@ -76,9 +132,35 @@ progress: Placed the first drill
         ledger.save_ledger("doug", saved)
 
         self.assertEqual(ledger.load_ledger("doug"), saved)
+        self.assertEqual(ledger.load_ledger_model("doug").to_dict(), saved)
         self.assertTrue((self.base / ".ledger-doug.json").read_text().endswith("\n"))
 
-    def test_load_and_apply_drop_low_value_planning_progress(self):
+    def test_model_ledger_api_round_trips_without_dict_churn(self):
+        saved = LedgerState(
+            objective="Automate iron",
+            plan_steps=["Place drill", "Route belt"],
+            progress_notes=["Found patch"],
+            updated_at="2026-06-30T04:22:28",
+        )
+
+        ledger.save_ledger_model("doug", saved)
+        loaded = ledger.load_ledger_model("doug")
+
+        self.assertIsInstance(loaded, LedgerState)
+        self.assertEqual(loaded, saved)
+
+        updated = ledger.apply_ledger_update_model(
+            "doug",
+            LedgerUpdate(progress="belt fixed", signal=ProgressSignal.PLAN_DONE),
+        )
+
+        self.assertIsInstance(updated, LedgerState)
+        self.assertEqual(updated.objective, "Automate iron")
+        self.assertEqual(updated.plan_steps, ["Place drill", "Route belt"])
+        self.assertEqual(updated.progress_notes, ["Found patch", "belt fixed"])
+        self.assertEqual(ledger.load_ledger("doug"), updated.to_dict())
+
+    def test_load_and_apply_preserve_planning_progress_without_signal(self):
         saved = {
             "objective": "Repair existing power",
             "plan_steps": ["fuel boiler"],
@@ -93,7 +175,7 @@ progress: Placed the first drill
         ledger.save_ledger("doug", saved)
 
         loaded = ledger.load_ledger("doug")
-        self.assertEqual(loaded["progress_notes"], ["Found boiler unit 49 with no fuel"])
+        self.assertEqual(loaded["progress_notes"], saved["progress_notes"])
 
         updated = ledger.apply_ledger_update(
             "doug",
@@ -102,7 +184,12 @@ progress: Placed the first drill
             "</ledger>",
         )
 
-        self.assertEqual(updated["progress_notes"], ["Found boiler unit 49 with no fuel"])
+        self.assertEqual(updated["progress_notes"], [
+            "Found boiler unit 49 with no fuel",
+            "no change across fifty-four planning ticks. State stable. "
+            "Plan fully validated and awaiting execution turns.",
+            "no changes across planning ticks; plan validated and ready for execution",
+        ])
 
     def test_stale_bootstrap_ledger_returns_default(self):
         stale = {
@@ -125,6 +212,21 @@ progress: Placed the first drill
 
             ledger.save_ledger("doug", recent)
             self.assertEqual(ledger.load_ledger("doug"), recent)
+
+    def test_stale_bootstrap_ledger_bad_env_uses_typed_default(self):
+        stale = {
+            "objective": "Establish initial extraction infrastructure on iron patch",
+            "plan_steps": ["place_entity burner-mining-drill on iron ore"],
+            "progress_notes": ["situation assessed; no infrastructure yet deployed"],
+            "updated_at": (datetime.now() - timedelta(hours=2)).isoformat(),
+        }
+
+        with mock.patch.dict(
+            "os.environ",
+            {"BRIDGE_STALE_BOOTSTRAP_LEDGER_MAX_AGE_S": "not-a-number"},
+        ):
+            ledger.save_ledger("doug", stale)
+            self.assertEqual(ledger.load_ledger("doug"), ledger.default_ledger())
 
     def test_apply_update_replaces_plan_for_new_objective_and_caps_progress(self):
         for i in range(11):

@@ -3,9 +3,44 @@ local inventory = require("inventory")
 
 local M = {}
 
+local LIVE_STATE_ENTITY_NAMES = {
+    "burner-mining-drill",
+    "electric-mining-drill",
+    "stone-furnace",
+    "assembling-machine-1",
+    "transport-belt",
+    "burner-inserter",
+    "inserter",
+    "small-electric-pole",
+    "medium-electric-pole",
+    "offshore-pump",
+    "boiler",
+    "steam-engine",
+    "pipe",
+    "lab",
+}
+
 local function pos_table(pos)
     if not pos then return nil end
     return {x = pos.x, y = pos.y}
+end
+
+local function live_state_entity_counts(character)
+    local counts = {}
+    for _, name in ipairs(LIVE_STATE_ENTITY_NAMES) do
+        local count = #character.surface.find_entities_filtered{force = character.force, name = name}
+        if count > 0 then counts[name] = count end
+    end
+    return counts
+end
+
+local function live_state_entity_parts(counts)
+    local parts = {}
+    for _, name in ipairs(LIVE_STATE_ENTITY_NAMES) do
+        local count = counts[name]
+        if count and count > 0 then parts[#parts + 1] = name .. "=" .. count end
+    end
+    return parts
 end
 
 function M.find(agent_id)
@@ -56,6 +91,13 @@ function M.ensure_surface(planet_name)
     return "created"
 end
 
+function M.ensure_surface_result(planet_name)
+    return helpers.table_to_json({
+        planet = planet_name,
+        status = M.ensure_surface(planet_name),
+    })
+end
+
 function M.pre_place(agent_id, planet_name, spawn_x)
     local target_surface = game.surfaces[planet_name]
     if not target_surface then return "surface_not_found" end
@@ -89,32 +131,19 @@ function M.pre_place(agent_id, planet_name, spawn_x)
     return "creation_failed"
 end
 
+function M.pre_place_result(agent_id, planet_name, spawn_x)
+    return helpers.table_to_json({
+        agent_name = agent_id,
+        planet = planet_name,
+        status = M.pre_place(agent_id, planet_name, spawn_x),
+    })
+end
+
 function M.live_state_line(agent_id)
     local character = M.find(agent_id)
     if not (character and character.valid) then return "" end
 
-    local names = {
-        "burner-mining-drill",
-        "electric-mining-drill",
-        "stone-furnace",
-        "assembling-machine-1",
-        "transport-belt",
-        "burner-inserter",
-        "inserter",
-        "small-electric-pole",
-        "medium-electric-pole",
-        "offshore-pump",
-        "boiler",
-        "steam-engine",
-        "pipe",
-        "lab",
-    }
-    local parts = {}
-    for _, name in ipairs(names) do
-        local count = #character.surface.find_entities_filtered{force = character.force, name = name}
-        if count > 0 then parts[#parts + 1] = name .. "=" .. count end
-    end
-
+    local parts = live_state_entity_parts(live_state_entity_counts(character))
     local summary = ""
     if #parts > 0 then summary = "; player entities: " .. table.concat(parts, ", ") end
     return "Live state: "
@@ -124,8 +153,32 @@ function M.live_state_line(agent_id)
         .. summary
 end
 
+function M.live_state_result(agent_id)
+    local character = M.find(agent_id)
+    if not (character and character.valid) then
+        return helpers.table_to_json({
+            found = false,
+            entity_counts = {},
+        })
+    end
+
+    return helpers.table_to_json({
+        found = true,
+        surface = character.surface.name,
+        x = character.position.x,
+        y = character.position.y,
+        entity_counts = live_state_entity_counts(character),
+    })
+end
+
 function M.connected_player_count()
     return #game.connected_players
+end
+
+function M.connected_player_count_result()
+    return helpers.table_to_json({
+        count = M.connected_player_count(),
+    })
 end
 
 function M.set_walk_target(agent_id, x, y)
