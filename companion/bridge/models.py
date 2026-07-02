@@ -14,7 +14,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Callable, ClassVar, Iterable
+from typing import Any, Callable, ClassVar, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
@@ -35,11 +35,20 @@ TOOL_PARAM_TYPES = {
 }
 FACTORIO_MCP_TOOL_PREFIX = "mcp__factorioctl__"
 FACTORIO_MUTATING_TOOLS = frozenset({
+    "build_assembler_feed",
+    "build_assembler_output",
+    "build_automation_science",
+    "build_recipe_assembler_cell",
     "clear_area",
+    "build_lab_feed",
     "craft",
     "create_zone",
+    "build_fuel_supply",
     "delete_zone",
     "extract_items",
+    "execute_direct_smelter",
+    "execute_edge_miner",
+    "execute_entity_placement_near",
     "feed_lab_from_inventory",
     "hand_feed_furnace",
     "insert_items",
@@ -64,6 +73,7 @@ FACTORIO_READ_ONLY_TOOLS = frozenset({
     "check_placement",
     "detect_sushi_belts",
     "diagnose_factory_blockers",
+    "diagnose_fuel_sustainability",
     "diagnose_steam_power",
     "extend_power_to",
     "find_build_area",
@@ -90,12 +100,26 @@ FACTORIO_READ_ONLY_TOOLS = frozenset({
     "get_zone",
     "list_zones",
     "plan_steam_power",
+    "plan_automation_science",
+    "plan_recipe_assembler_cell",
     "repair_steam_power",
     "render_map",
     "scan_resources",
     "situation_report",
     "trace_belt_sources",
     "verify_production",
+})
+FACTORIO_DRY_RUN_SAFE_MUTATING_TOOLS = frozenset({
+    "build_assembler_feed",
+    "build_assembler_output",
+    "build_automation_science",
+    "build_recipe_assembler_cell",
+    "build_fuel_supply",
+    "execute_edge_miner",
+    "execute_entity_placement_near",
+    "build_lab_feed",
+    "clear_area",
+    "route_belt",
 })
 
 _BRIDGE_LOG_OBJECTIVE_RE = re.compile(
@@ -441,6 +465,7 @@ class AutonomyDecisionReason(str, Enum):
     PLAN_DONE = "plan_done"
     LIVE_STATE_COMPLETION = "live_state_completion"
     REFLECTION_DUE = "reflection_due"
+    STALE_MANUAL_AUTOMATION = "stale_manual_automation"
 
 
 def progress_signal(value: Any) -> ProgressSignal:
@@ -587,6 +612,9 @@ BRIDGE_SKILL_REQUIRED_GUARD_PREFIX = (
 BRIDGE_PARAM_SCHEMA_GUARD_PREFIX = (
     "Factorioctl bridge blocked invalid Factorio tool parameters:"
 )
+BRIDGE_MANUAL_AUTOMATION_GUARD_PREFIX = (
+    "Factorioctl bridge blocked stale manual automation tool:"
+)
 
 _LIVE_ENTITY_RE = re.compile(r"\b([a-z0-9][a-z0-9-]*)=(\d+)\b", re.IGNORECASE)
 _LIVE_ENTITY_ORDER = (
@@ -659,6 +687,7 @@ _TOOL_OPERATOR_ONLY_PREFIXES = (
     BRIDGE_READ_ONLY_TURN_GUARD_PREFIX,
     BRIDGE_SKILL_REQUIRED_GUARD_PREFIX,
     BRIDGE_PARAM_SCHEMA_GUARD_PREFIX,
+    BRIDGE_MANUAL_AUTOMATION_GUARD_PREFIX,
 )
 
 
@@ -758,6 +787,34 @@ class LiveState(BridgeModel):
 
     def has_any(self, names: Iterable[str]) -> bool:
         return any(self.has(name) for name in names)
+
+    def has_automation_capable_footprint(self) -> bool:
+        """Return true once the factory can build durable logistics.
+
+        A single hand-fed furnace is still bootstrap. Belts, inserters, power,
+        labs, assemblers, or mining drills mean the agent should stop treating
+        repeated manual transfers as a valid objective and build routes instead.
+        """
+        return self.has_any((
+            "transport-belt",
+            "underground-belt",
+            "splitter",
+            "inserter",
+            "burner-inserter",
+            "small-electric-pole",
+            "medium-electric-pole",
+            "big-electric-pole",
+            "substation",
+            "offshore-pump",
+            "boiler",
+            "steam-engine",
+            "burner-mining-drill",
+            "electric-mining-drill",
+            "assembling-machine-1",
+            "assembling-machine-2",
+            "assembling-machine-3",
+            "lab",
+        ))
 
     @property
     def entity_summary(self) -> str:
@@ -1586,6 +1643,8 @@ class GameRejectionPayload(RemotePayloadModel):
     research_progress: Any = None
     research_queue: Any = None
     current_research: Any = None
+    automation_verified: Any = None
+    verification: Any = None
 
     @field_validator("raw_text", mode="before")
     @classmethod
@@ -1639,6 +1698,13 @@ class GameRejectionPayload(RemotePayloadModel):
             or _contains_invalid_request_marker(error)
             or _contains_invalid_request_marker(raw)
         )
+
+    @property
+    def automation_verification_failed(self) -> bool:
+        for value in (self.automation_verified, self.verification):
+            if isinstance(value, dict) and value.get("success") is False:
+                return True
+        return False
 
     def evidence(self, *, limit: int = 180) -> "GameRejectionEvidence":
         return GameRejectionEvidence.from_payload(self, limit=limit)
@@ -1721,6 +1787,12 @@ class GameRejectionEvidence(BridgeModel):
             return cls(
                 kind=GameRejectionEvidenceKind.INVALID_REQUEST,
                 reason="invalid-request payload",
+            )
+        if payload.automation_verification_failed:
+            return cls(
+                kind=GameRejectionEvidenceKind.GAMEPLAY_FAILURE,
+                signature="automation_unverified",
+                reason="automation verification payload",
             )
         parts: list[str] = []
         if payload.error:
@@ -1960,6 +2032,41 @@ class ToolResultOutcome(BridgeModel):
             return "warning"
         return "debug"
 
+    @staticmethod
+    def _mapping_from_value(value: Any) -> Mapping[str, Any] | None:
+        if isinstance(value, BaseModel):
+            return value.model_dump()
+        if isinstance(value, Mapping):
+            return value
+        return None
+
+    @classmethod
+    def _automation_verification_failed(
+        cls,
+        *,
+        success_false: bool,
+        extra_items: Iterable[tuple[str, Any]],
+    ) -> bool:
+        if not success_false:
+            return False
+        items = dict(extra_items)
+        for key in ("automation_verified", "verification"):
+            diagnostic = cls._mapping_from_value(items.get(key))
+            if not diagnostic:
+                continue
+            if diagnostic.get("success") is False:
+                return True
+            statuses = diagnostic.get("placed_unit_statuses")
+            if isinstance(statuses, Sequence) and not isinstance(statuses, (str, bytes)):
+                for status in statuses:
+                    status_map = cls._mapping_from_value(status)
+                    if not status_map:
+                        continue
+                    status_text = str(status_map.get("status") or "").strip().lower()
+                    if status_text and status_text not in {"working", "ok"}:
+                        return True
+        return "automation_verified" in items and items.get("success") is False
+
     @classmethod
     def from_payload(
         cls,
@@ -2051,6 +2158,15 @@ class ToolResultOutcome(BridgeModel):
             return cls(
                 classification=ToolResultClassification.OK,
                 source="placement_diagnostic",
+            )
+
+        if cls._automation_verification_failed(
+            success_false=success_false,
+            extra_items=extra_items,
+        ):
+            return cls(
+                classification=ToolResultClassification.GAME_REJECTED,
+                source="automation_unverified",
             )
 
         for key in ("error", "message", "reason", "action_needed"):
@@ -2297,6 +2413,23 @@ class BridgeRunReport(MutableBridgeModel):
     live_error: str = ""
     recent_progress_events: int = 0
     recent_progress_window_s: float = 1800.0
+    automation_tool_calls: int = 0
+    manual_transfer_tool_calls: int = 0
+    automation_to_manual_ratio: float | None = None
+    fuel_automation_tool_calls: int = 0
+    manual_fuel_transfer_tool_calls: int = 0
+    fuel_automation_to_manual_ratio: float | None = None
+    science_automation_tool_calls: int = 0
+    manual_science_transfer_tool_calls: int = 0
+    science_automation_to_manual_ratio: float | None = None
+    material_flow_automation_tool_calls: int = 0
+    manual_material_transfer_tool_calls: int = 0
+    material_flow_automation_to_manual_ratio: float | None = None
+    component_automation_tool_calls: int = 0
+    manual_component_craft_tool_calls: int = 0
+    component_automation_to_manual_ratio: float | None = None
+    automation_verified_successes: int = 0
+    automation_verified_failures: int = 0
     top_gameplay_rejections: list[tuple[str, int]] = Field(default_factory=list)
     verdict: str = "operator attention needed: no bridge records found"
 
@@ -2335,6 +2468,23 @@ class BridgeRunReport(MutableBridgeModel):
             "live_error": self.live_error,
             "recent_progress_events": self.recent_progress_events,
             "recent_progress_window_s": self.recent_progress_window_s,
+            "automation_tool_calls": self.automation_tool_calls,
+            "manual_transfer_tool_calls": self.manual_transfer_tool_calls,
+            "automation_to_manual_ratio": self.automation_to_manual_ratio,
+            "fuel_automation_tool_calls": self.fuel_automation_tool_calls,
+            "manual_fuel_transfer_tool_calls": self.manual_fuel_transfer_tool_calls,
+            "fuel_automation_to_manual_ratio": self.fuel_automation_to_manual_ratio,
+            "science_automation_tool_calls": self.science_automation_tool_calls,
+            "manual_science_transfer_tool_calls": self.manual_science_transfer_tool_calls,
+            "science_automation_to_manual_ratio": self.science_automation_to_manual_ratio,
+            "material_flow_automation_tool_calls": self.material_flow_automation_tool_calls,
+            "manual_material_transfer_tool_calls": self.manual_material_transfer_tool_calls,
+            "material_flow_automation_to_manual_ratio": self.material_flow_automation_to_manual_ratio,
+            "component_automation_tool_calls": self.component_automation_tool_calls,
+            "manual_component_craft_tool_calls": self.manual_component_craft_tool_calls,
+            "component_automation_to_manual_ratio": self.component_automation_to_manual_ratio,
+            "automation_verified_successes": self.automation_verified_successes,
+            "automation_verified_failures": self.automation_verified_failures,
             "top_gameplay_rejections": [
                 {"count": count, "signature": signature}
                 for signature, count in self.top_gameplay_rejections
@@ -2766,6 +2916,13 @@ class BridgeLogRecordCollection(BridgeModel):
 class BridgeRunVerdictKind(str, Enum):
     NO_RECORDS = "no_records"
     PROVIDER_PAUSED = "provider_paused"
+    AUTOMATION_UNVERIFIED = "automation_unverified"
+    FUEL_ROUTE_IN_PROGRESS = "fuel_route_in_progress"
+    FUEL_MANUAL_HEAVY = "fuel_manual_heavy"
+    SCIENCE_MANUAL_HEAVY = "science_manual_heavy"
+    MATERIAL_MANUAL_HEAVY = "material_manual_heavy"
+    COMPONENT_MANUAL_HEAVY = "component_manual_heavy"
+    MANUAL_HEAVY = "manual_heavy"
     RECENT_PROGRESS = "recent_progress"
     REPEATED_FAILURES = "repeated_failures"
     CONTEXT_RESETS = "context_resets"
@@ -2843,6 +3000,63 @@ class BridgeRunVerdict(BridgeModel):
                 kind=BridgeRunVerdictKind.PROVIDER_PAUSED,
                 provider_reset_until=getattr(report, "provider_reset_until", ""),
             )
+        automation_failures = int(
+            _coerce_float(getattr(report, "automation_verified_failures", 0))
+        )
+        automation_successes = int(
+            _coerce_float(getattr(report, "automation_verified_successes", 0))
+        )
+        if automation_failures and automation_failures >= automation_successes:
+            return cls(kind=BridgeRunVerdictKind.AUTOMATION_UNVERIFIED)
+        manual_fuel_calls = int(
+            _coerce_float(getattr(report, "manual_fuel_transfer_tool_calls", 0))
+        )
+        fuel_automation_calls = int(
+            _coerce_float(getattr(report, "fuel_automation_tool_calls", 0))
+        )
+        if manual_fuel_calls >= 2 and manual_fuel_calls > fuel_automation_calls:
+            material_automation_calls = int(
+                _coerce_float(getattr(report, "material_flow_automation_tool_calls", 0))
+            )
+            latest_objective = str(getattr(report, "latest_objective", "") or "").lower()
+            if material_automation_calls and any(
+                marker in latest_objective
+                for marker in ("boiler", "coal", "fuel", "power", "steam")
+            ):
+                return cls(kind=BridgeRunVerdictKind.FUEL_ROUTE_IN_PROGRESS)
+            return cls(kind=BridgeRunVerdictKind.FUEL_MANUAL_HEAVY)
+        manual_science_calls = int(
+            _coerce_float(getattr(report, "manual_science_transfer_tool_calls", 0))
+        )
+        science_automation_calls = int(
+            _coerce_float(getattr(report, "science_automation_tool_calls", 0))
+        )
+        if manual_science_calls >= 2 and manual_science_calls > science_automation_calls:
+            return cls(kind=BridgeRunVerdictKind.SCIENCE_MANUAL_HEAVY)
+        manual_material_calls = int(
+            _coerce_float(getattr(report, "manual_material_transfer_tool_calls", 0))
+        )
+        material_automation_calls = int(
+            _coerce_float(getattr(report, "material_flow_automation_tool_calls", 0))
+        )
+        if manual_material_calls >= 2 and manual_material_calls > material_automation_calls:
+            return cls(kind=BridgeRunVerdictKind.MATERIAL_MANUAL_HEAVY)
+        manual_component_calls = int(
+            _coerce_float(getattr(report, "manual_component_craft_tool_calls", 0))
+        )
+        component_automation_calls = int(
+            _coerce_float(getattr(report, "component_automation_tool_calls", 0))
+        )
+        if manual_component_calls >= 2 and manual_component_calls > component_automation_calls:
+            return cls(kind=BridgeRunVerdictKind.COMPONENT_MANUAL_HEAVY)
+        manual_calls = int(
+            _coerce_float(getattr(report, "manual_transfer_tool_calls", 0))
+        )
+        automation_calls = int(
+            _coerce_float(getattr(report, "automation_tool_calls", 0))
+        )
+        if manual_calls >= 3 and manual_calls > automation_calls:
+            return cls(kind=BridgeRunVerdictKind.MANUAL_HEAVY)
         if getattr(report, "recent_progress_events", 0):
             return cls(kind=BridgeRunVerdictKind.RECENT_PROGRESS)
         rejections = getattr(report, "top_gameplay_rejections", []) or []
@@ -2861,6 +3075,20 @@ class BridgeRunVerdict(BridgeModel):
         if self.kind == BridgeRunVerdictKind.PROVIDER_PAUSED:
             reset = f" until {self.provider_reset_until}" if self.provider_reset_until else ""
             return f"provider paused{reset}; safe to leave running"
+        if self.kind == BridgeRunVerdictKind.AUTOMATION_UNVERIFIED:
+            return "operator attention needed: automation controllers are failing verification"
+        if self.kind == BridgeRunVerdictKind.FUEL_ROUTE_IN_PROGRESS:
+            return "safe to keep running: fuel route automation is in progress but not connected yet"
+        if self.kind == BridgeRunVerdictKind.FUEL_MANUAL_HEAVY:
+            return "operator attention useful: fuel is being babysat manually instead of routed with build_fuel_supply"
+        if self.kind == BridgeRunVerdictKind.SCIENCE_MANUAL_HEAVY:
+            return "operator attention useful: science is being hand-crafted or hand-fed instead of routed through automation controllers"
+        if self.kind == BridgeRunVerdictKind.MATERIAL_MANUAL_HEAVY:
+            return "operator attention useful: ore or plates are being hand-carried instead of routed through smelting/material-flow controllers"
+        if self.kind == BridgeRunVerdictKind.COMPONENT_MANUAL_HEAVY:
+            return "operator attention useful: science ingredients are being hand-crafted instead of produced by assembler cells"
+        if self.kind == BridgeRunVerdictKind.MANUAL_HEAVY:
+            return "operator attention useful: manual transfer calls exceed automation controller calls"
         if self.kind == BridgeRunVerdictKind.RECENT_PROGRESS:
             return "safe to keep running: recent progress detected"
         if self.kind == BridgeRunVerdictKind.REPEATED_FAILURES:
@@ -4639,8 +4867,74 @@ class ToolCallRequest(BridgeModel):
     @property
     def is_read_only_dry_run(self) -> bool:
         if self.short_name != "feed_lab_from_inventory":
-            return False
+            return (
+                self.short_name in FACTORIO_DRY_RUN_SAFE_MUTATING_TOOLS
+                and self.tool_input.get("dry_run") is True
+            )
         return self.tool_input.get("dry_run", True) is not False
+
+    @property
+    def is_manual_fuel_transfer(self) -> bool:
+        if self.short_name not in {"hand_feed_furnace", "insert_items"}:
+            return False
+        item = str(self.tool_input.get("item") or "").strip().lower()
+        inventory_type = str(self.tool_input.get("inventory_type") or "").strip().lower()
+        return inventory_type == "fuel" or item in {
+            "coal",
+            "wood",
+            "solid-fuel",
+            "rocket-fuel",
+            "nuclear-fuel",
+        }
+
+    @property
+    def is_manual_science_transfer(self) -> bool:
+        item = str(self.tool_input.get("item") or "").strip().lower()
+        recipe = str(self.tool_input.get("recipe") or "").strip().lower()
+        science_pack = str(self.tool_input.get("science_pack") or "").strip().lower()
+        if self.short_name == "feed_lab_from_inventory":
+            return self.tool_input.get("dry_run", True) is False
+        if self.short_name == "craft":
+            return recipe.endswith("-science-pack") or recipe == "automation-science-pack"
+        if self.short_name in {"extract_items", "insert_items"}:
+            return (
+                item.endswith("-science-pack")
+                or science_pack.endswith("-science-pack")
+                or item == "automation-science-pack"
+                or science_pack == "automation-science-pack"
+            )
+        return False
+
+    @property
+    def is_manual_material_transfer(self) -> bool:
+        item = str(self.tool_input.get("item") or "").strip().lower()
+        inventory_type = str(self.tool_input.get("inventory_type") or "").strip().lower()
+        if self.short_name == "hand_feed_furnace":
+            return True
+        if self.short_name == "insert_items":
+            return inventory_type == "furnace_source" and item in {
+                "iron-ore",
+                "copper-ore",
+                "stone",
+            }
+        if self.short_name == "extract_items":
+            return inventory_type == "furnace_result" and item in {
+                "iron-plate",
+                "copper-plate",
+                "steel-plate",
+            }
+        return False
+
+    @property
+    def is_manual_component_craft(self) -> bool:
+        if self.short_name != "craft":
+            return False
+        recipe = str(self.tool_input.get("recipe") or "").strip().lower()
+        return recipe in {
+            "iron-gear-wheel",
+            "copper-cable",
+            "electronic-circuit",
+        }
 
     def validate_params(
         self,
@@ -4685,6 +4979,7 @@ class PreToolUseGuardKind(str, Enum):
     READ_ONLY_TURN = "read_only_turn"
     PARAM_SCHEMA = "param_schema"
     SKILL_REQUIRED = "skill_required"
+    MANUAL_AUTOMATION = "manual_automation"
 
 
 class PreToolUseDecision(BridgeModel):
@@ -4871,6 +5166,13 @@ class PreToolUseGuardBlock(BridgeModel):
             tool_name=ToolCallRequest.short_factorio_tool_name(tool_name),
         )
 
+    @classmethod
+    def manual_automation(cls, *, tool_name: Any) -> "PreToolUseGuardBlock":
+        return cls(
+            kind=PreToolUseGuardKind.MANUAL_AUTOMATION,
+            tool_name=ToolCallRequest.short_factorio_tool_name(tool_name),
+        )
+
     @property
     def reason(self) -> str:
         if self.kind == PreToolUseGuardKind.PARALLEL_MUTATION:
@@ -4890,6 +5192,16 @@ class PreToolUseGuardBlock(BridgeModel):
                 f"{BRIDGE_SKILL_REQUIRED_GUARD_PREFIX} {self.tool_name}. "
                 "Call Skill(factorio-control) before using Factorio MCP tools."
             )
+        if self.kind == PreToolUseGuardKind.MANUAL_AUTOMATION:
+            return (
+                f"{BRIDGE_MANUAL_AUTOMATION_GUARD_PREFIX} {self.tool_name}. "
+                "The active ledger plan is stale because it relies on manual "
+                "transfer loops. Replace it with durable automation controllers "
+                "such as build_fuel_supply, execute_direct_smelter, "
+                "plan_recipe_assembler_cell, build_recipe_assembler_cell, "
+                "build_automation_science, build_assembler_feed, "
+                "build_assembler_output, or build_lab_feed."
+            )
         return f"{BRIDGE_PARAM_SCHEMA_GUARD_PREFIX} {self.detail}"
 
     @property
@@ -4907,6 +5219,8 @@ class PreToolUseGuardBlock(BridgeModel):
             )
         if self.kind == PreToolUseGuardKind.SKILL_REQUIRED:
             return f"blocked Factorio MCP tool before skill: {self.tool_name}"
+        if self.kind == PreToolUseGuardKind.MANUAL_AUTOMATION:
+            return f"blocked stale manual automation tool: {self.tool_name}"
         if self.tool_name:
             return f"blocked invalid {self.tool_name} params: {self.detail}"
         return f"blocked malformed tool call hook input: {self.detail}"
@@ -7863,6 +8177,146 @@ class LedgerState(BridgeModel):
     def progress_text(self) -> str:
         return "\n".join(self.progress_notes).lower()
 
+    def has_stale_manual_automation_plan(
+        self,
+        live_state: LiveState | None = None,
+    ) -> bool:
+        """Return true when a plan repeats manual transfers instead of automation.
+
+        Once automation infrastructure exists, plans that only craft/extract/feed
+        by hand preserve the wrong end state. This predicate is intentionally
+        narrow: science/research manual plans are always stale; fuel/feed plans
+        are stale as soon as live state has a real logistics/power footprint;
+        output transfer plans need repeated-loop evidence in progress text.
+        It yields to durable automation controllers when they are present.
+        """
+        text = self.active_text()
+        if not text:
+            return False
+        durable_markers = (
+            "execute_direct_smelter",
+            "execute_edge_miner",
+            "diagnose_fuel_sustainability",
+            "build_fuel_supply",
+            "route_belt",
+            "plan_automation_science",
+            "build_automation_science",
+            "plan_recipe_assembler_cell",
+            "build_recipe_assembler_cell",
+            "build_assembler_feed",
+            "build_assembler_output",
+            "build_lab_feed",
+        )
+        if any(marker in text for marker in durable_markers):
+            return False
+        manual_markers = (
+            "feed_lab_from_inventory",
+            "hand_feed_furnace",
+            "insert_items",
+            "extract_items",
+            "craft ",
+            "craft(",
+            "craft_",
+        )
+        if not any(marker in text for marker in manual_markers):
+            return False
+        mentions_science = any(
+            marker in text
+            for marker in (
+                "automation-science-pack",
+                "science pack",
+                "science-pack",
+                "research",
+                "lab",
+            )
+        )
+        mentions_manual_science_component = any(
+            marker in text
+            for marker in (
+                "iron-gear-wheel",
+                "copper-cable",
+                "electronic-circuit",
+            )
+        ) and any(
+            marker in text
+            for marker in (
+                "science",
+                "research",
+                "lab",
+                "automation-science",
+            )
+        )
+        if mentions_science or mentions_manual_science_component:
+            return True
+
+        automation_capable = bool(
+            live_state and live_state.has_automation_capable_footprint()
+        )
+        mentions_manual_feed = (
+            any(marker in text for marker in ("insert_items", "hand_feed_furnace"))
+            and any(
+                marker in text
+                for marker in (
+                    "coal",
+                    "fuel",
+                    "boiler",
+                    "burner",
+                    "furnace",
+                    "furnace_source",
+                    "iron-ore",
+                    "copper-ore",
+                )
+            )
+        )
+        if automation_capable and mentions_manual_feed:
+            return True
+
+        progress = self.progress_text()
+        repeated_loop_text = "\n".join([text, progress])
+        repeated_loop_markers = (
+            "manual cycle",
+            "manual extraction",
+            "manual transfer",
+            "manual feeding",
+            "again",
+            "repeated",
+            "recurring",
+            "continues",
+            "still requires manual",
+            "runs out",
+            "ran out",
+            "exhausted",
+            "jammed",
+            "full_output",
+            "reloaded",
+            "refueled",
+        )
+
+        def has_loop_marker(marker: str) -> bool:
+            return re.search(
+                rf"(?<![a-z0-9_-]){re.escape(marker)}(?![a-z0-9_-])",
+                repeated_loop_text,
+            ) is not None
+
+        if not any(has_loop_marker(marker) for marker in repeated_loop_markers):
+            return False
+
+        mentions_fuel_loop = (
+            any(
+                marker in text
+                for marker in ("coal", "fuel", "boiler", "burner", "furnace")
+            )
+            and any(marker in text for marker in ("insert_items", "hand_feed_furnace"))
+        )
+        mentions_output_loop = (
+            "extract_items" in text
+            and any(
+                marker in repeated_loop_text
+                for marker in ("plate", "output", "full_output", "chest", "jam")
+            )
+        )
+        return mentions_fuel_loop or mentions_output_loop
+
     def age_seconds(self, *, now: datetime | None = None) -> float | None:
         if not self.updated_at:
             return None
@@ -7937,6 +8391,7 @@ class AutonomyPromptInput(BridgeModel):
     memory_text: str = ""
     learned_text: str = ""
     live_completion_reason: str = ""
+    planner_advisory: str = ""
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -7960,7 +8415,13 @@ class AutonomyPromptInput(BridgeModel):
         except BridgeValidationError:
             return LiveState()
 
-    @field_validator("memory_text", "learned_text", "live_completion_reason", mode="before")
+    @field_validator(
+        "memory_text",
+        "learned_text",
+        "live_completion_reason",
+        "planner_advisory",
+        mode="before",
+    )
     @classmethod
     def _coerce_text(cls, value: Any) -> str:
         return value.strip() if isinstance(value, str) else ""
@@ -7991,6 +8452,7 @@ class AutonomyPromptInput(BridgeModel):
             self.ledger.render(recent_progress_count=3),
             self.learned_text,
             self.live_state_line,
+            self.planner_advisory,
             tick_prompt,
         ]
         return "\n\n".join(part for part in parts if part)

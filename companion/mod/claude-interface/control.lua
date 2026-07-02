@@ -1961,6 +1961,10 @@ remote.add_interface("claude_interface", {
         return json_remote_call("diagnose_factory_blockers", entities.diagnose_factory_blockers, x1, y1, x2, y2, limit)
     end,
 
+    diagnose_fuel_sustainability = function(x1, y1, x2, y2, limit)
+        return json_remote_call("diagnose_fuel_sustainability", entities.diagnose_fuel_sustainability, x1, y1, x2, y2, limit)
+    end,
+
     get_entity = function(unit_number)
         return json_remote_call("get_entity", entities.get_entity, unit_number)
     end,

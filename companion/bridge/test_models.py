@@ -1775,6 +1775,18 @@ After.
         )
         self.assertTrue(state.has("transport-belt"))
         self.assertFalse(state.has("lab"))
+        self.assertTrue(state.has_automation_capable_footprint())
+
+    def test_live_state_treats_lone_furnace_as_bootstrap_footprint(self):
+        state = LiveState(
+            found=True,
+            surface="nauvis",
+            x=5,
+            y=0,
+            entity_counts={"stone-furnace": 1},
+        )
+
+        self.assertFalse(state.has_automation_capable_footprint())
 
     def test_live_state_validates_json_remote_payload(self):
         state = LiveState.from_rcon_response(json.dumps({
@@ -2480,6 +2492,21 @@ After.
             provider_reset_until="2026-06-30 03:19:43 CDT",
         )
         progress = BridgeRunReport(recent_progress_events=1)
+        unverified = BridgeRunReport(
+            recent_progress_events=2,
+            automation_verified_successes=1,
+            automation_verified_failures=2,
+        )
+        manual_heavy = BridgeRunReport(
+            recent_progress_events=2,
+            automation_tool_calls=1,
+            manual_transfer_tool_calls=4,
+        )
+        component_manual = BridgeRunReport(
+            recent_progress_events=2,
+            component_automation_tool_calls=1,
+            manual_component_craft_tool_calls=3,
+        )
         repeated = BridgeRunReport(
             top_gameplay_rejections=[("Cannot place entity here", 3)],
         )
@@ -2497,6 +2524,30 @@ After.
         self.assertEqual(
             BridgeRunVerdict.from_report_state(progress).kind,
             BridgeRunVerdictKind.RECENT_PROGRESS,
+        )
+        self.assertEqual(
+            BridgeRunVerdict.from_report_state(unverified).kind,
+            BridgeRunVerdictKind.AUTOMATION_UNVERIFIED,
+        )
+        self.assertIn(
+            "automation controllers are failing verification",
+            BridgeRunVerdict.from_report_state(unverified).message,
+        )
+        self.assertEqual(
+            BridgeRunVerdict.from_report_state(manual_heavy).kind,
+            BridgeRunVerdictKind.MANUAL_HEAVY,
+        )
+        self.assertIn(
+            "manual transfer calls exceed automation controller calls",
+            BridgeRunVerdict.from_report_state(manual_heavy).message,
+        )
+        self.assertEqual(
+            BridgeRunVerdict.from_report_state(component_manual).kind,
+            BridgeRunVerdictKind.COMPONENT_MANUAL_HEAVY,
+        )
+        self.assertIn(
+            "science ingredients are being hand-crafted",
+            BridgeRunVerdict.from_report_state(component_manual).message,
         )
         self.assertEqual(
             BridgeRunVerdict.from_report_state(repeated).kind,
@@ -3143,6 +3194,24 @@ After.
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.classification, ToolResultClassification.OK)
         self.assertEqual(outcome.source, "placement_diagnostic")
+
+    def test_tool_result_outcome_classifies_automation_verification_failures_as_game_rejected(self):
+        outcome = ToolResultOutcome.from_payload({
+            "success": False,
+            "placement_success": True,
+            "automation_verified": {
+                "success": False,
+                "placed_unit_statuses": [
+                    {"unit_number": 77, "name": "inserter", "status": "no_power"},
+                ],
+            },
+        })
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.classification, ToolResultClassification.GAME_REJECTED)
+        self.assertEqual(outcome.source, "automation_unverified")
+        self.assertTrue(outcome.should_journal_failure)
+        self.assertEqual(outcome.log_level, "info")
 
     def test_tool_result_outcome_recurses_through_text_block_json(self):
         blocks = ({
@@ -4326,11 +4395,47 @@ acceptance:
             "tool_name": "mcp__factorioctl__place_entity",
             "tool_input": {"entity_name": "transport-belt", "x": 1, "y": 2},
         })
+        fuel_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_fuel_supply",
+        })
+        lab_feed_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_lab_feed",
+        })
+        assembler_feed_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_assembler_feed",
+        })
+        assembler_output_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_assembler_output",
+        })
+        automation_science_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_automation_science",
+        })
+        recipe_cell_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_recipe_assembler_cell",
+        })
+        edge_miner_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__execute_edge_miner",
+        })
+        placement_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__execute_entity_placement_near",
+        })
+        smelter_build = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__execute_direct_smelter",
+        })
         scan = ToolCallRequest.from_hook_input({
             "tool_name": "mcp__factorioctl__situation_report",
         })
         diagnostic = ToolCallRequest.from_hook_input({
             "tool_name": "mcp__factorioctl__diagnose_factory_blockers",
+        })
+        fuel_diagnostic = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__diagnose_fuel_sustainability",
+        })
+        automation_science_plan = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__plan_automation_science",
+        })
+        recipe_cell_plan = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__plan_recipe_assembler_cell",
         })
         item_flow = ToolCallRequest.from_hook_input({
             "tool_name": "mcp__factorioctl__analyze_item_flow",
@@ -4338,6 +4443,38 @@ acceptance:
         dry_run_feed = ToolCallRequest.from_hook_input({
             "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
             "tool_input": {"dry_run": True},
+        })
+        dry_run_automation_science = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_automation_science",
+            "tool_input": {"dry_run": True},
+        })
+        dry_run_recipe_cell = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_recipe_assembler_cell",
+            "tool_input": {"dry_run": True},
+        })
+        dry_run_edge_miner = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__execute_edge_miner",
+            "tool_input": {"dry_run": True},
+        })
+        dry_run_placement = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__execute_entity_placement_near",
+            "tool_input": {"dry_run": True},
+        })
+        active_automation_science = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_automation_science",
+            "tool_input": {"dry_run": False},
+        })
+        active_recipe_cell = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_recipe_assembler_cell",
+            "tool_input": {"dry_run": False},
+        })
+        active_edge_miner = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__execute_edge_miner",
+            "tool_input": {"dry_run": False},
+        })
+        active_placement = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__execute_entity_placement_near",
+            "tool_input": {"dry_run": False},
         })
         active_feed = ToolCallRequest.from_hook_input({
             "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
@@ -4352,13 +4489,45 @@ acceptance:
         self.assertTrue(placement.is_factorio_mcp_tool)
         self.assertTrue(placement.is_mutating_factorio_tool)
         self.assertFalse(placement.is_read_only_factorio_tool)
+        self.assertTrue(fuel_build.is_mutating_factorio_tool)
+        self.assertFalse(fuel_build.is_read_only_factorio_tool)
+        self.assertTrue(lab_feed_build.is_mutating_factorio_tool)
+        self.assertFalse(lab_feed_build.is_read_only_factorio_tool)
+        self.assertTrue(assembler_feed_build.is_mutating_factorio_tool)
+        self.assertFalse(assembler_feed_build.is_read_only_factorio_tool)
+        self.assertTrue(assembler_output_build.is_mutating_factorio_tool)
+        self.assertFalse(assembler_output_build.is_read_only_factorio_tool)
+        self.assertTrue(automation_science_build.is_mutating_factorio_tool)
+        self.assertFalse(automation_science_build.is_read_only_factorio_tool)
+        self.assertTrue(recipe_cell_build.is_mutating_factorio_tool)
+        self.assertFalse(recipe_cell_build.is_read_only_factorio_tool)
+        self.assertTrue(edge_miner_build.is_mutating_factorio_tool)
+        self.assertFalse(edge_miner_build.is_read_only_factorio_tool)
+        self.assertTrue(placement_build.is_mutating_factorio_tool)
+        self.assertFalse(placement_build.is_read_only_factorio_tool)
+        self.assertTrue(smelter_build.is_mutating_factorio_tool)
+        self.assertFalse(smelter_build.is_read_only_factorio_tool)
         self.assertTrue(scan.is_read_only_factorio_tool)
         self.assertFalse(scan.is_mutating_factorio_tool)
         self.assertTrue(diagnostic.is_read_only_factorio_tool)
         self.assertFalse(diagnostic.is_mutating_factorio_tool)
+        self.assertTrue(fuel_diagnostic.is_read_only_factorio_tool)
+        self.assertFalse(fuel_diagnostic.is_mutating_factorio_tool)
+        self.assertTrue(automation_science_plan.is_read_only_factorio_tool)
+        self.assertFalse(automation_science_plan.is_mutating_factorio_tool)
+        self.assertTrue(recipe_cell_plan.is_read_only_factorio_tool)
+        self.assertFalse(recipe_cell_plan.is_mutating_factorio_tool)
         self.assertTrue(item_flow.is_read_only_factorio_tool)
         self.assertFalse(item_flow.is_mutating_factorio_tool)
         self.assertTrue(dry_run_feed.is_read_only_dry_run)
+        self.assertTrue(dry_run_automation_science.is_read_only_dry_run)
+        self.assertTrue(dry_run_recipe_cell.is_read_only_dry_run)
+        self.assertTrue(dry_run_edge_miner.is_read_only_dry_run)
+        self.assertTrue(dry_run_placement.is_read_only_dry_run)
+        self.assertFalse(active_automation_science.is_read_only_dry_run)
+        self.assertFalse(active_recipe_cell.is_read_only_dry_run)
+        self.assertFalse(active_edge_miner.is_read_only_dry_run)
+        self.assertFalse(active_placement.is_read_only_dry_run)
         self.assertFalse(active_feed.is_read_only_dry_run)
         self.assertTrue(hand_feed.is_mutating_factorio_tool)
         self.assertFalse(hand_feed.is_read_only_factorio_tool)
@@ -4838,6 +5007,21 @@ acceptance:
                 "blocked Factorio MCP tool before skill: insert_items",
             ),
             (
+                PreToolUseGuardBlock.manual_automation(
+                    tool_name="mcp__factorioctl__insert_items",
+                ),
+                (
+                    "Factorioctl bridge blocked stale manual automation tool: "
+                    "insert_items. The active ledger plan is stale because it "
+                    "relies on manual transfer loops. Replace it with durable "
+                    "automation controllers such as build_fuel_supply, "
+                    "execute_direct_smelter, plan_recipe_assembler_cell, "
+                    "build_recipe_assembler_cell, build_automation_science, "
+                    "build_assembler_feed, build_assembler_output, or build_lab_feed."
+                ),
+                "blocked stale manual automation tool: insert_items",
+            ),
+            (
                 PreToolUseGuardBlock.param_schema(
                     tool_name="mcp__factorioctl__walk_to",
                     detail="walk_to: x: expected number",
@@ -4926,6 +5110,143 @@ acceptance:
 
         self.assertEqual(request.tool_name, "mcp__factorioctl__insert_items")
         self.assertEqual(request.tool_input["item"], "coal")
+
+    def test_tool_call_request_identifies_manual_fuel_transfers(self):
+        coal = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__insert_items",
+            "tool_input": {"unit_number": 42, "item": "coal", "count": 5},
+        })
+        fuel_inventory = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__insert_items",
+            "tool_input": {
+                "unit_number": 42,
+                "item": "not-a-fuel",
+                "count": 5,
+                "inventory_type": "fuel",
+            },
+        })
+        ore = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__insert_items",
+            "tool_input": {
+                "unit_number": 42,
+                "item": "iron-ore",
+                "count": 5,
+                "inventory_type": "furnace_source",
+            },
+        })
+        durable_controller = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_fuel_supply",
+            "tool_input": {"consumer_unit_number": 49},
+        })
+
+        self.assertTrue(coal.is_manual_fuel_transfer)
+        self.assertTrue(fuel_inventory.is_manual_fuel_transfer)
+        self.assertFalse(ore.is_manual_fuel_transfer)
+        self.assertFalse(durable_controller.is_manual_fuel_transfer)
+
+    def test_tool_call_request_identifies_manual_science_transfers(self):
+        craft_science = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__craft",
+            "tool_input": {"recipe": "automation-science-pack", "count": 12},
+        })
+        feed_lab = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
+            "tool_input": {
+                "lab_unit_number": 69,
+                "science_pack": "automation-science-pack",
+                "count": 12,
+                "dry_run": False,
+            },
+        })
+        dry_run_feed = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
+            "tool_input": {
+                "lab_unit_number": 69,
+                "science_pack": "automation-science-pack",
+                "count": 12,
+                "dry_run": True,
+            },
+        })
+        craft_belt = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__craft",
+            "tool_input": {"recipe": "transport-belt", "count": 12},
+        })
+        durable_controller = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_automation_science",
+            "tool_input": {"assembler_unit_number": 80},
+        })
+
+        self.assertTrue(craft_science.is_manual_science_transfer)
+        self.assertTrue(feed_lab.is_manual_science_transfer)
+        self.assertFalse(dry_run_feed.is_manual_science_transfer)
+        self.assertFalse(craft_belt.is_manual_science_transfer)
+        self.assertFalse(durable_controller.is_manual_science_transfer)
+
+    def test_tool_call_request_identifies_manual_material_transfers(self):
+        ore_input = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__insert_items",
+            "tool_input": {
+                "unit_number": 42,
+                "item": "iron-ore",
+                "count": 20,
+                "inventory_type": "furnace_source",
+            },
+        })
+        plate_output = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__extract_items",
+            "tool_input": {
+                "unit_number": 42,
+                "item": "iron-plate",
+                "count": 20,
+                "inventory_type": "furnace_result",
+            },
+        })
+        chest_extract = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__extract_items",
+            "tool_input": {
+                "unit_number": 42,
+                "item": "iron-plate",
+                "count": 20,
+                "inventory_type": "chest",
+            },
+        })
+        durable_controller = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__execute_direct_smelter",
+            "tool_input": {"drill_unit_number": 80},
+        })
+
+        self.assertTrue(ore_input.is_manual_material_transfer)
+        self.assertTrue(plate_output.is_manual_material_transfer)
+        self.assertFalse(chest_extract.is_manual_material_transfer)
+        self.assertFalse(durable_controller.is_manual_material_transfer)
+
+    def test_tool_call_request_identifies_manual_component_crafting(self):
+        craft_gears = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__craft",
+            "tool_input": {"recipe": "iron-gear-wheel", "count": 12},
+        })
+        craft_cables = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__craft",
+            "tool_input": {"recipe": "copper-cable", "count": 12},
+        })
+        craft_circuits = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__craft",
+            "tool_input": {"recipe": "electronic-circuit", "count": 12},
+        })
+        craft_belts = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__craft",
+            "tool_input": {"recipe": "transport-belt", "count": 12},
+        })
+        durable_controller = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__build_assembler_feed",
+            "tool_input": {"assembler_unit_number": 80},
+        })
+
+        self.assertTrue(craft_gears.is_manual_component_craft)
+        self.assertTrue(craft_cables.is_manual_component_craft)
+        self.assertTrue(craft_circuits.is_manual_component_craft)
+        self.assertFalse(craft_belts.is_manual_component_craft)
+        self.assertFalse(durable_controller.is_manual_component_craft)
 
     def test_agent_session_state_models_current_and_legacy_files(self):
         current = AgentSessionState.from_file_text(

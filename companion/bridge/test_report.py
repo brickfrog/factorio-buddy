@@ -135,10 +135,23 @@ class BridgeReportTest(unittest.TestCase):
                     "progress: steam power online\n</ledger>",
                     1020,
                 ),
+                log_line('tool: insert_items({"item":"coal"})', 1025),
+                log_line('tool: build_fuel_supply({"consumer_unit_number":49})', 1026),
+                log_line('tool: build_automation_science({"assembler_unit_number":80})', 1027),
+                log_line('tool: craft({"recipe":"iron-gear-wheel","count":4})', 1028),
                 log_line(
-                    'tool_result game_rejected: {"entity":"transport-belt",'
-                    '"error":"Cannot place entity here"}',
+                    'tool: feed_lab_from_inventory({"science_pack":"automation-science-pack",'
+                    '"dry_run":false})',
+                    1029,
+                ),
+                log_line(
+                    'tool_result: {"automation_verified":{"success":true}}',
                     1030,
+                ),
+                log_line(
+                    'tool_result game_rejected: {"success":false,'
+                    '"automation_verified":{"success":false}}',
+                    1031,
                 ),
                 log_line(
                     'tool_result game_rejected: {"entity":"transport-belt",'
@@ -151,16 +164,21 @@ class BridgeReportTest(unittest.TestCase):
                     1050,
                 ),
                 log_line(
+                    'tool_result game_rejected: {"entity":"transport-belt",'
+                    '"error":"Cannot place entity here"}',
+                    1060,
+                ),
+                log_line(
                     "text: automation research completed. Research count: 4 of 275. "
                     "Power grid operational.",
-                    1060,
+                    1070,
                 ),
                 log_line(
                     "provider usage limit active until 2026-06-30 03:19:43 CDT; "
                     "pausing agent attempts",
-                    1070,
+                    1080,
                 ),
-                log_line("done: $1.0000 | 10 turns | 60.0s", 1080),
+                log_line("done: $1.0000 | 10 turns | 60.0s", 1090),
             ]) + "\n")
 
             report = bridge_report.analyze_log(path, recent_progress_window_s=300)
@@ -174,11 +192,199 @@ class BridgeReportTest(unittest.TestCase):
         self.assertEqual(report.latest_entities, "burner-mining-drill=2, lab=1")
         self.assertEqual(report.latest_objective, "Build automation")
         self.assertEqual(report.latest_progress, "steam power online")
+        self.assertEqual(report.automation_tool_calls, 2)
+        self.assertEqual(report.manual_transfer_tool_calls, 3)
+        self.assertEqual(report.automation_to_manual_ratio, 0.666667)
+        self.assertEqual(report.fuel_automation_tool_calls, 1)
+        self.assertEqual(report.manual_fuel_transfer_tool_calls, 1)
+        self.assertEqual(report.fuel_automation_to_manual_ratio, 1.0)
+        self.assertEqual(report.science_automation_tool_calls, 1)
+        self.assertEqual(report.manual_science_transfer_tool_calls, 1)
+        self.assertEqual(report.science_automation_to_manual_ratio, 1.0)
+        self.assertEqual(report.material_flow_automation_tool_calls, 0)
+        self.assertEqual(report.manual_material_transfer_tool_calls, 0)
+        self.assertEqual(report.component_automation_tool_calls, 1)
+        self.assertEqual(report.manual_component_craft_tool_calls, 1)
+        self.assertEqual(report.component_automation_to_manual_ratio, 1.0)
+        self.assertEqual(report.automation_verified_successes, 1)
+        self.assertEqual(report.automation_verified_failures, 1)
         self.assertEqual(
             report.top_gameplay_rejections,
-            [("Cannot place entity here | entity=transport-belt", 3)],
+            [
+                ("Cannot place entity here | entity=transport-belt", 3),
+                ("automation_unverified", 1),
+            ],
         )
         self.assertIn("provider paused", report.verdict)
+
+    def test_analyze_log_flags_unverified_automation_despite_recent_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge-test.jsonl"
+            path.write_text("\n".join([
+                log_line("spawning claude sdk [model=haiku] (new session)", 1000),
+                log_line(
+                    "autonomy -> doug-nauvis: <ledger>\n"
+                    "objective: Build automation\n"
+                    "progress: attempted automation controller\n"
+                    "</ledger>",
+                    1010,
+                ),
+                log_line(
+                    'tool_result game_rejected: {"success":false,'
+                    '"automation_verified":{"success":false}}',
+                    1020,
+                ),
+                log_line(
+                    'tool_result game_rejected: {"success":false,'
+                    '"automation_verified":{"success":false}}',
+                    1030,
+                ),
+                log_line("done: $1.0000 | 10 turns | 60.0s", 1040),
+            ]) + "\n")
+
+            report = bridge_report.analyze_log(path, recent_progress_window_s=300)
+
+        self.assertEqual(report.automation_verified_failures, 2)
+        self.assertIn("automation controllers are failing verification", report.verdict)
+
+    def test_analyze_log_flags_manual_fuel_babysitting_despite_recent_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge-test.jsonl"
+            path.write_text("\n".join([
+                log_line("spawning claude sdk [model=haiku] (new session)", 1000),
+                log_line(
+                    "autonomy -> doug-nauvis: <ledger>\n"
+                    "objective: Build automation\n"
+                    "progress: plates are being produced\n"
+                    "</ledger>",
+                    1010,
+                ),
+                log_line('tool: insert_items({"item":"coal","inventory_type":"fuel"})', 1020),
+                log_line('tool: insert_items({"item":"coal","inventory_type":"fuel"})', 1030),
+                log_line("done: $0.2500 | 4 turns | 30.0s", 1040),
+            ]) + "\n")
+
+            report = bridge_report.analyze_log(path, recent_progress_window_s=300)
+
+        self.assertEqual(report.manual_fuel_transfer_tool_calls, 2)
+        self.assertEqual(report.fuel_automation_tool_calls, 0)
+        self.assertIn("fuel is being babysat manually", report.verdict)
+
+    def test_analyze_log_treats_belted_fuel_route_as_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge-test.jsonl"
+            path.write_text("\n".join([
+                log_line("spawning claude sdk [model=haiku] (new session)", 1000),
+                log_line(
+                    "autonomy -> doug-nauvis: <ledger>\n"
+                    "objective: build coal fuel route to boiler\n"
+                    "progress: belt route started\n"
+                    "</ledger>",
+                    1010,
+                ),
+                log_line('tool: insert_items({"item":"coal","inventory_type":"fuel"})', 1020),
+                log_line('tool: insert_items({"item":"coal","inventory_type":"fuel"})', 1030),
+                log_line('tool: route_belt({"from":{"x":1,"y":1},"to":{"x":2,"y":1}})', 1040),
+                log_line("done: $0.2500 | 4 turns | 30.0s", 1050),
+            ]) + "\n")
+
+            report = bridge_report.analyze_log(path, recent_progress_window_s=300)
+
+        self.assertEqual(report.manual_fuel_transfer_tool_calls, 2)
+        self.assertEqual(report.material_flow_automation_tool_calls, 1)
+        self.assertIn("fuel route automation is in progress", report.verdict)
+
+    def test_analyze_log_flags_manual_science_babysitting_despite_recent_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge-test.jsonl"
+            path.write_text("\n".join([
+                log_line("spawning claude sdk [model=haiku] (new session)", 1000),
+                log_line(
+                    "autonomy -> doug-nauvis: <ledger>\n"
+                    "objective: Build automation\n"
+                    "progress: research is moving\n"
+                    "</ledger>",
+                    1010,
+                ),
+                log_line(
+                    'tool: craft({"recipe":"automation-science-pack","count":12})',
+                    1020,
+                ),
+                log_line(
+                    'tool: feed_lab_from_inventory({"science_pack":"automation-science-pack",'
+                    '"dry_run":false})',
+                    1030,
+                ),
+                log_line("done: $0.2500 | 4 turns | 30.0s", 1040),
+            ]) + "\n")
+
+            report = bridge_report.analyze_log(path, recent_progress_window_s=300)
+
+        self.assertEqual(report.manual_science_transfer_tool_calls, 2)
+        self.assertEqual(report.science_automation_tool_calls, 0)
+        self.assertIn("science is being hand-crafted or hand-fed", report.verdict)
+
+    def test_analyze_log_flags_manual_material_babysitting_despite_recent_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge-test.jsonl"
+            path.write_text("\n".join([
+                log_line("spawning claude sdk [model=haiku] (new session)", 1000),
+                log_line(
+                    "autonomy -> doug-nauvis: <ledger>\n"
+                    "objective: Build automation\n"
+                    "progress: plates are being produced\n"
+                    "</ledger>",
+                    1010,
+                ),
+                log_line(
+                    'tool: insert_items({"item":"iron-ore","inventory_type":"furnace_source"})',
+                    1020,
+                ),
+                log_line(
+                    'tool: extract_items({"item":"iron-plate","inventory_type":"furnace_result"})',
+                    1030,
+                ),
+                log_line("done: $0.2500 | 4 turns | 30.0s", 1040),
+            ]) + "\n")
+
+            report = bridge_report.analyze_log(path, recent_progress_window_s=300)
+
+        self.assertEqual(report.manual_material_transfer_tool_calls, 2)
+        self.assertEqual(report.material_flow_automation_tool_calls, 0)
+        self.assertIn("ore or plates are being hand-carried", report.verdict)
+
+    def test_analyze_log_flags_manual_component_babysitting_despite_recent_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge-test.jsonl"
+            path.write_text("\n".join([
+                log_line("spawning claude sdk [model=haiku] (new session)", 1000),
+                log_line(
+                    "autonomy -> doug-nauvis: <ledger>\n"
+                    "objective: Build automation science\n"
+                    "progress: research is moving\n"
+                    "</ledger>",
+                    1010,
+                ),
+                log_line(
+                    'tool: craft({"recipe":"iron-gear-wheel","count":12})',
+                    1020,
+                ),
+                log_line(
+                    'tool: craft({"recipe":"copper-cable","count":12})',
+                    1030,
+                ),
+                log_line(
+                    'tool: build_assembler_feed({"assembler_unit_number":80})',
+                    1040,
+                ),
+                log_line("done: $0.2500 | 4 turns | 30.0s", 1050),
+            ]) + "\n")
+
+            report = bridge_report.analyze_log(path, recent_progress_window_s=300)
+
+        self.assertEqual(report.manual_component_craft_tool_calls, 2)
+        self.assertEqual(report.component_automation_tool_calls, 1)
+        self.assertIn("science ingredients are being hand-crafted", report.verdict)
 
     def test_analyze_records_accepts_typed_records_without_file_roundtrip(self):
         done_line = json.dumps({
@@ -543,6 +749,23 @@ class BridgeReportTest(unittest.TestCase):
             sdk_attempts=2,
             sdk_done=1,
             recent_progress_events=1,
+            automation_tool_calls=3,
+            manual_transfer_tool_calls=2,
+            automation_to_manual_ratio=1.5,
+            fuel_automation_tool_calls=1,
+            manual_fuel_transfer_tool_calls=2,
+            fuel_automation_to_manual_ratio=0.5,
+            science_automation_tool_calls=2,
+            manual_science_transfer_tool_calls=1,
+            science_automation_to_manual_ratio=2.0,
+            material_flow_automation_tool_calls=3,
+            manual_material_transfer_tool_calls=1,
+            material_flow_automation_to_manual_ratio=3.0,
+            component_automation_tool_calls=4,
+            manual_component_craft_tool_calls=2,
+            component_automation_to_manual_ratio=2.0,
+            automation_verified_successes=2,
+            automation_verified_failures=1,
             latest_objective="Build smelting",
             top_gameplay_rejections=[("Cannot place entity here", 4)],
             verdict="safe to keep running: recent progress detected",
@@ -554,6 +777,32 @@ class BridgeReportTest(unittest.TestCase):
         self.assertIn("1h01m01s", text)
         self.assertIn("attempts=2", text)
         self.assertIn("4x Cannot place entity here", text)
+        self.assertIn(
+            "automation_vs_manual: automation_tool_calls=3 "
+            "manual_transfer_tool_calls=2 ratio=1.50",
+            text,
+        )
+        self.assertIn(
+            "fuel_automation: build_fuel_supply_calls=1 "
+            "manual_fuel_transfer_calls=2 ratio=0.50",
+            text,
+        )
+        self.assertIn(
+            "science_automation: automation_science_controller_calls=2 "
+            "manual_science_transfer_calls=1 ratio=2.00",
+            text,
+        )
+        self.assertIn(
+            "material_flow_automation: material_flow_controller_calls=3 "
+            "manual_material_transfer_calls=1 ratio=3.00",
+            text,
+        )
+        self.assertIn(
+            "component_automation: component_controller_calls=4 "
+            "manual_component_craft_calls=2 ratio=2.00",
+            text,
+        )
+        self.assertIn("automation_verified: successes=2 failures=1", text)
         self.assertIn("verdict: safe to keep running", text)
 
     def test_enrich_live_state_uses_compact_mod_remotes(self):

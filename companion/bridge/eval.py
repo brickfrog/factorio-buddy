@@ -14,12 +14,14 @@ reached.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import time
 from typing import Any, Callable
 
 from models import (
     BridgeLogRecordCollection,
+    BridgeLogToolResultLine,
     EvalMilestoneSpec,
     EvalProductionSnapshot,
     EvalResult,
@@ -32,6 +34,60 @@ Milestone = tuple[str, Callable[[Any], bool]]
 
 _DONE_COST_RE = re.compile(r"\bdone:\s*\$([0-9]+(?:\.[0-9]+)?)")
 _LEDGER_OBJECTIVE_RE = re.compile(r"^\s*objective:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+_TOOL_CALL_RE = re.compile(r"\btool:\s*([A-Za-z0-9_]+)\s*\(")
+_TOOL_CALL_WITH_ARGS_RE = re.compile(r"\btool:\s*([A-Za-z0-9_]+)\s*\((.*)\)\s*$")
+
+AUTOMATION_TOOL_NAMES = frozenset({
+    "build_assembler_feed",
+    "build_assembler_output",
+    "build_automation_science",
+    "build_recipe_assembler_cell",
+    "build_fuel_supply",
+    "build_lab_feed",
+    "execute_direct_smelter",
+    "execute_edge_miner",
+    "execute_entity_placement_near",
+    "plan_automation_science",
+    "plan_recipe_assembler_cell",
+    "route_belt",
+})
+MANUAL_TRANSFER_TOOL_NAMES = frozenset({
+    "craft",
+    "extract_items",
+    "feed_lab_from_inventory",
+    "hand_feed_furnace",
+    "insert_items",
+})
+FUEL_AUTOMATION_TOOL_NAMES = frozenset({
+    "build_fuel_supply",
+})
+SCIENCE_AUTOMATION_TOOL_NAMES = frozenset({
+    "build_automation_science",
+    "build_lab_feed",
+    "plan_automation_science",
+})
+MATERIAL_FLOW_AUTOMATION_TOOL_NAMES = frozenset({
+    "build_assembler_feed",
+    "build_assembler_output",
+    "execute_direct_smelter",
+    "execute_edge_miner",
+    "route_belt",
+})
+COMPONENT_AUTOMATION_TOOL_NAMES = frozenset({
+    "build_assembler_feed",
+    "build_assembler_output",
+    "build_automation_science",
+    "plan_automation_science",
+    "build_recipe_assembler_cell",
+    "plan_recipe_assembler_cell",
+})
+FUEL_ITEMS = frozenset({
+    "coal",
+    "wood",
+    "solid-fuel",
+    "rocket-fuel",
+    "nuclear-fuel",
+})
 
 
 VALUES: dict[str, float] = {
@@ -117,6 +173,23 @@ def wasted_turn_metrics(records: Any) -> dict[str, Any]:
         "tool_calls_before_first_milestone": 0,
         "expected_misses": 0,
         "real_failures": 0,
+        "automation_tool_calls": 0,
+        "manual_transfer_tool_calls": 0,
+        "automation_to_manual_ratio": None,
+        "fuel_automation_tool_calls": 0,
+        "manual_fuel_transfer_tool_calls": 0,
+        "fuel_automation_to_manual_ratio": None,
+        "science_automation_tool_calls": 0,
+        "manual_science_transfer_tool_calls": 0,
+        "science_automation_to_manual_ratio": None,
+        "material_flow_automation_tool_calls": 0,
+        "manual_material_transfer_tool_calls": 0,
+        "material_flow_automation_to_manual_ratio": None,
+        "component_automation_tool_calls": 0,
+        "manual_component_craft_tool_calls": 0,
+        "component_automation_to_manual_ratio": None,
+        "automation_verified_successes": 0,
+        "automation_verified_failures": 0,
         "cost_to_first_milestone_usd": 0.0,
         "total_cost_usd": 0.0,
     }
@@ -162,9 +235,36 @@ def wasted_turn_metrics(records: Any) -> dict[str, Any]:
             or '"can_place":false' in lower
         ):
             metrics["rejected_placements"] += 1
+        verification = _automation_verification_from_tool_result(text)
+        if verification is True:
+            metrics["automation_verified_successes"] += 1
+        elif verification is False:
+            metrics["automation_verified_failures"] += 1
 
-        if text.startswith("tool:") and not first_milestone_seen:
-            metrics["tool_calls_before_first_milestone"] += 1
+        if text.startswith("tool:"):
+            tool_name = _tool_name_from_log_message(text)
+            if tool_name in AUTOMATION_TOOL_NAMES:
+                metrics["automation_tool_calls"] += 1
+            if tool_name in MANUAL_TRANSFER_TOOL_NAMES:
+                metrics["manual_transfer_tool_calls"] += 1
+            if tool_name in FUEL_AUTOMATION_TOOL_NAMES:
+                metrics["fuel_automation_tool_calls"] += 1
+            if _is_manual_fuel_transfer_tool_call(text, tool_name=tool_name):
+                metrics["manual_fuel_transfer_tool_calls"] += 1
+            if tool_name in SCIENCE_AUTOMATION_TOOL_NAMES:
+                metrics["science_automation_tool_calls"] += 1
+            if _is_manual_science_transfer_tool_call(text, tool_name=tool_name):
+                metrics["manual_science_transfer_tool_calls"] += 1
+            if tool_name in MATERIAL_FLOW_AUTOMATION_TOOL_NAMES:
+                metrics["material_flow_automation_tool_calls"] += 1
+            if _is_manual_material_transfer_tool_call(text, tool_name=tool_name):
+                metrics["manual_material_transfer_tool_calls"] += 1
+            if tool_name in COMPONENT_AUTOMATION_TOOL_NAMES:
+                metrics["component_automation_tool_calls"] += 1
+            if _is_manual_component_craft_tool_call(text, tool_name=tool_name):
+                metrics["manual_component_craft_tool_calls"] += 1
+            if not first_milestone_seen:
+                metrics["tool_calls_before_first_milestone"] += 1
 
         for match in _DONE_COST_RE.finditer(text):
             cost = float(match.group(1))
@@ -180,7 +280,196 @@ def wasted_turn_metrics(records: Any) -> dict[str, Any]:
         6,
     )
     metrics["total_cost_usd"] = round(metrics["total_cost_usd"], 6)
+    manual_count = metrics["manual_transfer_tool_calls"]
+    if manual_count:
+        metrics["automation_to_manual_ratio"] = round(
+            metrics["automation_tool_calls"] / manual_count,
+            6,
+        )
+    elif metrics["automation_tool_calls"]:
+        metrics["automation_to_manual_ratio"] = float("inf")
+    manual_fuel_count = metrics["manual_fuel_transfer_tool_calls"]
+    if manual_fuel_count:
+        metrics["fuel_automation_to_manual_ratio"] = round(
+            metrics["fuel_automation_tool_calls"] / manual_fuel_count,
+            6,
+        )
+    elif metrics["fuel_automation_tool_calls"]:
+        metrics["fuel_automation_to_manual_ratio"] = float("inf")
+    manual_science_count = metrics["manual_science_transfer_tool_calls"]
+    if manual_science_count:
+        metrics["science_automation_to_manual_ratio"] = round(
+            metrics["science_automation_tool_calls"] / manual_science_count,
+            6,
+        )
+    elif metrics["science_automation_tool_calls"]:
+        metrics["science_automation_to_manual_ratio"] = float("inf")
+    manual_material_count = metrics["manual_material_transfer_tool_calls"]
+    if manual_material_count:
+        metrics["material_flow_automation_to_manual_ratio"] = round(
+            metrics["material_flow_automation_tool_calls"] / manual_material_count,
+            6,
+        )
+    elif metrics["material_flow_automation_tool_calls"]:
+        metrics["material_flow_automation_to_manual_ratio"] = float("inf")
+    manual_component_count = metrics["manual_component_craft_tool_calls"]
+    if manual_component_count:
+        metrics["component_automation_to_manual_ratio"] = round(
+            metrics["component_automation_tool_calls"] / manual_component_count,
+            6,
+        )
+    elif metrics["component_automation_tool_calls"]:
+        metrics["component_automation_to_manual_ratio"] = float("inf")
     return metrics
+
+
+def _tool_name_from_log_message(text: str) -> str:
+    match = _TOOL_CALL_RE.search(text)
+    return match.group(1) if match else ""
+
+
+def _tool_args_from_log_message(text: str) -> Any:
+    match = _TOOL_CALL_WITH_ARGS_RE.search(text)
+    if not match:
+        return None
+    return _json_value_from_tool_result_suffix(match.group(2).strip())
+
+
+def _is_manual_fuel_transfer_tool_call(text: str, *, tool_name: str) -> bool:
+    if tool_name not in {"hand_feed_furnace", "insert_items"}:
+        return False
+    args = _tool_args_from_log_message(text)
+    if isinstance(args, dict):
+        item = str(args.get("item") or "").strip().lower()
+        inventory_type = str(args.get("inventory_type") or "").strip().lower()
+        if item in FUEL_ITEMS or inventory_type == "fuel":
+            return True
+    lower = text.lower()
+    return any(
+        marker in lower
+        for marker in (
+            '"inventory_type":"fuel"',
+            '"inventory_type": "fuel"',
+            '"item":"coal"',
+            '"item": "coal"',
+            '"item":"wood"',
+            '"item": "wood"',
+            '"item":"solid-fuel"',
+            '"item": "solid-fuel"',
+        )
+    )
+
+
+def _is_manual_science_transfer_tool_call(text: str, *, tool_name: str) -> bool:
+    if tool_name not in {
+        "craft",
+        "extract_items",
+        "feed_lab_from_inventory",
+        "insert_items",
+    }:
+        return False
+    args = _tool_args_from_log_message(text)
+    if isinstance(args, dict):
+        recipe = str(args.get("recipe") or "").strip().lower()
+        item = str(args.get("item") or "").strip().lower()
+        science_pack = str(args.get("science_pack") or "").strip().lower()
+        if (
+            recipe.endswith("-science-pack")
+            or item.endswith("-science-pack")
+            or science_pack.endswith("-science-pack")
+        ):
+            return True
+    lower = text.lower()
+    return "automation-science-pack" in lower or "-science-pack" in lower
+
+
+def _is_manual_material_transfer_tool_call(text: str, *, tool_name: str) -> bool:
+    if tool_name == "hand_feed_furnace":
+        return True
+    if tool_name not in {"extract_items", "insert_items"}:
+        return False
+    args = _tool_args_from_log_message(text)
+    if isinstance(args, dict):
+        item = str(args.get("item") or "").strip().lower()
+        inventory_type = str(args.get("inventory_type") or "").strip().lower()
+        if tool_name == "insert_items":
+            return inventory_type == "furnace_source" and item in {
+                "iron-ore",
+                "copper-ore",
+                "stone",
+            }
+        return inventory_type == "furnace_result" and item in {
+            "iron-plate",
+            "copper-plate",
+            "steel-plate",
+        }
+    lower = text.lower()
+    return (
+        "furnace_source" in lower
+        or (
+            "furnace_result" in lower
+            and any(item in lower for item in ("iron-plate", "copper-plate", "steel-plate"))
+        )
+    )
+
+
+def _is_manual_component_craft_tool_call(text: str, *, tool_name: str) -> bool:
+    if tool_name != "craft":
+        return False
+    args = _tool_args_from_log_message(text)
+    if isinstance(args, dict):
+        recipe = str(args.get("recipe") or "").strip().lower()
+        return recipe in {
+            "iron-gear-wheel",
+            "copper-cable",
+            "electronic-circuit",
+        }
+    lower = text.lower()
+    return any(
+        recipe in lower
+        for recipe in (
+            "iron-gear-wheel",
+            "copper-cable",
+            "electronic-circuit",
+        )
+    )
+
+
+def _automation_verification_from_tool_result(text: str) -> bool | None:
+    line = BridgeLogToolResultLine.from_line(text)
+    if not line.has_tool_result_payload:
+        return None
+    payload = _json_value_from_tool_result_suffix(line.suffix)
+    return _automation_verification_from_payload(payload)
+
+
+def _json_value_from_tool_result_suffix(suffix: str) -> Any:
+    try:
+        return json.loads(suffix)
+    except (TypeError, ValueError):
+        return None
+
+
+def _automation_verification_from_payload(value: Any) -> bool | None:
+    if isinstance(value, list):
+        for item in value:
+            result = _automation_verification_from_payload(item)
+            if result is not None:
+                return result
+        return None
+    if not isinstance(value, dict):
+        return None
+    if value.get("type") == "text" and isinstance(value.get("text"), str):
+        nested = _json_value_from_tool_result_suffix(value["text"])
+        return _automation_verification_from_payload(nested)
+    verification = value.get("automation_verified") or value.get("verification")
+    if isinstance(verification, dict) and isinstance(verification.get("success"), bool):
+        return bool(verification["success"])
+    for item in value.values():
+        result = _automation_verification_from_payload(item)
+        if result is not None:
+            return result
+    return None
 
 
 def _is_eval_milestone_text(lower_text: str) -> bool:

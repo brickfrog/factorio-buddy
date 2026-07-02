@@ -9,6 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+from eval import wasted_turn_metrics
 from models import (
     BridgeLogMessage,
     BridgeLogRecord,
@@ -134,6 +135,62 @@ def analyze_records(
         cutoff = last_ts - report.recent_progress_window_s
         report.recent_progress_events = sum(1 for ts in progress_timestamps if ts >= cutoff)
 
+    waste_metrics = wasted_turn_metrics(records)
+    report.automation_tool_calls = int(waste_metrics.get("automation_tool_calls") or 0)
+    report.manual_transfer_tool_calls = int(
+        waste_metrics.get("manual_transfer_tool_calls") or 0
+    )
+    ratio = waste_metrics.get("automation_to_manual_ratio")
+    report.automation_to_manual_ratio = (
+        float(ratio) if isinstance(ratio, (int, float)) else None
+    )
+    report.fuel_automation_tool_calls = int(
+        waste_metrics.get("fuel_automation_tool_calls") or 0
+    )
+    report.manual_fuel_transfer_tool_calls = int(
+        waste_metrics.get("manual_fuel_transfer_tool_calls") or 0
+    )
+    fuel_ratio = waste_metrics.get("fuel_automation_to_manual_ratio")
+    report.fuel_automation_to_manual_ratio = (
+        float(fuel_ratio) if isinstance(fuel_ratio, (int, float)) else None
+    )
+    report.science_automation_tool_calls = int(
+        waste_metrics.get("science_automation_tool_calls") or 0
+    )
+    report.manual_science_transfer_tool_calls = int(
+        waste_metrics.get("manual_science_transfer_tool_calls") or 0
+    )
+    science_ratio = waste_metrics.get("science_automation_to_manual_ratio")
+    report.science_automation_to_manual_ratio = (
+        float(science_ratio) if isinstance(science_ratio, (int, float)) else None
+    )
+    report.material_flow_automation_tool_calls = int(
+        waste_metrics.get("material_flow_automation_tool_calls") or 0
+    )
+    report.manual_material_transfer_tool_calls = int(
+        waste_metrics.get("manual_material_transfer_tool_calls") or 0
+    )
+    material_ratio = waste_metrics.get("material_flow_automation_to_manual_ratio")
+    report.material_flow_automation_to_manual_ratio = (
+        float(material_ratio) if isinstance(material_ratio, (int, float)) else None
+    )
+    report.component_automation_tool_calls = int(
+        waste_metrics.get("component_automation_tool_calls") or 0
+    )
+    report.manual_component_craft_tool_calls = int(
+        waste_metrics.get("manual_component_craft_tool_calls") or 0
+    )
+    component_ratio = waste_metrics.get("component_automation_to_manual_ratio")
+    report.component_automation_to_manual_ratio = (
+        float(component_ratio) if isinstance(component_ratio, (int, float)) else None
+    )
+    report.automation_verified_successes = int(
+        waste_metrics.get("automation_verified_successes") or 0
+    )
+    report.automation_verified_failures = int(
+        waste_metrics.get("automation_verified_failures") or 0
+    )
+
     report.top_gameplay_rejections = rejection_counts.most_common(5)
     report.verdict = _verdict(report, last_provider_pause_ts, progress_timestamps)
     return report
@@ -226,6 +283,29 @@ def format_report(report: BridgeRunReport) -> str:
     lines.extend([
         f"recent_progress: {report.recent_progress_events} events in "
         f"{_format_duration(report.recent_progress_window_s)}",
+        "automation_vs_manual: "
+        f"automation_tool_calls={report.automation_tool_calls} "
+        f"manual_transfer_tool_calls={report.manual_transfer_tool_calls} "
+        f"ratio={_format_ratio(report.automation_to_manual_ratio)}",
+        "fuel_automation: "
+        f"build_fuel_supply_calls={report.fuel_automation_tool_calls} "
+        f"manual_fuel_transfer_calls={report.manual_fuel_transfer_tool_calls} "
+        f"ratio={_format_ratio(report.fuel_automation_to_manual_ratio)}",
+        "science_automation: "
+        f"automation_science_controller_calls={report.science_automation_tool_calls} "
+        f"manual_science_transfer_calls={report.manual_science_transfer_tool_calls} "
+        f"ratio={_format_ratio(report.science_automation_to_manual_ratio)}",
+        "material_flow_automation: "
+        f"material_flow_controller_calls={report.material_flow_automation_tool_calls} "
+        f"manual_material_transfer_calls={report.manual_material_transfer_tool_calls} "
+        f"ratio={_format_ratio(report.material_flow_automation_to_manual_ratio)}",
+        "component_automation: "
+        f"component_controller_calls={report.component_automation_tool_calls} "
+        f"manual_component_craft_calls={report.manual_component_craft_tool_calls} "
+        f"ratio={_format_ratio(report.component_automation_to_manual_ratio)}",
+        "automation_verified: "
+        f"successes={report.automation_verified_successes} "
+        f"failures={report.automation_verified_failures}",
     ])
     if report.top_gameplay_rejections:
         lines.append("top_gameplay_rejections:")
@@ -294,6 +374,14 @@ def _format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m{secs:02d}s"
     return f"{secs}s"
+
+
+def _format_ratio(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if math.isinf(value):
+        return "inf"
+    return f"{value:.2f}"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

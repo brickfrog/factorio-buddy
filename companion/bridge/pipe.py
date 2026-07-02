@@ -151,6 +151,7 @@ from planner import (
     build_autonomy_prompt_model,
     choose_autonomy_decision,
     objective_completion_evidence,
+    planner_advisory_for_decision,
 )
 from skills import strip_skill_trailer
 from rcon import RCONClient, ThreadSafeRCON, lua_long_string
@@ -408,6 +409,30 @@ _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
         },
         "optional": {"inventory_type": TOOL_PARAM_STRING},
     },
+    "build_fuel_supply": {
+        "required": {
+            "consumer_unit_number": TOOL_PARAM_INTEGER,
+            "from_x": TOOL_PARAM_INTEGER,
+            "from_y": TOOL_PARAM_INTEGER,
+            "pickup_x": TOOL_PARAM_INTEGER,
+            "pickup_y": TOOL_PARAM_INTEGER,
+            "inserter_x": TOOL_PARAM_NUMBER,
+            "inserter_y": TOOL_PARAM_NUMBER,
+            "inserter_direction": TOOL_PARAM_STRING,
+        },
+        "optional": {
+            "inserter_name": TOOL_PARAM_STRING,
+            "inserter_fuel_item": TOOL_PARAM_STRING,
+            "inserter_fuel_count": TOOL_PARAM_INTEGER,
+            "belt_type": TOOL_PARAM_STRING,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+            "verify_radius": TOOL_PARAM_INTEGER,
+        },
+    },
     "feed_lab_from_inventory": {
         "required": {
             "lab_unit_number": TOOL_PARAM_INTEGER,
@@ -415,6 +440,124 @@ _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
             "count": TOOL_PARAM_INTEGER,
         },
         "optional": {"dry_run": TOOL_PARAM_BOOLEAN},
+    },
+    "plan_automation_science": {
+        "required": {
+            "assembler_unit_number": TOOL_PARAM_INTEGER,
+            "lab_unit_number": TOOL_PARAM_INTEGER,
+            "gear_from_x": TOOL_PARAM_INTEGER,
+            "gear_from_y": TOOL_PARAM_INTEGER,
+            "copper_from_x": TOOL_PARAM_INTEGER,
+            "copper_from_y": TOOL_PARAM_INTEGER,
+        },
+        "optional": {
+            "gear_side": TOOL_PARAM_STRING,
+            "copper_side": TOOL_PARAM_STRING,
+            "output_side": TOOL_PARAM_STRING,
+            "lab_side": TOOL_PARAM_STRING,
+            "belt_type": TOOL_PARAM_STRING,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+            "verify_radius": TOOL_PARAM_INTEGER,
+        },
+    },
+    "build_automation_science": {
+        "required": {
+            "assembler_unit_number": TOOL_PARAM_INTEGER,
+            "lab_unit_number": TOOL_PARAM_INTEGER,
+            "gear_from_x": TOOL_PARAM_INTEGER,
+            "gear_from_y": TOOL_PARAM_INTEGER,
+            "gear_pickup_x": TOOL_PARAM_INTEGER,
+            "gear_pickup_y": TOOL_PARAM_INTEGER,
+            "gear_inserter_x": TOOL_PARAM_NUMBER,
+            "gear_inserter_y": TOOL_PARAM_NUMBER,
+            "gear_inserter_direction": TOOL_PARAM_STRING,
+            "copper_from_x": TOOL_PARAM_INTEGER,
+            "copper_from_y": TOOL_PARAM_INTEGER,
+            "copper_pickup_x": TOOL_PARAM_INTEGER,
+            "copper_pickup_y": TOOL_PARAM_INTEGER,
+            "copper_inserter_x": TOOL_PARAM_NUMBER,
+            "copper_inserter_y": TOOL_PARAM_NUMBER,
+            "copper_inserter_direction": TOOL_PARAM_STRING,
+            "science_drop_x": TOOL_PARAM_INTEGER,
+            "science_drop_y": TOOL_PARAM_INTEGER,
+            "science_to_x": TOOL_PARAM_INTEGER,
+            "science_to_y": TOOL_PARAM_INTEGER,
+            "output_inserter_x": TOOL_PARAM_NUMBER,
+            "output_inserter_y": TOOL_PARAM_NUMBER,
+            "output_inserter_direction": TOOL_PARAM_STRING,
+            "lab_from_x": TOOL_PARAM_INTEGER,
+            "lab_from_y": TOOL_PARAM_INTEGER,
+            "lab_pickup_x": TOOL_PARAM_INTEGER,
+            "lab_pickup_y": TOOL_PARAM_INTEGER,
+            "lab_inserter_x": TOOL_PARAM_NUMBER,
+            "lab_inserter_y": TOOL_PARAM_NUMBER,
+            "lab_inserter_direction": TOOL_PARAM_STRING,
+        },
+        "optional": {
+            "belt_type": TOOL_PARAM_STRING,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+            "verify_radius": TOOL_PARAM_INTEGER,
+        },
+    },
+    "plan_recipe_assembler_cell": {
+        "required": {
+            "assembler_unit_number": TOOL_PARAM_INTEGER,
+            "recipe": TOOL_PARAM_STRING,
+            "input_item_name": TOOL_PARAM_STRING,
+            "output_item_name": TOOL_PARAM_STRING,
+            "input_from_x": TOOL_PARAM_INTEGER,
+            "input_from_y": TOOL_PARAM_INTEGER,
+            "output_to_x": TOOL_PARAM_INTEGER,
+            "output_to_y": TOOL_PARAM_INTEGER,
+        },
+        "optional": {
+            "input_side": TOOL_PARAM_STRING,
+            "output_side": TOOL_PARAM_STRING,
+            "belt_type": TOOL_PARAM_STRING,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+            "verify_radius": TOOL_PARAM_INTEGER,
+        },
+    },
+    "build_recipe_assembler_cell": {
+        "required": {
+            "assembler_unit_number": TOOL_PARAM_INTEGER,
+            "recipe": TOOL_PARAM_STRING,
+            "input_item_name": TOOL_PARAM_STRING,
+            "output_item_name": TOOL_PARAM_STRING,
+            "input_from_x": TOOL_PARAM_INTEGER,
+            "input_from_y": TOOL_PARAM_INTEGER,
+            "input_pickup_x": TOOL_PARAM_INTEGER,
+            "input_pickup_y": TOOL_PARAM_INTEGER,
+            "input_inserter_x": TOOL_PARAM_NUMBER,
+            "input_inserter_y": TOOL_PARAM_NUMBER,
+            "input_inserter_direction": TOOL_PARAM_STRING,
+            "output_drop_x": TOOL_PARAM_INTEGER,
+            "output_drop_y": TOOL_PARAM_INTEGER,
+            "output_to_x": TOOL_PARAM_INTEGER,
+            "output_to_y": TOOL_PARAM_INTEGER,
+            "output_inserter_x": TOOL_PARAM_NUMBER,
+            "output_inserter_y": TOOL_PARAM_NUMBER,
+            "output_inserter_direction": TOOL_PARAM_STRING,
+        },
+        "optional": {
+            "belt_type": TOOL_PARAM_STRING,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+            "verify_radius": TOOL_PARAM_INTEGER,
+        },
     },
     "route_belt": {
         "required": {
@@ -479,6 +622,18 @@ _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
     "get_machine_belt_positions": {
         "required": {"unit_number": TOOL_PARAM_INTEGER},
     },
+    "execute_entity_placement_near": {
+        "required": {
+            "entity_name": TOOL_PARAM_STRING,
+            "x": TOOL_PARAM_NUMBER,
+            "y": TOOL_PARAM_NUMBER,
+        },
+        "optional": {
+            "radius": TOOL_PARAM_INTEGER,
+            "limit": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+        },
+    },
     "build_edge_miner": {
         "required": {
             "resource_type": TOOL_PARAM_STRING,
@@ -489,6 +644,22 @@ _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
             "radius": TOOL_PARAM_INTEGER,
             "drill_name": TOOL_PARAM_STRING,
             "limit": TOOL_PARAM_INTEGER,
+        },
+    },
+    "execute_edge_miner": {
+        "required": {
+            "resource_type": TOOL_PARAM_STRING,
+            "x": TOOL_PARAM_NUMBER,
+            "y": TOOL_PARAM_NUMBER,
+        },
+        "optional": {
+            "radius": TOOL_PARAM_INTEGER,
+            "drill_name": TOOL_PARAM_STRING,
+            "limit": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+            "fuel_item": TOOL_PARAM_STRING,
+            "fuel_count": TOOL_PARAM_INTEGER,
+            "verify_radius": TOOL_PARAM_INTEGER,
         },
     },
     "build_direct_smelter": {
@@ -678,6 +849,142 @@ class PlannerReadOnlyToolGate:
         block = PreToolUseGuardBlock.read_only_turn(tool_name=request.short_name)
         self.log.debug(block.debug_message)
         return PreToolUseHookResponse.block(block).to_dict()
+
+
+class ManualAutomationDriftGate:
+    """Block manual transfer tools when the committed plan is stale automation."""
+
+    MANUAL_TRANSFER_TOOLS = frozenset({
+        "craft",
+        "extract_items",
+        "feed_lab_from_inventory",
+        "hand_feed_furnace",
+        "insert_items",
+    })
+
+    def __init__(
+        self,
+        log,
+        agent_name: str,
+        ledger_loader: Any = load_ledger_model,
+        live_state_loader: Any | None = None,
+    ):
+        self.log = log
+        self.agent_name = str(agent_name or "")
+        self.ledger_loader = ledger_loader
+        self.live_state_loader = live_state_loader
+
+    async def hook(
+        self,
+        hook_input: Any,
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        request = _tool_request_from_hook_input(hook_input)
+        if request is None or not request.is_factorio_mcp_tool:
+            return PreToolUseHookResponse.noop().to_dict()
+        if request.short_name not in self.MANUAL_TRANSFER_TOOLS:
+            return PreToolUseHookResponse.noop().to_dict()
+
+        try:
+            ledger = self.ledger_loader(self.agent_name)
+        except Exception as exc:
+            self.log.debug("manual automation guard ledger lookup failed: {}", exc)
+            return PreToolUseHookResponse.noop().to_dict()
+        live_state = None
+        if self.live_state_loader is not None:
+            try:
+                live_state = self.live_state_loader(self.agent_name)
+            except Exception as exc:
+                self.log.debug("manual automation guard live-state lookup failed: {}", exc)
+        durable_recovery_context = self._ledger_has_durable_recovery_context(ledger)
+        if durable_recovery_context and (
+            request.is_manual_fuel_transfer or request.is_manual_material_transfer
+        ):
+            return PreToolUseHookResponse.noop().to_dict()
+        if (
+            request.is_manual_fuel_transfer
+            and live_state is not None
+            and live_state.has_automation_capable_footprint()
+        ):
+            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
+            self.log.debug(block.debug_message)
+            return PreToolUseHookResponse.block(block).to_dict()
+        if (
+            request.is_manual_science_transfer
+            and live_state is not None
+            and live_state.has_any((
+                "assembling-machine-1",
+                "assembling-machine-2",
+                "assembling-machine-3",
+            ))
+        ):
+            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
+            self.log.debug(block.debug_message)
+            return PreToolUseHookResponse.block(block).to_dict()
+        if (
+            request.is_manual_material_transfer
+            and live_state is not None
+            and live_state.has_automation_capable_footprint()
+        ):
+            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
+            self.log.debug(block.debug_message)
+            return PreToolUseHookResponse.block(block).to_dict()
+        if (
+            request.is_manual_component_craft
+            and live_state is not None
+            and live_state.has_any((
+                "assembling-machine-1",
+                "assembling-machine-2",
+                "assembling-machine-3",
+            ))
+            and self._ledger_is_science_automation_context(ledger)
+        ):
+            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
+            self.log.debug(block.debug_message)
+            return PreToolUseHookResponse.block(block).to_dict()
+        if not ledger.has_stale_manual_automation_plan(live_state):
+            return PreToolUseHookResponse.noop().to_dict()
+
+        block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
+        self.log.debug(block.debug_message)
+        return PreToolUseHookResponse.block(block).to_dict()
+
+    @staticmethod
+    def _ledger_is_science_automation_context(ledger: Any) -> bool:
+        try:
+            text = str(ledger.active_text() or "")
+        except Exception:
+            text = ""
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "automation-science",
+                "science pack",
+                "red science",
+                "plan_automation_science",
+                "build_automation_science",
+                "build_lab_feed",
+            )
+        )
+
+    @staticmethod
+    def _ledger_has_durable_recovery_context(ledger: Any) -> bool:
+        try:
+            text = str(ledger.active_text() or "").lower()
+        except Exception:
+            text = ""
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "route_belt",
+                "build_fuel_supply",
+            )
+        )
 
 
 class FactorioToolSchemaGate:
@@ -1356,6 +1663,27 @@ def _finalize_reply(reply: str, agent_name: str) -> str:
     return reply
 
 
+def _load_live_state_for_agent(
+    rcon: RCONClient,
+    agent_name: str,
+    log: Any = logger,
+) -> LiveState:
+    """Best-effort live state for hook-time automation guards."""
+    try:
+        agent = lua_long_string(agent_name)
+        out = rcon.execute(RconRemoteCall.command(
+            "live_state_result",
+            agent,
+        ))
+        try:
+            return LiveState.from_rcon_response(out)
+        except BridgeValidationError:
+            return LiveState.from_line(out)
+    except Exception as exc:
+        log.debug("live-state lookup failed: {}", exc)
+        return LiveState()
+
+
 def handle_message_model(
     prompt: str,
     mcp_config: McpServersConfig | str | Path,
@@ -1415,6 +1743,15 @@ def handle_message_model(
         required=invocation.skill_config.requires_factorio_control,
     )
     factorio_schema_gate = FactorioToolSchemaGate(log)
+    manual_automation_gate = ManualAutomationDriftGate(
+        log,
+        agent_name=invocation.agent_name,
+        live_state_loader=lambda agent_name: _load_live_state_for_agent(
+            rcon,
+            agent_name,
+            log,
+        ),
+    )
     options = ClaudeAgentOptions(
         system_prompt=sdk_options_spec.system_prompt,
         model=sdk_options_spec.model,
@@ -1435,6 +1772,7 @@ def handle_message_model(
                     read_only_tool_gate.hook,
                     factorio_skill_gate.hook,
                     factorio_schema_gate.hook,
+                    manual_automation_gate.hook,
                     mutating_tool_gate.hook,
                 ])
             ],
@@ -1834,6 +2172,7 @@ class AgentThread:
             self._exec_ticks_since_plan,
             self._planner_interval,
             journal_window=journal_window,
+            live_state=live_state,
             live_completion_evidence=live_completion,
             reflect_due=reflect_due,
         )
@@ -1856,6 +2195,7 @@ class AgentThread:
                 memory_text=memory,
                 learned_text=learned_text,
                 live_completion_reason=live_completion_reason,
+                planner_advisory=planner_advisory_for_decision(decision.reason),
             ),
         )
         if decision.is_plan:

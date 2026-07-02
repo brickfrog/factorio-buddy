@@ -41,11 +41,57 @@ tool can inspect the current game state.
    relevant status tool. If verification reports a problem, fix that concrete
    problem before expanding the build.
 
-6. Treat research and recipes as runtime data.
+6. Build durable automation instead of repeating manual cycles.
+   Manual `insert_items`, `extract_items`, `craft`, `hand_feed_furnace`, and
+   `feed_lab_from_inventory` are bootstrap or recovery actions, not finished
+   factory work. If the same ingredient, fuel, plate, or science-pack transfer
+   will be needed again, spend the next actionable turn building the durable
+   route:
+   - use `execute_direct_smelter` for drill-to-furnace cells
+   - use `execute_edge_miner` for patch-edge drill plus output-belt cells
+   - use `execute_entity_placement_near` for safe assembler, lab, pole, chest,
+     or crowded-build placement
+   - use `diagnose_fuel_sustainability` then `build_fuel_supply` for boilers,
+     furnaces, and burner drills; when diagnostics return
+     `build_fuel_supply_args`, pass those directly to `build_fuel_supply`
+   - use `plan_automation_science` to derive a complete red-science cell, then
+     pass its `ready_to_call.execute_args` to `build_automation_science`
+   - use `plan_recipe_assembler_cell` then `build_recipe_assembler_cell` to
+     create component belts such as `iron-gear-wheel` from an `iron-plate` belt
+   - use `build_assembler_feed` for assembler input belts
+   - use `build_assembler_output` for assembler product belts
+   - use `build_lab_feed` for science belts into labs
+   A plan that only hand-crafts and hand-delivers more science packs is stale
+   once assemblers, inserters, belts, and power exist.
+   A plan that only inserts coal or ore into an existing furnace, boiler, or
+   burner drill is stale once belts, inserters, power poles, drills, labs, or
+   assemblers exist. In that state, diagnose the consumer and build the coal
+   delivery path with `build_fuel_supply` instead of refilling it by hand.
+
+7. Automate science production as a complete cell.
+   For `automation-science-pack`, do not stop at crafting packs in inventory.
+   Place missing assemblers or labs with `execute_entity_placement_near`
+   first, then use the returned `placed_unit_number`. Prefer
+   `plan_recipe_assembler_cell` before `plan_automation_science` when no
+   `iron-gear-wheel` belt exists: place a small gear assembler, plan the
+   `iron-gear-wheel` cell from an `iron-plate` belt, execute
+   `build_recipe_assembler_cell`, and use that output belt as the gear source.
+   Then prefer
+   `plan_automation_science` during planning. It takes the assembler, lab, gear
+   source belt tile, and copper source belt tile, then returns exact
+   `build_automation_science` arguments plus dry-run route checks. If
+   `plan_automation_science.success` is true, call `build_automation_science`
+   with `ready_to_call.execute_args`. Use `build_automation_science` with
+   hand-written coordinates only when repairing a known custom layout. Use
+   `build_assembler_feed`, `build_assembler_output`, and `build_lab_feed` only
+   for repair or custom layouts that the composite planner cannot cover. Verify
+   the assembler and lab before starting another research objective.
+
+8. Treat research and recipes as runtime data.
    If a craft fails or a recipe seems unavailable, query the recipe/technology
    state and follow the reported blockers. Avoid guessing alternate recipe
    names.
 
-7. Keep replies short.
+9. Keep replies short.
    The player sees in-game text. Report the operational result and any real
    blocker, not an internal chain of thought.

@@ -11,6 +11,7 @@ fn production(
 ) -> EntityProduction {
     EntityProduction {
         name: name.to_string(),
+        unit_number: None,
         position: Position::new(x, y),
         status: status.to_string(),
         products_finished,
@@ -41,6 +42,7 @@ fn production_report_is_compact_and_aggregated() {
             "entities": [
                 {
                     "name": "burner-mining-drill",
+                    "unit_number": null,
                     "position": { "x": 10.5, "y": -3.5 },
                     "status": "working",
                     "products_finished": 42,
@@ -48,6 +50,7 @@ fn production_report_is_compact_and_aggregated() {
                 },
                 {
                     "name": "stone-furnace",
+                    "unit_number": null,
                     "position": { "x": 12.5, "y": -3.5 },
                     "status": "no_fuel",
                     "products_finished": 7,
@@ -55,6 +58,7 @@ fn production_report_is_compact_and_aggregated() {
                 },
                 {
                     "name": "assembling-machine-1",
+                    "unit_number": null,
                     "position": { "x": 14.0, "y": -2.0 },
                     "status": "full_output",
                     "products_finished": 3,
@@ -62,6 +66,7 @@ fn production_report_is_compact_and_aggregated() {
                 },
                 {
                     "name": "electric-mining-drill",
+                    "unit_number": null,
                     "position": { "x": 8.5, "y": -4.5 },
                     "status": "no_power",
                     "products_finished": null,
@@ -69,6 +74,7 @@ fn production_report_is_compact_and_aggregated() {
                 },
                 {
                     "name": "lab",
+                    "unit_number": null,
                     "position": { "x": 16.0, "y": -2.5 },
                     "status": "working",
                     "products_finished": null,

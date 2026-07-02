@@ -13,6 +13,7 @@ from models import (
     LedgerStatus,
     LiveCompletionEvidence,
     LiveState,
+    ProgressSignal,
     autonomy_mode,
 )
 
@@ -86,17 +87,39 @@ EXECUTION_PROMPT = (
 )
 
 
+STALE_MANUAL_AUTOMATION_ADVISORY = (
+    "Planner correction: the current ledger plan relies on manual transfers "
+    "inside an automation-capable factory. Do not reaffirm that plan. Replace "
+    "it with durable automation steps. For fuel, first plan "
+    "diagnose_fuel_sustainability near the starving boiler/furnace/drill, then "
+    "build_fuel_supply for the ranked consumer. For red science, use "
+    "plan_recipe_assembler_cell and build_recipe_assembler_cell first when an "
+    "iron-gear-wheel belt is missing, then use plan_automation_science and pass "
+    "ready_to_call.execute_args to build_automation_science. For other item flow, use execute_direct_smelter, "
+    "execute_edge_miner, build_assembler_feed, build_assembler_output, or build_lab_feed as "
+    "appropriate. Manual insert_items, extract_items, craft, hand_feed_furnace, "
+    "or feed_lab_from_inventory may appear only as a temporary recovery step "
+    "after the durable route is planned."
+)
+
+
 def choose_autonomy_decision(
     ledger: LedgerState | dict,
     exec_ticks_since_plan: int,
     planner_interval: int,
     *,
     journal_window: Any = None,
+    live_state: LiveState | str | None = None,
     live_completion_evidence: Any = None,
     reflect_due: bool = False,
 ) -> AutonomyDecision:
     """Return the typed autonomy decision for this tick without IO/state."""
     state = LedgerState.coerce(ledger)
+    live = (
+        _live_state_model(live_state)
+        if live_state is not None
+        else LiveState()
+    )
     window = (
         journal_window
         if isinstance(journal_window, JournalWindow)
@@ -141,16 +164,71 @@ def choose_autonomy_decision(
             mode=AutonomyMode.PLAN,
             reason=AutonomyDecisionReason.PLAN_DONE,
         )
+    if state.signal == ProgressSignal.PLAN_DONE:
+        return AutonomyDecision(
+            mode=AutonomyMode.PLAN,
+            reason=AutonomyDecisionReason.PLAN_DONE,
+        )
+    if state.status == LedgerStatus.BLOCKED:
+        return AutonomyDecision(
+            mode=AutonomyMode.PLAN,
+            reason=AutonomyDecisionReason.REFLECTION_DUE,
+        )
+    if repeated_plan_progress:
+        return AutonomyDecision(
+            mode=AutonomyMode.EXECUTE,
+            reason=AutonomyDecisionReason.REPEATED_PLAN_PROGRESS,
+            actionable_plan=True,
+        )
+    if state.has_stale_manual_automation_plan(live):
+        return AutonomyDecision(
+            mode=AutonomyMode.PLAN,
+            reason=AutonomyDecisionReason.STALE_MANUAL_AUTOMATION,
+            actionable_plan=False,
+        )
     if state.next_required_mode == LedgerNextRequiredMode.PLAN:
         return AutonomyDecision(
             mode=AutonomyMode.PLAN,
             reason=AutonomyDecisionReason.ACTIONABLE_PLAN,
+        )
+    if state.next_required_mode == LedgerNextRequiredMode.WAIT:
+        return AutonomyDecision(
+            mode=AutonomyMode.PLAN,
+            reason=AutonomyDecisionReason.REFLECTION_DUE,
         )
     if state.next_required_mode == LedgerNextRequiredMode.EXECUTE:
         return AutonomyDecision(
             mode=AutonomyMode.EXECUTE,
             reason=AutonomyDecisionReason.ACTIONABLE_PLAN,
             actionable_plan=True,
+        )
+    if live_completion_reason:
+        return AutonomyDecision(
+            mode=AutonomyMode.PLAN,
+            reason=AutonomyDecisionReason.LIVE_STATE_COMPLETION,
+            actionable_plan=actionable_plan or repeated_plan_progress,
+        )
+    if has_plan and not state.blocker.strip():
+        if (
+            window.newest_event_indicates_plan_done()
+            and not actionable_plan
+            and not repeated_plan_progress
+        ):
+            return AutonomyDecision(
+                mode=AutonomyMode.PLAN,
+                reason=AutonomyDecisionReason.PLAN_DONE,
+            )
+        reason = (
+            AutonomyDecisionReason.ACTIONABLE_PLAN
+            if actionable_plan
+            else AutonomyDecisionReason.WITHIN_INTERVAL
+        )
+        if repeated_plan_progress:
+            reason = AutonomyDecisionReason.REPEATED_PLAN_PROGRESS
+        return AutonomyDecision(
+            mode=AutonomyMode.EXECUTE,
+            reason=reason,
+            actionable_plan=actionable_plan or repeated_plan_progress,
         )
 
     try:
@@ -210,6 +288,7 @@ def choose_autonomy_mode(ledger: LedgerState | dict, exec_ticks_since_plan: int,
         ledger,
         exec_ticks_since_plan,
         planner_interval,
+        live_state=LiveState(),
     ).mode_value
 
 
@@ -259,3 +338,18 @@ def build_autonomy_prompt_model(source: AutonomyPromptInput | dict) -> str:
         planner_prompt=PLANNER_PROMPT,
         execution_prompt=EXECUTION_PROMPT,
     )
+
+
+def planner_advisory_for_decision(reason: AutonomyDecisionReason | str) -> str:
+    """Return extra planner guidance for non-default autonomy decisions."""
+    try:
+        normalized = (
+            reason
+            if isinstance(reason, AutonomyDecisionReason)
+            else AutonomyDecisionReason(str(reason))
+        )
+    except ValueError:
+        normalized = None
+    if normalized == AutonomyDecisionReason.STALE_MANUAL_AUTOMATION:
+        return STALE_MANUAL_AUTOMATION_ADVISORY
+    return ""

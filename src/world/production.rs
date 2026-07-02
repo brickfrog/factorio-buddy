@@ -7,6 +7,7 @@ use super::Position;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityProduction {
     pub name: String,
+    pub unit_number: Option<u32>,
     pub position: Position,
     pub status: String,
     pub products_finished: Option<u64>,

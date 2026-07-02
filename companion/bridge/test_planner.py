@@ -77,7 +77,7 @@ class PlannerTests(unittest.TestCase):
             "execute",
         )
 
-    def test_choose_autonomy_mode_plans_at_interval(self):
+    def test_choose_autonomy_mode_executes_active_plan_at_interval(self):
         self.assertEqual(
             planner.choose_autonomy_mode(
                 {
@@ -89,7 +89,7 @@ class PlannerTests(unittest.TestCase):
                 5,
                 5,
             ),
-            "plan",
+            "execute",
         )
 
     def test_choose_autonomy_decision_executes_actionable_plan_at_interval(self):
@@ -135,7 +135,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(decision.reason, "actionable_plan")
         self.assertTrue(decision.actionable_plan)
 
-    def test_choose_autonomy_decision_does_not_execute_from_ready_prose_only(self):
+    def test_choose_autonomy_decision_executes_active_plan_from_ready_prose_only(self):
         decision = planner.choose_autonomy_decision(
             {
                 "objective": "activate second stone-furnace unit 15",
@@ -150,11 +150,11 @@ class PlannerTests(unittest.TestCase):
             5,
         )
 
-        self.assertEqual(decision.mode, AutonomyMode.PLAN)
-        self.assertEqual(decision.reason, "planner_interval")
+        self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
+        self.assertEqual(decision.reason, "within_interval")
         self.assertFalse(decision.actionable_plan)
-        self.assertTrue(decision.read_only_tools)
-        self.assertEqual(decision.next_exec_ticks_since_plan("5"), 0)
+        self.assertFalse(decision.read_only_tools)
+        self.assertEqual(decision.next_exec_ticks_since_plan("5"), 6)
 
     def test_choose_autonomy_decision_executes_after_repeated_ready_ledger_notes(self):
         decision = planner.choose_autonomy_decision(
@@ -191,6 +191,76 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
         self.assertEqual(decision.reason, "actionable_plan")
         self.assertTrue(decision.actionable_plan)
+
+    def test_choose_autonomy_decision_replans_stale_manual_plan_before_typed_execute(self):
+        decision = planner.choose_autonomy_decision(
+            LedgerState(
+                objective="activate second furnace with hand-fed ore",
+                plan_steps=[
+                    "walk_to (42, -21)",
+                    "insert_items coal count=5 into furnace fuel inventory",
+                    "insert_items iron-ore count=20 into furnace_source inventory",
+                ],
+                next_required_mode=LedgerNextRequiredMode.EXECUTE,
+            ),
+            5,
+            5,
+            live_state=LiveState(
+                found=True,
+                surface="nauvis",
+                x=54.1,
+                y=-21.0,
+                entity_counts={
+                    "transport-belt": 16,
+                    "small-electric-pole": 21,
+                    "lab": 1,
+                },
+            ),
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "stale_manual_automation")
+        self.assertFalse(decision.actionable_plan)
+        self.assertTrue(decision.read_only_tools)
+
+    def test_repeated_ready_churn_executes_even_when_plan_is_manual_feed(self):
+        decision = planner.choose_autonomy_decision(
+            LedgerState(
+                objective="activate second stone-furnace unit 15 with hand-fed fuel and ore",
+                plan_steps=[
+                    "walk_to (42, -21) to approach furnace unit 15",
+                    "insert_items coal count=5 into fuel inventory of unit 15",
+                    "insert_items iron-ore count=20 into furnace_source inventory of unit 15",
+                    "verify_production at (42, -22) radius 4",
+                ],
+                progress_notes=[
+                    "situation_report confirmed stable at tick 4105905. "
+                    "Plan validated against live state, ready for execution.",
+                    "situation_report confirmed stable at tick 4107121. "
+                    "Plan validated, queued for execution.",
+                    "situation_report confirmed stable at tick 4108864. "
+                    "Plan validated, awaiting execution.",
+                ],
+            ),
+            5,
+            5,
+            live_state=LiveState(
+                found=True,
+                surface="nauvis",
+                x=54.1,
+                y=-21.0,
+                entity_counts={
+                    "transport-belt": 16,
+                    "small-electric-pole": 21,
+                    "lab": 1,
+                },
+            ),
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
+        self.assertEqual(decision.reason, "repeated_plan_progress")
+        self.assertTrue(decision.actionable_plan)
+        self.assertFalse(decision.read_only_tools)
 
     def test_choose_autonomy_decision_honors_typed_done_status(self):
         decision = planner.choose_autonomy_decision(
@@ -342,6 +412,227 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(decision.mode, AutonomyMode.PLAN)
         self.assertEqual(decision.reason, "plan_done")
+
+    def test_choose_autonomy_decision_replans_manual_science_delivery_plan(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": (
+                    "Complete logistic-science-pack research by delivering "
+                    "final automation-science-packs"
+                ),
+                "plan_steps": [
+                    "extract_items copper-plate count=15 from furnace unit 15",
+                    "craft iron-gear-wheel count=12",
+                    "craft automation-science-pack count=12",
+                    "feed_lab_from_inventory lab_unit_number=69 science_pack=automation-science-pack count=12 dry_run=false",
+                ],
+                "progress_notes": [
+                    "Manual cycle continues. Lab empty again, needs more packs.",
+                ],
+                "updated_at": "now",
+            },
+            0,
+            5,
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "stale_manual_automation")
+        self.assertIs(
+            decision.reason,
+            AutonomyDecisionReason.STALE_MANUAL_AUTOMATION,
+        )
+        self.assertTrue(decision.read_only_tools)
+
+    def test_choose_autonomy_decision_replans_manual_component_science_plan(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "Prepare ingredients for automation-science research",
+                "plan_steps": [
+                    "craft iron-gear-wheel count=12 for science assemblers",
+                    "craft copper-cable count=12 while plates accumulate",
+                    "walk_to lab and check research status",
+                ],
+                "progress_notes": [
+                    "Need more science ingredients; gear crafting continues.",
+                ],
+                "updated_at": "now",
+            },
+            0,
+            5,
+            live_state=LiveState(
+                found=True,
+                entity_counts={
+                    "assembling-machine-1": 1,
+                    "transport-belt": 8,
+                    "lab": 1,
+                },
+            ),
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "stale_manual_automation")
+        self.assertTrue(decision.read_only_tools)
+
+    def test_choose_autonomy_decision_executes_science_plan_with_automation_controllers(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "Build automated automation-science-pack cell",
+                "plan_steps": [
+                    "call plan_recipe_assembler_cell for iron-gear-wheel from iron-plate belt",
+                    "call build_recipe_assembler_cell with ready_to_call.execute_args",
+                    "call plan_automation_science for assembler/lab/source belts",
+                    "call build_automation_science with ready_to_call.execute_args",
+                    "call build_assembler_feed for iron-gear-wheel into assembler",
+                    "call build_assembler_feed for copper-plate into assembler",
+                    "call build_assembler_output for automation-science-pack toward lab belt",
+                    "call build_lab_feed from science belt to lab",
+                ],
+                "progress_notes": [],
+                "updated_at": "now",
+            },
+            0,
+            5,
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
+        self.assertFalse(decision.read_only_tools)
+
+    def test_choose_autonomy_decision_replans_repeated_manual_fuel_loop(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "keep boiler and furnace fueled",
+                "plan_steps": [
+                    "insert_items coal count=5 into boiler fuel inventory",
+                    "insert_items coal count=5 into furnace fuel inventory",
+                    "verify_production around base",
+                ],
+                "progress_notes": [
+                    "Boiler fuel exhausted again; manual refuel cycle continues.",
+                ],
+                "updated_at": "now",
+            },
+            0,
+            5,
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "stale_manual_automation")
+
+    def test_choose_autonomy_decision_replans_repeated_manual_output_loop(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "clear recurring furnace output jams",
+                "plan_steps": [
+                    "extract_items iron-plate count=50 from furnace output",
+                    "extract_items copper-plate count=15 from furnace output",
+                    "verify_production around smelters",
+                ],
+                "progress_notes": [
+                    "Furnace full_output jammed again; recurring manual extraction.",
+                ],
+                "updated_at": "now",
+            },
+            0,
+            5,
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "stale_manual_automation")
+
+    def test_choose_autonomy_decision_allows_bootstrap_manual_fuel_without_loop_evidence(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "bootstrap first smelting",
+                "plan_steps": [
+                    "insert_items coal count=1 into furnace fuel inventory",
+                    "insert_items iron-ore count=5 into furnace_source",
+                ],
+                "progress_notes": [],
+                "updated_at": "now",
+            },
+            0,
+            5,
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
+        self.assertFalse(decision.read_only_tools)
+
+    def test_choose_autonomy_decision_replans_manual_feed_when_factory_exists(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "activate second stone-furnace with hand-fed fuel and ore",
+                "plan_steps": [
+                    "walk_to (42, -21) to approach furnace unit 15",
+                    "insert_items coal count=5 into fuel inventory of unit 15",
+                    "insert_items iron-ore count=20 into furnace_source inventory of unit 15",
+                    "verify_production at (42, -22) radius 4",
+                ],
+                "progress_notes": [
+                    "Inventory intact. Plan validated against live state, ready for execution.",
+                ],
+                "updated_at": "now",
+            },
+            0,
+            5,
+            live_state=LiveState(
+                found=True,
+                surface="nauvis",
+                x=54.1,
+                y=-21.0,
+                entity_counts={
+                    "electric-mining-drill": 1,
+                    "transport-belt": 16,
+                    "small-electric-pole": 21,
+                    "lab": 1,
+                },
+            ),
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "stale_manual_automation")
+        self.assertTrue(decision.read_only_tools)
+
+    def test_choose_autonomy_decision_executes_bootstrap_when_plan_routes_fuel_belt(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": (
+                    "Restore durable coal supply to boiler via incremental "
+                    "belt route from coal drill output"
+                ),
+                "plan_steps": [
+                    "extract_items unit=107 item=iron-plate count=50",
+                    "insert_items unit=49 item=coal count=4 inventory_type=fuel",
+                    "insert_items unit=73 item=coal count=2 inventory_type=fuel",
+                    "craft transport-belt count=12",
+                    "route_belt from_x=78 from_y=-17 to_x=60 to_y=-17 extend_existing=true",
+                    "route_belt from_x=60 from_y=-17 to_x=45 to_y=-17 extend_existing=true",
+                ],
+                "progress_notes": [
+                    "Temporary recovery fuels the plant while route_belt extends durable coal logistics.",
+                ],
+                "updated_at": "now",
+                "signal": "plan_ready",
+            },
+            5,
+            5,
+            live_state=LiveState(
+                found=True,
+                surface="nauvis",
+                x=-39.3,
+                y=24.7,
+                entity_counts={
+                    "electric-mining-drill": 1,
+                    "transport-belt": 16,
+                    "small-electric-pole": 21,
+                    "boiler": 1,
+                    "lab": 1,
+                },
+            ),
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
+        self.assertEqual(decision.reason, "actionable_plan")
+        self.assertFalse(decision.read_only_tools)
 
     def test_choose_autonomy_decision_uses_typed_live_completion_evidence(self):
         decision = planner.choose_autonomy_decision(
@@ -664,8 +955,40 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("Build starter power", prompt)
         self.assertIn("Live state: nauvis @ 5.0,0.0; player entities: boiler=1", prompt)
         self.assertIn(planner.PLANNER_PROMPT, prompt)
+        self.assertNotIn("Planner correction:", prompt)
 
-    def test_agent_thread_executes_until_interval_then_plans(self):
+    def test_build_autonomy_prompt_model_includes_planner_advisory(self):
+        prompt = planner.build_autonomy_prompt_model(
+            AutonomyPromptInput(
+                mode=AutonomyMode.PLAN,
+                ledger=LedgerState(
+                    objective="stop hand feeding boiler",
+                    plan_steps=["insert_items coal count=5 into boiler fuel"],
+                ),
+                live_state=LiveState(
+                    found=True,
+                    surface="nauvis",
+                    x=55,
+                    y=-21,
+                    entity_counts={"boiler": 1, "transport-belt": 4},
+                ),
+                planner_advisory=planner.STALE_MANUAL_AUTOMATION_ADVISORY,
+            )
+        )
+
+        self.assertIn("Planner correction:", prompt)
+        self.assertIn("Do not reaffirm that plan", prompt)
+        self.assertIn("diagnose_fuel_sustainability", prompt)
+        self.assertIn("build_fuel_supply", prompt)
+        self.assertIn("plan_recipe_assembler_cell", prompt)
+        self.assertIn("build_recipe_assembler_cell", prompt)
+        self.assertIn("plan_automation_science", prompt)
+        self.assertIn("ready_to_call.execute_args", prompt)
+        self.assertIn("build_automation_science", prompt)
+        self.assertIn("execute_edge_miner", prompt)
+        self.assertIn(planner.PLANNER_PROMPT, prompt)
+
+    def test_agent_thread_executes_active_plan_past_interval(self):
         ledger.save_ledger("doug", {
             "objective": "Build a smelting column",
             "plan_steps": ["Place furnaces", "Lay the belt"],
@@ -687,9 +1010,9 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, 2)
 
         tick3 = thread._autonomy_tick()
-        self.assertIn(planner.PLANNER_PROMPT, tick3["message"])
-        self.assertTrue(tick3["read_only_tools"])
-        self.assertEqual(thread._exec_ticks_since_plan, 0)
+        self.assertIn(planner.EXECUTION_PROMPT, tick3["message"])
+        self.assertNotIn("read_only_tools", tick3)
+        self.assertEqual(thread._exec_ticks_since_plan, 3)
 
     def test_agent_thread_empty_ledger_plans_first_tick(self):
         thread = self._thread()
@@ -774,7 +1097,7 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("Live state: nauvis @ 46.7,-15.6", tick["message"])
         self.assertEqual(thread._exec_ticks_since_plan, 0)
 
-    def test_agent_thread_executes_existing_plant_repair_after_planner_tick(self):
+    def test_agent_thread_replans_manual_boiler_refill_when_factory_exists(self):
         ledger.save_ledger("doug", {
             "objective": (
                 "energize the power grid to activate the existing automated "
@@ -805,10 +1128,12 @@ class PlannerTests(unittest.TestCase):
 
         tick = thread._autonomy_tick()
 
-        self.assertIn(planner.EXECUTION_PROMPT, tick["message"])
-        self.assertNotIn("read_only_tools", tick)
+        self.assertIn(planner.PLANNER_PROMPT, tick["message"])
+        self.assertTrue(tick["read_only_tools"])
+        self.assertIn("Planner correction:", tick["message"])
+        self.assertIn("build_fuel_supply", tick["message"])
         self.assertNotIn("Live-state completion signal", tick["message"])
-        self.assertEqual(thread._exec_ticks_since_plan, 1)
+        self.assertEqual(thread._exec_ticks_since_plan, 0)
 
     def test_agent_thread_executes_belt_plan_despite_old_power_progress(self):
         ledger.save_ledger("doug", {
@@ -849,7 +1174,7 @@ class PlannerTests(unittest.TestCase):
         self.assertNotIn("Live-state completion signal", tick["message"])
         self.assertEqual(thread._exec_ticks_since_plan, 1)
 
-    def test_agent_thread_executes_new_objective_after_old_complete_event(self):
+    def test_agent_thread_replans_hand_fed_new_objective_after_old_complete_event(self):
         ledger.save_ledger("doug", {
             "objective": (
                 "activate second stone-furnace unit 15 at (42, -22) with "
@@ -889,10 +1214,12 @@ class PlannerTests(unittest.TestCase):
 
         tick = thread._autonomy_tick()
 
-        self.assertIn(planner.EXECUTION_PROMPT, tick["message"])
-        self.assertNotIn("read_only_tools", tick)
+        self.assertIn(planner.PLANNER_PROMPT, tick["message"])
+        self.assertTrue(tick["read_only_tools"])
+        self.assertIn("Planner correction:", tick["message"])
+        self.assertIn("Do not reaffirm that plan", tick["message"])
         self.assertIn("walk_to (42, -21)", tick["message"])
-        self.assertEqual(thread._exec_ticks_since_plan, 1)
+        self.assertEqual(thread._exec_ticks_since_plan, 0)
 
     def test_agent_thread_executes_plan_ready_signal_even_when_planner_due(self):
         ledger.save_ledger("doug", {

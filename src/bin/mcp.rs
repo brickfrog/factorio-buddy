@@ -21,8 +21,226 @@ use factorioctl::client::{lua::LuaCommand, AgentId, FactorioClient};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
 use factorioctl::world::{
     build_production_report, build_situation_report, find_belt_route_with_options, Area, BeltKind,
-    Direction, GridPos, Position, RoutingOptions, TilePos, UndergroundConfig,
+    Direction, Entity, EntityProduction, GridPos, Position, RoutingOptions, TilePos,
+    UndergroundConfig,
 };
+
+fn production_verification_json(
+    entities: Vec<EntityProduction>,
+) -> (serde_json::Value, bool, bool) {
+    let report = build_production_report(entities);
+    let has_working_entity = report.working_count > 0;
+    (
+        serde_json::json!({
+            "success": true,
+            "report": report,
+        }),
+        true,
+        has_working_entity,
+    )
+}
+
+fn placed_units_not_dead(
+    verification: &serde_json::Value,
+    unit_numbers: &[u32],
+) -> (bool, Vec<serde_json::Value>) {
+    let entities = verification
+        .get("report")
+        .and_then(|report| report.get("entities"))
+        .and_then(|entities| entities.as_array());
+    let mut statuses = Vec::new();
+    let mut ok = true;
+    for unit_number in unit_numbers {
+        let entity = entities.and_then(|entities| {
+            entities.iter().find(|entity| {
+                entity
+                    .get("unit_number")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as u32)
+                    == Some(*unit_number)
+            })
+        });
+        match entity {
+            Some(entity) => {
+                let status = entity
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let dead = matches!(status, "no_power" | "no_fuel" | "disabled");
+                ok &= !dead;
+                statuses.push(serde_json::json!({
+                    "unit_number": unit_number,
+                    "name": entity.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                    "status": status,
+                    "working": entity.get("working").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                    "ok": !dead,
+                }));
+            }
+            None => {
+                ok = false;
+                statuses.push(serde_json::json!({
+                    "unit_number": unit_number,
+                    "status": "missing_from_verification_area",
+                    "ok": false,
+                }));
+            }
+        }
+    }
+    (ok, statuses)
+}
+
+fn placed_unit_working(verification: &serde_json::Value, unit_number: Option<u32>) -> bool {
+    let Some(unit_number) = unit_number else {
+        return false;
+    };
+    verification
+        .get("report")
+        .and_then(|report| report.get("entities"))
+        .and_then(|entities| entities.as_array())
+        .and_then(|entities| {
+            entities.iter().find(|entity| {
+                entity
+                    .get("unit_number")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as u32)
+                    == Some(unit_number)
+            })
+        })
+        .and_then(|entity| entity.get("working"))
+        .and_then(|working| working.as_bool())
+        .unwrap_or(false)
+}
+
+fn verification_statuses(verification: &serde_json::Value) -> Vec<String> {
+    verification
+        .get("report")
+        .and_then(|report| report.get("entities"))
+        .and_then(|entities| entities.as_array())
+        .map(|entities| {
+            entities
+                .iter()
+                .filter_map(|entity| entity.get("status").and_then(|status| status.as_str()))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn placed_statuses(placed_unit_statuses: &[serde_json::Value]) -> Vec<String> {
+    placed_unit_statuses
+        .iter()
+        .filter(|status| {
+            !status
+                .get("ok")
+                .and_then(|ok| ok.as_bool())
+                .unwrap_or(false)
+        })
+        .filter_map(|status| status.get("status").and_then(|status| status.as_str()))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn automation_repair_hint(
+    success_tool: &str,
+    context: &str,
+    verification_call_ok: bool,
+    verification: &serde_json::Value,
+    placed_unit_statuses: &[serde_json::Value],
+    route_success: Option<bool>,
+) -> serde_json::Value {
+    let report_statuses = verification_statuses(verification);
+    let placed_statuses = placed_statuses(placed_unit_statuses);
+    let has = |status: &str| {
+        report_statuses.iter().any(|seen| seen == status)
+            || placed_statuses.iter().any(|seen| seen == status)
+    };
+    let mut actions = Vec::new();
+
+    if !verification_call_ok {
+        actions.push(serde_json::json!({
+            "tool": "verify_production",
+            "reason": "verification call failed; inspect the target area before mutating again",
+        }));
+    }
+    if route_success == Some(false) {
+        actions.push(serde_json::json!({
+            "tool": "analyze_belt_gaps",
+            "reason": "the routed belt segment did not build completely",
+        }));
+        actions.push(serde_json::json!({
+            "tool": "route_belt",
+            "reason": "rerun the route with corrected endpoints or more belt material",
+        }));
+    }
+    if has("no_power") {
+        actions.push(serde_json::json!({
+            "tool": "execute_entity_placement_near",
+            "entity_name": "small-electric-pole",
+            "reason": "a placed inserter, drill, lab, or assembler is unpowered",
+        }));
+        actions.push(serde_json::json!({
+            "tool": "verify_production",
+            "reason": "confirm the powered entity changes from no_power to working or waiting_for_source_items",
+        }));
+    }
+    if has("no_fuel") {
+        actions.push(serde_json::json!({
+            "tool": "diagnose_fuel_sustainability",
+            "reason": "a burner consumer has no durable coal path",
+        }));
+        actions.push(serde_json::json!({
+            "tool": "build_fuel_supply",
+            "reason": "build a coal belt/inserter path instead of hand-feeding a small fuel buffer",
+        }));
+    }
+    if has("no_ingredients") || has("waiting_for_source_items") {
+        actions.push(serde_json::json!({
+            "tool": "analyze_item_flow",
+            "reason": "the consumer is alive but not receiving the expected item",
+        }));
+        actions.push(serde_json::json!({
+            "tool": "build_assembler_feed",
+            "reason": "if the empty consumer is an assembler, build a durable input feed",
+        }));
+        actions.push(serde_json::json!({
+            "tool": "execute_direct_smelter",
+            "reason": "if the empty consumer is a furnace, build or repair the drill-to-furnace feed cell",
+        }));
+    }
+    if has("full_output") || has("waiting_for_space_in_destination") {
+        actions.push(serde_json::json!({
+            "tool": "build_assembler_output",
+            "reason": "the producer cannot drain output; build a durable output belt/inserter",
+        }));
+        actions.push(serde_json::json!({
+            "tool": "analyze_belt_reach",
+            "reason": "trace the blocked output lane before placing more entities",
+        }));
+    }
+    if has("missing_from_verification_area") {
+        actions.push(serde_json::json!({
+            "tool": "verify_production",
+            "reason": "the newly placed unit was outside the verification radius or was not actually created",
+        }));
+    }
+    if actions.is_empty() {
+        actions.push(serde_json::json!({
+            "tool": "verify_production",
+            "reason": "automation did not prove working; inspect statuses before using manual transfer tools",
+        }));
+    }
+
+    serde_json::json!({
+        "context": context,
+        "if_success": format!("{success_tool} completed durable automation; keep using automation controllers instead of manual insert/extract loops."),
+        "if_failed": actions,
+        "observed_statuses": {
+            "verification": report_statuses,
+            "placed_units": placed_statuses,
+        },
+        "anti_pattern": "Do not treat hand-feeding, hand-crafting, or inventory extraction as completion when automation_verified.success is false.",
+    })
+}
 
 /// Connection configuration loaded from environment or config
 #[derive(Clone)]
@@ -34,9 +252,12 @@ struct ConnectionConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_lua_refusal, flow_lookup, flow_scan_area, raw_lua_enabled};
+    use super::{
+        automation_repair_hint, execute_lua_refusal, flow_lookup, flow_scan_area,
+        machine_side_layout, placed_unit_working, placed_units_not_dead, raw_lua_enabled,
+    };
     use factorioctl::analyze::EntityLookup;
-    use factorioctl::world::TilePos;
+    use factorioctl::world::{Area, Entity, Position, TilePos};
 
     #[test]
     fn raw_lua_enabled_only_accepts_explicit_truthy_values() {
@@ -57,6 +278,98 @@ mod tests {
         for (env_value, expected) in cases {
             assert_eq!(raw_lua_enabled(env_value), expected, "{env_value:?}");
         }
+    }
+
+    #[test]
+    fn placed_unit_status_helpers_require_matching_healthy_units() {
+        let verification = serde_json::json!({
+            "success": true,
+            "report": {
+                "entities": [
+                    {
+                        "name": "electric-mining-drill",
+                        "unit_number": 10,
+                        "status": "working",
+                        "working": true
+                    },
+                    {
+                        "name": "inserter",
+                        "unit_number": 11,
+                        "status": "no_power",
+                        "working": false
+                    }
+                ]
+            }
+        });
+
+        assert!(placed_unit_working(&verification, Some(10)));
+        assert!(!placed_unit_working(&verification, Some(11)));
+        assert!(!placed_unit_working(&verification, Some(99)));
+        assert!(!placed_unit_working(&verification, None));
+
+        let (ok, statuses) = placed_units_not_dead(&verification, &[10, 11, 99]);
+        assert!(!ok);
+        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses[0]["ok"], true);
+        assert_eq!(statuses[1]["ok"], false);
+        assert_eq!(statuses[1]["status"], "no_power");
+        assert_eq!(statuses[2]["ok"], false);
+        assert_eq!(statuses[2]["status"], "missing_from_verification_area");
+    }
+
+    #[test]
+    fn automation_repair_hint_points_failed_automation_to_durable_repairs() {
+        let verification = serde_json::json!({
+            "success": true,
+            "report": {
+                "entities": [
+                    {
+                        "name": "inserter",
+                        "unit_number": 11,
+                        "status": "no_power",
+                        "working": false
+                    },
+                    {
+                        "name": "stone-furnace",
+                        "unit_number": 12,
+                        "status": "no_ingredients",
+                        "working": false
+                    }
+                ]
+            }
+        });
+        let placed_statuses = vec![serde_json::json!({
+            "unit_number": 11,
+            "name": "inserter",
+            "status": "no_power",
+            "working": false,
+            "ok": false,
+        })];
+
+        let hint = automation_repair_hint(
+            "build_assembler_feed",
+            "assembler input feed",
+            true,
+            &verification,
+            &placed_statuses,
+            Some(false),
+        );
+        let actions = hint["if_failed"]
+            .as_array()
+            .expect("repair actions should be an array");
+        let tools: Vec<&str> = actions
+            .iter()
+            .filter_map(|action| action.get("tool").and_then(|tool| tool.as_str()))
+            .collect();
+
+        assert!(tools.contains(&"analyze_belt_gaps"));
+        assert!(tools.contains(&"execute_entity_placement_near"));
+        assert!(tools.contains(&"analyze_item_flow"));
+        assert!(tools.contains(&"build_assembler_feed"));
+        assert_eq!(
+            hint["anti_pattern"],
+            "Do not treat hand-feeding, hand-crafting, or inventory extraction as completion when automation_verified.success is false."
+        );
     }
 
     #[test]
@@ -98,6 +411,36 @@ mod tests {
         assert_eq!(area.left_top.y, -5.0);
         assert_eq!(area.right_bottom.x, 18.0);
         assert_eq!(area.right_bottom.y, 7.0);
+    }
+
+    #[test]
+    fn machine_side_layout_returns_pickup_upstream_and_direction_pairs() {
+        let entity = Entity {
+            unit_number: Some(80),
+            name: "assembling-machine-1".to_string(),
+            entity_type: Some("assembling-machine".to_string()),
+            position: Position::new(10.5, 20.5),
+            direction: 0,
+            health: None,
+            force: Some("player".to_string()),
+            bounding_box: Some(Area::new(9.0, 19.0, 12.0, 22.0)),
+        };
+
+        let north = machine_side_layout(&entity, "north").expect("north side");
+        assert_eq!(north.belt_x, 10);
+        assert_eq!(north.belt_y, 17);
+        assert_eq!(north.upstream_x, 10);
+        assert_eq!(north.upstream_y, 16);
+        assert_eq!(north.input_direction, "north");
+        assert_eq!(north.output_direction, "south");
+
+        let east = machine_side_layout(&entity, "east").expect("east side");
+        assert_eq!(east.belt_x, 13);
+        assert_eq!(east.belt_y, 20);
+        assert_eq!(east.upstream_x, 14);
+        assert_eq!(east.upstream_y, 20);
+        assert_eq!(east.input_direction, "east");
+        assert_eq!(east.output_direction, "west");
     }
 }
 
@@ -256,6 +599,19 @@ pub struct DiagnoseFactoryBlockersParams {
     pub limit: Option<u32>,
 }
 
+/// Parameters for diagnose_fuel_sustainability tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DiagnoseFuelSustainabilityParams {
+    /// X coordinate of area center (default: character position)
+    pub x: Option<f64>,
+    /// Y coordinate of area center (default: character position)
+    pub y: Option<f64>,
+    /// Radius around the center to scan
+    pub radius: Option<u32>,
+    /// Maximum number of ranked fuel consumers to return
+    pub limit: Option<u32>,
+}
+
 /// Parameters for find_nearest_resource tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct FindNearestResourceParams {
@@ -396,6 +752,26 @@ pub struct PlanEntityPlacementNearParams {
     pub limit: u32,
 }
 
+/// Parameters for execute_entity_placement_near tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ExecuteEntityPlacementNearParams {
+    /// Entity name to place
+    pub entity_name: String,
+    /// X coordinate of desired target area
+    pub x: f64,
+    /// Y coordinate of desired target area
+    pub y: f64,
+    /// Search radius in tiles (default: 10)
+    #[serde(default = "default_placement_radius")]
+    pub radius: u32,
+    /// Maximum candidate placements to return (default: 20, max: 50)
+    #[serde(default = "default_placement_limit")]
+    pub limit: u32,
+    /// If true, only return the checked placement plan without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 /// Parameters for build_edge_miner tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct BuildEdgeMinerParams {
@@ -414,6 +790,38 @@ pub struct BuildEdgeMinerParams {
     /// Maximum candidate placements to return (default: 10, max: 50)
     #[serde(default = "default_edge_miner_limit")]
     pub limit: u32,
+}
+
+/// Parameters for execute_edge_miner tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ExecuteEdgeMinerParams {
+    /// Resource type to mine (e.g., 'iron-ore', 'copper-ore', 'coal', 'stone')
+    pub resource_type: String,
+    /// X coordinate of target resource area center
+    pub x: f64,
+    /// Y coordinate of target resource area center
+    pub y: f64,
+    /// Search radius in tiles (default: 25, max: 40)
+    #[serde(default = "default_edge_miner_radius")]
+    pub radius: u32,
+    /// Drill entity name (default: burner-mining-drill)
+    #[serde(default = "default_drill_name")]
+    pub drill_name: String,
+    /// Maximum candidate placements to return (default: 10, max: 50)
+    #[serde(default = "default_edge_miner_limit")]
+    pub limit: u32,
+    /// If true, only return the checked plan without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Bootstrap fuel item for burner drills.
+    #[serde(default = "default_fuel_item")]
+    pub fuel_item: String,
+    /// Bootstrap fuel count for burner drills.
+    #[serde(default = "default_furnace_fuel_count")]
+    pub fuel_count: u32,
+    /// Verification radius around the placed drill after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
 }
 
 /// Parameters for build_direct_smelter tool
@@ -439,6 +847,38 @@ pub struct BuildDirectSmelterParams {
     /// Search radius for furnace placement around the output tile (default: 6, max: 12)
     #[serde(default = "default_direct_smelter_radius")]
     pub radius: u32,
+}
+
+/// Parameters for execute_direct_smelter tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ExecuteDirectSmelterParams {
+    /// Existing drill unit number. If omitted, provide output_x/output_y/output_direction from build_edge_miner or get_machine_belt_positions.
+    pub drill_unit_number: Option<u32>,
+    /// X coordinate of the drill output belt tile.
+    pub output_x: Option<f64>,
+    /// Y coordinate of the drill output belt tile.
+    pub output_y: Option<f64>,
+    /// Direction the output belt should face: north, east, south, west (or 0/4/8/12).
+    pub output_direction: Option<String>,
+    /// Furnace entity name (default: stone-furnace)
+    #[serde(default = "default_furnace_name")]
+    pub furnace_name: String,
+    /// Inserter entity name (default: inserter)
+    #[serde(default = "default_electric_inserter_name")]
+    pub inserter_name: String,
+    /// Belt entity name (default: transport-belt)
+    #[serde(default = "default_belt_type")]
+    pub belt_name: String,
+    /// Search radius for furnace placement around the output tile (default: 6, max: 12)
+    #[serde(default = "default_direct_smelter_radius")]
+    pub radius: u32,
+    /// If true, only return the checked plan without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_electric_inserter_name() -> String {
+    "inserter".to_string()
 }
 
 fn default_placement_radius() -> u32 {
@@ -538,7 +978,7 @@ fn default_inventory_type() -> String {
     "chest".to_string()
 }
 
-/// Parameters for hand_feed_furnace tool
+/// Parameters for emergency_furnace_feed tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HandFeedFurnaceParams {
     /// Unit number of the furnace to feed.
@@ -546,7 +986,8 @@ pub struct HandFeedFurnaceParams {
     /// Fuel item to insert, usually coal or wood.
     #[serde(default = "default_fuel_item")]
     pub fuel_item: String,
-    /// Fuel item count to insert.
+    /// Fuel item count to insert. Defaults to a short recovery buffer, not a
+    /// durable fuel strategy.
     #[serde(default = "default_furnace_fuel_count")]
     pub fuel_count: u32,
     /// Source item to smelt, usually iron-ore or copper-ore.
@@ -565,7 +1006,7 @@ fn default_fuel_item() -> String {
 }
 
 fn default_furnace_fuel_count() -> u32 {
-    5
+    25
 }
 
 fn default_furnace_source_item() -> String {
@@ -622,7 +1063,7 @@ pub struct SetRecipeParams {
 }
 
 /// Parameters for route_belt tool - routes belts from A to B using pathfinding
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RouteBeltParams {
     /// Starting X coordinate (integer tile)
     pub from_x: i32,
@@ -663,6 +1104,521 @@ fn default_belt_type() -> String {
 }
 fn default_search_radius() -> u32 {
     10
+}
+
+/// Parameters for build_fuel_supply tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BuildFuelSupplyParams {
+    /// Fuel consumer to supply, used for verification context.
+    pub consumer_unit_number: u32,
+    /// Coal source or existing coal belt X tile.
+    pub from_x: i32,
+    /// Coal source or existing coal belt Y tile.
+    pub from_y: i32,
+    /// Inserter pickup belt X tile.
+    pub pickup_x: i32,
+    /// Inserter pickup belt Y tile.
+    pub pickup_y: i32,
+    /// Inserter placement X coordinate.
+    pub inserter_x: f64,
+    /// Inserter placement Y coordinate.
+    pub inserter_y: f64,
+    /// Inserter direction feeding the consumer.
+    pub inserter_direction: String,
+    /// Inserter entity name to place (default: burner-inserter for fuel feeds).
+    #[serde(default = "default_inserter_name")]
+    pub inserter_name: String,
+    /// Bootstrap fuel item for a burner inserter.
+    #[serde(default = "default_fuel_item")]
+    pub inserter_fuel_item: String,
+    /// Bootstrap fuel count for a burner inserter.
+    #[serde(default = "default_furnace_fuel_count")]
+    pub inserter_fuel_count: u32,
+    /// Belt type to route.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for obstacle detection.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// If true, only plan the route/inserter without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the consumer after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+/// Parameters for build_lab_feed tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BuildLabFeedParams {
+    /// Target lab unit number, used for research verification context.
+    pub lab_unit_number: u32,
+    /// Science source or existing science belt X tile.
+    pub from_x: i32,
+    /// Science source or existing science belt Y tile.
+    pub from_y: i32,
+    /// Inserter pickup belt X tile.
+    pub pickup_x: i32,
+    /// Inserter pickup belt Y tile.
+    pub pickup_y: i32,
+    /// Inserter placement X coordinate.
+    pub inserter_x: f64,
+    /// Inserter placement Y coordinate.
+    pub inserter_y: f64,
+    /// Inserter direction feeding the lab.
+    pub inserter_direction: String,
+    /// Belt type to route.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for obstacle detection.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// If true, only plan the route/inserter without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+}
+
+/// Parameters for build_assembler_feed tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BuildAssemblerFeedParams {
+    /// Target assembling machine unit number.
+    pub assembler_unit_number: u32,
+    /// Optional recipe to set on the assembler before building the feed.
+    #[serde(default)]
+    pub recipe: String,
+    /// Item expected on this feed lane, used for reporting and guidance.
+    pub item_name: String,
+    /// Item source or existing item belt X tile.
+    pub from_x: i32,
+    /// Item source or existing item belt Y tile.
+    pub from_y: i32,
+    /// Inserter pickup belt X tile.
+    pub pickup_x: i32,
+    /// Inserter pickup belt Y tile.
+    pub pickup_y: i32,
+    /// Inserter placement X coordinate.
+    pub inserter_x: f64,
+    /// Inserter placement Y coordinate.
+    pub inserter_y: f64,
+    /// Inserter direction feeding the assembler.
+    pub inserter_direction: String,
+    /// Belt type to route.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for obstacle detection.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// If true, only plan the route/recipe/inserter without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the assembler after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+/// Parameters for build_assembler_output tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BuildAssemblerOutputParams {
+    /// Source assembling machine unit number.
+    pub assembler_unit_number: u32,
+    /// Item expected on this output lane, used for reporting and guidance.
+    pub item_name: String,
+    /// Inserter drop belt X tile.
+    pub drop_x: i32,
+    /// Inserter drop belt Y tile.
+    pub drop_y: i32,
+    /// Target belt X tile to route the output toward.
+    pub to_x: i32,
+    /// Target belt Y tile to route the output toward.
+    pub to_y: i32,
+    /// Inserter placement X coordinate.
+    pub inserter_x: f64,
+    /// Inserter placement Y coordinate.
+    pub inserter_y: f64,
+    /// Inserter direction extracting from the assembler toward the output belt.
+    pub inserter_direction: String,
+    /// Belt type to route.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for obstacle detection.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// If true, only plan the route/inserter without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the assembler after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+fn default_recipe_input_side() -> String {
+    "west".to_string()
+}
+
+fn default_recipe_output_side() -> String {
+    "east".to_string()
+}
+
+/// Parameters for plan_recipe_assembler_cell tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlanRecipeAssemblerCellParams {
+    /// Assembling machine that will craft the component recipe.
+    pub assembler_unit_number: u32,
+    /// Recipe to set on the assembler (for example iron-gear-wheel).
+    pub recipe: String,
+    /// Recipe input item expected on the source belt.
+    pub input_item_name: String,
+    /// Product item expected on the output belt.
+    pub output_item_name: String,
+    /// Input item source or existing input belt X tile.
+    pub input_from_x: i32,
+    /// Input item source or existing input belt Y tile.
+    pub input_from_y: i32,
+    /// Target belt X tile to route the product toward.
+    pub output_to_x: i32,
+    /// Target belt Y tile to route the product toward.
+    pub output_to_y: i32,
+    /// Side of the assembler to feed input from.
+    #[serde(default = "default_recipe_input_side")]
+    pub input_side: String,
+    /// Side of the assembler to extract output from.
+    #[serde(default = "default_recipe_output_side")]
+    pub output_side: String,
+    /// Belt type to route for both input and output legs.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for each routed leg.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the assembler after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+/// Parameters for build_recipe_assembler_cell tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BuildRecipeAssemblerCellParams {
+    /// Assembling machine that will craft the component recipe.
+    pub assembler_unit_number: u32,
+    /// Recipe to set on the assembler (for example iron-gear-wheel).
+    pub recipe: String,
+    /// Recipe input item expected on the source belt.
+    pub input_item_name: String,
+    /// Product item expected on the output belt.
+    pub output_item_name: String,
+    /// Input item source or existing input belt X tile.
+    pub input_from_x: i32,
+    /// Input item source or existing input belt Y tile.
+    pub input_from_y: i32,
+    /// Input inserter pickup belt X tile.
+    pub input_pickup_x: i32,
+    /// Input inserter pickup belt Y tile.
+    pub input_pickup_y: i32,
+    /// Input inserter placement X coordinate.
+    pub input_inserter_x: f64,
+    /// Input inserter placement Y coordinate.
+    pub input_inserter_y: f64,
+    /// Input inserter direction feeding the assembler.
+    pub input_inserter_direction: String,
+    /// Assembler output inserter drop belt X tile.
+    pub output_drop_x: i32,
+    /// Assembler output inserter drop belt Y tile.
+    pub output_drop_y: i32,
+    /// Target belt X tile to route the product toward.
+    pub output_to_x: i32,
+    /// Target belt Y tile to route the product toward.
+    pub output_to_y: i32,
+    /// Output inserter placement X coordinate.
+    pub output_inserter_x: f64,
+    /// Output inserter placement Y coordinate.
+    pub output_inserter_y: f64,
+    /// Output inserter direction extracting from the assembler.
+    pub output_inserter_direction: String,
+    /// Belt type to route for both input and output legs.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for each routed leg.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// If true, only plan routes/inserters/recipe without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the assembler after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+/// Parameters for build_automation_science tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BuildAutomationScienceParams {
+    /// Assembling machine that will craft automation-science-pack.
+    pub assembler_unit_number: u32,
+    /// Lab that should receive the science belt.
+    pub lab_unit_number: u32,
+    /// Iron gear source or existing gear belt X tile.
+    pub gear_from_x: i32,
+    /// Iron gear source or existing gear belt Y tile.
+    pub gear_from_y: i32,
+    /// Gear inserter pickup belt X tile.
+    pub gear_pickup_x: i32,
+    /// Gear inserter pickup belt Y tile.
+    pub gear_pickup_y: i32,
+    /// Gear inserter placement X coordinate.
+    pub gear_inserter_x: f64,
+    /// Gear inserter placement Y coordinate.
+    pub gear_inserter_y: f64,
+    /// Gear inserter direction feeding the assembler.
+    pub gear_inserter_direction: String,
+    /// Copper plate source or existing copper belt X tile.
+    pub copper_from_x: i32,
+    /// Copper plate source or existing copper belt Y tile.
+    pub copper_from_y: i32,
+    /// Copper inserter pickup belt X tile.
+    pub copper_pickup_x: i32,
+    /// Copper inserter pickup belt Y tile.
+    pub copper_pickup_y: i32,
+    /// Copper inserter placement X coordinate.
+    pub copper_inserter_x: f64,
+    /// Copper inserter placement Y coordinate.
+    pub copper_inserter_y: f64,
+    /// Copper inserter direction feeding the assembler.
+    pub copper_inserter_direction: String,
+    /// Assembler output inserter drop belt X tile.
+    pub science_drop_x: i32,
+    /// Assembler output inserter drop belt Y tile.
+    pub science_drop_y: i32,
+    /// Intermediate science belt target X tile.
+    pub science_to_x: i32,
+    /// Intermediate science belt target Y tile.
+    pub science_to_y: i32,
+    /// Output inserter placement X coordinate.
+    pub output_inserter_x: f64,
+    /// Output inserter placement Y coordinate.
+    pub output_inserter_y: f64,
+    /// Output inserter direction extracting science from the assembler.
+    pub output_inserter_direction: String,
+    /// Science belt source X tile for the lab-feed leg, usually science_to_x.
+    pub lab_from_x: i32,
+    /// Science belt source Y tile for the lab-feed leg, usually science_to_y.
+    pub lab_from_y: i32,
+    /// Lab inserter pickup belt X tile.
+    pub lab_pickup_x: i32,
+    /// Lab inserter pickup belt Y tile.
+    pub lab_pickup_y: i32,
+    /// Lab inserter placement X coordinate.
+    pub lab_inserter_x: f64,
+    /// Lab inserter placement Y coordinate.
+    pub lab_inserter_y: f64,
+    /// Lab inserter direction feeding the lab.
+    pub lab_inserter_direction: String,
+    /// Belt type to route for all science-cell belts.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for each routed leg.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// If true, only plan routes/inserters/recipe without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the assembler after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+fn default_automation_gear_side() -> String {
+    "north".to_string()
+}
+
+fn default_automation_copper_side() -> String {
+    "south".to_string()
+}
+
+fn default_automation_output_side() -> String {
+    "east".to_string()
+}
+
+fn default_automation_lab_side() -> String {
+    "west".to_string()
+}
+
+/// Parameters for plan_automation_science tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlanAutomationScienceParams {
+    /// Assembling machine that will craft automation-science-pack.
+    pub assembler_unit_number: u32,
+    /// Lab that should receive the science belt.
+    pub lab_unit_number: u32,
+    /// Iron gear source or existing gear belt X tile.
+    pub gear_from_x: i32,
+    /// Iron gear source or existing gear belt Y tile.
+    pub gear_from_y: i32,
+    /// Copper plate source or existing copper belt X tile.
+    pub copper_from_x: i32,
+    /// Copper plate source or existing copper belt Y tile.
+    pub copper_from_y: i32,
+    /// Side of the assembler to feed iron gears from.
+    #[serde(default = "default_automation_gear_side")]
+    pub gear_side: String,
+    /// Side of the assembler to feed copper plates from.
+    #[serde(default = "default_automation_copper_side")]
+    pub copper_side: String,
+    /// Side of the assembler to extract automation science packs from.
+    #[serde(default = "default_automation_output_side")]
+    pub output_side: String,
+    /// Side of the lab to feed automation science packs from.
+    #[serde(default = "default_automation_lab_side")]
+    pub lab_side: String,
+    /// Belt type to route for all science-cell belts.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for each routed leg.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the assembler after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct MachineSideLayout {
+    side: &'static str,
+    inserter_x: f64,
+    inserter_y: f64,
+    belt_x: i32,
+    belt_y: i32,
+    upstream_x: i32,
+    upstream_y: i32,
+    input_direction: &'static str,
+    output_direction: &'static str,
+}
+
+fn machine_side_layout(entity: &Entity, side: &str) -> Result<MachineSideLayout, String> {
+    let bbox = entity
+        .bounding_box
+        .ok_or_else(|| format!("{} has no bounding box", entity.name))?;
+    let center = bbox.center();
+    match side.to_lowercase().as_str() {
+        "north" | "n" | "up" => Ok(MachineSideLayout {
+            side: "north",
+            inserter_x: center.x,
+            inserter_y: bbox.left_top.y - 0.5,
+            belt_x: center.x.floor() as i32,
+            belt_y: (bbox.left_top.y - 1.5).floor() as i32,
+            upstream_x: center.x.floor() as i32,
+            upstream_y: (bbox.left_top.y - 2.5).floor() as i32,
+            input_direction: "north",
+            output_direction: "south",
+        }),
+        "east" | "e" | "right" => Ok(MachineSideLayout {
+            side: "east",
+            inserter_x: bbox.right_bottom.x + 0.5,
+            inserter_y: center.y,
+            belt_x: (bbox.right_bottom.x + 1.5).floor() as i32,
+            belt_y: center.y.floor() as i32,
+            upstream_x: (bbox.right_bottom.x + 2.5).floor() as i32,
+            upstream_y: center.y.floor() as i32,
+            input_direction: "east",
+            output_direction: "west",
+        }),
+        "south" | "s" | "down" => Ok(MachineSideLayout {
+            side: "south",
+            inserter_x: center.x,
+            inserter_y: bbox.right_bottom.y + 0.5,
+            belt_x: center.x.floor() as i32,
+            belt_y: (bbox.right_bottom.y + 1.5).floor() as i32,
+            upstream_x: center.x.floor() as i32,
+            upstream_y: (bbox.right_bottom.y + 2.5).floor() as i32,
+            input_direction: "south",
+            output_direction: "north",
+        }),
+        "west" | "w" | "left" => Ok(MachineSideLayout {
+            side: "west",
+            inserter_x: bbox.left_top.x - 0.5,
+            inserter_y: center.y,
+            belt_x: (bbox.left_top.x - 1.5).floor() as i32,
+            belt_y: center.y.floor() as i32,
+            upstream_x: (bbox.left_top.x - 2.5).floor() as i32,
+            upstream_y: center.y.floor() as i32,
+            input_direction: "west",
+            output_direction: "east",
+        }),
+        _ => Err(format!(
+            "invalid side '{}'; use north, east, south, or west",
+            side
+        )),
+    }
 }
 
 /// Parameters for remove_entity tool
@@ -2031,6 +2987,56 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
+    /// Diagnose durable fuel automation, not one-off hand feeding.
+    #[tool(
+        description = "Diagnose whether burners, furnaces, boilers, and burner inserters have durable coal supply. Returns ranked fuel consumers, nearby coal drills/belts/chests/resources, and concrete durable repair actions. Use this whenever no_fuel appears or after bootstrap fuel; do not treat insert_items/hand_feed_furnace as completion unless this reports a durable coal source path to the consumer."
+    )]
+    async fn diagnose_fuel_sustainability(
+        &self,
+        Parameters(params): Parameters<DiagnoseFuelSustainabilityParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let radius = params.radius.unwrap_or(64);
+        let limit = params.limit.unwrap_or(20).clamp(1, 100);
+        let position = match (params.x, params.y) {
+            (Some(x), Some(y)) => Position::new(x, y),
+            (None, None) => {
+                let status = match client.character_status().await {
+                    Ok(status) => status,
+                    Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+                };
+                match status.position {
+                    Some(position) => position,
+                    None => match client.get_character_position().await {
+                        Ok(position) => position,
+                        Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+                    },
+                }
+            }
+            _ => {
+                return self
+                    .with_player_messages("Error: x and y must be provided together".to_string())
+                    .await;
+            }
+        };
+        let r = radius as f64;
+        let area = Area {
+            left_top: Position::new(position.x - r, position.y - r),
+            right_bottom: Position::new(position.x + r, position.y + r),
+        };
+        let report = match client.diagnose_fuel_sustainability(area, limit).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let result =
+            serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(result).await
+    }
+
     /// Get current game tick.
     #[tool(description = "Get current game tick and elapsed time.")]
     async fn get_tick(&self) -> String {
@@ -2423,6 +3429,120 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
+    /// Execute a safe entity placement selected by plan_entity_placement_near.
+    #[tool(
+        description = "Place one entity using the selected safe placement from plan_entity_placement_near. Avoids agent-overlap/trapping placements and returns the placed unit number. Prefer this over manual place_entity for assemblers, labs, poles, chests, and crowded builds. Use dry_run=true during planner turns."
+    )]
+    async fn execute_entity_placement_near(
+        &self,
+        Parameters(params): Parameters<ExecuteEntityPlacementNearParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let target = Position::new(params.x, params.y);
+        let radius = params.radius.clamp(1, 25);
+        let limit = params.limit.clamp(1, 50);
+        let plan = match client
+            .plan_entity_placement_near(&params.entity_name, target, radius, limit)
+            .await
+        {
+            Ok(value) => value,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": plan.get("success").and_then(|value| value.as_bool()).unwrap_or(false),
+                "dry_run": true,
+                "plan": plan,
+                "guidance": "If success is true, call execute_entity_placement_near again with dry_run=false. Use the returned placed_unit_number in follow-up tools.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        if !plan
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            let msg =
+                serde_json::to_string_pretty(&plan).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let selected = plan
+            .get("selected")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let args = selected
+            .get("tool_args")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let entity_name = args
+            .get("entity_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&params.entity_name);
+        let x = args
+            .get("x")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        let y = args
+            .get("y")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        let direction_name = args
+            .get("direction")
+            .and_then(|value| value.as_str())
+            .unwrap_or("north");
+        let direction = match Direction::parse(direction_name) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid selected direction '{}'. Re-run plan_entity_placement_near.",
+                        direction_name
+                    ))
+                    .await;
+            }
+        };
+
+        let placed = client
+            .place_entity(entity_name, Position::new(x, y), direction)
+            .await;
+        let verify_area = Area::new(x - 6.0, y - 6.0, x + 6.0, y + 6.0);
+        let verification = match client.verify_production(verify_area).await {
+            Ok(entities) => production_verification_json(entities).0,
+            Err(e) => serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+            }),
+        };
+        let result = serde_json::json!({
+            "success": placed.is_ok(),
+            "placement_success": placed.is_ok(),
+            "dry_run": false,
+            "plan": plan,
+            "selected": selected,
+            "action": {
+                "tool": "place_entity",
+                "args": args,
+                "success": placed.is_ok(),
+                "entity": placed.as_ref().ok(),
+                "error": placed.as_ref().err().map(|e| e.to_string()),
+            },
+            "placed_unit_number": placed.as_ref().ok().and_then(|entity| entity.unit_number),
+            "verification": verification,
+            "guidance": "Use placed_unit_number for set_recipe, plan_automation_science, build_lab_feed, or other follow-up automation controllers.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
     /// Plan an edge mining drill and output belt without mutating the game.
     #[tool(
         description = "Plan a patch-edge mining setup without mutating the game. Returns a resource-backed drill placement whose output belt tile is clear/buildable, plus ordered place_entity steps and missing_items. Use before placing burner/electric drills on large ore patches."
@@ -2455,6 +3575,225 @@ impl FactorioMcp {
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
+    }
+
+    /// Execute a checked edge mining drill and output belt plan.
+    #[tool(
+        description = "Build a patch-edge mining setup from build_edge_miner geometry: places the selected drill, places the output belt, bootstraps burner drill fuel, verifies production, and returns the placed drill unit/output tile. Prefer this over manually replaying build_edge_miner steps. Use dry_run=true during planner turns."
+    )]
+    async fn execute_edge_miner(
+        &self,
+        Parameters(params): Parameters<ExecuteEdgeMinerParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let center = Position::new(params.x, params.y);
+        let radius = params.radius.clamp(1, 40);
+        let limit = params.limit.clamp(1, 50);
+        let plan = match client
+            .build_edge_miner(
+                &params.resource_type,
+                center,
+                radius,
+                &params.drill_name,
+                limit,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": plan.get("success").and_then(|value| value.as_bool()).unwrap_or(false),
+                "dry_run": true,
+                "plan": plan,
+                "guidance": "If success/ready are true and missing_items is empty, call execute_edge_miner again with dry_run=false. For coal, follow with diagnose_fuel_sustainability/build_fuel_supply for nearby consumers.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        if !plan
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            let msg =
+                serde_json::to_string_pretty(&plan).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let selected = plan
+            .get("selected")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let steps = plan
+            .get("steps")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut actions = Vec::new();
+        let mut placed_drill_unit = None;
+        let mut placed_belt_unit = None;
+
+        for step in steps {
+            let tool = step
+                .get("tool")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let args = step.get("tool_args").unwrap_or(&serde_json::Value::Null);
+            if tool != "place_entity" {
+                actions.push(serde_json::json!({
+                    "tool": tool,
+                    "args": args,
+                    "success": false,
+                    "skipped": true,
+                    "error": "unsupported step in execute_edge_miner",
+                }));
+                continue;
+            }
+
+            let entity_name = args
+                .get("entity_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let x = args
+                .get("x")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            let y = args
+                .get("y")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            let direction_name = args
+                .get("direction")
+                .and_then(|value| value.as_str())
+                .unwrap_or("north");
+            let direction = match Direction::parse(direction_name) {
+                Some(direction) => direction,
+                None => {
+                    actions.push(serde_json::json!({
+                        "tool": "place_entity",
+                        "args": args,
+                        "success": false,
+                        "error": format!("invalid direction '{}'", direction_name),
+                    }));
+                    continue;
+                }
+            };
+            let placed = client
+                .place_entity(entity_name, Position::new(x, y), direction)
+                .await;
+            match &placed {
+                Ok(entity) if entity.name.contains("mining-drill") => {
+                    placed_drill_unit = entity.unit_number;
+                }
+                Ok(entity) if entity.name.contains("transport-belt") => {
+                    placed_belt_unit = entity.unit_number;
+                }
+                _ => {}
+            }
+            actions.push(serde_json::json!({
+                "tool": "place_entity",
+                "args": args,
+                "success": placed.is_ok(),
+                "entity": placed.as_ref().ok(),
+                "error": placed.as_ref().err().map(|e| e.to_string()),
+            }));
+        }
+
+        let mut fuel_report = serde_json::json!({
+            "skipped": true,
+            "reason": "not a burner drill or drill placement failed",
+        });
+        if params.drill_name.contains("burner") {
+            if let Some(unit) = placed_drill_unit {
+                let inserted = client
+                    .insert_items(unit, &params.fuel_item, params.fuel_count, "fuel")
+                    .await;
+                fuel_report = serde_json::json!({
+                    "tool": "insert_items",
+                    "unit_number": unit,
+                    "item": params.fuel_item,
+                    "count": params.fuel_count,
+                    "inventory_type": "fuel",
+                    "temporary": true,
+                    "success": inserted.is_ok(),
+                    "error": inserted.as_ref().err().map(|e| e.to_string()),
+                });
+            }
+        }
+
+        let verify_radius = params.verify_radius.clamp(1, 50) as f64;
+        let verify_area = Area::new(
+            center.x - verify_radius,
+            center.y - verify_radius,
+            center.x + verify_radius,
+            center.y + verify_radius,
+        );
+        let (verification, verification_call_ok, _) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+        let drill_working = placed_unit_working(&verification, placed_drill_unit);
+        let placed_units: Vec<u32> = placed_drill_unit.into_iter().collect();
+        let (_, placed_unit_statuses) = placed_units_not_dead(&verification, &placed_units);
+        let action_success = actions.iter().all(|action| {
+            action
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        });
+        let repair_hint = automation_repair_hint(
+            "execute_edge_miner",
+            "edge miner output belt",
+            verification_call_ok,
+            &verification,
+            &placed_unit_statuses,
+            Some(action_success),
+        );
+
+        let success = action_success
+            && fuel_report
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true)
+            && verification_call_ok
+            && drill_working;
+        let result = serde_json::json!({
+            "success": success,
+            "dry_run": false,
+            "plan": plan,
+            "selected": selected,
+            "placed_drill_unit_number": placed_drill_unit,
+            "placed_belt_unit_number": placed_belt_unit,
+            "actions": actions,
+            "bootstrap_fuel": fuel_report,
+            "automation_verified": {
+                "placed_drill_working": drill_working,
+                "verification_call_ok": verification_call_ok,
+                "placed_unit_statuses": placed_unit_statuses,
+            },
+            "verification": verification,
+            "repair_hint": repair_hint,
+            "guidance": "If this is coal production, route this belt to consumers with diagnose_fuel_sustainability/build_fuel_supply. Temporary burner fuel is not durable automation completion.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
     }
 
     /// Plan a direct drill-output smelter without mutating the game.
@@ -2513,6 +3852,303 @@ impl FactorioMcp {
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
+    }
+
+    /// Execute a checked direct drill-output smelter plan.
+    #[tool(
+        description = "Build a direct drill-output smelter cell from build_direct_smelter geometry: places/rotates the output belt, places furnace and inserter, bootstraps any burner fuel, verifies production, and diagnoses durable fuel supply. Prefer this over manually executing individual smelter placement steps."
+    )]
+    async fn execute_direct_smelter(
+        &self,
+        Parameters(params): Parameters<ExecuteDirectSmelterParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let output = match (params.output_x, params.output_y) {
+            (Some(x), Some(y)) => {
+                let direction_name = params.output_direction.clone().unwrap_or_default();
+                let direction = match Direction::parse(&direction_name) {
+                    Some(direction) => direction,
+                    None => {
+                        return self
+                            .with_player_messages(format!(
+                                "Invalid output_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                                direction_name
+                            ))
+                            .await;
+                    }
+                };
+                Some((Position::new(x, y), direction))
+            }
+            (None, None) => None,
+            _ => {
+                return self
+                    .with_player_messages(
+                        "Error: output_x and output_y must be provided together".to_string(),
+                    )
+                    .await;
+            }
+        };
+
+        let plan = match client
+            .build_direct_smelter(
+                params.drill_unit_number,
+                output,
+                &params.furnace_name,
+                &params.inserter_name,
+                &params.belt_name,
+                params.radius.clamp(2, 12),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": plan.get("success").and_then(|value| value.as_bool()).unwrap_or(false),
+                "dry_run": true,
+                "plan": plan,
+                "guidance": "If success/ready are true and missing_items is empty, call execute_direct_smelter again with dry_run=false.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        if !plan
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            let msg =
+                serde_json::to_string_pretty(&plan).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let mut actions = Vec::new();
+        let mut placed_furnace_unit = None;
+        let mut placed_inserter_unit = None;
+        let steps = plan
+            .get("steps")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        for step in steps {
+            let tool = step
+                .get("tool")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let args = step.get("tool_args").unwrap_or(&serde_json::Value::Null);
+            match tool {
+                "place_entity" => {
+                    let entity_name = args
+                        .get("entity_name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let x = args
+                        .get("x")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0);
+                    let y = args
+                        .get("y")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0);
+                    let direction_name = args
+                        .get("direction")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("north");
+                    let direction = match Direction::parse(direction_name) {
+                        Some(direction) => direction,
+                        None => {
+                            actions.push(serde_json::json!({
+                                "tool": tool,
+                                "args": args,
+                                "success": false,
+                                "error": format!("invalid direction {}", direction_name),
+                            }));
+                            continue;
+                        }
+                    };
+                    let placed = client
+                        .place_entity(entity_name, Position::new(x, y), direction)
+                        .await;
+                    match placed {
+                        Ok(entity) => {
+                            if entity_name == params.furnace_name {
+                                placed_furnace_unit = entity.unit_number;
+                            }
+                            if entity_name == params.inserter_name {
+                                placed_inserter_unit = entity.unit_number;
+                            }
+                            actions.push(serde_json::json!({
+                                "tool": tool,
+                                "args": args,
+                                "success": true,
+                                "unit_number": entity.unit_number,
+                            }));
+                        }
+                        Err(e) => actions.push(serde_json::json!({
+                            "tool": tool,
+                            "args": args,
+                            "success": false,
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
+                "rotate_entity" => {
+                    let unit_number = args
+                        .get("unit_number")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0) as u32;
+                    let direction_name = args
+                        .get("direction")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("north");
+                    let direction = match Direction::parse(direction_name) {
+                        Some(direction) => direction,
+                        None => {
+                            actions.push(serde_json::json!({
+                                "tool": tool,
+                                "args": args,
+                                "success": false,
+                                "error": format!("invalid direction {}", direction_name),
+                            }));
+                            continue;
+                        }
+                    };
+                    let rotated = client
+                        .rotate_entity(unit_number, direction.to_factorio())
+                        .await;
+                    actions.push(serde_json::json!({
+                        "tool": tool,
+                        "args": args,
+                        "success": rotated.is_ok(),
+                        "error": rotated.as_ref().err().map(|e| e.to_string()),
+                    }));
+                }
+                _ => actions.push(serde_json::json!({
+                    "tool": tool,
+                    "args": args,
+                    "success": false,
+                    "error": "unsupported execute_direct_smelter step",
+                })),
+            }
+        }
+
+        let mut bootstrap_fuel = Vec::new();
+        if params.furnace_name != "electric-furnace" {
+            if let Some(unit) = placed_furnace_unit {
+                let inserted = client.insert_items(unit, "coal", 25, "fuel").await;
+                bootstrap_fuel.push(serde_json::json!({
+                    "unit_number": unit,
+                    "item": "coal",
+                    "count": 25,
+                    "inventory_type": "fuel",
+                    "temporary": true,
+                    "success": inserted.is_ok(),
+                    "error": inserted.as_ref().err().map(|e| e.to_string()),
+                }));
+            }
+        }
+        if params.inserter_name.contains("burner") {
+            if let Some(unit) = placed_inserter_unit {
+                let inserted = client.insert_items(unit, "coal", 5, "fuel").await;
+                bootstrap_fuel.push(serde_json::json!({
+                    "unit_number": unit,
+                    "item": "coal",
+                    "count": 5,
+                    "inventory_type": "fuel",
+                    "temporary": true,
+                    "success": inserted.is_ok(),
+                    "error": inserted.as_ref().err().map(|e| e.to_string()),
+                }));
+            }
+        }
+
+        let selected = plan.get("selected").unwrap_or(&serde_json::Value::Null);
+        let belt_position = selected
+            .get("output_belt")
+            .and_then(|value| value.get("position"));
+        let (verify_x, verify_y) = belt_position
+            .and_then(|position| Some((position.get("x")?.as_f64()?, position.get("y")?.as_f64()?)))
+            .unwrap_or((0.0, 0.0));
+        let verify_area = Area::new(
+            verify_x - 8.0,
+            verify_y - 8.0,
+            verify_x + 8.0,
+            verify_y + 8.0,
+        );
+        let (verification, verification_call_ok, has_working_entity) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+        let fuel_sustainability = match client.diagnose_fuel_sustainability(verify_area, 20).await {
+            Ok(report) => serde_json::json!({
+                "success": true,
+                "report": report,
+            }),
+            Err(e) => serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+            }),
+        };
+
+        let action_success = actions.iter().all(|action| {
+            action
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        });
+        let placed_units: Vec<u32> = [placed_furnace_unit, placed_inserter_unit]
+            .into_iter()
+            .flatten()
+            .collect();
+        let (placed_units_ready, placed_unit_statuses) =
+            placed_units_not_dead(&verification, &placed_units);
+        let automation_verified = verification_call_ok && has_working_entity && placed_units_ready;
+        let repair_hint = automation_repair_hint(
+            "execute_direct_smelter",
+            "direct drill-to-furnace smelter cell",
+            verification_call_ok,
+            &verification,
+            &placed_unit_statuses,
+            Some(action_success),
+        );
+        let result = serde_json::json!({
+            "success": action_success && automation_verified,
+            "placement_success": action_success,
+            "dry_run": false,
+            "plan": plan,
+            "actions": actions,
+            "bootstrap_fuel": bootstrap_fuel,
+            "automation_verified": {
+                "success": automation_verified,
+                "verification_call_ok": verification_call_ok,
+                "has_working_entity_near_cell": has_working_entity,
+                "placed_units_ready": placed_units_ready,
+                "placed_unit_statuses": placed_unit_statuses,
+            },
+            "verification": verification,
+            "fuel_sustainability": fuel_sustainability,
+            "repair_hint": repair_hint,
+            "guidance": "If fuel_sustainability reports ranked consumers without durable supply, run build_fuel_supply next; temporary bootstrap fuel is not automation completion.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
     }
 
     /// Mine entities at a position.
@@ -2637,9 +4273,9 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
-    /// Hand-feed a furnace with fuel and source items, then verify production.
+    /// Temporarily hand-feed a furnace with fuel and source items, then verify production.
     #[tool(
-        description = "Cheap local controller for the common furnace bootstrap loop. Walks near a furnace, inserts fuel into fuel inventory, inserts ore into furnace_source, then runs verify_production around the furnace. Use this instead of spending multiple LLM turns on walk_to + insert_items + insert_items + verify_production."
+        description = "Emergency recovery controller for a stalled furnace, not a normal automation step. Walks near a furnace, inserts a temporary fuel buffer into fuel inventory, inserts ore into furnace_source, then runs verify_production. Use only to recover bootstrap production or unjam a line; after success, plan a durable input/fuel belt, inserter, chest, or logistics repair instead of repeatedly calling this tool."
     )]
     async fn hand_feed_furnace(
         &self,
@@ -2860,6 +4496,278 @@ impl FactorioMcp {
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
+    }
+
+    async fn route_belt_core(
+        &self,
+        client: &mut FactorioClient,
+        params: &RouteBeltParams,
+    ) -> Result<serde_json::Value, String> {
+        let padding = params.search_radius as i32;
+        let area = Area {
+            left_top: Position::new(
+                (params.from_x.min(params.to_x) - padding) as f64,
+                (params.from_y.min(params.to_y) - padding) as f64,
+            ),
+            right_bottom: Position::new(
+                (params.from_x.max(params.to_x) + padding + 1) as f64,
+                (params.from_y.max(params.to_y) + padding + 1) as f64,
+            ),
+        };
+
+        let mut collision_map = match client.build_collision_map(area).await {
+            Ok(map) => map,
+            Err(e) => {
+                let error = e.to_string();
+                if error.contains("Packet too large") {
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "dry_run": params.dry_run,
+                        "error_kind": "route_area_too_large",
+                        "error": format!("Error building collision map: {}", error),
+                        "from": { "x": params.from_x, "y": params.from_y },
+                        "to": { "x": params.to_x, "y": params.to_y },
+                        "belt_type": params.belt_type,
+                        "search_radius": params.search_radius,
+                        "span": {
+                            "x": (params.to_x - params.from_x).abs(),
+                            "y": (params.to_y - params.from_y).abs(),
+                            "manhattan": (params.to_x - params.from_x).abs()
+                                + (params.to_y - params.from_y).abs(),
+                        },
+                        "materials_sufficient": false,
+                        "guidance": "Route is too large for one collision-map request. Build shorter route_belt or build_fuel_supply segments from the existing coal belt toward the consumer, then retry the remaining span.",
+                    }));
+                }
+                return Err(format!("Error building collision map: {}", e));
+            }
+        };
+
+        if params.extend_existing {
+            collision_map.unblock(GridPos::new(params.from_x, params.from_y));
+            collision_map.unblock(GridPos::new(params.to_x, params.to_y));
+        }
+
+        if params.respect_zones {
+            let memory = AgentMemory::load();
+            for zone in memory.zones.values() {
+                match zone.zone_type.belt_routing() {
+                    BeltRouting::Blocked => collision_map.block_area(&zone.bounds),
+                    BeltRouting::Preferred => collision_map.prefer_area(&zone.bounds),
+                    BeltRouting::Allowed => {}
+                }
+            }
+        }
+
+        let underground_config = if params.allow_underground {
+            if let Some(config) = UndergroundConfig::from_belt_type(&params.belt_type) {
+                match client.is_tech_researched(&config.required_tech).await {
+                    Ok(true) => Some(config),
+                    Ok(false) | Err(_) => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let routing_options = RoutingOptions {
+            allow_underground: underground_config.is_some(),
+            underground_config: underground_config.clone(),
+            underground_penalty: 0.5,
+            underground_skip_cost: 0.05,
+        };
+        let result = find_belt_route_with_options(
+            GridPos::new(params.from_x, params.from_y),
+            GridPos::new(params.to_x, params.to_y),
+            &collision_map,
+            &routing_options,
+        );
+
+        if !result.success {
+            return Err(format!(
+                "Route failed: {}",
+                result.error.unwrap_or_else(|| "unknown error".to_string())
+            ));
+        }
+
+        let inventory = client
+            .character_inventory()
+            .await
+            .map_err(|e| format!("Error checking inventory: {}", e))?;
+        let surface_belts_needed = result
+            .belts
+            .iter()
+            .filter(|b| b.kind == BeltKind::Surface)
+            .count() as u32;
+        let underground_belts_needed = result
+            .belts
+            .iter()
+            .filter(|b| b.kind != BeltKind::Surface)
+            .count() as u32;
+        let surface_belts_have = inventory
+            .items
+            .iter()
+            .find(|i| i.name == params.belt_type)
+            .map(|i| i.count)
+            .unwrap_or(0);
+        let underground_belt_name = underground_config.as_ref().map(|c| c.entity_name.as_str());
+        let underground_belts_have = underground_belt_name
+            .and_then(|name| inventory.items.iter().find(|i| i.name == name))
+            .map(|i| i.count)
+            .unwrap_or(0);
+
+        let steps: Vec<serde_json::Value> = result
+            .belts
+            .iter()
+            .map(|belt| {
+                let entity_name = match belt.kind {
+                    BeltKind::Surface => params.belt_type.as_str(),
+                    BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
+                        underground_belt_name.unwrap_or(params.belt_type.as_str())
+                    }
+                };
+                serde_json::json!({
+                    "tool": "place_entity",
+                    "tool_args": {
+                        "entity_name": entity_name,
+                        "x": belt.position.x,
+                        "y": belt.position.y,
+                        "direction": belt.direction.to_factorio()
+                    },
+                    "kind": belt.kind,
+                    "description": format!(
+                        "Place {} at ({:.1},{:.1}) facing {:?}",
+                        entity_name, belt.position.x, belt.position.y, belt.direction
+                    )
+                })
+            })
+            .collect();
+
+        let materials = serde_json::json!({
+            "surface": {
+                "item": params.belt_type,
+                "needed": surface_belts_needed,
+                "available": surface_belts_have,
+                "sufficient": surface_belts_have >= surface_belts_needed,
+            },
+            "underground": {
+                "item": underground_belt_name,
+                "needed": underground_belts_needed,
+                "available": underground_belts_have,
+                "sufficient": underground_belts_have >= underground_belts_needed,
+            },
+        });
+        let materials_sufficient = surface_belts_have >= surface_belts_needed
+            && underground_belts_have >= underground_belts_needed;
+
+        if params.dry_run {
+            let mut response = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "from": { "x": params.from_x, "y": params.from_y },
+                "to": { "x": params.to_x, "y": params.to_y },
+                "belt_type": params.belt_type,
+                "belt_count": result.belt_count,
+                "turn_count": result.turn_count,
+                "underground_count": result.underground_count,
+                "materials": materials,
+                "materials_sufficient": materials_sufficient,
+                "topology": result.topology,
+            });
+            if let Some(object) = response.as_object_mut() {
+                if result.belts.len() <= 80 {
+                    object.insert("steps".to_string(), serde_json::json!(steps));
+                    object.insert("belts".to_string(), serde_json::json!(result.belts));
+                } else {
+                    let first_belts: Vec<_> = result.belts.iter().take(8).collect();
+                    let mut last_belts: Vec<_> = result.belts.iter().rev().take(8).collect();
+                    last_belts.reverse();
+                    object.insert("steps_truncated".to_string(), serde_json::json!(true));
+                    object.insert("belts_truncated".to_string(), serde_json::json!(true));
+                    object.insert(
+                        "preview".to_string(),
+                        serde_json::json!({
+                            "first_belts": first_belts,
+                            "last_belts": last_belts,
+                            "omitted_belts": result.belts.len().saturating_sub(16),
+                        }),
+                    );
+                    object.insert(
+                        "guidance".to_string(),
+                        serde_json::json!(
+                            "Route is long; response omits full step list. If materials are insufficient or placement reliability matters, build it in shorter route_belt/build_fuel_supply segments using the preview endpoints."
+                        ),
+                    );
+                }
+            }
+            return Ok(response);
+        }
+
+        if surface_belts_have < surface_belts_needed {
+            return Err(format!(
+                "Insufficient materials: need {} {}, have {}. Craft more belts first.",
+                surface_belts_needed, params.belt_type, surface_belts_have
+            ));
+        }
+        if underground_belts_needed > 0 && underground_belts_have < underground_belts_needed {
+            let ug_name = underground_belt_name.unwrap_or("underground-belt");
+            return Err(format!(
+                "Insufficient materials: need {} {}, have {}. Craft more underground belts first.",
+                underground_belts_needed, ug_name, underground_belts_have
+            ));
+        }
+
+        let mut placed = 0;
+        let mut errors = Vec::new();
+        let underground_entity = underground_config.as_ref().map(|c| c.entity_name.as_str());
+
+        for belt in &result.belts {
+            let entity_name = match belt.kind {
+                BeltKind::Surface => &params.belt_type,
+                BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
+                    underground_entity.unwrap_or(&params.belt_type)
+                }
+            };
+            let place_result = if belt.kind == BeltKind::UndergroundEntry
+                || belt.kind == BeltKind::UndergroundExit
+            {
+                let ug_type = match belt.kind {
+                    BeltKind::UndergroundEntry => "input",
+                    BeltKind::UndergroundExit => "output",
+                    _ => "input",
+                };
+                client
+                    .place_underground_belt(entity_name, belt.position, belt.direction, ug_type)
+                    .await
+            } else {
+                client
+                    .place_entity(entity_name, belt.position, belt.direction)
+                    .await
+            };
+
+            match place_result {
+                Ok(_) => placed += 1,
+                Err(e) => errors.push(format!("({}, {}): {}", belt.position.x, belt.position.y, e)),
+            }
+        }
+
+        Ok(serde_json::json!({
+            "success": errors.is_empty(),
+            "dry_run": false,
+            "from": { "x": params.from_x, "y": params.from_y },
+            "to": { "x": params.to_x, "y": params.to_y },
+            "belt_type": params.belt_type,
+            "belt_count": result.belt_count,
+            "placed": placed,
+            "turn_count": result.turn_count,
+            "underground_count": result.underground_count,
+            "materials": materials,
+            "materials_sufficient": materials_sufficient,
+            "topology": result.topology,
+            "errors": errors,
+        }))
     }
 
     /// Route belts from point A to point B using A* pathfinding.
@@ -3134,6 +5042,1929 @@ impl FactorioMcp {
             ));
         }
         self.with_player_messages(result_msg).await
+    }
+
+    /// Build a coal fuel belt plus inserter feed for one burnable consumer.
+    #[tool(
+        description = "Execute a durable coal fuel-supply plan for one burner/furnace/boiler. Use args from diagnose_fuel_sustainability: route coal to the pickup tile, place the inserter feeding the consumer, then verify production. Prefer this over insert_items/hand_feed_furnace once coal supply exists. Use dry_run=true during planner turns."
+    )]
+    async fn build_fuel_supply(
+        &self,
+        Parameters(params): Parameters<BuildFuelSupplyParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let consumer = match client.get_entity(params.consumer_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let inserter_direction = match Direction::parse(&params.inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.inserter_direction
+                    ))
+                    .await;
+            }
+        };
+
+        let route_params = RouteBeltParams {
+            from_x: params.from_x,
+            from_y: params.from_y,
+            to_x: params.pickup_x,
+            to_y: params.pickup_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+
+        let route = match self.route_belt_core(&mut client, &route_params).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let route_success = route
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        let inserter_args = serde_json::json!({
+            "entity_name": params.inserter_name,
+            "x": params.inserter_x,
+            "y": params.inserter_y,
+            "direction": params.inserter_direction,
+        });
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": route_success,
+                "dry_run": true,
+                "consumer": {
+                    "unit_number": consumer.unit_number,
+                    "name": consumer.name,
+                    "position": consumer.position,
+                },
+                "route": route,
+                "steps": [{
+                    "tool": "route_belt",
+                    "args": route_params,
+                }, {
+                    "tool": "place_entity",
+                    "args": inserter_args,
+                }, {
+                    "tool": "verify_production",
+                    "args": {
+                        "x": consumer.position.x,
+                        "y": consumer.position.y,
+                        "radius": params.verify_radius,
+                    },
+                }],
+                "guidance": if route_success {
+                    "If route.materials_sufficient is true and inserter placement is clear, call build_fuel_supply again with dry_run=false."
+                } else {
+                    "Route planning failed. Follow route.guidance; for long coal-to-boiler paths, build shorter route_belt/build_fuel_supply segments from the coal output toward the consumer."
+                },
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        if !route_success {
+            let result = serde_json::json!({
+                "success": false,
+                "dry_run": false,
+                "consumer": {
+                    "unit_number": consumer.unit_number,
+                    "name": consumer.name,
+                    "position": consumer.position,
+                },
+                "route": route,
+                "inserter": {
+                    "skipped": true,
+                    "reason": "route planning failed",
+                    "args": inserter_args,
+                },
+                "guidance": "No inserter placed because the fuel belt route failed. Build shorter route_belt/build_fuel_supply segments, then retry this consumer feed.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
+        let inserter = client
+            .place_entity(&params.inserter_name, inserter_position, inserter_direction)
+            .await;
+        let placed_inserter_unit = inserter.as_ref().ok().and_then(|entity| entity.unit_number);
+        let bootstrap_fuel = if params.inserter_name.contains("burner") {
+            match placed_inserter_unit {
+                Some(unit) => {
+                    let inserted = client
+                        .insert_items(
+                            unit,
+                            &params.inserter_fuel_item,
+                            params.inserter_fuel_count,
+                            "fuel",
+                        )
+                        .await;
+                    serde_json::json!({
+                        "tool": "insert_items",
+                        "unit_number": unit,
+                        "item": params.inserter_fuel_item,
+                        "count": params.inserter_fuel_count,
+                        "inventory_type": "fuel",
+                        "temporary_startup_buffer": true,
+                        "success": inserted.is_ok(),
+                        "error": inserted.as_ref().err().map(|e| e.to_string()),
+                    })
+                }
+                None => serde_json::json!({
+                    "skipped": true,
+                    "reason": "burner inserter placement failed",
+                }),
+            }
+        } else {
+            serde_json::json!({
+                "skipped": true,
+                "reason": "inserter is not burner-powered",
+            })
+        };
+        let inserter_report = serde_json::json!({
+            "tool": "place_entity",
+            "args": inserter_args,
+            "success": inserter.is_ok(),
+            "unit_number": placed_inserter_unit,
+            "error": inserter.as_ref().err().map(|e| e.to_string()),
+        });
+
+        let verify_radius = params.verify_radius.clamp(1, 50) as f64;
+        let verify_area = Area::new(
+            consumer.position.x - verify_radius,
+            consumer.position.y - verify_radius,
+            consumer.position.x + verify_radius,
+            consumer.position.y + verify_radius,
+        );
+        let (verification, verification_call_ok, _) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+        let placed_units: Vec<u32> = placed_inserter_unit.into_iter().collect();
+        let (fuel_inserter_ready, placed_unit_statuses) =
+            placed_units_not_dead(&verification, &placed_units);
+        let repair_hint = automation_repair_hint(
+            "build_fuel_supply",
+            "durable fuel delivery",
+            verification_call_ok,
+            &verification,
+            &placed_unit_statuses,
+            Some(route_success),
+        );
+        let bootstrap_ok = bootstrap_fuel
+            .get("skipped")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || bootstrap_fuel
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+
+        let success = route_success
+            && inserter.is_ok()
+            && bootstrap_ok
+            && verification_call_ok
+            && fuel_inserter_ready;
+        let result = serde_json::json!({
+            "success": success,
+            "placement_success": inserter.is_ok(),
+            "dry_run": false,
+            "consumer": {
+                "unit_number": consumer.unit_number,
+                "name": consumer.name,
+                "position": consumer.position,
+            },
+            "route": route,
+            "inserter": inserter_report,
+            "bootstrap_fuel": bootstrap_fuel,
+            "automation_verified": {
+                "success": verification_call_ok && fuel_inserter_ready,
+                "verification_call_ok": verification_call_ok,
+                "fuel_inserter_ready": fuel_inserter_ready,
+                "placed_unit_statuses": placed_unit_statuses,
+            },
+            "verification": verification,
+            "repair_hint": repair_hint,
+            "guidance": "If success is true, fuel delivery is built; rerun diagnose_fuel_sustainability and verify_production before moving on.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Build a science belt plus inserter feed for one lab.
+    #[tool(
+        description = "Execute a durable science-pack feed into a lab: route a science belt to the inserter pickup tile, place the inserter feeding the lab, then check research status. Prefer this over repeated feed_lab_from_inventory once science is on a belt or staged source. Use dry_run=true during planner turns."
+    )]
+    async fn build_lab_feed(&self, Parameters(params): Parameters<BuildLabFeedParams>) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let lab = match client.get_entity(params.lab_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if lab.name != "lab" {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not lab",
+                    params.lab_unit_number, lab.name
+                ))
+                .await;
+        }
+        let inserter_direction = match Direction::parse(&params.inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.inserter_direction
+                    ))
+                    .await;
+            }
+        };
+
+        let route_params = RouteBeltParams {
+            from_x: params.from_x,
+            from_y: params.from_y,
+            to_x: params.pickup_x,
+            to_y: params.pickup_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+
+        let route = match self.route_belt_core(&mut client, &route_params).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.inserter_x,
+            "y": params.inserter_y,
+            "direction": params.inserter_direction,
+        });
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "lab": {
+                    "unit_number": lab.unit_number,
+                    "name": lab.name,
+                    "position": lab.position,
+                },
+                "route": route,
+                "steps": [{
+                    "tool": "route_belt",
+                    "args": route_params,
+                }, {
+                    "tool": "place_entity",
+                    "args": inserter_args,
+                }, {
+                    "tool": "get_research_status",
+                    "args": {},
+                }],
+                "guidance": "If route.materials_sufficient is true and inserter placement is clear, call build_lab_feed again with dry_run=false.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
+        let inserter = client
+            .place_entity("inserter", inserter_position, inserter_direction)
+            .await;
+        let placed_inserter_unit = inserter.as_ref().ok().and_then(|entity| entity.unit_number);
+        let inserter_report = serde_json::json!({
+            "tool": "place_entity",
+            "args": inserter_args,
+            "success": inserter.is_ok(),
+            "unit_number": placed_inserter_unit,
+            "error": inserter.as_ref().err().map(|e| e.to_string()),
+        });
+
+        let verify_area = Area::new(
+            lab.position.x - 8.0,
+            lab.position.y - 8.0,
+            lab.position.x + 8.0,
+            lab.position.y + 8.0,
+        );
+        let (verification, verification_call_ok, _) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+        let placed_units: Vec<u32> = placed_inserter_unit.into_iter().collect();
+        let (feed_inserter_ready, placed_unit_statuses) =
+            placed_units_not_dead(&verification, &placed_units);
+        let route_success = route
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let repair_hint = automation_repair_hint(
+            "build_lab_feed",
+            "science belt to lab feed",
+            verification_call_ok,
+            &verification,
+            &placed_unit_statuses,
+            Some(route_success),
+        );
+
+        let research_lua = LuaCommand::get_research_status();
+        let research_status = match client.execute_lua(&research_lua).await {
+            Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
+                Ok(report) => serde_json::json!({
+                    "success": true,
+                    "report": report,
+                }),
+                Err(e) => serde_json::json!({
+                    "success": false,
+                    "error": e.to_string(),
+                    "raw": response,
+                }),
+            },
+            Err(e) => serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+            }),
+        };
+
+        let success = route_success
+            && inserter.is_ok()
+            && verification_call_ok
+            && feed_inserter_ready
+            && research_status
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+        let result = serde_json::json!({
+            "success": success,
+            "placement_success": inserter.is_ok(),
+            "dry_run": false,
+            "lab": {
+                "unit_number": lab.unit_number,
+                "name": lab.name,
+                "position": lab.position,
+            },
+            "route": route,
+            "inserter": inserter_report,
+            "automation_verified": {
+                "success": verification_call_ok && feed_inserter_ready,
+                "verification_call_ok": verification_call_ok,
+                "feed_inserter_ready": feed_inserter_ready,
+                "placed_unit_statuses": placed_unit_statuses,
+            },
+            "verification": verification,
+            "research_status": research_status,
+            "repair_hint": repair_hint,
+            "guidance": "If success is true, lab feed infrastructure is built; ensure science production feeds this belt and research is selected.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Build one belt plus inserter feed into an assembling machine.
+    #[tool(
+        description = "Execute a durable item feed into an assembling machine: optionally set its recipe, route an item belt to the inserter pickup tile, place the inserter feeding the assembler, then verify production. Use this for automation-science-pack inputs such as iron-gear-wheel and copper-plate instead of hand-feeding assemblers. Use dry_run=true during planner turns."
+    )]
+    async fn build_assembler_feed(
+        &self,
+        Parameters(params): Parameters<BuildAssemblerFeedParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let assembler = match client.get_entity(params.assembler_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if !assembler.name.starts_with("assembling-machine") {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not an assembling machine",
+                    params.assembler_unit_number, assembler.name
+                ))
+                .await;
+        }
+        let inserter_direction = match Direction::parse(&params.inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.inserter_direction
+                    ))
+                    .await;
+            }
+        };
+
+        let route_params = RouteBeltParams {
+            from_x: params.from_x,
+            from_y: params.from_y,
+            to_x: params.pickup_x,
+            to_y: params.pickup_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+
+        let route = match self.route_belt_core(&mut client, &route_params).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let recipe_args = serde_json::json!({
+            "unit_number": params.assembler_unit_number,
+            "recipe": params.recipe.clone(),
+        });
+        let inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.inserter_x,
+            "y": params.inserter_y,
+            "direction": params.inserter_direction,
+        });
+
+        if params.dry_run {
+            let mut steps = Vec::new();
+            if !params.recipe.trim().is_empty() {
+                steps.push(serde_json::json!({
+                    "tool": "set_recipe",
+                    "args": recipe_args,
+                }));
+            }
+            steps.push(serde_json::json!({
+                "tool": "route_belt",
+                "args": route_params,
+            }));
+            steps.push(serde_json::json!({
+                "tool": "place_entity",
+                "args": inserter_args,
+            }));
+            steps.push(serde_json::json!({
+                "tool": "verify_production",
+                "args": {
+                    "x": assembler.position.x,
+                    "y": assembler.position.y,
+                    "radius": params.verify_radius,
+                },
+            }));
+            let result = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "item_name": params.item_name.clone(),
+                "assembler": {
+                    "unit_number": assembler.unit_number,
+                    "name": assembler.name,
+                    "position": assembler.position,
+                },
+                "route": route,
+                "steps": steps,
+                "guidance": "If route.materials_sufficient is true and inserter placement is clear, call build_assembler_feed again with dry_run=false. Repeat once per recipe input belt.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let recipe_report = if params.recipe.trim().is_empty() {
+            serde_json::json!({
+                "tool": "set_recipe",
+                "skipped": true,
+                "reason": "recipe was empty",
+            })
+        } else {
+            let set_recipe = client
+                .set_recipe(params.assembler_unit_number, params.recipe.trim())
+                .await;
+            serde_json::json!({
+                "tool": "set_recipe",
+                "args": recipe_args,
+                "success": set_recipe.is_ok(),
+                "error": set_recipe.as_ref().err().map(|e| e.to_string()),
+            })
+        };
+
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
+        let inserter = client
+            .place_entity("inserter", inserter_position, inserter_direction)
+            .await;
+        let placed_inserter_unit = inserter.as_ref().ok().and_then(|entity| entity.unit_number);
+        let inserter_report = serde_json::json!({
+            "tool": "place_entity",
+            "args": inserter_args,
+            "success": inserter.is_ok(),
+            "unit_number": placed_inserter_unit,
+            "error": inserter.as_ref().err().map(|e| e.to_string()),
+        });
+
+        let verify_radius = params.verify_radius.clamp(1, 50) as f64;
+        let verify_area = Area::new(
+            assembler.position.x - verify_radius,
+            assembler.position.y - verify_radius,
+            assembler.position.x + verify_radius,
+            assembler.position.y + verify_radius,
+        );
+        let (verification, verification_call_ok, _) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+        let placed_units: Vec<u32> = placed_inserter_unit.into_iter().collect();
+        let (feed_inserter_ready, placed_unit_statuses) =
+            placed_units_not_dead(&verification, &placed_units);
+        let route_success = route
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let repair_hint = automation_repair_hint(
+            "build_assembler_feed",
+            "item belt to assembler input feed",
+            verification_call_ok,
+            &verification,
+            &placed_unit_statuses,
+            Some(route_success),
+        );
+
+        let recipe_ok = recipe_report
+            .get("skipped")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || recipe_report
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+        let success = route_success
+            && recipe_ok
+            && inserter.is_ok()
+            && verification_call_ok
+            && feed_inserter_ready;
+        let result = serde_json::json!({
+            "success": success,
+            "placement_success": inserter.is_ok(),
+            "dry_run": false,
+            "item_name": params.item_name.clone(),
+            "assembler": {
+                "unit_number": assembler.unit_number,
+                "name": assembler.name,
+                "position": assembler.position,
+            },
+            "recipe": recipe_report,
+            "route": route,
+            "inserter": inserter_report,
+            "automation_verified": {
+                "success": verification_call_ok && feed_inserter_ready,
+                "verification_call_ok": verification_call_ok,
+                "feed_inserter_ready": feed_inserter_ready,
+                "placed_unit_statuses": placed_unit_statuses,
+            },
+            "verification": verification,
+            "repair_hint": repair_hint,
+            "guidance": "If success is true, this assembler input feed is built. Add the other recipe input feeds, then route assembler output toward the lab feed.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Build one output belt plus inserter from an assembling machine.
+    #[tool(
+        description = "Execute a durable output from an assembling machine: route a belt from the output inserter drop tile to a target belt tile, place the inserter extracting from the assembler, then verify production. Use this to move automation-science-pack output toward lab feed instead of hand-extracting assembler products. Use dry_run=true during planner turns."
+    )]
+    async fn build_assembler_output(
+        &self,
+        Parameters(params): Parameters<BuildAssemblerOutputParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let assembler = match client.get_entity(params.assembler_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if !assembler.name.starts_with("assembling-machine") {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not an assembling machine",
+                    params.assembler_unit_number, assembler.name
+                ))
+                .await;
+        }
+        let inserter_direction = match Direction::parse(&params.inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.inserter_direction
+                    ))
+                    .await;
+            }
+        };
+
+        let route_params = RouteBeltParams {
+            from_x: params.drop_x,
+            from_y: params.drop_y,
+            to_x: params.to_x,
+            to_y: params.to_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+
+        let route = match self.route_belt_core(&mut client, &route_params).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.inserter_x,
+            "y": params.inserter_y,
+            "direction": params.inserter_direction,
+        });
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "item_name": params.item_name.clone(),
+                "assembler": {
+                    "unit_number": assembler.unit_number,
+                    "name": assembler.name,
+                    "position": assembler.position,
+                },
+                "route": route,
+                "steps": [{
+                    "tool": "route_belt",
+                    "args": route_params,
+                }, {
+                    "tool": "place_entity",
+                    "args": inserter_args,
+                }, {
+                    "tool": "verify_production",
+                    "args": {
+                        "x": assembler.position.x,
+                        "y": assembler.position.y,
+                        "radius": params.verify_radius,
+                    },
+                }],
+                "guidance": "If route.materials_sufficient is true and inserter placement is clear, call build_assembler_output again with dry_run=false, then connect the target belt to build_lab_feed.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
+        let inserter = client
+            .place_entity("inserter", inserter_position, inserter_direction)
+            .await;
+        let placed_inserter_unit = inserter.as_ref().ok().and_then(|entity| entity.unit_number);
+        let inserter_report = serde_json::json!({
+            "tool": "place_entity",
+            "args": inserter_args,
+            "success": inserter.is_ok(),
+            "unit_number": placed_inserter_unit,
+            "error": inserter.as_ref().err().map(|e| e.to_string()),
+        });
+
+        let verify_radius = params.verify_radius.clamp(1, 50) as f64;
+        let verify_area = Area::new(
+            assembler.position.x - verify_radius,
+            assembler.position.y - verify_radius,
+            assembler.position.x + verify_radius,
+            assembler.position.y + verify_radius,
+        );
+        let (verification, verification_call_ok, _) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+        let placed_units: Vec<u32> = placed_inserter_unit.into_iter().collect();
+        let (output_inserter_ready, placed_unit_statuses) =
+            placed_units_not_dead(&verification, &placed_units);
+        let route_success = route
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let repair_hint = automation_repair_hint(
+            "build_assembler_output",
+            "assembler output belt",
+            verification_call_ok,
+            &verification,
+            &placed_unit_statuses,
+            Some(route_success),
+        );
+
+        let success =
+            route_success && inserter.is_ok() && verification_call_ok && output_inserter_ready;
+        let result = serde_json::json!({
+            "success": success,
+            "placement_success": inserter.is_ok(),
+            "dry_run": false,
+            "item_name": params.item_name.clone(),
+            "assembler": {
+                "unit_number": assembler.unit_number,
+                "name": assembler.name,
+                "position": assembler.position,
+            },
+            "route": route,
+            "inserter": inserter_report,
+            "automation_verified": {
+                "success": verification_call_ok && output_inserter_ready,
+                "verification_call_ok": verification_call_ok,
+                "output_inserter_ready": output_inserter_ready,
+                "placed_unit_statuses": placed_unit_statuses,
+            },
+            "verification": verification,
+            "repair_hint": repair_hint,
+            "guidance": "If success is true, assembler output is on the routed belt. Use build_lab_feed to consume science packs from that belt.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Plan a one-input recipe assembler cell.
+    #[tool(
+        description = "Read-only layout planner for a one-input assembler component cell, such as iron-gear-wheel from iron-plate. Derives input/output belt and inserter coordinates from an assembler and side choices, dry-runs both belt routes, and returns ready_to_call build_recipe_assembler_cell payloads. Use this before hand-crafting gears, cables, or circuits for science automation."
+    )]
+    async fn plan_recipe_assembler_cell(
+        &self,
+        Parameters(params): Parameters<PlanRecipeAssemblerCellParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let assembler = match client.get_entity(params.assembler_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if !assembler.name.starts_with("assembling-machine") {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not an assembling machine",
+                    params.assembler_unit_number, assembler.name
+                ))
+                .await;
+        }
+
+        let input = match machine_side_layout(&assembler, &params.input_side) {
+            Ok(layout) => layout,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let output = match machine_side_layout(&assembler, &params.output_side) {
+            Ok(layout) => layout,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if input.side == output.side {
+            return self
+                .with_player_messages(format!(
+                    "Error: input_side and output_side both resolve to {}; choose different sides",
+                    input.side
+                ))
+                .await;
+        }
+
+        let build_args = BuildRecipeAssemblerCellParams {
+            assembler_unit_number: params.assembler_unit_number,
+            recipe: params.recipe.clone(),
+            input_item_name: params.input_item_name.clone(),
+            output_item_name: params.output_item_name.clone(),
+            input_from_x: params.input_from_x,
+            input_from_y: params.input_from_y,
+            input_pickup_x: input.belt_x,
+            input_pickup_y: input.belt_y,
+            input_inserter_x: input.inserter_x,
+            input_inserter_y: input.inserter_y,
+            input_inserter_direction: input.input_direction.to_string(),
+            output_drop_x: output.belt_x,
+            output_drop_y: output.belt_y,
+            output_to_x: params.output_to_x,
+            output_to_y: params.output_to_y,
+            output_inserter_x: output.inserter_x,
+            output_inserter_y: output.inserter_y,
+            output_inserter_direction: output.output_direction.to_string(),
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: true,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+            verify_radius: params.verify_radius,
+        };
+        let input_route_params = RouteBeltParams {
+            from_x: params.input_from_x,
+            from_y: params.input_from_y,
+            to_x: input.belt_x,
+            to_y: input.belt_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: true,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+        let output_route_params = RouteBeltParams {
+            from_x: output.belt_x,
+            from_y: output.belt_y,
+            to_x: params.output_to_x,
+            to_y: params.output_to_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: true,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+
+        let input_route = self.route_belt_core(&mut client, &input_route_params).await;
+        let output_route = self
+            .route_belt_core(&mut client, &output_route_params)
+            .await;
+        let routes = serde_json::json!({
+            "input": match input_route {
+                Ok(report) => report,
+                Err(error) => serde_json::json!({"success": false, "error": error}),
+            },
+            "output": match output_route {
+                Ok(report) => report,
+                Err(error) => serde_json::json!({"success": false, "error": error}),
+            },
+        });
+        let route_ready = routes
+            .as_object()
+            .map(|object| {
+                object.values().all(|value| {
+                    value
+                        .get("success")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                        && value
+                            .get("materials_sufficient")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        let mut execute_args =
+            serde_json::to_value(&build_args).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(object) = execute_args.as_object_mut() {
+            object.insert("dry_run".to_string(), serde_json::json!(false));
+        }
+
+        let result = serde_json::json!({
+            "success": route_ready,
+            "dry_run": true,
+            "recipe": params.recipe,
+            "input_item_name": params.input_item_name,
+            "output_item_name": params.output_item_name,
+            "assembler": {
+                "unit_number": assembler.unit_number,
+                "name": assembler.name,
+                "position": assembler.position,
+            },
+            "sides": {
+                "input": input,
+                "output": output,
+            },
+            "routes": routes,
+            "ready_to_call": {
+                "tool": "build_recipe_assembler_cell",
+                "dry_run_args": build_args,
+                "execute_args": execute_args,
+            },
+            "guidance": "If success is true, call build_recipe_assembler_cell with ready_to_call.execute_args. Use its output belt as the source for downstream plan_automation_science/build_automation_science instead of hand-crafting components.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Build a one-input recipe assembler cell.
+    #[tool(
+        description = "Execute a durable one-input assembler component cell: set the recipe, route the input item belt to an inserter, place the input inserter, route the product output belt, place the output inserter, then verify production. Use this for iron-gear-wheel or copper-cable cells instead of hand-crafting science ingredients. Use dry_run=true during planner turns."
+    )]
+    async fn build_recipe_assembler_cell(
+        &self,
+        Parameters(params): Parameters<BuildRecipeAssemblerCellParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let assembler = match client.get_entity(params.assembler_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if !assembler.name.starts_with("assembling-machine") {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not an assembling machine",
+                    params.assembler_unit_number, assembler.name
+                ))
+                .await;
+        }
+        let input_direction = match Direction::parse(&params.input_inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid input_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.input_inserter_direction
+                    ))
+                    .await;
+            }
+        };
+        let output_direction = match Direction::parse(&params.output_inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid output_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.output_inserter_direction
+                    ))
+                    .await;
+            }
+        };
+
+        let input_route_params = RouteBeltParams {
+            from_x: params.input_from_x,
+            from_y: params.input_from_y,
+            to_x: params.input_pickup_x,
+            to_y: params.input_pickup_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+        let output_route_params = RouteBeltParams {
+            from_x: params.output_drop_x,
+            from_y: params.output_drop_y,
+            to_x: params.output_to_x,
+            to_y: params.output_to_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+        let input_route = match self.route_belt_core(&mut client, &input_route_params).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let output_route = match self
+            .route_belt_core(&mut client, &output_route_params)
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let recipe_args = serde_json::json!({
+            "unit_number": params.assembler_unit_number,
+            "recipe": params.recipe.clone(),
+        });
+        let input_inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.input_inserter_x,
+            "y": params.input_inserter_y,
+            "direction": params.input_inserter_direction,
+        });
+        let output_inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.output_inserter_x,
+            "y": params.output_inserter_y,
+            "direction": params.output_inserter_direction,
+        });
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "recipe": params.recipe,
+                "input_item_name": params.input_item_name,
+                "output_item_name": params.output_item_name,
+                "assembler": {
+                    "unit_number": assembler.unit_number,
+                    "name": assembler.name,
+                    "position": assembler.position,
+                },
+                "routes": {
+                    "input": input_route,
+                    "output": output_route,
+                },
+                "steps": [{
+                    "tool": "set_recipe",
+                    "args": recipe_args,
+                }, {
+                    "tool": "route_belt",
+                    "item": params.input_item_name,
+                    "args": input_route_params,
+                }, {
+                    "tool": "place_entity",
+                    "item": params.input_item_name,
+                    "args": input_inserter_args,
+                }, {
+                    "tool": "route_belt",
+                    "item": params.output_item_name,
+                    "args": output_route_params,
+                }, {
+                    "tool": "place_entity",
+                    "item": params.output_item_name,
+                    "args": output_inserter_args,
+                }, {
+                    "tool": "verify_production",
+                    "args": {
+                        "x": assembler.position.x,
+                        "y": assembler.position.y,
+                        "radius": params.verify_radius,
+                    },
+                }],
+                "guidance": "If both routes have materials_sufficient=true and inserter placements are clear, call build_recipe_assembler_cell again with dry_run=false.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let set_recipe = client
+            .set_recipe(params.assembler_unit_number, params.recipe.trim())
+            .await;
+        let recipe_report = serde_json::json!({
+            "tool": "set_recipe",
+            "args": recipe_args,
+            "success": set_recipe.is_ok(),
+            "error": set_recipe.as_ref().err().map(|e| e.to_string()),
+        });
+        let input_inserter = client
+            .place_entity(
+                "inserter",
+                Position::new(params.input_inserter_x, params.input_inserter_y),
+                input_direction,
+            )
+            .await;
+        let output_inserter = client
+            .place_entity(
+                "inserter",
+                Position::new(params.output_inserter_x, params.output_inserter_y),
+                output_direction,
+            )
+            .await;
+        let input_inserter_unit = input_inserter
+            .as_ref()
+            .ok()
+            .and_then(|entity| entity.unit_number);
+        let output_inserter_unit = output_inserter
+            .as_ref()
+            .ok()
+            .and_then(|entity| entity.unit_number);
+
+        let verify_radius = params.verify_radius.clamp(1, 50) as f64;
+        let verify_area = Area::new(
+            assembler.position.x - verify_radius,
+            assembler.position.y - verify_radius,
+            assembler.position.x + verify_radius,
+            assembler.position.y + verify_radius,
+        );
+        let (verification, verification_call_ok, _) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+        let placed_units: Vec<u32> = [input_inserter_unit, output_inserter_unit]
+            .into_iter()
+            .flatten()
+            .collect();
+        let (inserters_ready, placed_unit_statuses) =
+            placed_units_not_dead(&verification, &placed_units);
+        let route_ok = |value: &serde_json::Value| {
+            value
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        };
+        let routes_success = route_ok(&input_route) && route_ok(&output_route);
+        let repair_hint = automation_repair_hint(
+            "build_recipe_assembler_cell",
+            "one-input assembler component cell",
+            verification_call_ok,
+            &verification,
+            &placed_unit_statuses,
+            Some(routes_success),
+        );
+        let success = set_recipe.is_ok()
+            && routes_success
+            && input_inserter.is_ok()
+            && output_inserter.is_ok()
+            && verification_call_ok
+            && inserters_ready;
+
+        let result = serde_json::json!({
+            "success": success,
+            "placement_success": input_inserter.is_ok() && output_inserter.is_ok(),
+            "dry_run": false,
+            "recipe": params.recipe,
+            "input_item_name": params.input_item_name,
+            "output_item_name": params.output_item_name,
+            "assembler": {
+                "unit_number": assembler.unit_number,
+                "name": assembler.name,
+                "position": assembler.position,
+            },
+            "recipe_set": recipe_report,
+            "routes": {
+                "input": input_route,
+                "output": output_route,
+            },
+            "inserters": {
+                "input": {
+                    "tool": "place_entity",
+                    "args": input_inserter_args,
+                    "success": input_inserter.is_ok(),
+                    "unit_number": input_inserter_unit,
+                    "error": input_inserter.as_ref().err().map(|e| e.to_string()),
+                },
+                "output": {
+                    "tool": "place_entity",
+                    "args": output_inserter_args,
+                    "success": output_inserter.is_ok(),
+                    "unit_number": output_inserter_unit,
+                    "error": output_inserter.as_ref().err().map(|e| e.to_string()),
+                },
+            },
+            "automation_verified": {
+                "success": verification_call_ok && inserters_ready,
+                "verification_call_ok": verification_call_ok,
+                "inserters_ready": inserters_ready,
+                "placed_unit_statuses": placed_unit_statuses,
+            },
+            "verification": verification,
+            "repair_hint": repair_hint,
+            "guidance": "If success is true, the component is being assembled onto the output belt. Use output_drop/output target as the source belt for downstream assembler feeds.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Plan the payload for a complete automation-science assembler-to-lab cell.
+    #[tool(
+        description = "Read-only layout planner for automation-science-pack automation. Takes an assembler, lab, gear source belt tile, and copper source belt tile; chooses side-based inserter/pickup/drop coordinates; dry-runs all belt routes; and returns a ready_to_call build_automation_science payload. Use this in planner turns instead of hand-deriving 30 coordinates."
+    )]
+    async fn plan_automation_science(
+        &self,
+        Parameters(params): Parameters<PlanAutomationScienceParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let assembler = match client.get_entity(params.assembler_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if !assembler.name.starts_with("assembling-machine") {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not an assembling machine",
+                    params.assembler_unit_number, assembler.name
+                ))
+                .await;
+        }
+
+        let lab = match client.get_entity(params.lab_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if lab.name != "lab" {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not lab",
+                    params.lab_unit_number, lab.name
+                ))
+                .await;
+        }
+
+        let gear = match machine_side_layout(&assembler, &params.gear_side) {
+            Ok(layout) => layout,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let copper = match machine_side_layout(&assembler, &params.copper_side) {
+            Ok(layout) => layout,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let output = match machine_side_layout(&assembler, &params.output_side) {
+            Ok(layout) => layout,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let lab_feed = match machine_side_layout(&lab, &params.lab_side) {
+            Ok(layout) => layout,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let build_args = BuildAutomationScienceParams {
+            assembler_unit_number: params.assembler_unit_number,
+            lab_unit_number: params.lab_unit_number,
+            gear_from_x: params.gear_from_x,
+            gear_from_y: params.gear_from_y,
+            gear_pickup_x: gear.belt_x,
+            gear_pickup_y: gear.belt_y,
+            gear_inserter_x: gear.inserter_x,
+            gear_inserter_y: gear.inserter_y,
+            gear_inserter_direction: gear.input_direction.to_string(),
+            copper_from_x: params.copper_from_x,
+            copper_from_y: params.copper_from_y,
+            copper_pickup_x: copper.belt_x,
+            copper_pickup_y: copper.belt_y,
+            copper_inserter_x: copper.inserter_x,
+            copper_inserter_y: copper.inserter_y,
+            copper_inserter_direction: copper.input_direction.to_string(),
+            science_drop_x: output.belt_x,
+            science_drop_y: output.belt_y,
+            science_to_x: lab_feed.upstream_x,
+            science_to_y: lab_feed.upstream_y,
+            output_inserter_x: output.inserter_x,
+            output_inserter_y: output.inserter_y,
+            output_inserter_direction: output.output_direction.to_string(),
+            lab_from_x: lab_feed.upstream_x,
+            lab_from_y: lab_feed.upstream_y,
+            lab_pickup_x: lab_feed.belt_x,
+            lab_pickup_y: lab_feed.belt_y,
+            lab_inserter_x: lab_feed.inserter_x,
+            lab_inserter_y: lab_feed.inserter_y,
+            lab_inserter_direction: lab_feed.input_direction.to_string(),
+            belt_type: params.belt_type,
+            search_radius: params.search_radius,
+            dry_run: true,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+            verify_radius: params.verify_radius,
+        };
+
+        let gear_route_params = RouteBeltParams {
+            from_x: build_args.gear_from_x,
+            from_y: build_args.gear_from_y,
+            to_x: build_args.gear_pickup_x,
+            to_y: build_args.gear_pickup_y,
+            belt_type: build_args.belt_type.clone(),
+            search_radius: build_args.search_radius,
+            dry_run: true,
+            respect_zones: build_args.respect_zones,
+            allow_underground: build_args.allow_underground,
+            extend_existing: build_args.extend_existing,
+        };
+        let copper_route_params = RouteBeltParams {
+            from_x: build_args.copper_from_x,
+            from_y: build_args.copper_from_y,
+            to_x: build_args.copper_pickup_x,
+            to_y: build_args.copper_pickup_y,
+            belt_type: build_args.belt_type.clone(),
+            search_radius: build_args.search_radius,
+            dry_run: true,
+            respect_zones: build_args.respect_zones,
+            allow_underground: build_args.allow_underground,
+            extend_existing: build_args.extend_existing,
+        };
+        let output_route_params = RouteBeltParams {
+            from_x: build_args.science_drop_x,
+            from_y: build_args.science_drop_y,
+            to_x: build_args.science_to_x,
+            to_y: build_args.science_to_y,
+            belt_type: build_args.belt_type.clone(),
+            search_radius: build_args.search_radius,
+            dry_run: true,
+            respect_zones: build_args.respect_zones,
+            allow_underground: build_args.allow_underground,
+            extend_existing: build_args.extend_existing,
+        };
+        let lab_route_params = RouteBeltParams {
+            from_x: build_args.lab_from_x,
+            from_y: build_args.lab_from_y,
+            to_x: build_args.lab_pickup_x,
+            to_y: build_args.lab_pickup_y,
+            belt_type: build_args.belt_type.clone(),
+            search_radius: build_args.search_radius,
+            dry_run: true,
+            respect_zones: build_args.respect_zones,
+            allow_underground: build_args.allow_underground,
+            extend_existing: build_args.extend_existing,
+        };
+
+        let gear_route = self.route_belt_core(&mut client, &gear_route_params).await;
+        let copper_route = self
+            .route_belt_core(&mut client, &copper_route_params)
+            .await;
+        let output_route = self
+            .route_belt_core(&mut client, &output_route_params)
+            .await;
+        let lab_route = self.route_belt_core(&mut client, &lab_route_params).await;
+
+        let route_value = |route: Result<serde_json::Value, String>| match route {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({
+                "success": false,
+                "dry_run": true,
+                "error": error,
+            }),
+        };
+        let routes = serde_json::json!({
+            "iron_gear_wheel": route_value(gear_route),
+            "copper_plate": route_value(copper_route),
+            "automation_science_pack": route_value(output_route),
+            "lab_feed": route_value(lab_route),
+        });
+        let route_success = routes
+            .as_object()
+            .map(|object| {
+                object.values().all(|value| {
+                    value
+                        .get("success")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                        && value
+                            .get("materials_sufficient")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        let mut execute_args =
+            serde_json::to_value(&build_args).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(object) = execute_args.as_object_mut() {
+            object.insert("dry_run".to_string(), serde_json::json!(false));
+        }
+
+        let result = serde_json::json!({
+            "success": route_success,
+            "dry_run": true,
+            "recipe": "automation-science-pack",
+            "assembler": {
+                "unit_number": assembler.unit_number,
+                "name": assembler.name,
+                "position": assembler.position,
+            },
+            "lab": {
+                "unit_number": lab.unit_number,
+                "name": lab.name,
+                "position": lab.position,
+            },
+            "sides": {
+                "gear": gear,
+                "copper": copper,
+                "science_output": output,
+                "lab_feed": lab_feed,
+            },
+            "routes": routes,
+            "ready_to_call": {
+                "tool": "build_automation_science",
+                "dry_run_args": build_args,
+                "execute_args": execute_args,
+            },
+            "guidance": "If success is true, call build_automation_science with ready_to_call.execute_args. If false, choose different sides or source belt tiles and call plan_automation_science again; do not hand-craft or hand-feed automation science packs.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Build a complete automation-science assembler-to-lab cell.
+    #[tool(
+        description = "Execute a complete durable automation-science-pack cell: set an assembler to automation-science-pack, route iron-gear-wheel and copper-plate belts into it, route science output toward a lab, place all inserters, then verify assembler/research state. Prefer this over hand-crafting or hand-feeding red science. Use dry_run=true during planner turns."
+    )]
+    async fn build_automation_science(
+        &self,
+        Parameters(params): Parameters<BuildAutomationScienceParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let assembler = match client.get_entity(params.assembler_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if !assembler.name.starts_with("assembling-machine") {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not an assembling machine",
+                    params.assembler_unit_number, assembler.name
+                ))
+                .await;
+        }
+
+        let lab = match client.get_entity(params.lab_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        if lab.name != "lab" {
+            return self
+                .with_player_messages(format!(
+                    "Error: unit {} is {}, not lab",
+                    params.lab_unit_number, lab.name
+                ))
+                .await;
+        }
+
+        let gear_direction = match Direction::parse(&params.gear_inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid gear_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.gear_inserter_direction
+                    ))
+                    .await;
+            }
+        };
+        let copper_direction = match Direction::parse(&params.copper_inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid copper_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.copper_inserter_direction
+                    ))
+                    .await;
+            }
+        };
+        let output_direction = match Direction::parse(&params.output_inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid output_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.output_inserter_direction
+                    ))
+                    .await;
+            }
+        };
+        let lab_direction = match Direction::parse(&params.lab_inserter_direction) {
+            Some(direction) => direction,
+            None => {
+                return self
+                    .with_player_messages(format!(
+                        "Invalid lab_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                        params.lab_inserter_direction
+                    ))
+                    .await;
+            }
+        };
+
+        let gear_route_params = RouteBeltParams {
+            from_x: params.gear_from_x,
+            from_y: params.gear_from_y,
+            to_x: params.gear_pickup_x,
+            to_y: params.gear_pickup_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+        let copper_route_params = RouteBeltParams {
+            from_x: params.copper_from_x,
+            from_y: params.copper_from_y,
+            to_x: params.copper_pickup_x,
+            to_y: params.copper_pickup_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+        let output_route_params = RouteBeltParams {
+            from_x: params.science_drop_x,
+            from_y: params.science_drop_y,
+            to_x: params.science_to_x,
+            to_y: params.science_to_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+        let lab_route_params = RouteBeltParams {
+            from_x: params.lab_from_x,
+            from_y: params.lab_from_y,
+            to_x: params.lab_pickup_x,
+            to_y: params.lab_pickup_y,
+            belt_type: params.belt_type.clone(),
+            search_radius: params.search_radius,
+            dry_run: params.dry_run,
+            respect_zones: params.respect_zones,
+            allow_underground: params.allow_underground,
+            extend_existing: params.extend_existing,
+        };
+
+        let gear_route = match self.route_belt_core(&mut client, &gear_route_params).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let copper_route = match self
+            .route_belt_core(&mut client, &copper_route_params)
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let output_route = match self
+            .route_belt_core(&mut client, &output_route_params)
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let lab_route = match self.route_belt_core(&mut client, &lab_route_params).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let recipe_args = serde_json::json!({
+            "unit_number": params.assembler_unit_number,
+            "recipe": "automation-science-pack",
+        });
+        let gear_inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.gear_inserter_x,
+            "y": params.gear_inserter_y,
+            "direction": params.gear_inserter_direction,
+        });
+        let copper_inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.copper_inserter_x,
+            "y": params.copper_inserter_y,
+            "direction": params.copper_inserter_direction,
+        });
+        let output_inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.output_inserter_x,
+            "y": params.output_inserter_y,
+            "direction": params.output_inserter_direction,
+        });
+        let lab_inserter_args = serde_json::json!({
+            "entity_name": "inserter",
+            "x": params.lab_inserter_x,
+            "y": params.lab_inserter_y,
+            "direction": params.lab_inserter_direction,
+        });
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "recipe": "automation-science-pack",
+                "assembler": {
+                    "unit_number": assembler.unit_number,
+                    "name": assembler.name,
+                    "position": assembler.position,
+                },
+                "lab": {
+                    "unit_number": lab.unit_number,
+                    "name": lab.name,
+                    "position": lab.position,
+                },
+                "routes": {
+                    "iron_gear_wheel": gear_route,
+                    "copper_plate": copper_route,
+                    "automation_science_pack": output_route,
+                    "lab_feed": lab_route,
+                },
+                "steps": [{
+                    "tool": "set_recipe",
+                    "args": recipe_args,
+                }, {
+                    "tool": "route_belt",
+                    "item": "iron-gear-wheel",
+                    "args": gear_route_params,
+                }, {
+                    "tool": "place_entity",
+                    "item": "iron-gear-wheel",
+                    "args": gear_inserter_args,
+                }, {
+                    "tool": "route_belt",
+                    "item": "copper-plate",
+                    "args": copper_route_params,
+                }, {
+                    "tool": "place_entity",
+                    "item": "copper-plate",
+                    "args": copper_inserter_args,
+                }, {
+                    "tool": "route_belt",
+                    "item": "automation-science-pack",
+                    "args": output_route_params,
+                }, {
+                    "tool": "place_entity",
+                    "item": "automation-science-pack-output",
+                    "args": output_inserter_args,
+                }, {
+                    "tool": "route_belt",
+                    "item": "automation-science-pack-to-lab",
+                    "args": lab_route_params,
+                }, {
+                    "tool": "place_entity",
+                    "item": "automation-science-pack-to-lab",
+                    "args": lab_inserter_args,
+                }, {
+                    "tool": "verify_production",
+                    "args": {
+                        "x": assembler.position.x,
+                        "y": assembler.position.y,
+                        "radius": params.verify_radius,
+                    },
+                }, {
+                    "tool": "get_research_status",
+                    "args": {},
+                }],
+                "guidance": "If all route materials_sufficient values are true and inserter placements are clear, call build_automation_science again with dry_run=false. Do not hand-craft or hand-feed automation science packs.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let set_recipe = client
+            .set_recipe(params.assembler_unit_number, "automation-science-pack")
+            .await;
+        let recipe_report = serde_json::json!({
+            "tool": "set_recipe",
+            "args": recipe_args,
+            "success": set_recipe.is_ok(),
+            "error": set_recipe.as_ref().err().map(|e| e.to_string()),
+        });
+
+        let gear_inserter = client
+            .place_entity(
+                "inserter",
+                Position::new(params.gear_inserter_x, params.gear_inserter_y),
+                gear_direction,
+            )
+            .await;
+        let copper_inserter = client
+            .place_entity(
+                "inserter",
+                Position::new(params.copper_inserter_x, params.copper_inserter_y),
+                copper_direction,
+            )
+            .await;
+        let output_inserter = client
+            .place_entity(
+                "inserter",
+                Position::new(params.output_inserter_x, params.output_inserter_y),
+                output_direction,
+            )
+            .await;
+        let lab_inserter = client
+            .place_entity(
+                "inserter",
+                Position::new(params.lab_inserter_x, params.lab_inserter_y),
+                lab_direction,
+            )
+            .await;
+        let gear_inserter_unit = gear_inserter
+            .as_ref()
+            .ok()
+            .and_then(|entity| entity.unit_number);
+        let copper_inserter_unit = copper_inserter
+            .as_ref()
+            .ok()
+            .and_then(|entity| entity.unit_number);
+        let output_inserter_unit = output_inserter
+            .as_ref()
+            .ok()
+            .and_then(|entity| entity.unit_number);
+        let lab_inserter_unit = lab_inserter
+            .as_ref()
+            .ok()
+            .and_then(|entity| entity.unit_number);
+
+        let verify_radius = params.verify_radius.clamp(1, 50) as f64;
+        let verify_area = Area::new(
+            assembler.position.x.min(lab.position.x) - verify_radius,
+            assembler.position.y.min(lab.position.y) - verify_radius,
+            assembler.position.x.max(lab.position.x) + verify_radius,
+            assembler.position.y.max(lab.position.y) + verify_radius,
+        );
+        let (verification, verification_call_ok, _) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+        let placed_units: Vec<u32> = [
+            gear_inserter_unit,
+            copper_inserter_unit,
+            output_inserter_unit,
+            lab_inserter_unit,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let (inserters_ready, placed_unit_statuses) =
+            placed_units_not_dead(&verification, &placed_units);
+
+        let research_lua = LuaCommand::get_research_status();
+        let research_status = match client.execute_lua(&research_lua).await {
+            Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
+                Ok(report) => serde_json::json!({
+                    "success": true,
+                    "report": report,
+                }),
+                Err(e) => serde_json::json!({
+                    "success": false,
+                    "error": e.to_string(),
+                    "raw": response,
+                }),
+            },
+            Err(e) => serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+            }),
+        };
+
+        let route_ok = |value: &serde_json::Value| {
+            value
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        };
+        let routes_success = route_ok(&gear_route)
+            && route_ok(&copper_route)
+            && route_ok(&output_route)
+            && route_ok(&lab_route);
+        let repair_hint = automation_repair_hint(
+            "build_automation_science",
+            "complete automation-science assembler-to-lab cell",
+            verification_call_ok,
+            &verification,
+            &placed_unit_statuses,
+            Some(routes_success),
+        );
+        let success = set_recipe.is_ok()
+            && routes_success
+            && gear_inserter.is_ok()
+            && copper_inserter.is_ok()
+            && output_inserter.is_ok()
+            && lab_inserter.is_ok()
+            && verification_call_ok
+            && inserters_ready
+            && research_status
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+
+        let result = serde_json::json!({
+            "success": success,
+            "placement_success": gear_inserter.is_ok()
+                && copper_inserter.is_ok()
+                && output_inserter.is_ok()
+                && lab_inserter.is_ok(),
+            "dry_run": false,
+            "recipe": "automation-science-pack",
+            "assembler": {
+                "unit_number": assembler.unit_number,
+                "name": assembler.name,
+                "position": assembler.position,
+            },
+            "lab": {
+                "unit_number": lab.unit_number,
+                "name": lab.name,
+                "position": lab.position,
+            },
+            "recipe_set": recipe_report,
+            "routes": {
+                "iron_gear_wheel": gear_route,
+                "copper_plate": copper_route,
+                "automation_science_pack": output_route,
+                "lab_feed": lab_route,
+            },
+            "inserters": {
+                "iron_gear_wheel": {
+                    "tool": "place_entity",
+                    "args": gear_inserter_args,
+                    "success": gear_inserter.is_ok(),
+                    "unit_number": gear_inserter_unit,
+                    "error": gear_inserter.as_ref().err().map(|e| e.to_string()),
+                },
+                "copper_plate": {
+                    "tool": "place_entity",
+                    "args": copper_inserter_args,
+                    "success": copper_inserter.is_ok(),
+                    "unit_number": copper_inserter_unit,
+                    "error": copper_inserter.as_ref().err().map(|e| e.to_string()),
+                },
+                "automation_science_pack_output": {
+                    "tool": "place_entity",
+                    "args": output_inserter_args,
+                    "success": output_inserter.is_ok(),
+                    "unit_number": output_inserter_unit,
+                    "error": output_inserter.as_ref().err().map(|e| e.to_string()),
+                },
+                "lab_feed": {
+                    "tool": "place_entity",
+                    "args": lab_inserter_args,
+                    "success": lab_inserter.is_ok(),
+                    "unit_number": lab_inserter_unit,
+                    "error": lab_inserter.as_ref().err().map(|e| e.to_string()),
+                },
+            },
+            "automation_verified": {
+                "success": verification_call_ok && inserters_ready,
+                "verification_call_ok": verification_call_ok,
+                "inserters_ready": inserters_ready,
+                "placed_unit_statuses": placed_unit_statuses,
+            },
+            "verification": verification,
+            "research_status": research_status,
+            "repair_hint": repair_hint,
+            "guidance": "If success is true, automation science production and lab delivery are built. Keep research running from this belt instead of feeding packs from inventory.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
     }
 
     /// Get belt contents with lane separation.

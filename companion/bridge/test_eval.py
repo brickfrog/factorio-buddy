@@ -187,6 +187,13 @@ class EvaluateTest(unittest.TestCase):
             BridgeLogRecord(message="autonomy -> doug: (execution tick) Do the next step"),
             BridgeLogRecord(message="tool: walk_to({\"x\":42,\"y\":-21})"),
             BridgeLogRecord(message="tool: insert_items({\"item\":\"coal\"})"),
+            BridgeLogRecord(message="tool: build_fuel_supply({\"consumer_unit_number\":49})"),
+            BridgeLogRecord(message="tool: build_automation_science({\"assembler_unit_number\":80})"),
+            BridgeLogRecord(message='tool: craft({"recipe":"iron-gear-wheel","count":4})'),
+            BridgeLogRecord(message="tool: feed_lab_from_inventory({\"lab_unit_number\":69,\"science_pack\":\"automation-science-pack\",\"dry_run\":false})"),
+            BridgeLogRecord(message='tool_result: {"automation_verified":{"success":true}}'),
+            BridgeLogRecord(message='tool_result game_rejected: {"success":false,"automation_verified":{"success":false}}'),
+            BridgeLogRecord(message='tool_result game_rejected: [{"type":"text","text":"{\\"success\\":false,\\"automation_verified\\":{\\"success\\":false}}"}]'),
             BridgeLogRecord(message="tool_result expected_miss: Error: No items of that type in inventory"),
             BridgeLogRecord(message="tool_result game_rejected: Error: Cannot place entity here"),
             BridgeLogRecord(message="done: $0.2500 | 3 turns | 10.0s"),
@@ -201,12 +208,111 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(metrics["execution_ticks"], 1)
         self.assertEqual(metrics["planner_turns_with_no_state_change"], 2)
         self.assertEqual(metrics["repeated_objective_restatements"], 1)
-        self.assertEqual(metrics["tool_calls_before_first_milestone"], 2)
+        self.assertEqual(metrics["tool_calls_before_first_milestone"], 6)
         self.assertEqual(metrics["expected_misses"], 1)
-        self.assertEqual(metrics["real_failures"], 1)
+        self.assertEqual(metrics["real_failures"], 3)
         self.assertEqual(metrics["rejected_placements"], 1)
+        self.assertEqual(metrics["automation_tool_calls"], 2)
+        self.assertEqual(metrics["manual_transfer_tool_calls"], 3)
+        self.assertEqual(metrics["automation_to_manual_ratio"], 0.666667)
+        self.assertEqual(metrics["fuel_automation_tool_calls"], 1)
+        self.assertEqual(metrics["manual_fuel_transfer_tool_calls"], 1)
+        self.assertEqual(metrics["fuel_automation_to_manual_ratio"], 1.0)
+        self.assertEqual(metrics["science_automation_tool_calls"], 1)
+        self.assertEqual(metrics["manual_science_transfer_tool_calls"], 1)
+        self.assertEqual(metrics["science_automation_to_manual_ratio"], 1.0)
+        self.assertEqual(metrics["component_automation_tool_calls"], 1)
+        self.assertEqual(metrics["manual_component_craft_tool_calls"], 1)
+        self.assertEqual(metrics["component_automation_to_manual_ratio"], 1.0)
+        self.assertEqual(metrics["automation_verified_successes"], 1)
+        self.assertEqual(metrics["automation_verified_failures"], 2)
         self.assertEqual(metrics["cost_to_first_milestone_usd"], 0.25)
         self.assertEqual(metrics["total_cost_usd"], 0.75)
+
+    def test_wasted_turn_metrics_reports_infinite_automation_ratio_without_manual_transfers(self):
+        metrics = eval_harness.wasted_turn_metrics([
+            BridgeLogRecord(message="tool: build_fuel_supply({})"),
+        ])
+
+        self.assertEqual(metrics["automation_tool_calls"], 1)
+        self.assertEqual(metrics["manual_transfer_tool_calls"], 0)
+        self.assertEqual(metrics["automation_to_manual_ratio"], float("inf"))
+        self.assertEqual(metrics["fuel_automation_tool_calls"], 1)
+        self.assertEqual(metrics["manual_fuel_transfer_tool_calls"], 0)
+        self.assertEqual(metrics["fuel_automation_to_manual_ratio"], float("inf"))
+
+    def test_wasted_turn_metrics_counts_manual_science_babysitting(self):
+        metrics = eval_harness.wasted_turn_metrics([
+            BridgeLogRecord(
+                message='tool: craft({"recipe":"automation-science-pack","count":12})',
+            ),
+            BridgeLogRecord(
+                message='tool: feed_lab_from_inventory({"science_pack":"automation-science-pack","dry_run":false})',
+            ),
+            BridgeLogRecord(
+                message='tool: build_lab_feed({"lab_unit_number":69})',
+            ),
+        ])
+
+        self.assertEqual(metrics["manual_transfer_tool_calls"], 2)
+        self.assertEqual(metrics["science_automation_tool_calls"], 1)
+        self.assertEqual(metrics["manual_science_transfer_tool_calls"], 2)
+        self.assertEqual(metrics["science_automation_to_manual_ratio"], 0.5)
+
+    def test_wasted_turn_metrics_counts_manual_material_babysitting(self):
+        metrics = eval_harness.wasted_turn_metrics([
+            BridgeLogRecord(
+                message='tool: insert_items({"item":"iron-ore","inventory_type":"furnace_source"})',
+            ),
+            BridgeLogRecord(
+                message='tool: extract_items({"item":"iron-plate","inventory_type":"furnace_result"})',
+            ),
+            BridgeLogRecord(
+                message='tool: execute_direct_smelter({"drill_unit_number":80})',
+            ),
+        ])
+
+        self.assertEqual(metrics["manual_transfer_tool_calls"], 2)
+        self.assertEqual(metrics["material_flow_automation_tool_calls"], 1)
+        self.assertEqual(metrics["manual_material_transfer_tool_calls"], 2)
+        self.assertEqual(metrics["material_flow_automation_to_manual_ratio"], 0.5)
+
+    def test_wasted_turn_metrics_counts_manual_component_babysitting(self):
+        metrics = eval_harness.wasted_turn_metrics([
+            BridgeLogRecord(
+                message='tool: craft({"recipe":"iron-gear-wheel","count":12})',
+            ),
+            BridgeLogRecord(
+                message='tool: craft({"recipe":"copper-cable","count":12})',
+            ),
+            BridgeLogRecord(
+                message='tool: craft({"recipe":"transport-belt","count":12})',
+            ),
+            BridgeLogRecord(
+                message='tool: build_assembler_feed({"assembler_unit_number":80})',
+            ),
+        ])
+
+        self.assertEqual(metrics["manual_transfer_tool_calls"], 3)
+        self.assertEqual(metrics["component_automation_tool_calls"], 1)
+        self.assertEqual(metrics["manual_component_craft_tool_calls"], 2)
+        self.assertEqual(metrics["component_automation_to_manual_ratio"], 0.5)
+
+    def test_wasted_turn_metrics_counts_manual_fuel_babysitting(self):
+        metrics = eval_harness.wasted_turn_metrics([
+            BridgeLogRecord(
+                message='tool: insert_items({"item":"coal","inventory_type":"fuel"})',
+            ),
+            BridgeLogRecord(
+                message='tool: insert_items({"item":"iron-ore","inventory_type":"furnace_source"})',
+            ),
+            BridgeLogRecord(message='tool: hand_feed_furnace({"item":"wood"})'),
+        ])
+
+        self.assertEqual(metrics["manual_transfer_tool_calls"], 3)
+        self.assertEqual(metrics["manual_fuel_transfer_tool_calls"], 2)
+        self.assertEqual(metrics["fuel_automation_tool_calls"], 0)
+        self.assertEqual(metrics["fuel_automation_to_manual_ratio"], 0.0)
 
 
 class QuerySnapshotTest(unittest.TestCase):

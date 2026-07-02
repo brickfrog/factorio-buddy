@@ -171,6 +171,21 @@ end
         )
     }
 
+    /// Diagnose whether burnable consumers have durable coal supply.
+    pub fn diagnose_fuel_sustainability(area: Area, limit: u32) -> String {
+        Self::claude_interface_json_call(
+            "diagnose_fuel_sustainability",
+            &[
+                area.left_top.x.to_string(),
+                area.left_top.y.to_string(),
+                area.right_bottom.x.to_string(),
+                area.right_bottom.y.to_string(),
+                limit.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before diagnosing fuel sustainability.",
+        )
+    }
+
     /// Get a specific entity by unit number
     pub fn get_entity(unit_number: u32) -> String {
         Self::claude_interface_json_call(
@@ -1236,6 +1251,29 @@ mod tests {
                 r#"remote.call("claude_interface", "diagnose_factory_blockers", 1, 2, 11, 12, 7)"#
             ),
             "diagnostic should pass area corners and limit through the mod"
+        );
+        assert!(!lua.contains("execute_lua"));
+    }
+
+    #[test]
+    fn diagnose_fuel_sustainability_routes_to_mod_remote_with_limit() {
+        let area = Area {
+            left_top: Position::new(1.0, 2.0),
+            right_bottom: Position::new(11.0, 12.0),
+        };
+        let lua = LuaCommand::diagnose_fuel_sustainability(area, 9);
+
+        assert!(
+            lua.contains(
+                r#"remote.interfaces["claude_interface"]["diagnose_fuel_sustainability"]"#
+            ),
+            "fuel diagnostic should guard the mod remote path"
+        );
+        assert!(
+            lua.contains(
+                r#"remote.call("claude_interface", "diagnose_fuel_sustainability", 1, 2, 11, 12, 9)"#
+            ),
+            "fuel diagnostic should pass area corners and limit through the mod"
         );
         assert!(!lua.contains("execute_lua"));
     }
