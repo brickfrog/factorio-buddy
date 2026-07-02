@@ -14,14 +14,24 @@ reached.
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from typing import Any, Callable
 
-from models import EvalMilestoneSpec, EvalProductionSnapshot, EvalResult, RconRemoteCall
+from models import (
+    BridgeLogRecordCollection,
+    EvalMilestoneSpec,
+    EvalProductionSnapshot,
+    EvalResult,
+    RconRemoteCall,
+)
 from rcon import RCONClient, lua_long_string
 
 
 Milestone = tuple[str, Callable[[Any], bool]]
+
+_DONE_COST_RE = re.compile(r"\bdone:\s*\$([0-9]+(?:\.[0-9]+)?)")
+_LEDGER_OBJECTIVE_RE = re.compile(r"^\s*objective:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 VALUES: dict[str, float] = {
@@ -89,6 +99,102 @@ MILESTONES: list[Milestone] = [
     (spec.name, spec.reached)
     for spec in MILESTONE_SPECS
 ]
+
+
+def wasted_turn_metrics(records: Any) -> dict[str, Any]:
+    """Return cheap log-derived waste metrics for autonomy runs.
+
+    This deliberately works from bridge log records instead of live game state so
+    overnight logs can be scored after the fact.
+    """
+    typed_records = BridgeLogRecordCollection.from_value(records).to_list()
+    metrics: dict[str, Any] = {
+        "planner_ticks": 0,
+        "execution_ticks": 0,
+        "planner_turns_with_no_state_change": 0,
+        "repeated_objective_restatements": 0,
+        "rejected_placements": 0,
+        "tool_calls_before_first_milestone": 0,
+        "expected_misses": 0,
+        "real_failures": 0,
+        "cost_to_first_milestone_usd": 0.0,
+        "total_cost_usd": 0.0,
+    }
+    seen_objectives: set[str] = set()
+    first_milestone_seen = False
+
+    for record in typed_records:
+        text = record.message
+        lower = text.lower()
+
+        if "(planner tick)" in lower:
+            metrics["planner_ticks"] += 1
+        if "(execution tick)" in lower:
+            metrics["execution_ticks"] += 1
+        if "(planner tick)" in lower and any(
+            phrase in lower
+            for phrase in (
+                "no state drift",
+                "state unchanged",
+                "confirmed stable state",
+                "confirmed static state",
+                "plan re-affirmed",
+                "plan reaffirmed",
+            )
+        ):
+            metrics["planner_turns_with_no_state_change"] += 1
+
+        for objective in _LEDGER_OBJECTIVE_RE.findall(text):
+            normalized = " ".join(objective.lower().split())
+            if normalized in seen_objectives:
+                metrics["repeated_objective_restatements"] += 1
+            elif normalized:
+                seen_objectives.add(normalized)
+
+        if "expected_miss" in lower:
+            metrics["expected_misses"] += 1
+        if any(marker in lower for marker in ("sdk_failure", "invalid_request", "game_rejected")):
+            if "expected_miss" not in lower:
+                metrics["real_failures"] += 1
+        if "game_rejected" in lower and (
+            "cannot place entity here" in lower
+            or '"can_place": false' in lower
+            or '"can_place":false' in lower
+        ):
+            metrics["rejected_placements"] += 1
+
+        if text.startswith("tool:") and not first_milestone_seen:
+            metrics["tool_calls_before_first_milestone"] += 1
+
+        for match in _DONE_COST_RE.finditer(text):
+            cost = float(match.group(1))
+            metrics["total_cost_usd"] += cost
+            if not first_milestone_seen:
+                metrics["cost_to_first_milestone_usd"] += cost
+
+        if _is_eval_milestone_text(lower):
+            first_milestone_seen = True
+
+    metrics["cost_to_first_milestone_usd"] = round(
+        metrics["cost_to_first_milestone_usd"],
+        6,
+    )
+    metrics["total_cost_usd"] = round(metrics["total_cost_usd"], 6)
+    return metrics
+
+
+def _is_eval_milestone_text(lower_text: str) -> bool:
+    return any(
+        phrase in lower_text
+        for phrase in (
+            "milestone",
+            "research completed",
+            "verified working",
+            "automation research completed",
+            "furnace producing",
+            "production verified",
+        )
+    )
 
 
 def evaluate_model(snapshot: EvalProductionSnapshot | dict[str, Any]) -> EvalResult:

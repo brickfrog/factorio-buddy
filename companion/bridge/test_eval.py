@@ -1,7 +1,7 @@
 import unittest
 
 import eval as eval_harness
-from models import EvalMilestoneSpec, EvalProductionSnapshot, EvalResult
+from models import BridgeLogRecord, EvalMilestoneSpec, EvalProductionSnapshot, EvalResult
 
 
 class FakeRcon:
@@ -179,6 +179,34 @@ class EvaluateTest(unittest.TestCase):
             result["milestones"],
             {name: False for name, _ in eval_harness.MILESTONES},
         )
+
+    def test_wasted_turn_metrics_counts_log_smells(self):
+        records = [
+            BridgeLogRecord(message="autonomy -> doug: (planner tick) No state drift. <ledger>\nobjective: Feed furnace\n</ledger>"),
+            BridgeLogRecord(message="autonomy -> doug: (planner tick) state unchanged. <ledger>\nobjective: Feed furnace\n</ledger>"),
+            BridgeLogRecord(message="autonomy -> doug: (execution tick) Do the next step"),
+            BridgeLogRecord(message="tool: walk_to({\"x\":42,\"y\":-21})"),
+            BridgeLogRecord(message="tool: insert_items({\"item\":\"coal\"})"),
+            BridgeLogRecord(message="tool_result expected_miss: Error: No items of that type in inventory"),
+            BridgeLogRecord(message="tool_result game_rejected: Error: Cannot place entity here"),
+            BridgeLogRecord(message="done: $0.2500 | 3 turns | 10.0s"),
+            BridgeLogRecord(message="progress: production verified, furnace producing plates"),
+            BridgeLogRecord(message="tool: verify_production({})"),
+            BridgeLogRecord(message="done: $0.5000 | 2 turns | 8.0s"),
+        ]
+
+        metrics = eval_harness.wasted_turn_metrics(records)
+
+        self.assertEqual(metrics["planner_ticks"], 2)
+        self.assertEqual(metrics["execution_ticks"], 1)
+        self.assertEqual(metrics["planner_turns_with_no_state_change"], 2)
+        self.assertEqual(metrics["repeated_objective_restatements"], 1)
+        self.assertEqual(metrics["tool_calls_before_first_milestone"], 2)
+        self.assertEqual(metrics["expected_misses"], 1)
+        self.assertEqual(metrics["real_failures"], 1)
+        self.assertEqual(metrics["rejected_placements"], 1)
+        self.assertEqual(metrics["cost_to_first_milestone_usd"], 0.25)
+        self.assertEqual(metrics["total_cost_usd"], 0.75)
 
 
 class QuerySnapshotTest(unittest.TestCase):
