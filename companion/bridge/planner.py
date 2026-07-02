@@ -148,8 +148,6 @@ def choose_autonomy_decision(
     if (
         mode == AutonomyMode.EXECUTE
         and window.newest_event_indicates_plan_done()
-        and not actionable_plan
-        and not repeated_plan_progress
     ):
         mode = AutonomyMode.PLAN
         reason = AutonomyDecisionReason.PLAN_DONE

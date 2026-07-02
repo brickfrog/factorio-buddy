@@ -282,6 +282,35 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(decision.reason, "repeated_plan_progress")
         self.assertTrue(decision.actionable_plan)
 
+    def test_choose_autonomy_decision_plans_after_plan_done_despite_old_ready_notes(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "feed automation-science-packs to lab",
+                "plan_steps": ["feed_lab_from_inventory count=15"],
+                "progress_notes": [
+                    "Plan validated, awaiting execution tick.",
+                    "15 packs transferred. Research infrastructure fully operational.",
+                ],
+                "updated_at": "now",
+                "signal": "plan_done",
+            },
+            1,
+            5,
+            journal_window=[
+                {
+                    "kind": "progress",
+                    "signal": "plan_done",
+                    "text": (
+                        "15 automation-science-packs transferred to lab unit 69. "
+                        "Lab confirmed working."
+                    ),
+                },
+            ],
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "plan_done")
+
     def test_choose_autonomy_decision_uses_typed_live_completion_evidence(self):
         decision = planner.choose_autonomy_decision(
             {

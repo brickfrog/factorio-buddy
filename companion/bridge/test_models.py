@@ -3205,6 +3205,11 @@ After.
             sdk_is_error=True,
             text_classifier=classify,
         )
+        inventory_shape_miss = ToolResultOutcome.from_text(
+            "Error: Entity has no such inventory",
+            sdk_is_error=True,
+            text_classifier=classify,
+        )
         game_rejected = ToolResultOutcome.from_text(
             '{"success":false,"can_place":false,"entity":"transport-belt",'
             '"error":"Cannot place entity here","position":{"x":56,"y":-25}}',
@@ -3228,6 +3233,13 @@ After.
         )
         self.assertEqual(expected_miss.log_level, "debug")
         self.assertFalse(expected_miss.should_journal_failure)
+
+        self.assertEqual(
+            inventory_shape_miss.classification,
+            ToolResultClassification.EXPECTED_MISS,
+        )
+        self.assertEqual(inventory_shape_miss.log_level, "debug")
+        self.assertFalse(inventory_shape_miss.should_journal_failure)
 
         self.assertEqual(
             game_rejected.classification,
@@ -4911,7 +4923,8 @@ acceptance:
 
     def test_factorio_mod_info_parses_info_json_version(self):
         info = FactorioModInfo.from_file_text(
-            '{"name":"claude-interface","version":" 0.9.0 ","title":"Bridge"}'
+            '{"name":"claude-interface","version":" 0.9.0 ","title":"Bridge",'
+            '"author":"qry","factorio_version":"2.0","dependencies":["base >= 2.0"]}'
         )
         missing_version = FactorioModInfo.from_file_text('{"name":"claude-interface"}')
 

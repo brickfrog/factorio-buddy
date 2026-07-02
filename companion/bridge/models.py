@@ -606,6 +606,8 @@ _TOOL_GAME_REJECTED_RE = re.compile(
 _TOOL_BENIGN_MISSES = frozenset({
     "error: no items of that type in inventory",
     "no items of that type in inventory",
+    "error: entity has no such inventory",
+    "entity has no such inventory",
     "error: no electric poles found in area",
     "no electric poles found in area",
     "error: no minable entity at position",
@@ -6548,6 +6550,8 @@ class FactorioPathSettings(BridgeModel):
 
 class FactorioModInfo(BridgeModel):
     """Typed view of a Factorio mod info.json file."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
     name: str = ""
     version: str = ""
