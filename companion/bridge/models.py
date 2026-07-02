@@ -54,6 +54,7 @@ FACTORIO_MUTATING_TOOLS = frozenset({
 })
 FACTORIO_READ_ONLY_TOOLS = frozenset({
     "analyze_belt_gaps",
+    "analyze_item_flow",
     "analyze_belt_networks",
     "analyze_belt_reach",
     "analyze_inserters",

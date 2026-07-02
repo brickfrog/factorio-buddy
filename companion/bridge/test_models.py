@@ -4320,6 +4320,9 @@ acceptance:
         diagnostic = ToolCallRequest.from_hook_input({
             "tool_name": "mcp__factorioctl__diagnose_factory_blockers",
         })
+        item_flow = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__analyze_item_flow",
+        })
         dry_run_feed = ToolCallRequest.from_hook_input({
             "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
             "tool_input": {"dry_run": True},
@@ -4338,6 +4341,8 @@ acceptance:
         self.assertFalse(scan.is_mutating_factorio_tool)
         self.assertTrue(diagnostic.is_read_only_factorio_tool)
         self.assertFalse(diagnostic.is_mutating_factorio_tool)
+        self.assertTrue(item_flow.is_read_only_factorio_tool)
+        self.assertFalse(item_flow.is_mutating_factorio_tool)
         self.assertTrue(dry_run_feed.is_read_only_dry_run)
         self.assertFalse(active_feed.is_read_only_dry_run)
         self.assertFalse(non_factorio.is_factorio_mcp_tool)

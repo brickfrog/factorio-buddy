@@ -14,8 +14,8 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use factorioctl::analyze::{
-    analyze_belt_reach, analyze_inserters, detect_sushi_belts, find_belt_gaps, find_belt_networks,
-    trace_belt_sources, BeltGraph,
+    analyze_belt_reach, analyze_inserters, analyze_item_flow, detect_sushi_belts, find_belt_gaps,
+    find_belt_networks, trace_belt_sources, BeltGraph, EntityLookup,
 };
 use factorioctl::client::{lua::LuaCommand, AgentId, FactorioClient};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
@@ -34,7 +34,9 @@ struct ConnectionConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_lua_refusal, raw_lua_enabled};
+    use super::{execute_lua_refusal, flow_lookup, flow_scan_area, raw_lua_enabled};
+    use factorioctl::analyze::EntityLookup;
+    use factorioctl::world::TilePos;
 
     #[test]
     fn raw_lua_enabled_only_accepts_explicit_truthy_values() {
@@ -71,6 +73,31 @@ mod tests {
         for env_value in [Some("1"), Some("true"), Some("yes"), Some("on")] {
             assert_eq!(execute_lua_refusal(env_value), None, "{env_value:?}");
         }
+    }
+
+    #[test]
+    fn flow_lookup_requires_unit_or_complete_tile_pair() {
+        assert!(matches!(
+            flow_lookup(Some(42), None, None, "source").unwrap(),
+            EntityLookup::Unit(42)
+        ));
+        assert!(matches!(
+            flow_lookup(None, Some(1), Some(2), "target").unwrap(),
+            EntityLookup::Tile(TilePos { x: 1, y: 2 })
+        ));
+        assert!(flow_lookup(Some(42), Some(1), Some(2), "source").is_err());
+        assert!(flow_lookup(None, Some(1), None, "source").is_err());
+        assert!(flow_lookup(None, None, None, "target").is_err());
+    }
+
+    #[test]
+    fn flow_scan_area_covers_source_and_target_with_radius() {
+        let area = flow_scan_area(TilePos::new(10, -2), TilePos::new(15, 4), 3);
+
+        assert_eq!(area.left_top.x, 7.0);
+        assert_eq!(area.left_top.y, -5.0);
+        assert_eq!(area.right_bottom.x, 18.0);
+        assert_eq!(area.right_bottom.y, 7.0);
     }
 }
 
@@ -112,6 +139,51 @@ impl AreaParams {
             left_top: Position::new(self.x as f64 - r, self.y as f64 - r),
             right_bottom: Position::new(self.x as f64 + r, self.y as f64 + r),
         }
+    }
+}
+
+fn flow_lookup(
+    unit_number: Option<u32>,
+    x: Option<i32>,
+    y: Option<i32>,
+    label: &str,
+) -> Result<EntityLookup, String> {
+    match (unit_number, x, y) {
+        (Some(unit), None, None) => Ok(EntityLookup::Unit(unit)),
+        (None, Some(x), Some(y)) => Ok(EntityLookup::Tile(TilePos::new(x, y))),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(format!(
+            "Error: provide either {label}_unit_number or {label}_x/{label}_y, not both"
+        )),
+        (None, Some(_), None) | (None, None, Some(_)) => Err(format!(
+            "Error: {label}_x and {label}_y must be provided together"
+        )),
+        (None, None, None) => Err(format!(
+            "Error: provide {label}_unit_number or {label}_x/{label}_y"
+        )),
+    }
+}
+
+fn flow_scan_area(source: TilePos, target: TilePos, radius: u32) -> Area {
+    let r = radius as f64;
+    Area::new(
+        source.x.min(target.x) as f64 - r,
+        source.y.min(target.y) as f64 - r,
+        source.x.max(target.x) as f64 + r,
+        source.y.max(target.y) as f64 + r,
+    )
+}
+
+async fn flow_reference_tile(
+    client: &mut FactorioClient,
+    lookup: EntityLookup,
+) -> Result<TilePos, String> {
+    match lookup {
+        EntityLookup::Tile(tile) => Ok(tile),
+        EntityLookup::Unit(unit) => client
+            .get_entity(unit)
+            .await
+            .map(|entity| entity.position.to_tile())
+            .map_err(|e| format!("Error reading entity {unit}: {e}")),
     }
 }
 
@@ -252,6 +324,26 @@ pub struct BeltReachParams {
     /// Y coordinate of starting belt (integer tile)
     pub y: i32,
     /// Search radius
+    #[serde(default = "default_radius")]
+    pub radius: u32,
+}
+
+/// Parameters for item-flow analysis
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AnalyzeItemFlowParams {
+    /// Source entity unit number. If omitted, provide source_x and source_y.
+    pub source_unit_number: Option<u32>,
+    /// Source tile X coordinate, usually a belt tile.
+    pub source_x: Option<i32>,
+    /// Source tile Y coordinate, usually a belt tile.
+    pub source_y: Option<i32>,
+    /// Target entity unit number. If omitted, provide target_x and target_y.
+    pub target_unit_number: Option<u32>,
+    /// Target tile X coordinate, usually a belt tile or target entity tile.
+    pub target_x: Option<i32>,
+    /// Target tile Y coordinate, usually a belt tile or target entity tile.
+    pub target_y: Option<i32>,
+    /// Search radius around the source/target bounding area.
     #[serde(default = "default_radius")]
     pub radius: u32,
 }
@@ -2007,6 +2099,61 @@ impl FactorioMcp {
                 let r = analyze_inserters(&entities);
                 serde_json::to_string_pretty(&r).unwrap_or_else(|e| format!("Error: {}", e))
             }
+            Err(e) => format!("Error: {}", e),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Analyze item flow between a source and target.
+    #[tool(
+        description = "Analyze item flow from a source entity/tile to a target entity/tile. Returns whether belts connect, current items on the reachable belt path, source/target belt tiles, the first missing/wrong-way/blocked belt break, and a concrete repair action such as place_entity or rotate_entity. Use before manually squinting at belt directions."
+    )]
+    async fn analyze_item_flow(
+        &self,
+        Parameters(params): Parameters<AnalyzeItemFlowParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let source = match flow_lookup(
+            params.source_unit_number,
+            params.source_x,
+            params.source_y,
+            "source",
+        ) {
+            Ok(lookup) => lookup,
+            Err(e) => return self.with_player_messages(e).await,
+        };
+        let target = match flow_lookup(
+            params.target_unit_number,
+            params.target_x,
+            params.target_y,
+            "target",
+        ) {
+            Ok(lookup) => lookup,
+            Err(e) => return self.with_player_messages(e).await,
+        };
+        let source_tile = match flow_reference_tile(&mut client, source).await {
+            Ok(tile) => tile,
+            Err(e) => return self.with_player_messages(e).await,
+        };
+        let target_tile = match flow_reference_tile(&mut client, target).await {
+            Ok(tile) => tile,
+            Err(e) => return self.with_player_messages(e).await,
+        };
+        let area = flow_scan_area(source_tile, target_tile, params.radius.clamp(1, 100));
+
+        let result = match client.find_entities(area, None, None).await {
+            Ok(entities) => match client.get_belt_lane_contents(area).await {
+                Ok(belt_contents) => {
+                    let report = analyze_item_flow(&entities, &belt_contents.belts, source, target);
+                    serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|e| format!("Error: {}", e))
+                }
+                Err(e) => format!("Error reading belt contents: {}", e),
+            },
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await

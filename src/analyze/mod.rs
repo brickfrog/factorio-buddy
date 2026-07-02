@@ -11,6 +11,7 @@ mod belt_source_trace;
 mod belt_sushi;
 mod entity_reach;
 mod inserter;
+mod item_flow;
 
 pub use belt_gaps::*;
 pub use belt_graph::*;
@@ -20,6 +21,7 @@ pub use belt_source_trace::*;
 pub use belt_sushi::*;
 pub use entity_reach::*;
 pub use inserter::*;
+pub use item_flow::*;
 
 use crate::world::{Direction, TilePos};
 use serde::{Deserialize, Serialize};
