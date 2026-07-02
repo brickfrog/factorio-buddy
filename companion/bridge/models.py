@@ -41,6 +41,7 @@ FACTORIO_MUTATING_TOOLS = frozenset({
     "delete_zone",
     "extract_items",
     "feed_lab_from_inventory",
+    "hand_feed_furnace",
     "insert_items",
     "mine_at",
     "place_entity",

@@ -4343,6 +4343,9 @@ acceptance:
             "tool_name": "mcp__factorioctl__feed_lab_from_inventory",
             "tool_input": {"dry_run": False},
         })
+        hand_feed = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__hand_feed_furnace",
+        })
         non_factorio = ToolCallRequest.from_hook_input({"tool_name": "Skill"})
 
         self.assertEqual(placement.short_name, "place_entity")
@@ -4357,6 +4360,8 @@ acceptance:
         self.assertFalse(item_flow.is_mutating_factorio_tool)
         self.assertTrue(dry_run_feed.is_read_only_dry_run)
         self.assertFalse(active_feed.is_read_only_dry_run)
+        self.assertTrue(hand_feed.is_mutating_factorio_tool)
+        self.assertFalse(hand_feed.is_read_only_factorio_tool)
         self.assertFalse(non_factorio.is_factorio_mcp_tool)
         self.assertEqual(non_factorio.short_name, "Skill")
 

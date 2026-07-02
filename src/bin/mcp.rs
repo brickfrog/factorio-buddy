@@ -538,6 +538,48 @@ fn default_inventory_type() -> String {
     "chest".to_string()
 }
 
+/// Parameters for hand_feed_furnace tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct HandFeedFurnaceParams {
+    /// Unit number of the furnace to feed.
+    pub furnace_unit_number: u32,
+    /// Fuel item to insert, usually coal or wood.
+    #[serde(default = "default_fuel_item")]
+    pub fuel_item: String,
+    /// Fuel item count to insert.
+    #[serde(default = "default_furnace_fuel_count")]
+    pub fuel_count: u32,
+    /// Source item to smelt, usually iron-ore or copper-ore.
+    #[serde(default = "default_furnace_source_item")]
+    pub source_item: String,
+    /// Source item count to insert.
+    #[serde(default = "default_furnace_source_count")]
+    pub source_count: u32,
+    /// Verification radius around the furnace after feeding.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+fn default_fuel_item() -> String {
+    "coal".to_string()
+}
+
+fn default_furnace_fuel_count() -> u32 {
+    5
+}
+
+fn default_furnace_source_item() -> String {
+    "iron-ore".to_string()
+}
+
+fn default_furnace_source_count() -> u32 {
+    20
+}
+
+fn default_verify_radius() -> u32 {
+    4
+}
+
 fn raw_lua_enabled(env_value: Option<&str>) -> bool {
     matches!(
         env_value.map(|value| value.trim().to_ascii_lowercase()),
@@ -2593,6 +2635,132 @@ impl FactorioMcp {
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
+    }
+
+    /// Hand-feed a furnace with fuel and source items, then verify production.
+    #[tool(
+        description = "Cheap local controller for the common furnace bootstrap loop. Walks near a furnace, inserts fuel into fuel inventory, inserts ore into furnace_source, then runs verify_production around the furnace. Use this instead of spending multiple LLM turns on walk_to + insert_items + insert_items + verify_production."
+    )]
+    async fn hand_feed_furnace(
+        &self,
+        Parameters(params): Parameters<HandFeedFurnaceParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let furnace = match client.get_entity(params.furnace_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let target = furnace.position;
+        let verify_radius = params.verify_radius.clamp(1, 25) as f64;
+        let verify_area = Area::new(
+            target.x - verify_radius,
+            target.y - verify_radius,
+            target.x + verify_radius,
+            target.y + verify_radius,
+        );
+
+        let mut actions = Vec::new();
+        let mut success = true;
+        let walk = client.walk_to(target, false).await;
+        success &= walk.is_ok();
+        actions.push(serde_json::json!({
+            "tool": "walk_to",
+            "success": walk.is_ok(),
+            "error": walk.as_ref().err().map(|e| e.to_string()),
+        }));
+
+        let mut fuel_inserted = false;
+        if walk.is_ok() {
+            let fuel = client
+                .insert_items(
+                    params.furnace_unit_number,
+                    &params.fuel_item,
+                    params.fuel_count,
+                    "fuel",
+                )
+                .await;
+            fuel_inserted = fuel.is_ok();
+            success &= fuel.is_ok();
+            actions.push(serde_json::json!({
+                "tool": "insert_items",
+                "inventory_type": "fuel",
+                "item": params.fuel_item,
+                "count": params.fuel_count,
+                "success": fuel.is_ok(),
+                "error": fuel.as_ref().err().map(|e| e.to_string()),
+            }));
+        } else {
+            actions.push(serde_json::json!({
+                "tool": "insert_items",
+                "inventory_type": "fuel",
+                "item": params.fuel_item,
+                "count": params.fuel_count,
+                "success": false,
+                "skipped": true,
+                "error": "walk_to failed",
+            }));
+        }
+
+        if fuel_inserted {
+            let source = client
+                .insert_items(
+                    params.furnace_unit_number,
+                    &params.source_item,
+                    params.source_count,
+                    "furnace_source",
+                )
+                .await;
+            success &= source.is_ok();
+            actions.push(serde_json::json!({
+                "tool": "insert_items",
+                "inventory_type": "furnace_source",
+                "item": params.source_item,
+                "count": params.source_count,
+                "success": source.is_ok(),
+                "error": source.as_ref().err().map(|e| e.to_string()),
+            }));
+        } else {
+            success = false;
+            actions.push(serde_json::json!({
+                "tool": "insert_items",
+                "inventory_type": "furnace_source",
+                "item": params.source_item,
+                "count": params.source_count,
+                "success": false,
+                "skipped": true,
+                "error": "fuel insert failed or was skipped",
+            }));
+        }
+
+        let verification = client.verify_production(verify_area).await;
+        let result = serde_json::json!({
+            "success": success,
+            "furnace_unit_number": params.furnace_unit_number,
+            "furnace": {
+                "name": furnace.name,
+                "position": furnace.position,
+            },
+            "actions": actions,
+            "verification": match verification {
+                Ok(entities) => serde_json::json!({
+                    "success": true,
+                    "entities": entities,
+                }),
+                Err(e) => serde_json::json!({
+                    "success": false,
+                    "error": e.to_string(),
+                }),
+            },
+            "guidance": "If success is true and verification shows the furnace working, continue the objective. If not, fix the first failed action."
+        });
+        self.with_player_messages(
+            serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e)),
+        )
+        .await
     }
 
     /// Extract items from an entity into player inventory.
