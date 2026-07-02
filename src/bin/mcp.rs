@@ -171,6 +171,19 @@ pub struct VerifyProductionParams {
     pub radius: Option<u32>,
 }
 
+/// Parameters for diagnose_factory_blockers tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DiagnoseFactoryBlockersParams {
+    /// X coordinate of area center (default: character position)
+    pub x: Option<f64>,
+    /// Y coordinate of area center (default: character position)
+    pub y: Option<f64>,
+    /// Radius around the center to scan
+    pub radius: Option<u32>,
+    /// Maximum number of ranked blockers to return
+    pub limit: Option<u32>,
+}
+
 /// Parameters for find_nearest_resource tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct FindNearestResourceParams {
@@ -1829,6 +1842,56 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
         let report = build_production_report(entities);
+        let result =
+            serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(result).await
+    }
+
+    /// Diagnose ranked factory blockers and likely causal repairs in an area.
+    #[tool(
+        description = "Diagnose ranked production blockers near a point. Returns non-working entities, likely root causes such as unfueled boilers causing downstream no_power, and concrete suggested tool actions. Use this before spending turns manually debugging no_power, no_fuel, no_ingredients, output blockage, or idle labs."
+    )]
+    async fn diagnose_factory_blockers(
+        &self,
+        Parameters(params): Parameters<DiagnoseFactoryBlockersParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let radius = params.radius.unwrap_or(32);
+        let limit = params.limit.unwrap_or(10).clamp(1, 50);
+        let position = match (params.x, params.y) {
+            (Some(x), Some(y)) => Position::new(x, y),
+            (None, None) => {
+                let status = match client.character_status().await {
+                    Ok(status) => status,
+                    Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+                };
+                match status.position {
+                    Some(position) => position,
+                    None => match client.get_character_position().await {
+                        Ok(position) => position,
+                        Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+                    },
+                }
+            }
+            _ => {
+                return self
+                    .with_player_messages("Error: x and y must be provided together".to_string())
+                    .await;
+            }
+        };
+        let r = radius as f64;
+        let area = Area {
+            left_top: Position::new(position.x - r, position.y - r),
+            right_bottom: Position::new(position.x + r, position.y + r),
+        };
+        let report = match client.diagnose_factory_blockers(area, limit).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
         let result =
             serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(result).await

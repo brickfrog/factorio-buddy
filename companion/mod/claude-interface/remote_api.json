@@ -17,6 +17,7 @@
     "craft": {"args": ["agent_id", "recipe_name", "count"], "returns": "json"},
     "create_native_blueprint": {"args": ["agent_id", "x1", "y1", "x2", "y2"], "returns": "json"},
     "delete_blueprint": {"args": ["name"], "returns": "json"},
+    "diagnose_factory_blockers": {"args": ["x1", "y1", "x2", "y2", "limit"], "returns": "json"},
     "diagnose_steam_power": {"args": ["x", "y", "radius"], "returns": "json"},
     "extend_power_to": {"args": ["agent_id", "x", "y", "radius", "target_x", "target_y"], "returns": "json"},
     "extract_items": {"args": ["agent_id", "unit_number", "item", "count", "inventory_type"], "returns": "json"},

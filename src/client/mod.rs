@@ -232,6 +232,17 @@ impl FactorioClient {
         Ok(entities)
     }
 
+    /// Diagnose ranked production blockers and likely root causes in an area.
+    pub async fn diagnose_factory_blockers(
+        &mut self,
+        area: Area,
+        limit: u32,
+    ) -> Result<serde_json::Value> {
+        let lua = LuaCommand::diagnose_factory_blockers(area, limit);
+        let response = self.execute_lua(&lua).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     // --- Resource Queries ---
 
     /// Find resources in an area

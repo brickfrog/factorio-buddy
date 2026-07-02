@@ -1957,6 +1957,10 @@ remote.add_interface("claude_interface", {
         return json_remote_call("verify_production", entities.verify_production, x1, y1, x2, y2)
     end,
 
+    diagnose_factory_blockers = function(x1, y1, x2, y2, limit)
+        return json_remote_call("diagnose_factory_blockers", entities.diagnose_factory_blockers, x1, y1, x2, y2, limit)
+    end,
+
     get_entity = function(unit_number)
         return json_remote_call("get_entity", entities.get_entity, unit_number)
     end,

@@ -61,6 +61,7 @@ FACTORIO_READ_ONLY_TOOLS = frozenset({
     "build_edge_miner",
     "check_placement",
     "detect_sushi_belts",
+    "diagnose_factory_blockers",
     "diagnose_steam_power",
     "extend_power_to",
     "find_build_area",

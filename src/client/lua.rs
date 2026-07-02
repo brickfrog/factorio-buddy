@@ -156,6 +156,21 @@ end
         )
     }
 
+    /// Diagnose ranked production blockers in an area.
+    pub fn diagnose_factory_blockers(area: Area, limit: u32) -> String {
+        Self::claude_interface_json_call(
+            "diagnose_factory_blockers",
+            &[
+                area.left_top.x.to_string(),
+                area.left_top.y.to_string(),
+                area.right_bottom.x.to_string(),
+                area.right_bottom.y.to_string(),
+                limit.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before diagnosing factory blockers.",
+        )
+    }
+
     /// Get a specific entity by unit number
     pub fn get_entity(unit_number: u32) -> String {
         Self::claude_interface_json_call(
@@ -1173,7 +1188,7 @@ end
 #[cfg(test)]
 mod tests {
     use crate::client::AgentId;
-    use crate::world::Position;
+    use crate::world::{Area, Position};
 
     use super::LuaCommand;
 
@@ -1202,6 +1217,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn diagnose_factory_blockers_routes_to_mod_remote_with_limit() {
+        let area = Area {
+            left_top: Position::new(1.0, 2.0),
+            right_bottom: Position::new(11.0, 12.0),
+        };
+        let lua = LuaCommand::diagnose_factory_blockers(area, 7);
+
+        assert!(
+            lua.contains(r#"remote.interfaces["claude_interface"]["diagnose_factory_blockers"]"#),
+            "diagnostic should guard the mod remote path"
+        );
+        assert!(
+            lua.contains(
+                r#"remote.call("claude_interface", "diagnose_factory_blockers", 1, 2, 11, 12, 7)"#
+            ),
+            "diagnostic should pass area corners and limit through the mod"
+        );
+        assert!(!lua.contains("execute_lua"));
     }
 
     #[test]
