@@ -69,6 +69,8 @@ from models import (
     LearningRuntimeSettings,
     LedgerRuntimeSettings,
     LedgerStalenessKind,
+    LedgerNextRequiredMode,
+    LedgerStatus,
     LedgerUpdateDraft,
     LedgerUpdate,
     LedgerState,
@@ -3037,6 +3039,16 @@ After.
             LedgerUpdate.coerce({"progress": "done", "signal": "plan-done"}).signal,
             ProgressSignal.PLAN_DONE,
         )
+        done = LedgerUpdate.coerce({
+            "progress": "objective complete",
+            "status": "done",
+            "next_required_mode": "plan",
+            "blocker": "none",
+        })
+        self.assertEqual(done.status, LedgerStatus.DONE)
+        self.assertEqual(done.signal, ProgressSignal.PLAN_DONE)
+        self.assertEqual(done.next_required_mode, LedgerNextRequiredMode.PLAN)
+        self.assertEqual(done.blocker, "none")
 
     def test_ledger_update_infers_plan_ready_from_structured_plan(self):
         update = LedgerUpdate.coerce({

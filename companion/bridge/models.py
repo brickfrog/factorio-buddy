@@ -330,6 +330,21 @@ class ProgressSignal(str, Enum):
     NEW_OBJECTIVE = "new_objective"
 
 
+class LedgerStatus(str, Enum):
+    NONE = "none"
+    READY = "ready"
+    EXECUTING = "executing"
+    DONE = "done"
+    BLOCKED = "blocked"
+
+
+class LedgerNextRequiredMode(str, Enum):
+    NONE = "none"
+    PLAN = "plan"
+    EXECUTE = "execute"
+    WAIT = "wait"
+
+
 class JournalFailureKind(str, Enum):
     NONE = "none"
     PROVIDER_LIMIT = "provider_limit"
@@ -436,6 +451,28 @@ def progress_signal(value: Any) -> ProgressSignal:
             if normalized == signal.value:
                 return signal
     return ProgressSignal.NONE
+
+
+def ledger_status(value: Any) -> LedgerStatus:
+    if isinstance(value, LedgerStatus):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_")
+        for status in LedgerStatus:
+            if normalized == status.value:
+                return status
+    return LedgerStatus.NONE
+
+
+def ledger_next_required_mode(value: Any) -> LedgerNextRequiredMode:
+    if isinstance(value, LedgerNextRequiredMode):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_")
+        for mode in LedgerNextRequiredMode:
+            if normalized == mode.value:
+                return mode
+    return LedgerNextRequiredMode.NONE
 
 
 def autonomy_mode(value: Any) -> AutonomyMode:
@@ -826,6 +863,8 @@ class LedgerReadinessEvidence(BridgeModel):
 
     has_plan: bool = False
     explicit_signal: ProgressSignal = ProgressSignal.NONE
+    status: LedgerStatus = LedgerStatus.NONE
+    next_required_mode: LedgerNextRequiredMode = LedgerNextRequiredMode.NONE
     ready_note_count: int = 0
     min_ready_notes: int = 3
 
@@ -834,12 +873,25 @@ class LedgerReadinessEvidence(BridgeModel):
     def _coerce_signal(cls, value: Any) -> ProgressSignal:
         return progress_signal(value)
 
+    @field_validator("status", mode="before")
+    @classmethod
+    def _coerce_status(cls, value: Any) -> LedgerStatus:
+        return ledger_status(value)
+
+    @field_validator("next_required_mode", mode="before")
+    @classmethod
+    def _coerce_next_required_mode(cls, value: Any) -> LedgerNextRequiredMode:
+        return ledger_next_required_mode(value)
+
     @property
     def explicit_ready(self) -> bool:
         return self.explicit_signal in {
             ProgressSignal.NEW_OBJECTIVE,
             ProgressSignal.PLAN_READY,
-        }
+        } or self.status in {
+            LedgerStatus.READY,
+            LedgerStatus.EXECUTING,
+        } or self.next_required_mode == LedgerNextRequiredMode.EXECUTE
 
     @property
     def repeated_ready(self) -> bool:
@@ -878,6 +930,8 @@ class LedgerReadinessEvidence(BridgeModel):
         return cls(
             has_plan=has_plan,
             explicit_signal=ledger.signal,
+            status=ledger.status,
+            next_required_mode=ledger.next_required_mode,
             ready_note_count=ready_note_count,
             min_ready_notes=min_ready_notes,
         )
@@ -7607,6 +7661,9 @@ class LedgerState(BridgeModel):
     progress_notes: list[str] = Field(default_factory=list)
     updated_at: str = ""
     signal: ProgressSignal = ProgressSignal.NONE
+    status: LedgerStatus = LedgerStatus.NONE
+    next_required_mode: LedgerNextRequiredMode = LedgerNextRequiredMode.NONE
+    blocker: str = ""
 
     @classmethod
     def default(cls) -> "LedgerState":
@@ -7616,6 +7673,9 @@ class LedgerState(BridgeModel):
             progress_notes=[],
             updated_at="",
             signal=ProgressSignal.NONE,
+            status=LedgerStatus.NONE,
+            next_required_mode=LedgerNextRequiredMode.NONE,
+            blocker="",
         )
 
     @classmethod
@@ -7629,6 +7689,9 @@ class LedgerState(BridgeModel):
             progress_notes=_required_str_list(data, "progress_notes"),
             updated_at=_optional_str(data, "updated_at") or "",
             signal=progress_signal(data.get("signal")),
+            status=ledger_status(data.get("status")),
+            next_required_mode=ledger_next_required_mode(data.get("next_required_mode")),
+            blocker=_optional_str(data, "blocker") or "",
         )
 
     @classmethod
@@ -7639,12 +7702,16 @@ class LedgerState(BridgeModel):
             return cls.default()
         objective = value.get("objective", "")
         updated_at = value.get("updated_at", "")
+        blocker = value.get("blocker", "")
         return cls(
             objective=objective if isinstance(objective, str) else "",
             plan_steps=_coerce_str_list(value.get("plan_steps", [])),
             progress_notes=_coerce_str_list(value.get("progress_notes", [])),
             updated_at=updated_at if isinstance(updated_at, str) else "",
             signal=progress_signal(value.get("signal")),
+            status=ledger_status(value.get("status")),
+            next_required_mode=ledger_next_required_mode(value.get("next_required_mode")),
+            blocker=blocker.strip() if isinstance(blocker, str) else "",
         )
 
     @classmethod
@@ -7690,6 +7757,9 @@ class LedgerState(BridgeModel):
             progress_notes=notes,
             updated_at=self.updated_at,
             signal=self.signal,
+            status=self.status,
+            next_required_mode=self.next_required_mode,
+            blocker=self.blocker,
         )
 
     def merged_with(
@@ -7705,14 +7775,26 @@ class LedgerState(BridgeModel):
         plan_steps = list(self.plan_steps)
         progress_notes = list(self.progress_notes)
         signal = self.signal
+        status = self.status
+        next_required_mode = self.next_required_mode
+        blocker = self.blocker
 
         if ledger_update.objective:
             objective = ledger_update.objective
             plan_steps = list(ledger_update.plan_steps)
+            status = ledger_update.status
+            next_required_mode = ledger_update.next_required_mode
+            blocker = ledger_update.blocker
         elif ledger_update.plan_steps:
             plan_steps = list(ledger_update.plan_steps)
         if ledger_update.signal != ProgressSignal.NONE:
             signal = ledger_update.signal
+        if ledger_update.status != LedgerStatus.NONE:
+            status = ledger_update.status
+        if ledger_update.next_required_mode != LedgerNextRequiredMode.NONE:
+            next_required_mode = ledger_update.next_required_mode
+        if ledger_update.blocker:
+            blocker = ledger_update.blocker
 
         try:
             drop_progress = (
@@ -7741,6 +7823,9 @@ class LedgerState(BridgeModel):
             progress_notes=progress_notes,
             updated_at=updated_at.strip() if isinstance(updated_at, str) and updated_at.strip() else self.updated_at,
             signal=signal,
+            status=status,
+            next_required_mode=next_required_mode,
+            blocker=blocker,
         ).cleaned(progress_should_drop=progress_should_drop)
 
     def to_dict(self) -> dict[str, Any]:
@@ -7752,6 +7837,12 @@ class LedgerState(BridgeModel):
         }
         if self.signal != ProgressSignal.NONE:
             result["signal"] = self.signal.value
+        if self.status != LedgerStatus.NONE:
+            result["status"] = self.status.value
+        if self.next_required_mode != LedgerNextRequiredMode.NONE:
+            result["next_required_mode"] = self.next_required_mode.value
+        if self.blocker:
+            result["blocker"] = self.blocker
         return result
 
     def to_json_line(self) -> str:
@@ -7818,6 +7909,12 @@ class LedgerState(BridgeModel):
         lines = [
             f"Continuity ledger: continue the committed objective, do not restart it: {objective}",
         ]
+        if self.status != LedgerStatus.NONE:
+            lines.append(f"Status: {self.status.value}")
+        if self.next_required_mode != LedgerNextRequiredMode.NONE:
+            lines.append(f"Next required mode: {self.next_required_mode.value}")
+        if self.blocker:
+            lines.append(f"Blocker: {self.blocker}")
         if self.plan_steps:
             lines.append("Plan:")
             for index, step in enumerate(self.plan_steps, start=1):
@@ -8042,8 +8139,11 @@ class LedgerUpdateDraft(BridgeModel):
     plan_steps: list[str] = Field(default_factory=list)
     progress: str = ""
     signal: ProgressSignal = ProgressSignal.NONE
+    status: LedgerStatus = LedgerStatus.NONE
+    next_required_mode: LedgerNextRequiredMode = LedgerNextRequiredMode.NONE
+    blocker: str = ""
 
-    @field_validator("objective", "progress", mode="before")
+    @field_validator("objective", "progress", "blocker", mode="before")
     @classmethod
     def _coerce_text(cls, value: Any) -> str:
         return value.strip() if isinstance(value, str) else ""
@@ -8058,6 +8158,16 @@ class LedgerUpdateDraft(BridgeModel):
     def _coerce_signal(cls, value: Any) -> ProgressSignal:
         return progress_signal(value)
 
+    @field_validator("status", mode="before")
+    @classmethod
+    def _coerce_status(cls, value: Any) -> LedgerStatus:
+        return ledger_status(value)
+
+    @field_validator("next_required_mode", mode="before")
+    @classmethod
+    def _coerce_next_required_mode(cls, value: Any) -> LedgerNextRequiredMode:
+        return ledger_next_required_mode(value)
+
     @classmethod
     def from_body(cls, body: Any) -> "LedgerUpdateDraft":
         if isinstance(body, cls):
@@ -8068,12 +8178,18 @@ class LedgerUpdateDraft(BridgeModel):
                 plan_steps=list(body.plan_steps),
                 progress=body.progress,
                 signal=body.signal,
+                status=body.status,
+                next_required_mode=body.next_required_mode,
+                blocker=body.blocker,
             )
         data: dict[str, Any] = {
             "objective": "",
             "plan_steps": [],
             "progress": "",
             "signal": ProgressSignal.NONE,
+            "status": LedgerStatus.NONE,
+            "next_required_mode": LedgerNextRequiredMode.NONE,
+            "blocker": "",
         }
         in_plan = False
         for line in HiddenTrailerBodyLine.iter_body(body):
@@ -8088,6 +8204,15 @@ class LedgerUpdateDraft(BridgeModel):
             elif line.key_is("signal"):
                 data["signal"] = line.value
                 in_plan = False
+            elif line.key_is("status"):
+                data["status"] = line.value
+                in_plan = False
+            elif line.key_is("next_required_mode"):
+                data["next_required_mode"] = line.value
+                in_plan = False
+            elif line.key_is("blocker"):
+                data["blocker"] = line.value
+                in_plan = False
             elif in_plan and line.is_bullet:
                 data["plan_steps"].append(line.bullet)
         return cls.model_validate(data)
@@ -8098,6 +8223,9 @@ class LedgerUpdateDraft(BridgeModel):
             "plan_steps": list(self.plan_steps),
             "progress": self.progress,
             "signal": self.signal,
+            "status": self.status,
+            "next_required_mode": self.next_required_mode,
+            "blocker": self.blocker,
         })
 
 
@@ -8106,6 +8234,9 @@ class LedgerUpdate(BridgeModel):
     plan_steps: list[str] = Field(default_factory=list)
     progress: str = ""
     signal: ProgressSignal = ProgressSignal.NONE
+    status: LedgerStatus = LedgerStatus.NONE
+    next_required_mode: LedgerNextRequiredMode = LedgerNextRequiredMode.NONE
+    blocker: str = ""
 
     @classmethod
     def from_trailer_text(cls, text: Any) -> "LedgerUpdate | None":
@@ -8134,8 +8265,17 @@ class LedgerUpdate(BridgeModel):
         progress = value.get("progress", "")
         plan_steps = _coerce_str_list(value.get("plan_steps", []))
         signal = progress_signal(value.get("signal"))
+        status = ledger_status(value.get("status"))
+        next_required_mode = ledger_next_required_mode(value.get("next_required_mode"))
+        blocker = value.get("blocker", "")
         if signal == ProgressSignal.NONE:
-            if plan_steps:
+            if status == LedgerStatus.DONE:
+                signal = ProgressSignal.PLAN_DONE
+            elif status in {LedgerStatus.READY, LedgerStatus.EXECUTING}:
+                signal = ProgressSignal.PLAN_READY
+            elif next_required_mode == LedgerNextRequiredMode.EXECUTE:
+                signal = ProgressSignal.PLAN_READY
+            elif plan_steps:
                 signal = ProgressSignal.PLAN_READY
             elif isinstance(objective, str) and objective.strip():
                 signal = ProgressSignal.NEW_OBJECTIVE
@@ -8144,6 +8284,9 @@ class LedgerUpdate(BridgeModel):
             plan_steps=plan_steps,
             progress=progress.strip() if isinstance(progress, str) else "",
             signal=signal,
+            status=status,
+            next_required_mode=next_required_mode,
+            blocker=blocker.strip() if isinstance(blocker, str) else "",
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -8156,6 +8299,12 @@ class LedgerUpdate(BridgeModel):
             result["progress"] = self.progress
         if self.signal != ProgressSignal.NONE:
             result["signal"] = self.signal.value
+        if self.status != LedgerStatus.NONE:
+            result["status"] = self.status.value
+        if self.next_required_mode != LedgerNextRequiredMode.NONE:
+            result["next_required_mode"] = self.next_required_mode.value
+        if self.blocker:
+            result["blocker"] = self.blocker
         return result
 
 

@@ -14,7 +14,9 @@ from models import (
     AutonomyMode,
     AutonomyPromptInput,
     AutonomyTickMessage,
+    LedgerNextRequiredMode,
     LedgerState,
+    LedgerStatus,
     LiveCompletionEvidence,
     LiveState,
     ObjectiveCompletionKind,
@@ -174,6 +176,36 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(decision.reason, "repeated_plan_progress")
         self.assertTrue(decision.actionable_plan)
         self.assertFalse(decision.read_only_tools)
+
+    def test_choose_autonomy_decision_honors_typed_next_required_mode(self):
+        decision = planner.choose_autonomy_decision(
+            LedgerState(
+                objective="activate second furnace",
+                plan_steps=["walk_to (42, -21)"],
+                next_required_mode=LedgerNextRequiredMode.EXECUTE,
+            ),
+            5,
+            5,
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
+        self.assertEqual(decision.reason, "actionable_plan")
+        self.assertTrue(decision.actionable_plan)
+
+    def test_choose_autonomy_decision_honors_typed_done_status(self):
+        decision = planner.choose_autonomy_decision(
+            LedgerState(
+                objective="activate second furnace",
+                plan_steps=["verify_production"],
+                status=LedgerStatus.DONE,
+                next_required_mode=LedgerNextRequiredMode.PLAN,
+            ),
+            0,
+            5,
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "plan_done")
 
     def test_choose_autonomy_decision_executes_after_repeated_unsignaled_progress(self):
         repeated = {

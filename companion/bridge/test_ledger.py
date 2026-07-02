@@ -7,7 +7,13 @@ from unittest import mock
 
 import journal
 import ledger
-from models import LedgerState, LedgerUpdate, ProgressSignal
+from models import (
+    LedgerNextRequiredMode,
+    LedgerState,
+    LedgerStatus,
+    LedgerUpdate,
+    ProgressSignal,
+)
 
 
 class LedgerTests(unittest.TestCase):
@@ -93,11 +99,17 @@ progress: Placed the first drill
             "- walk_to (42, -21)\n"
             "progress: previous objective complete; new objective selected\n"
             "signal: new_objective\n"
+            "status: ready\n"
+            "next_required_mode: execute\n"
+            "blocker: waiting for ore\n"
             "</ledger>"
         )
 
         self.assertEqual(parsed["objective"], "Activate second furnace")
         self.assertEqual(parsed["signal"], "new_objective")
+        self.assertEqual(parsed["status"], "ready")
+        self.assertEqual(parsed["next_required_mode"], "execute")
+        self.assertEqual(parsed["blocker"], "waiting for ore")
 
     def test_parse_ledger_trailer_infers_plan_ready_for_omitted_signal(self):
         parsed = ledger.parse_ledger_trailer(
@@ -159,6 +171,29 @@ progress: Placed the first drill
         self.assertEqual(updated.plan_steps, ["Place drill", "Route belt"])
         self.assertEqual(updated.progress_notes, ["Found patch", "belt fixed"])
         self.assertEqual(ledger.load_ledger("doug"), updated.to_dict())
+
+    def test_ledger_state_round_trips_typed_status_fields(self):
+        saved = LedgerState(
+            objective="Feed furnace",
+            plan_steps=["insert_items iron-ore"],
+            progress_notes=["ready"],
+            updated_at="now",
+            signal=ProgressSignal.PLAN_READY,
+            status=LedgerStatus.READY,
+            next_required_mode=LedgerNextRequiredMode.EXECUTE,
+            blocker="",
+        )
+
+        ledger.save_ledger_model("doug", saved)
+        loaded = ledger.load_ledger_model("doug")
+
+        self.assertEqual(loaded.status, LedgerStatus.READY)
+        self.assertEqual(
+            loaded.next_required_mode,
+            LedgerNextRequiredMode.EXECUTE,
+        )
+        self.assertIn("Status: ready", loaded.render())
+        self.assertIn("Next required mode: execute", loaded.render())
 
     def test_load_and_apply_preserve_planning_progress_without_signal(self):
         saved = {

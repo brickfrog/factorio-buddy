@@ -8,7 +8,9 @@ from models import (
     AutonomyMode,
     AutonomyPromptInput,
     JournalWindow,
+    LedgerNextRequiredMode,
     LedgerState,
+    LedgerStatus,
     LiveCompletionEvidence,
     LiveState,
     autonomy_mode,
@@ -42,6 +44,9 @@ PLANNER_PROMPT = (
     "- <step>\n"
     "progress: <what changed>\n"
     "signal: new_objective|plan_ready|plan_done|none\n"
+    "status: ready|executing|done|blocked|none\n"
+    "next_required_mode: plan|execute|wait|none\n"
+    "blocker: <why blocked, if any>\n"
     "</ledger>"
 )
 
@@ -62,6 +67,9 @@ EXECUTION_PROMPT = (
     "<ledger>\n"
     "progress: <what changed>\n"
     "signal: none|plan_done\n"
+    "status: executing|done|blocked|none\n"
+    "next_required_mode: plan|execute|wait|none\n"
+    "blocker: <why blocked, if any>\n"
     "</ledger>\n"
     "For stale/finished/wrong plans, end with one replacement ledger block:\n"
     "<ledger>\n"
@@ -71,6 +79,9 @@ EXECUTION_PROMPT = (
     "- <step>\n"
     "progress: <why the old plan was stale or complete>\n"
     "signal: new_objective|plan_done|none\n"
+    "status: ready|done|blocked|none\n"
+    "next_required_mode: plan|execute|wait|none\n"
+    "blocker: <why blocked, if any>\n"
     "</ledger>"
 )
 
@@ -124,6 +135,22 @@ def choose_autonomy_decision(
         return AutonomyDecision(
             mode=AutonomyMode.PLAN,
             reason=AutonomyDecisionReason.MISSING_PLAN,
+        )
+    if state.status == LedgerStatus.DONE:
+        return AutonomyDecision(
+            mode=AutonomyMode.PLAN,
+            reason=AutonomyDecisionReason.PLAN_DONE,
+        )
+    if state.next_required_mode == LedgerNextRequiredMode.PLAN:
+        return AutonomyDecision(
+            mode=AutonomyMode.PLAN,
+            reason=AutonomyDecisionReason.ACTIONABLE_PLAN,
+        )
+    if state.next_required_mode == LedgerNextRequiredMode.EXECUTE:
+        return AutonomyDecision(
+            mode=AutonomyMode.EXECUTE,
+            reason=AutonomyDecisionReason.ACTIONABLE_PLAN,
+            actionable_plan=True,
         )
 
     try:
