@@ -433,6 +433,21 @@ _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
             "verify_radius": TOOL_PARAM_INTEGER,
         },
     },
+    "repair_fuel_sustainability": {
+        "required": {},
+        "optional": {
+            "x": TOOL_PARAM_NUMBER,
+            "y": TOOL_PARAM_NUMBER,
+            "radius": TOOL_PARAM_INTEGER,
+            "limit": TOOL_PARAM_INTEGER,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+            "verify_radius": TOOL_PARAM_INTEGER,
+        },
+    },
     "feed_lab_from_inventory": {
         "required": {
             "lab_unit_number": TOOL_PARAM_INTEGER,
@@ -495,6 +510,45 @@ _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
             "lab_inserter_x": TOOL_PARAM_NUMBER,
             "lab_inserter_y": TOOL_PARAM_NUMBER,
             "lab_inserter_direction": TOOL_PARAM_STRING,
+        },
+        "optional": {
+            "belt_type": TOOL_PARAM_STRING,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+            "verify_radius": TOOL_PARAM_INTEGER,
+        },
+    },
+    "plan_machine_output": {
+        "required": {
+            "source_unit_number": TOOL_PARAM_INTEGER,
+            "item_name": TOOL_PARAM_STRING,
+            "to_x": TOOL_PARAM_INTEGER,
+            "to_y": TOOL_PARAM_INTEGER,
+        },
+        "optional": {
+            "output_side": TOOL_PARAM_STRING,
+            "belt_type": TOOL_PARAM_STRING,
+            "search_radius": TOOL_PARAM_INTEGER,
+            "respect_zones": TOOL_PARAM_BOOLEAN,
+            "allow_underground": TOOL_PARAM_BOOLEAN,
+            "extend_existing": TOOL_PARAM_BOOLEAN,
+            "verify_radius": TOOL_PARAM_INTEGER,
+        },
+    },
+    "build_assembler_output": {
+        "required": {
+            "assembler_unit_number": TOOL_PARAM_INTEGER,
+            "item_name": TOOL_PARAM_STRING,
+            "drop_x": TOOL_PARAM_INTEGER,
+            "drop_y": TOOL_PARAM_INTEGER,
+            "to_x": TOOL_PARAM_INTEGER,
+            "to_y": TOOL_PARAM_INTEGER,
+            "inserter_x": TOOL_PARAM_NUMBER,
+            "inserter_y": TOOL_PARAM_NUMBER,
+            "inserter_direction": TOOL_PARAM_STRING,
         },
         "optional": {
             "belt_type": TOOL_PARAM_STRING,
@@ -898,44 +952,48 @@ class ManualAutomationDriftGate:
             except Exception as exc:
                 self.log.debug("manual automation guard live-state lookup failed: {}", exc)
         durable_recovery_context = self._ledger_has_durable_recovery_context(ledger)
+        has_assembler_or_lab = live_state is not None and live_state.has_any((
+            "assembling-machine-1",
+            "assembling-machine-2",
+            "assembling-machine-3",
+            "lab",
+        ))
+        has_automation_footprint = (
+            live_state is not None and live_state.has_automation_capable_footprint()
+        )
         if durable_recovery_context and (
             request.is_manual_fuel_transfer or request.is_manual_material_transfer
         ):
             return PreToolUseHookResponse.noop().to_dict()
-        bootstrap_infrastructure_context = self._ledger_has_bootstrap_infrastructure_context(ledger)
-        if bootstrap_infrastructure_context and (
-            request.is_manual_fuel_transfer or request.is_manual_material_transfer
+        automation_setup_context = self._ledger_has_automation_enabling_setup_context(ledger)
+        if (
+            automation_setup_context
+            and request.is_manual_material_transfer
+            and not has_automation_footprint
         ):
             return PreToolUseHookResponse.noop().to_dict()
         if (
             request.is_bootstrap_infrastructure_craft
-            and bootstrap_infrastructure_context
+            and automation_setup_context
         ):
             return PreToolUseHookResponse.noop().to_dict()
         if (
             request.is_manual_fuel_transfer
-            and live_state is not None
-            and live_state.has_automation_capable_footprint()
+            and has_automation_footprint
         ):
             block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
             self.log.debug(block.debug_message)
             return PreToolUseHookResponse.block(block).to_dict()
         if (
             request.is_manual_science_transfer
-            and live_state is not None
-            and live_state.has_any((
-                "assembling-machine-1",
-                "assembling-machine-2",
-                "assembling-machine-3",
-            ))
+            and (has_assembler_or_lab or self._ledger_is_science_automation_context(ledger))
         ):
             block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
             self.log.debug(block.debug_message)
             return PreToolUseHookResponse.block(block).to_dict()
         if (
             request.is_manual_material_transfer
-            and live_state is not None
-            and live_state.has_automation_capable_footprint()
+            and has_automation_footprint
         ):
             block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
             self.log.debug(block.debug_message)
@@ -982,41 +1040,23 @@ class ManualAutomationDriftGate:
 
     @staticmethod
     def _ledger_has_durable_recovery_context(ledger: Any) -> bool:
-        try:
-            text = str(ledger.active_text() or "").lower()
-        except Exception:
-            text = ""
-        if not text:
-            return False
-        return any(
-            marker in text
-            for marker in (
-                "route_belt",
-                "build_fuel_supply",
-            )
-        )
+        checker = getattr(ledger, "has_durable_recovery_context", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return False
 
     @staticmethod
-    def _ledger_has_bootstrap_infrastructure_context(ledger: Any) -> bool:
-        try:
-            text = str(ledger.active_text() or "").lower()
-        except Exception:
-            text = ""
-        if not text:
-            return False
-        return any(
-            marker in text
-            for marker in (
-                "bootstrap",
-                "build_recipe_assembler_cell",
-                "durable automation",
-                "furnace output",
-                "inserter",
-                "plan_recipe_assembler_cell",
-                "plate output",
-                "recipe assembler",
-            )
-        )
+    def _ledger_has_automation_enabling_setup_context(ledger: Any) -> bool:
+        checker = getattr(ledger, "has_automation_enabling_setup_context", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return False
 
 
 class FactorioToolSchemaGate:

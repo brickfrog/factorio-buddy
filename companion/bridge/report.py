@@ -288,7 +288,7 @@ def format_report(report: BridgeRunReport) -> str:
         f"manual_transfer_tool_calls={report.manual_transfer_tool_calls} "
         f"ratio={_format_ratio(report.automation_to_manual_ratio)}",
         "fuel_automation: "
-        f"build_fuel_supply_calls={report.fuel_automation_tool_calls} "
+        f"fuel_controller_calls={report.fuel_automation_tool_calls} "
         f"manual_fuel_transfer_calls={report.manual_fuel_transfer_tool_calls} "
         f"ratio={_format_ratio(report.fuel_automation_to_manual_ratio)}",
         "science_automation: "

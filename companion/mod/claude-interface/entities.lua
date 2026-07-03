@@ -624,6 +624,7 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
             coal_count = nearest_chest.coal_count,
         } or nil
         local source = nearest_belt or nearest_drill or nearest_chest
+        local source_kind = nearest_belt and "coal_belt" or (nearest_drill and "coal_drill" or (nearest_chest and "coal_chest" or nil))
         if source and consumer.fuel_inserter_candidates then
             for _, candidate in ipairs(consumer.fuel_inserter_candidates) do
                 if candidate.can_place_inserter then
@@ -655,6 +656,15 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
                         tool = "verify_production",
                         args = {x = consumer.position.x, y = consumer.position.y, radius = 8},
                     }}
+                    consumer.ready_to_call = {
+                        tool = "build_fuel_supply",
+                        args = candidate.build_fuel_supply_args,
+                        source_kind = source_kind,
+                        follow_up = {
+                            tool = "verify_production",
+                            args = {x = consumer.position.x, y = consumer.position.y, radius = 8},
+                        },
+                    }
                     break
                 end
             end
@@ -664,7 +674,17 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
     local suggested_actions = {}
     if #consumers > 0 then
         local target = consumers[1]
-        if target.nearest_coal_belt then
+        if target.ready_to_call then
+            table.insert(suggested_actions, {
+                type = "build_fuel_supply",
+                target_unit_number = target.unit_number,
+                tool = target.ready_to_call.tool,
+                args = target.ready_to_call.args,
+                follow_up = target.ready_to_call.follow_up,
+                source_kind = target.ready_to_call.source_kind,
+                description = "Call build_fuel_supply with args to route durable coal delivery to " .. tostring(target.name) .. " unit " .. tostring(target.unit_number) .. ".",
+            })
+        elseif target.nearest_coal_belt then
             table.insert(suggested_actions, {
                 type = "connect_nearest_coal_belt",
                 target_unit_number = target.unit_number,

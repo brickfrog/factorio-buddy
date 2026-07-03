@@ -1127,7 +1127,7 @@ progress: plan confirmed; awaiting execution
 
         self.assertEqual(allowed, {})
 
-    def test_manual_automation_drift_gate_allows_bootstrap_infrastructure_craft(self):
+    def test_manual_automation_drift_gate_allows_setup_craft_but_blocks_transfers_after_belts(self):
         import pipe
         from models import LedgerState
 
@@ -1147,9 +1147,7 @@ progress: plan confirmed; awaiting execution
             x=54.1,
             y=-21.0,
             entity_counts={
-                "assembling-machine-1": 1,
                 "transport-belt": 16,
-                "lab": 1,
             },
         )
         gate = pipe.ManualAutomationDriftGate(
@@ -1192,7 +1190,7 @@ progress: plan confirmed; awaiting execution
             "tool-3",
             {},
         ))
-        allowed_furnace_feed = asyncio.run(gate.hook(
+        blocked_furnace_feed = asyncio.run(gate.hook(
             {
                 "tool_name": "mcp__factorioctl__hand_feed_furnace",
                 "tool_input": {
@@ -1206,7 +1204,7 @@ progress: plan confirmed; awaiting execution
             "tool-4",
             {},
         ))
-        allowed_plate_extract = asyncio.run(gate.hook(
+        blocked_plate_extract = asyncio.run(gate.hook(
             {
                 "tool_name": "mcp__factorioctl__extract_items",
                 "tool_input": {
@@ -1219,12 +1217,101 @@ progress: plan confirmed; awaiting execution
             "tool-5",
             {},
         ))
+        blocked_boiler_refuel = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__insert_items",
+                "tool_input": {
+                    "unit_number": 49,
+                    "item": "coal",
+                    "count": 4,
+                    "inventory_type": "fuel",
+                },
+            },
+            "tool-6",
+            {},
+        ))
 
         self.assertEqual(allowed_inserter, {})
         self.assertEqual(allowed_gear, {})
-        self.assertEqual(allowed_furnace_feed, {})
-        self.assertEqual(allowed_plate_extract, {})
+        self.assertEqual(blocked_furnace_feed["decision"], "block")
+        self.assertEqual(blocked_plate_extract["decision"], "block")
         self.assertEqual(blocked_science["decision"], "block")
+        self.assertEqual(blocked_boiler_refuel["decision"], "block")
+
+    def test_manual_automation_drift_gate_blocks_bootstrap_manual_flow_after_assembler(self):
+        import pipe
+        from models import LedgerState
+
+        bootstrap_plan = LedgerState(
+            objective="Bootstrap inserter and assembler crafting to enable durable automation pipeline",
+            plan_steps=[
+                "craft burner-inserter count=4",
+                "craft assembling-machine-1 count=1",
+                "plan_recipe_assembler_cell assembler=339 recipe=iron-gear-wheel",
+                "build_recipe_assembler_cell",
+                "build_automation_science",
+            ],
+        )
+        automation_capable = LiveState(
+            found=True,
+            surface="nauvis",
+            x=54.1,
+            y=-21.0,
+            entity_counts={
+                "assembling-machine-1": 1,
+                "transport-belt": 16,
+                "lab": 1,
+            },
+        )
+        gate = pipe.ManualAutomationDriftGate(
+            pipe.logger.bind(agent="test"),
+            agent_name="doug",
+            ledger_loader=lambda agent_name: bootstrap_plan,
+            live_state_loader=lambda agent_name: automation_capable,
+        )
+
+        allowed_craft = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__craft",
+                "tool_input": {
+                    "recipe": "iron-gear-wheel",
+                    "count": 5,
+                },
+            },
+            "tool-1",
+            {},
+        ))
+        blocked_feed = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__insert_items",
+                "tool_input": {
+                    "unit_number": 15,
+                    "item": "iron-ore",
+                    "count": 20,
+                    "inventory_type": "furnace_source",
+                },
+            },
+            "tool-2",
+            {},
+        ))
+        blocked_extract = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__extract_items",
+                "tool_input": {
+                    "unit_number": 15,
+                    "item": "iron-plate",
+                    "count": 10,
+                    "inventory_type": "furnace_result",
+                },
+            },
+            "tool-3",
+            {},
+        ))
+
+        self.assertEqual(allowed_craft, {})
+        self.assertEqual(blocked_feed["decision"], "block")
+        self.assertEqual(blocked_extract["decision"], "block")
+        self.assertIn("build_automation_science", blocked_feed["reason"])
 
     def test_manual_automation_drift_gate_blocks_manual_material_flow_after_belts_exist(self):
         import pipe
@@ -1390,6 +1477,38 @@ progress: plan confirmed; awaiting execution
             "build_fuel_supply: tool_input.inserter_name: expected string",
             blocked_fuel["reason"],
         )
+
+        allowed_repair = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__repair_fuel_sustainability",
+                "tool_input": {
+                    "x": 45.5,
+                    "y": -12.5,
+                    "radius": 64,
+                    "dry_run": True,
+                    "allow_underground": False,
+                },
+            },
+            "tool-3",
+            {},
+        ))
+        self.assertEqual(allowed_repair, {})
+
+        allowed_output_plan = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__plan_machine_output",
+                "tool_input": {
+                    "source_unit_number": 73,
+                    "item_name": "iron-plate",
+                    "to_x": 60,
+                    "to_y": -24,
+                    "output_side": "north",
+                },
+            },
+            "tool-4",
+            {},
+        ))
+        self.assertEqual(allowed_output_plan, {})
 
     def test_factorio_tool_schema_gate_blocks_bad_schema_declarations(self):
         import pipe

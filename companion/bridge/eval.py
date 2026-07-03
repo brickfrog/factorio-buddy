@@ -48,7 +48,9 @@ AUTOMATION_TOOL_NAMES = frozenset({
     "execute_edge_miner",
     "execute_entity_placement_near",
     "plan_automation_science",
+    "plan_machine_output",
     "plan_recipe_assembler_cell",
+    "repair_fuel_sustainability",
     "route_belt",
 })
 MANUAL_TRANSFER_TOOL_NAMES = frozenset({
@@ -60,10 +62,12 @@ MANUAL_TRANSFER_TOOL_NAMES = frozenset({
 })
 FUEL_AUTOMATION_TOOL_NAMES = frozenset({
     "build_fuel_supply",
+    "repair_fuel_sustainability",
 })
 SCIENCE_AUTOMATION_TOOL_NAMES = frozenset({
     "build_automation_science",
     "build_lab_feed",
+    "plan_machine_output",
     "plan_automation_science",
 })
 MATERIAL_FLOW_AUTOMATION_TOOL_NAMES = frozenset({
@@ -71,12 +75,14 @@ MATERIAL_FLOW_AUTOMATION_TOOL_NAMES = frozenset({
     "build_assembler_output",
     "execute_direct_smelter",
     "execute_edge_miner",
+    "plan_machine_output",
     "route_belt",
 })
 COMPONENT_AUTOMATION_TOOL_NAMES = frozenset({
     "build_assembler_feed",
     "build_assembler_output",
     "build_automation_science",
+    "plan_machine_output",
     "plan_automation_science",
     "build_recipe_assembler_cell",
     "plan_recipe_assembler_cell",

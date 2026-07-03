@@ -783,7 +783,7 @@ class BridgeReportTest(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "fuel_automation: build_fuel_supply_calls=1 "
+            "fuel_automation: fuel_controller_calls=1 "
             "manual_fuel_transfer_calls=2 ratio=0.50",
             text,
         )

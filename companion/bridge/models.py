@@ -55,6 +55,7 @@ FACTORIO_MUTATING_TOOLS = frozenset({
     "mine_at",
     "place_entity",
     "remove_entity",
+    "repair_fuel_sustainability",
     "route_belt",
     "rotate_entity",
     "set_recipe",
@@ -100,6 +101,7 @@ FACTORIO_READ_ONLY_TOOLS = frozenset({
     "get_zone",
     "list_zones",
     "plan_steam_power",
+    "plan_machine_output",
     "plan_automation_science",
     "plan_recipe_assembler_cell",
     "repair_steam_power",
@@ -115,6 +117,7 @@ FACTORIO_DRY_RUN_SAFE_MUTATING_TOOLS = frozenset({
     "build_automation_science",
     "build_recipe_assembler_cell",
     "build_fuel_supply",
+    "repair_fuel_sustainability",
     "execute_edge_miner",
     "execute_entity_placement_near",
     "build_lab_feed",
@@ -5213,10 +5216,11 @@ class PreToolUseGuardBlock(BridgeModel):
                 f"{BRIDGE_MANUAL_AUTOMATION_GUARD_PREFIX} {self.tool_name}. "
                 "The active ledger plan is stale because it relies on manual "
                 "transfer loops. Replace it with durable automation controllers "
-                "such as build_fuel_supply, execute_direct_smelter, "
+                "such as repair_fuel_sustainability, build_fuel_supply, execute_direct_smelter, "
                 "plan_recipe_assembler_cell, build_recipe_assembler_cell, "
                 "build_automation_science, build_assembler_feed, "
-                "build_assembler_output, or build_lab_feed."
+                "plan_machine_output, build_assembler_output for machine/furnace output belts, "
+                "or build_lab_feed."
             )
         return f"{BRIDGE_PARAM_SCHEMA_GUARD_PREFIX} {self.detail}"
 
@@ -8193,6 +8197,41 @@ class LedgerState(BridgeModel):
     def progress_text(self) -> str:
         return "\n".join(self.progress_notes).lower()
 
+    def has_automation_enabling_setup_context(self) -> bool:
+        """Return true for bounded setup steps that create automation parts."""
+        text = self.active_text()
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "bootstrap",
+                "build_recipe_assembler_cell",
+                "durable automation",
+                "furnace output",
+                "inserter",
+                "one-time",
+                "initial",
+                "plan_recipe_assembler_cell",
+                "plate output",
+                "recipe assembler",
+            )
+        )
+
+    def has_durable_recovery_context(self) -> bool:
+        """Return true when manual recovery is paired with durable logistics."""
+        text = self.active_text()
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "repair_fuel_sustainability",
+                "route_belt",
+                "build_fuel_supply",
+            )
+        )
+
     def has_stale_manual_automation_plan(
         self,
         live_state: LiveState | None = None,
@@ -8212,6 +8251,7 @@ class LedgerState(BridgeModel):
         durable_markers = (
             "execute_direct_smelter",
             "execute_edge_miner",
+            "repair_fuel_sustainability",
             "diagnose_fuel_sustainability",
             "build_fuel_supply",
             "route_belt",
@@ -8220,6 +8260,7 @@ class LedgerState(BridgeModel):
             "plan_recipe_assembler_cell",
             "build_recipe_assembler_cell",
             "build_assembler_feed",
+            "plan_machine_output",
             "build_assembler_output",
             "build_lab_feed",
         )
@@ -8285,7 +8326,7 @@ class LedgerState(BridgeModel):
             )
         )
         if automation_capable and mentions_manual_feed:
-            return True
+            return not self.has_durable_recovery_context()
 
         progress = self.progress_text()
         repeated_loop_text = "\n".join([text, progress])

@@ -557,10 +557,45 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(decision.mode, AutonomyMode.EXECUTE)
         self.assertFalse(decision.read_only_tools)
 
-    def test_choose_autonomy_decision_replans_manual_feed_when_factory_exists(self):
+    def test_choose_autonomy_decision_replans_bounded_manual_feed_when_factory_exists(self):
         decision = planner.choose_autonomy_decision(
             {
                 "objective": "activate second stone-furnace with hand-fed fuel and ore",
+                "plan_steps": [
+                    "walk_to (42, -21) to approach furnace unit 15",
+                    "insert_items coal count=5 into fuel inventory of unit 15",
+                    "insert_items iron-ore count=20 into furnace_source inventory of unit 15",
+                    "verify_production at (42, -22) radius 4",
+                ],
+                "progress_notes": [
+                    "Inventory intact. Plan validated against live state, ready for execution.",
+                ],
+                "updated_at": "now",
+            },
+            0,
+            5,
+            live_state=LiveState(
+                found=True,
+                surface="nauvis",
+                x=54.1,
+                y=-21.0,
+                entity_counts={
+                    "electric-mining-drill": 1,
+                    "transport-belt": 16,
+                    "small-electric-pole": 21,
+                    "lab": 1,
+                },
+            ),
+        )
+
+        self.assertEqual(decision.mode, AutonomyMode.PLAN)
+        self.assertEqual(decision.reason, "stale_manual_automation")
+        self.assertTrue(decision.read_only_tools)
+
+    def test_choose_autonomy_decision_replans_open_ended_manual_feed_when_factory_exists(self):
+        decision = planner.choose_autonomy_decision(
+            {
+                "objective": "keep the furnace running with hand-fed fuel and ore",
                 "plan_steps": [
                     "walk_to (42, -21) to approach furnace unit 15",
                     "insert_items coal count=5 into fuel inventory of unit 15",
@@ -1217,7 +1252,7 @@ class PlannerTests(unittest.TestCase):
         self.assertIn(planner.PLANNER_PROMPT, tick["message"])
         self.assertTrue(tick["read_only_tools"])
         self.assertIn("Planner correction:", tick["message"])
-        self.assertIn("Do not reaffirm that plan", tick["message"])
+        self.assertIn("build_fuel_supply", tick["message"])
         self.assertIn("walk_to (42, -21)", tick["message"])
         self.assertEqual(thread._exec_ticks_since_plan, 0)
 

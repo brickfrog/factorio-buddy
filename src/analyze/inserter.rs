@@ -6,15 +6,35 @@ use std::collections::HashMap;
 
 /// Analyze all inserters in the entity list
 pub fn analyze_inserters(entities: &[Entity]) -> Vec<InserterAnalysis> {
-    // Build entity lookup by position
-    let entity_at: HashMap<TilePos, &Entity> =
-        entities.iter().map(|e| (e.position.to_tile(), e)).collect();
+    let entity_at = build_entity_lookup(entities);
 
     entities
         .iter()
         .filter(|e| e.name.contains("inserter"))
         .filter_map(|inserter| analyze_single_inserter(inserter, &entity_at))
         .collect()
+}
+
+fn build_entity_lookup(entities: &[Entity]) -> HashMap<TilePos, &Entity> {
+    let mut entity_at: HashMap<TilePos, &Entity> = HashMap::new();
+    for entity in entities {
+        let tile = entity.position.to_tile();
+        match entity_at.get(&tile) {
+            Some(existing) if entity_priority(existing) >= entity_priority(entity) => {}
+            _ => {
+                entity_at.insert(tile, entity);
+            }
+        }
+    }
+    entity_at
+}
+
+fn entity_priority(entity: &Entity) -> u8 {
+    match entity.entity_type.as_deref() {
+        Some("resource") => 0,
+        Some("tree") | Some("simple-entity") => 1,
+        _ => 2,
+    }
 }
 
 /// Analyze a single inserter
@@ -93,10 +113,14 @@ mod tests {
     }
 
     fn make_entity(x: i32, y: i32, name: &str) -> Entity {
+        make_typed_entity(x, y, name, name)
+    }
+
+    fn make_typed_entity(x: i32, y: i32, name: &str, entity_type: &str) -> Entity {
         Entity {
             unit_number: Some((x * 1000 + y) as u32),
             name: name.to_string(),
-            entity_type: Some(name.to_string()),
+            entity_type: Some(entity_type.to_string()),
             position: Position::new(x as f64 + 0.5, y as f64 + 0.5),
             direction: 0,
             health: Some(100.0),
@@ -150,6 +174,29 @@ mod tests {
         assert!(analysis.dropoff_target.is_some());
         assert_eq!(analysis.dropoff_target.as_ref().unwrap().name, "iron-chest");
         // Drops to west (opposite)
+    }
+
+    #[test]
+    fn test_inserter_targets_prefer_belt_over_resource_on_same_tile() {
+        let entities = vec![
+            make_inserter(59, -23, Direction::South, "inserter"),
+            make_typed_entity(59, -22, "iron-ore", "resource"),
+            make_typed_entity(59, -22, "transport-belt", "transport-belt"),
+            make_typed_entity(59, -24, "stone-furnace", "furnace"),
+        ];
+
+        let results = analyze_inserters(&entities);
+        assert_eq!(results.len(), 1);
+
+        let analysis = &results[0];
+        assert_eq!(
+            analysis.pickup_target.as_ref().unwrap().name,
+            "transport-belt"
+        );
+        assert_eq!(
+            analysis.dropoff_target.as_ref().unwrap().name,
+            "stone-furnace"
+        );
     }
 
     #[test]

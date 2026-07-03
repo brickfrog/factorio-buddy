@@ -249,7 +249,7 @@ pub fn entity_size(name: &str) -> (u32, u32) {
         n if n.contains("splitter") => (2, 1),
 
         // 2x2 entities
-        "stone-furnace" | "steel-furnace" | "electric-furnace" => (2, 2),
+        "stone-furnace" | "steel-furnace" => (2, 2),
         "burner-mining-drill" | "electric-mining-drill" => (2, 2),
         "boiler" => (3, 2),
         "steam-engine" => (3, 5),
@@ -258,6 +258,7 @@ pub fn entity_size(name: &str) -> (u32, u32) {
         // 3x3 entities
         n if n.starts_with("assembling-machine") => (3, 3),
         "chemical-plant" => (3, 3),
+        "electric-furnace" => (3, 3),
         "lab" => (3, 3),
         "radar" => (3, 3),
         "centrifuge" => (3, 3),

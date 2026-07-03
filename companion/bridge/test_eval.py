@@ -188,6 +188,7 @@ class EvaluateTest(unittest.TestCase):
             BridgeLogRecord(message="tool: walk_to({\"x\":42,\"y\":-21})"),
             BridgeLogRecord(message="tool: insert_items({\"item\":\"coal\"})"),
             BridgeLogRecord(message="tool: build_fuel_supply({\"consumer_unit_number\":49})"),
+            BridgeLogRecord(message="tool: repair_fuel_sustainability({\"x\":45,\"y\":-20})"),
             BridgeLogRecord(message="tool: build_automation_science({\"assembler_unit_number\":80})"),
             BridgeLogRecord(message='tool: craft({"recipe":"iron-gear-wheel","count":4})'),
             BridgeLogRecord(message="tool: feed_lab_from_inventory({\"lab_unit_number\":69,\"science_pack\":\"automation-science-pack\",\"dry_run\":false})"),
@@ -208,16 +209,16 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(metrics["execution_ticks"], 1)
         self.assertEqual(metrics["planner_turns_with_no_state_change"], 2)
         self.assertEqual(metrics["repeated_objective_restatements"], 1)
-        self.assertEqual(metrics["tool_calls_before_first_milestone"], 6)
+        self.assertEqual(metrics["tool_calls_before_first_milestone"], 7)
         self.assertEqual(metrics["expected_misses"], 1)
         self.assertEqual(metrics["real_failures"], 3)
         self.assertEqual(metrics["rejected_placements"], 1)
-        self.assertEqual(metrics["automation_tool_calls"], 2)
+        self.assertEqual(metrics["automation_tool_calls"], 3)
         self.assertEqual(metrics["manual_transfer_tool_calls"], 3)
-        self.assertEqual(metrics["automation_to_manual_ratio"], 0.666667)
-        self.assertEqual(metrics["fuel_automation_tool_calls"], 1)
+        self.assertEqual(metrics["automation_to_manual_ratio"], 1.0)
+        self.assertEqual(metrics["fuel_automation_tool_calls"], 2)
         self.assertEqual(metrics["manual_fuel_transfer_tool_calls"], 1)
-        self.assertEqual(metrics["fuel_automation_to_manual_ratio"], 1.0)
+        self.assertEqual(metrics["fuel_automation_to_manual_ratio"], 2.0)
         self.assertEqual(metrics["science_automation_tool_calls"], 1)
         self.assertEqual(metrics["manual_science_transfer_tool_calls"], 1)
         self.assertEqual(metrics["science_automation_to_manual_ratio"], 1.0)
@@ -231,7 +232,7 @@ class EvaluateTest(unittest.TestCase):
 
     def test_wasted_turn_metrics_reports_infinite_automation_ratio_without_manual_transfers(self):
         metrics = eval_harness.wasted_turn_metrics([
-            BridgeLogRecord(message="tool: build_fuel_supply({})"),
+            BridgeLogRecord(message="tool: repair_fuel_sustainability({})"),
         ])
 
         self.assertEqual(metrics["automation_tool_calls"], 1)

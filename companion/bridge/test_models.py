@@ -5014,10 +5014,11 @@ acceptance:
                     "Factorioctl bridge blocked stale manual automation tool: "
                     "insert_items. The active ledger plan is stale because it "
                     "relies on manual transfer loops. Replace it with durable "
-                    "automation controllers such as build_fuel_supply, "
+                    "automation controllers such as repair_fuel_sustainability, build_fuel_supply, "
                     "execute_direct_smelter, plan_recipe_assembler_cell, "
                     "build_recipe_assembler_cell, build_automation_science, "
-                    "build_assembler_feed, build_assembler_output, or build_lab_feed."
+                    "build_assembler_feed, plan_machine_output, build_assembler_output for "
+                    "machine/furnace output belts, or build_lab_feed."
                 ),
                 "blocked stale manual automation tool: insert_items",
             ),
@@ -5282,6 +5283,19 @@ acceptance:
         self.assertIs(FactorioModInfo.from_file_text(info), info)
         with self.assertRaisesRegex(BridgeValidationError, "mod_info: expected object"):
             FactorioModInfo.from_file_text("[1, 2, 3]")
+
+    def test_fuel_sustainability_mod_exposes_ready_to_call_repair_args(self):
+        entities_lua = (
+            Path(__file__).resolve().parents[1]
+            / "mod"
+            / "claude-interface"
+            / "entities.lua"
+        ).read_text()
+
+        self.assertIn("consumer.ready_to_call = {", entities_lua)
+        self.assertIn('tool = "build_fuel_supply"', entities_lua)
+        self.assertIn("args = target.ready_to_call.args", entities_lua)
+        self.assertIn("follow_up = target.ready_to_call.follow_up", entities_lua)
 
     def test_dotenv_file_parses_and_applies_without_overwriting_existing_env(self):
         dotenv = DotEnvFile.from_text(

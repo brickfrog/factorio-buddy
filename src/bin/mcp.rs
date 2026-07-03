@@ -20,9 +20,9 @@ use factorioctl::analyze::{
 use factorioctl::client::{lua::LuaCommand, AgentId, FactorioClient};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
 use factorioctl::world::{
-    build_production_report, build_situation_report, find_belt_route_with_options, Area, BeltKind,
-    Direction, Entity, EntityProduction, GridPos, Position, RoutingOptions, TilePos,
-    UndergroundConfig,
+    build_production_report, build_situation_report, entity_size, find_belt_route_with_options,
+    Area, BeltKind, Direction, Entity, EntityProduction, GridPos, Position, RoutingOptions,
+    TilePos, UndergroundConfig,
 };
 
 fn production_verification_json(
@@ -254,10 +254,12 @@ struct ConnectionConfig {
 mod tests {
     use super::{
         automation_repair_hint, execute_lua_refusal, flow_lookup, flow_scan_area,
-        machine_side_layout, placed_unit_working, placed_units_not_dead, raw_lua_enabled,
+        is_machine_output_source, machine_output_build_args, machine_side_layout,
+        placed_unit_working, placed_units_not_dead, raw_lua_enabled, ready_fuel_supply_args,
+        route_segment_waypoint,
     };
     use factorioctl::analyze::EntityLookup;
-    use factorioctl::world::{Area, Entity, Position, TilePos};
+    use factorioctl::world::{Area, Entity, GridPos, Position, TilePos};
 
     #[test]
     fn raw_lua_enabled_only_accepts_explicit_truthy_values() {
@@ -427,20 +429,209 @@ mod tests {
         };
 
         let north = machine_side_layout(&entity, "north").expect("north side");
+        assert_eq!(north.inserter_x, 10.5);
+        assert_eq!(north.inserter_y, 18.5);
         assert_eq!(north.belt_x, 10);
         assert_eq!(north.belt_y, 17);
         assert_eq!(north.upstream_x, 10);
         assert_eq!(north.upstream_y, 16);
-        assert_eq!(north.input_direction, "north");
-        assert_eq!(north.output_direction, "south");
+        assert_eq!(north.input_direction, "south");
+        assert_eq!(north.output_direction, "north");
 
         let east = machine_side_layout(&entity, "east").expect("east side");
+        assert_eq!(east.inserter_x, 12.5);
+        assert_eq!(east.inserter_y, 20.5);
         assert_eq!(east.belt_x, 13);
         assert_eq!(east.belt_y, 20);
         assert_eq!(east.upstream_x, 14);
         assert_eq!(east.upstream_y, 20);
-        assert_eq!(east.input_direction, "east");
-        assert_eq!(east.output_direction, "west");
+        assert_eq!(east.input_direction, "west");
+        assert_eq!(east.output_direction, "east");
+
+        let furnace = Entity {
+            unit_number: Some(15),
+            name: "stone-furnace".to_string(),
+            entity_type: Some("furnace".to_string()),
+            position: Position::new(42.0, -22.0),
+            direction: 0,
+            health: None,
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+        let furnace_north = machine_side_layout(&furnace, "north").expect("furnace north side");
+        assert_eq!(furnace_north.inserter_x, 42.5);
+        assert_eq!(furnace_north.inserter_y, -23.5);
+        assert_eq!(furnace_north.belt_x, 42);
+        assert_eq!(furnace_north.belt_y, -25);
+        assert_eq!(furnace_north.output_direction, "north");
+
+        let assembler_without_bbox = Entity {
+            unit_number: Some(339),
+            name: "assembling-machine-1".to_string(),
+            entity_type: Some("assembling-machine".to_string()),
+            position: Position::new(51.5, -14.5),
+            direction: 0,
+            health: None,
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+        let assembler_south =
+            machine_side_layout(&assembler_without_bbox, "south").expect("assembler south side");
+        assert_eq!(assembler_south.inserter_x, 51.5);
+        assert_eq!(assembler_south.inserter_y, -12.5);
+        assert_eq!(assembler_south.belt_x, 51);
+        assert_eq!(assembler_south.belt_y, -12);
+        assert_eq!(assembler_south.input_direction, "north");
+    }
+
+    #[test]
+    fn route_segment_waypoint_limits_oversized_route_hints() {
+        let waypoint = route_segment_waypoint(0, 0, 120, 0, 40);
+        assert_eq!(waypoint, GridPos::new(40, 0));
+
+        let diagonal = route_segment_waypoint(10, -10, 70, 50, 40);
+        assert_eq!((diagonal.x - 10).abs() + (diagonal.y + 10).abs(), 40);
+
+        let already_close = route_segment_waypoint(0, 0, 12, -3, 40);
+        assert_eq!(already_close, GridPos::new(12, -3));
+    }
+
+    #[test]
+    fn machine_output_controller_accepts_furnaces_and_assemblers() {
+        let assembler = Entity {
+            unit_number: Some(1),
+            name: "assembling-machine-1".to_string(),
+            entity_type: Some("assembling-machine".to_string()),
+            position: Position::new(0.5, 0.5),
+            direction: 0,
+            health: None,
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+        let furnace = Entity {
+            unit_number: Some(2),
+            name: "stone-furnace".to_string(),
+            entity_type: Some("furnace".to_string()),
+            position: Position::new(2.0, 2.0),
+            direction: 0,
+            health: None,
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+        let belt = Entity {
+            unit_number: Some(3),
+            name: "transport-belt".to_string(),
+            entity_type: Some("transport-belt".to_string()),
+            position: Position::new(3.5, 3.5),
+            direction: 0,
+            health: None,
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+
+        assert!(is_machine_output_source(&assembler));
+        assert!(is_machine_output_source(&furnace));
+        assert!(!is_machine_output_source(&belt));
+    }
+
+    #[test]
+    fn ready_fuel_supply_args_prefers_ranked_consumer_ready_to_call() {
+        let report = serde_json::json!({
+            "consumers": [{
+                "unit_number": 49,
+                "ready_to_call": {
+                    "tool": "build_fuel_supply",
+                    "args": {
+                        "consumer_unit_number": 49,
+                        "from_x": 78,
+                        "from_y": -20,
+                        "pickup_x": 46,
+                        "pickup_y": 11,
+                        "inserter_x": 46.5,
+                        "inserter_y": 10.5,
+                        "inserter_direction": "north",
+                        "inserter_name": "burner-inserter"
+                    }
+                }
+            }],
+            "suggested_actions": []
+        });
+
+        let args = ready_fuel_supply_args(&report).expect("ready args");
+
+        assert_eq!(args.consumer_unit_number, 49);
+        assert_eq!(args.from_x, 78);
+        assert_eq!(args.pickup_y, 11);
+        assert_eq!(args.inserter_name, "burner-inserter");
+        assert_eq!(args.belt_type, "transport-belt");
+        assert!(args.extend_existing);
+    }
+
+    #[test]
+    fn ready_fuel_supply_args_accepts_top_level_suggested_action() {
+        let report = serde_json::json!({
+            "consumers": [],
+            "suggested_actions": [{
+                "type": "build_fuel_supply",
+                "tool": "build_fuel_supply",
+                "args": {
+                    "consumer_unit_number": 73,
+                    "from_x": 5,
+                    "from_y": 6,
+                    "pickup_x": 7,
+                    "pickup_y": 8,
+                    "inserter_x": 7.5,
+                    "inserter_y": 8.5,
+                    "inserter_direction": "south",
+                    "inserter_name": "inserter"
+                }
+            }]
+        });
+
+        let args = ready_fuel_supply_args(&report).expect("suggested action args");
+
+        assert_eq!(args.consumer_unit_number, 73);
+        assert_eq!(args.inserter_direction, "south");
+        assert_eq!(args.inserter_name, "inserter");
+    }
+
+    #[test]
+    fn machine_output_build_args_derives_furnace_output_controller_payload() {
+        let furnace = Entity {
+            unit_number: Some(15),
+            name: "stone-furnace".to_string(),
+            entity_type: Some("furnace".to_string()),
+            position: Position::new(42.0, -22.0),
+            direction: 0,
+            health: None,
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+
+        let args = machine_output_build_args(
+            &furnace,
+            "iron-plate".to_string(),
+            50,
+            -25,
+            "north",
+            "transport-belt".to_string(),
+            10,
+            false,
+            false,
+            true,
+            8,
+        )
+        .expect("output args");
+
+        assert_eq!(args.assembler_unit_number, 15);
+        assert_eq!(args.item_name, "iron-plate");
+        assert_eq!(args.drop_x, 42);
+        assert_eq!(args.drop_y, -25);
+        assert_eq!(args.to_x, 50);
+        assert_eq!(args.inserter_x, 42.5);
+        assert_eq!(args.inserter_y, -23.5);
+        assert_eq!(args.inserter_direction, "north");
+        assert!(args.dry_run);
     }
 }
 
@@ -1118,7 +1309,7 @@ fn is_existing_belt_entity(name: &str) -> bool {
 }
 
 /// Parameters for build_fuel_supply tool.
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct BuildFuelSupplyParams {
     /// Fuel consumer to supply, used for verification context.
     pub consumer_unit_number: u32,
@@ -1152,6 +1343,37 @@ pub struct BuildFuelSupplyParams {
     #[serde(default = "default_search_radius")]
     pub search_radius: u32,
     /// If true, only plan the route/inserter without placing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the consumer after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+/// Parameters for repair_fuel_sustainability tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RepairFuelSustainabilityParams {
+    /// X coordinate of area center (default: character position)
+    pub x: Option<f64>,
+    /// Y coordinate of area center (default: character position)
+    pub y: Option<f64>,
+    /// Radius around the center to scan
+    pub radius: Option<u32>,
+    /// Maximum number of ranked fuel consumers to inspect
+    pub limit: Option<u32>,
+    /// Search radius for route obstacle detection.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// If true, diagnose and return the selected build_fuel_supply call without placing.
     #[serde(default)]
     pub dry_run: bool,
     /// Respect zone boundaries when routing.
@@ -1255,9 +1477,9 @@ pub struct BuildAssemblerFeedParams {
 }
 
 /// Parameters for build_assembler_output tool.
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct BuildAssemblerOutputParams {
-    /// Source assembling machine unit number.
+    /// Source machine/furnace unit number. Field name is retained for compatibility.
     pub assembler_unit_number: u32,
     /// Item expected on this output lane, used for reporting and guidance.
     pub item_name: String,
@@ -1294,6 +1516,40 @@ pub struct BuildAssemblerOutputParams {
     #[serde(default = "default_true")]
     pub extend_existing: bool,
     /// Verification radius around the assembler after building.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+}
+
+/// Parameters for plan_machine_output tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlanMachineOutputParams {
+    /// Source crafting machine/furnace unit number.
+    pub source_unit_number: u32,
+    /// Item expected on the output belt, such as iron-plate or automation-science-pack.
+    pub item_name: String,
+    /// Target belt X tile to route the output toward.
+    pub to_x: i32,
+    /// Target belt Y tile to route the output toward.
+    pub to_y: i32,
+    /// Side of the machine to extract output from.
+    #[serde(default = "default_recipe_output_side")]
+    pub output_side: String,
+    /// Belt type to route.
+    #[serde(default = "default_belt_type")]
+    pub belt_type: String,
+    /// Search radius for obstacle detection.
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// Respect zone boundaries when routing.
+    #[serde(default)]
+    pub respect_zones: bool,
+    /// Allow underground belts if researched.
+    #[serde(default)]
+    pub allow_underground: bool,
+    /// Allow routing to start/end on existing belts.
+    #[serde(default = "default_true")]
+    pub extend_existing: bool,
+    /// Verification radius around the source after building.
     #[serde(default = "default_verify_radius")]
     pub verify_radius: u32,
 }
@@ -1575,53 +1831,86 @@ struct MachineSideLayout {
     output_direction: &'static str,
 }
 
+fn tile_center_axis(value: f64) -> f64 {
+    value.floor() + 0.5
+}
+
+fn route_segment_waypoint(
+    from_x: i32,
+    from_y: i32,
+    to_x: i32,
+    to_y: i32,
+    max_span: i32,
+) -> GridPos {
+    let max_span = max_span.max(1);
+    let dx = to_x - from_x;
+    let dy = to_y - from_y;
+    let manhattan = dx.abs() + dy.abs();
+    if manhattan <= max_span {
+        return GridPos::new(to_x, to_y);
+    }
+
+    let ratio = max_span as f64 / manhattan as f64;
+    let mut step_x = (dx as f64 * ratio).round() as i32;
+    let mut step_y = (dy as f64 * ratio).round() as i32;
+    if step_x == 0 && dx != 0 {
+        step_x = dx.signum();
+    }
+    if step_y == 0 && dy != 0 {
+        step_y = dy.signum();
+    }
+    GridPos::new(from_x + step_x, from_y + step_y)
+}
+
 fn machine_side_layout(entity: &Entity, side: &str) -> Result<MachineSideLayout, String> {
     let bbox = machine_bounding_box(entity)?;
     let center = bbox.center();
+    let lane_x = tile_center_axis(center.x);
+    let lane_y = tile_center_axis(center.y);
     match side.to_lowercase().as_str() {
         "north" | "n" | "up" => Ok(MachineSideLayout {
             side: "north",
-            inserter_x: center.x,
+            inserter_x: lane_x,
             inserter_y: bbox.left_top.y - 0.5,
-            belt_x: center.x.floor() as i32,
+            belt_x: lane_x.floor() as i32,
             belt_y: (bbox.left_top.y - 1.5).floor() as i32,
-            upstream_x: center.x.floor() as i32,
+            upstream_x: lane_x.floor() as i32,
             upstream_y: (bbox.left_top.y - 2.5).floor() as i32,
-            input_direction: "north",
-            output_direction: "south",
+            input_direction: "south",
+            output_direction: "north",
         }),
         "east" | "e" | "right" => Ok(MachineSideLayout {
             side: "east",
             inserter_x: bbox.right_bottom.x + 0.5,
-            inserter_y: center.y,
+            inserter_y: lane_y,
             belt_x: (bbox.right_bottom.x + 1.5).floor() as i32,
-            belt_y: center.y.floor() as i32,
+            belt_y: lane_y.floor() as i32,
             upstream_x: (bbox.right_bottom.x + 2.5).floor() as i32,
-            upstream_y: center.y.floor() as i32,
-            input_direction: "east",
-            output_direction: "west",
+            upstream_y: lane_y.floor() as i32,
+            input_direction: "west",
+            output_direction: "east",
         }),
         "south" | "s" | "down" => Ok(MachineSideLayout {
             side: "south",
-            inserter_x: center.x,
+            inserter_x: lane_x,
             inserter_y: bbox.right_bottom.y + 0.5,
-            belt_x: center.x.floor() as i32,
+            belt_x: lane_x.floor() as i32,
             belt_y: (bbox.right_bottom.y + 1.5).floor() as i32,
-            upstream_x: center.x.floor() as i32,
+            upstream_x: lane_x.floor() as i32,
             upstream_y: (bbox.right_bottom.y + 2.5).floor() as i32,
-            input_direction: "south",
-            output_direction: "north",
+            input_direction: "north",
+            output_direction: "south",
         }),
         "west" | "w" | "left" => Ok(MachineSideLayout {
             side: "west",
             inserter_x: bbox.left_top.x - 0.5,
-            inserter_y: center.y,
+            inserter_y: lane_y,
             belt_x: (bbox.left_top.x - 1.5).floor() as i32,
-            belt_y: center.y.floor() as i32,
+            belt_y: lane_y.floor() as i32,
             upstream_x: (bbox.left_top.x - 2.5).floor() as i32,
-            upstream_y: center.y.floor() as i32,
-            input_direction: "west",
-            output_direction: "east",
+            upstream_y: lane_y.floor() as i32,
+            input_direction: "east",
+            output_direction: "west",
         }),
         _ => Err(format!(
             "invalid side '{}'; use north, east, south, or west",
@@ -1635,24 +1924,116 @@ fn machine_bounding_box(entity: &Entity) -> Result<Area, String> {
         return Ok(bbox);
     }
     let entity_type = entity.entity_type.as_deref().unwrap_or("");
-    let (width, height) = if entity.name.starts_with("assembling-machine")
+    let is_machine_like = entity.name.starts_with("assembling-machine")
         || entity_type == "assembling-machine"
+        || entity.name.contains("furnace")
+        || entity_type == "furnace"
         || entity.name == "lab"
         || entity_type == "lab"
-        || entity.name == "chemical-plant"
-    {
-        (3.0, 3.0)
-    } else if entity.name.contains("furnace") || entity_type == "furnace" {
-        (2.0, 2.0)
-    } else {
+        || matches!(
+            entity.name.as_str(),
+            "chemical-plant" | "oil-refinery" | "centrifuge" | "rocket-silo"
+        );
+    let (width, height) = entity_size(&entity.name);
+    if !is_machine_like || (width, height) == (1, 1) {
         return Err(format!("{} has no bounding box", entity.name));
     };
+    let width = width as f64;
+    let height = height as f64;
     Ok(Area::new(
         entity.position.x - width / 2.0,
         entity.position.y - height / 2.0,
         entity.position.x + width / 2.0,
         entity.position.y + height / 2.0,
     ))
+}
+
+fn is_machine_output_source(entity: &Entity) -> bool {
+    let entity_type = entity.entity_type.as_deref().unwrap_or("");
+    entity.name.starts_with("assembling-machine")
+        || entity_type == "assembling-machine"
+        || entity.name.contains("furnace")
+        || entity_type == "furnace"
+        || entity.name == "chemical-plant"
+        || entity_type == "crafting-machine"
+}
+
+fn machine_output_build_args(
+    entity: &Entity,
+    item_name: String,
+    to_x: i32,
+    to_y: i32,
+    output_side: &str,
+    belt_type: String,
+    search_radius: u32,
+    respect_zones: bool,
+    allow_underground: bool,
+    extend_existing: bool,
+    verify_radius: u32,
+) -> Result<BuildAssemblerOutputParams, String> {
+    if !is_machine_output_source(entity) {
+        return Err(format!(
+            "unit {:?} is {}, not a supported output machine/furnace",
+            entity.unit_number, entity.name
+        ));
+    }
+    let output = machine_side_layout(entity, output_side)?;
+    Ok(BuildAssemblerOutputParams {
+        assembler_unit_number: entity
+            .unit_number
+            .ok_or_else(|| format!("{} has no unit_number", entity.name))?,
+        item_name,
+        drop_x: output.belt_x,
+        drop_y: output.belt_y,
+        to_x,
+        to_y,
+        inserter_x: output.inserter_x,
+        inserter_y: output.inserter_y,
+        inserter_direction: output.output_direction.to_string(),
+        belt_type,
+        search_radius,
+        dry_run: true,
+        respect_zones,
+        allow_underground,
+        extend_existing,
+        verify_radius,
+    })
+}
+
+fn ready_fuel_supply_args(report: &serde_json::Value) -> Option<BuildFuelSupplyParams> {
+    let consumers = report.get("consumers")?.as_array()?;
+    for consumer in consumers {
+        if let Some(args) = consumer
+            .get("ready_to_call")
+            .and_then(|ready| ready.get("args"))
+        {
+            if let Ok(params) = serde_json::from_value::<BuildFuelSupplyParams>(args.clone()) {
+                return Some(params);
+            }
+        }
+    }
+    let actions = report.get("suggested_actions")?.as_array()?;
+    for action in actions {
+        let is_build_fuel_supply = action
+            .get("tool")
+            .and_then(|value| value.as_str())
+            .map(|tool| tool == "build_fuel_supply")
+            .unwrap_or(false)
+            || action
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(|action_type| action_type == "build_fuel_supply")
+                .unwrap_or(false);
+        if !is_build_fuel_supply {
+            continue;
+        }
+        if let Some(args) = action.get("args") {
+            if let Ok(params) = serde_json::from_value::<BuildFuelSupplyParams>(args.clone()) {
+                return Some(params);
+            }
+        }
+    }
+    None
 }
 
 /// Parameters for remove_entity tool
@@ -2439,73 +2820,86 @@ impl FactorioMcp {
             }
         }
 
-        // For non-drill machines (furnaces, assemblers, etc.)
-        // Calculate machine size from bounding box or use defaults
-        let (width, height) = if let Some(bb) = &entity.bounding_box {
-            let w = (bb.right_bottom.x - bb.left_top.x).round() as i32;
-            let h = (bb.right_bottom.y - bb.left_top.y).round() as i32;
-            (w, h)
-        } else {
-            // Default sizes for common machines
-            match entity.name.as_str() {
-                "stone-furnace" | "steel-furnace" | "electric-furnace" => (2, 2),
-                "assembling-machine-1" | "assembling-machine-2" | "assembling-machine-3" => (3, 3),
-                "chemical-plant" => (3, 3),
-                "oil-refinery" => (5, 5),
-                "lab" => (3, 3),
-                _ => (1, 1),
-            }
+        let bbox = match machine_bounding_box(&entity) {
+            Ok(bbox) => bbox,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
-
-        let cx = entity.position.x.floor() as i32;
-        let cy = entity.position.y.floor() as i32;
-
-        // Calculate positions based on machine size
-        // For a 2x2 machine centered at (cx, cy):
-        //   - Machine occupies tiles from (cx, cy) to (cx+1, cy+1)
-        //   - South edge is at cy + height/2
-        //   - North edge is at cy - height/2
-        let half_h = height / 2;
-
-        // Input belt goes 1 tile beyond south edge (for inserter gap)
-        let input_belt_y = cy + half_h + 1;
-        let input_inserter_y = cy + half_h; // On the south edge tile
-
-        // Output belt goes 2 tiles beyond north edge (belt, then inserter, then furnace)
-        // For furnace at cy=-107 with half_h=1: inserter at -109, belt at -110
-        let output_belt_y = cy - half_h - 2;
-        let output_inserter_y = cy - half_h - 1;
+        let width = bbox.right_bottom.x - bbox.left_top.x;
+        let height = bbox.right_bottom.y - bbox.left_top.y;
+        let south = match machine_side_layout(&entity, "south") {
+            Ok(layout) => layout,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let north = match machine_side_layout(&entity, "north") {
+            Ok(layout) => layout,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
 
         let result = serde_json::json!({
             "entity_type": "machine",
             "machine": {
                 "unit_number": entity.unit_number,
                 "name": entity.name,
-                "position": { "x": cx, "y": cy },
+                "position": { "x": entity.position.x, "y": entity.position.y },
+                "bounding_box": {
+                    "left_top": { "x": bbox.left_top.x, "y": bbox.left_top.y },
+                    "right_bottom": { "x": bbox.right_bottom.x, "y": bbox.right_bottom.y }
+                },
                 "size": { "width": width, "height": height }
             },
             "input": {
-                "belt_tile_y": input_belt_y,
-                "inserter_tile_y": input_inserter_y,
-                "inserter_direction": "south",  // Faces south to pick from belt, drops north to machine
+                "side": "south",
+                "belt_tile": { "x": south.belt_x, "y": south.belt_y },
+                "belt_place_entity_args": {
+                    "entity_name": "transport-belt",
+                    "x": south.belt_x,
+                    "y": south.belt_y,
+                    "direction": south.input_direction
+                },
+                "inserter_position": { "x": south.inserter_x, "y": south.inserter_y },
+                "inserter_place_entity_args": {
+                    "entity_name": "inserter",
+                    "x": south.inserter_x,
+                    "y": south.inserter_y,
+                    "direction": south.input_direction
+                },
+                "belt_tile_y": south.belt_y,
+                "inserter_tile_y": south.inserter_y,
+                "inserter_direction": south.input_direction,
                 "description": format!(
-                    "Place input belt at y={}, inserter at y={} facing south to pick from belt",
-                    input_belt_y, input_inserter_y
+                    "Input on south side: place belt at ({}, {}) and inserter at ({:.1}, {:.1}) facing {} to pick from belt and drop into machine",
+                    south.belt_x, south.belt_y, south.inserter_x, south.inserter_y, south.input_direction
                 )
             },
             "output": {
-                "belt_tile_y": output_belt_y,
-                "inserter_tile_y": output_inserter_y,
-                "inserter_direction": "south",  // Faces south to pick from machine, drops north to belt
+                "side": "north",
+                "belt_tile": { "x": north.belt_x, "y": north.belt_y },
+                "belt_place_entity_args": {
+                    "entity_name": "transport-belt",
+                    "x": north.belt_x,
+                    "y": north.belt_y,
+                    "direction": north.output_direction
+                },
+                "inserter_position": { "x": north.inserter_x, "y": north.inserter_y },
+                "inserter_place_entity_args": {
+                    "entity_name": "inserter",
+                    "x": north.inserter_x,
+                    "y": north.inserter_y,
+                    "direction": north.output_direction
+                },
+                "belt_tile_y": north.belt_y,
+                "inserter_tile_y": north.inserter_y,
+                "inserter_direction": north.output_direction,
                 "description": format!(
-                    "Place output belt at y={}, inserter at y={} facing south to pick from machine",
-                    output_belt_y, output_inserter_y
+                    "Output on north side: place inserter at ({:.1}, {:.1}) facing {} to pick from machine and drop to belt at ({}, {})",
+                    north.inserter_x, north.inserter_y, north.output_direction, north.belt_x, north.belt_y
                 )
             },
             "routing_tip": format!(
                 "For a row of furnaces at y={}: route input belt to y={}, route output belt to y={}",
-                cy, input_belt_y, output_belt_y
-            )
+                entity.position.y, south.belt_y, north.belt_y
+            ),
+            "coordinate_note": "Use *_place_entity_args directly. belt_tile is the lower-left tile coordinate accepted by place_entity for belts; inserter_position is the actual inserter center. These positions are intentionally different and should not collide."
         });
 
         self.with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default())
@@ -4581,6 +4975,13 @@ impl FactorioMcp {
             Err(e) => {
                 let error = e.to_string();
                 if error.contains("Packet too large") {
+                    let waypoint = route_segment_waypoint(
+                        params.from_x,
+                        params.from_y,
+                        params.to_x,
+                        params.to_y,
+                        40,
+                    );
                     return Ok(serde_json::json!({
                         "success": false,
                         "dry_run": params.dry_run,
@@ -4597,7 +4998,29 @@ impl FactorioMcp {
                                 + (params.to_y - params.from_y).abs(),
                         },
                         "materials_sufficient": false,
-                        "guidance": "Route is too large for one collision-map request. Build shorter route_belt or build_fuel_supply segments from the existing coal belt toward the consumer, then retry the remaining span.",
+                        "next_segment": {
+                            "from": { "x": params.from_x, "y": params.from_y },
+                            "to": { "x": waypoint.x, "y": waypoint.y },
+                            "route_belt_args": {
+                                "from_x": params.from_x,
+                                "from_y": params.from_y,
+                                "to_x": waypoint.x,
+                                "to_y": waypoint.y,
+                                "belt_type": params.belt_type,
+                                "search_radius": params.search_radius,
+                                "dry_run": params.dry_run,
+                                "respect_zones": params.respect_zones,
+                                "allow_underground": params.allow_underground,
+                                "extend_existing": params.extend_existing,
+                            },
+                            "after_success": {
+                                "retry_from_x": waypoint.x,
+                                "retry_from_y": waypoint.y,
+                                "retry_to_x": params.to_x,
+                                "retry_to_y": params.to_y,
+                            }
+                        },
+                        "guidance": "Route is too large for one collision-map request. Call route_belt with next_segment.route_belt_args to extend the belt highway, then retry the original durable controller from next_segment.after_success.retry_from_* toward the final target. Do not call build_fuel_supply for intermediate waypoints because that would place the consumer inserter before fuel reaches it.",
                     }));
                 }
                 return Err(format!("Error building collision map: {}", e));
@@ -4828,7 +5251,7 @@ impl FactorioMcp {
                     object.insert(
                         "guidance".to_string(),
                         serde_json::json!(
-                            "Route is long; response omits full step list. If materials are insufficient or placement reliability matters, build it in shorter route_belt/build_fuel_supply segments using the preview endpoints."
+                            "Route is long; response omits full step list. If materials are insufficient or placement reliability matters, build it in shorter route_belt segments, then use build_fuel_supply only for the final consumer feed."
                         ),
                     );
                 }
@@ -4925,32 +5348,22 @@ impl FactorioMcp {
         }
     }
 
-    /// Build a coal fuel belt plus inserter feed for one burnable consumer.
-    #[tool(
-        description = "Execute a durable coal fuel-supply plan for one burner/furnace/boiler. Use args from diagnose_fuel_sustainability: route coal to the pickup tile, place the inserter feeding the consumer, then verify production. Prefer this over insert_items/hand_feed_furnace once coal supply exists. Use dry_run=true during planner turns."
-    )]
-    async fn build_fuel_supply(
+    async fn build_fuel_supply_core(
         &self,
-        Parameters(params): Parameters<BuildFuelSupplyParams>,
-    ) -> String {
-        let mut client = match self.connect().await {
-            Ok(c) => c,
-            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
-        };
-
+        client: &mut FactorioClient,
+        params: &BuildFuelSupplyParams,
+    ) -> Result<serde_json::Value, String> {
         let consumer = match client.get_entity(params.consumer_unit_number).await {
             Ok(entity) => entity,
-            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+            Err(e) => return Err(format!("Error: {}", e)),
         };
         let inserter_direction = match Direction::parse(&params.inserter_direction) {
             Some(direction) => direction,
             None => {
-                return self
-                    .with_player_messages(format!(
-                        "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.inserter_direction
-                    ))
-                    .await;
+                return Err(format!(
+                    "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                    params.inserter_direction
+                ));
             }
         };
 
@@ -4967,9 +5380,9 @@ impl FactorioMcp {
             extend_existing: params.extend_existing,
         };
 
-        let route = match self.route_belt_core(&mut client, &route_params).await {
+        let route = match self.route_belt_core(client, &route_params).await {
             Ok(report) => report,
-            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+            Err(e) => return Err(format!("Error: {}", e)),
         };
         let route_success = route
             .get("success")
@@ -4984,7 +5397,7 @@ impl FactorioMcp {
         });
 
         if params.dry_run {
-            let result = serde_json::json!({
+            return Ok(serde_json::json!({
                 "success": route_success,
                 "dry_run": true,
                 "consumer": {
@@ -5010,16 +5423,13 @@ impl FactorioMcp {
                 "guidance": if route_success {
                     "If route.materials_sufficient is true and inserter placement is clear, call build_fuel_supply again with dry_run=false."
                 } else {
-                    "Route planning failed. Follow route.guidance; for long coal-to-boiler paths, build shorter route_belt/build_fuel_supply segments from the coal output toward the consumer."
+                    "Route planning failed. Follow route.guidance; for long coal-to-boiler paths, build shorter route_belt segments from the coal output toward the consumer, then call build_fuel_supply for the final consumer feed."
                 },
-            });
-            let msg =
-                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
-            return self.with_player_messages(msg).await;
+            }));
         }
 
         if !route_success {
-            let result = serde_json::json!({
+            return Ok(serde_json::json!({
                 "success": false,
                 "dry_run": false,
                 "consumer": {
@@ -5033,11 +5443,8 @@ impl FactorioMcp {
                     "reason": "route planning failed",
                     "args": inserter_args,
                 },
-                "guidance": "No inserter placed because the fuel belt route failed. Build shorter route_belt/build_fuel_supply segments, then retry this consumer feed.",
-            });
-            let msg =
-                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
-            return self.with_player_messages(msg).await;
+                "guidance": "No inserter placed because the fuel belt route failed. If route.next_segment is present, call route_belt with route.next_segment.route_belt_args, then retry build_fuel_supply for the final consumer feed.",
+            }));
         }
 
         let inserter_position = Position::new(params.inserter_x, params.inserter_y);
@@ -5130,7 +5537,7 @@ impl FactorioMcp {
             && bootstrap_ok
             && verification_call_ok
             && fuel_inserter_ready;
-        let result = serde_json::json!({
+        Ok(serde_json::json!({
             "success": success,
             "placement_success": inserter.is_ok(),
             "dry_run": false,
@@ -5151,6 +5558,118 @@ impl FactorioMcp {
             "verification": verification,
             "repair_hint": repair_hint,
             "guidance": "If success is true, fuel delivery is built; rerun diagnose_fuel_sustainability and verify_production before moving on.",
+        }))
+    }
+
+    /// Build a coal fuel belt plus inserter feed for one burnable consumer.
+    #[tool(
+        description = "Execute a durable coal fuel-supply plan for one burner/furnace/boiler. Use args from diagnose_fuel_sustainability: route coal to the pickup tile, place the inserter feeding the consumer, then verify production. Prefer this over insert_items/hand_feed_furnace once coal supply exists. Use dry_run=true during planner turns."
+    )]
+    async fn build_fuel_supply(
+        &self,
+        Parameters(params): Parameters<BuildFuelSupplyParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let result = match self.build_fuel_supply_core(&mut client, &params).await {
+            Ok(result) => result,
+            Err(e) => return self.with_player_messages(e).await,
+        };
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Diagnose and repair the highest-priority missing durable fuel supply.
+    #[tool(
+        description = "One-call durable fuel repair. Diagnoses the nearby factory, selects the ranked fuel consumer with ready build_fuel_supply args, then routes coal and places the fuel inserter. Prefer this over manually calling insert_items or hand_feed_furnace when boilers/furnaces/burners run out of fuel. Use dry_run=true during planner turns."
+    )]
+    async fn repair_fuel_sustainability(
+        &self,
+        Parameters(params): Parameters<RepairFuelSustainabilityParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let radius = params.radius.unwrap_or(64);
+        let limit = params.limit.unwrap_or(20).clamp(1, 100);
+        let position = match (params.x, params.y) {
+            (Some(x), Some(y)) => Position::new(x, y),
+            (None, None) => {
+                let status = match client.character_status().await {
+                    Ok(status) => status,
+                    Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+                };
+                match status.position {
+                    Some(position) => position,
+                    None => match client.get_character_position().await {
+                        Ok(position) => position,
+                        Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+                    },
+                }
+            }
+            _ => {
+                return self
+                    .with_player_messages("Error: x and y must be provided together".to_string())
+                    .await;
+            }
+        };
+        let r = radius as f64;
+        let area = Area {
+            left_top: Position::new(position.x - r, position.y - r),
+            right_bottom: Position::new(position.x + r, position.y + r),
+        };
+        let diagnosis = match client.diagnose_fuel_sustainability(area, limit).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let mut selected_args = match ready_fuel_supply_args(&diagnosis) {
+            Some(args) => args,
+            None => {
+                let result = serde_json::json!({
+                    "success": false,
+                    "dry_run": params.dry_run,
+                    "selected": null,
+                    "diagnosis": diagnosis,
+                    "guidance": "No ready build_fuel_supply args were found. Build a coal source or clear inserter placement near the ranked consumer, then rerun repair_fuel_sustainability.",
+                });
+                let msg = serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|e| format!("Error: {}", e));
+                return self.with_player_messages(msg).await;
+            }
+        };
+        selected_args.dry_run = params.dry_run;
+        selected_args.search_radius = params.search_radius;
+        selected_args.respect_zones = params.respect_zones;
+        selected_args.allow_underground = params.allow_underground;
+        selected_args.extend_existing = params.extend_existing;
+        selected_args.verify_radius = params.verify_radius;
+
+        let repair = match self
+            .build_fuel_supply_core(&mut client, &selected_args)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => return self.with_player_messages(e).await,
+        };
+        let success = repair
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let result = serde_json::json!({
+            "success": success,
+            "dry_run": params.dry_run,
+            "selected_build_fuel_supply_args": selected_args,
+            "diagnosis": diagnosis,
+            "repair": repair,
+            "guidance": if success {
+                "Durable fuel repair succeeded. Rerun diagnose_fuel_sustainability before manually touching fuel again."
+            } else {
+                "Durable fuel repair did not verify success. Follow repair.repair_hint or route.next_segment if present; do not fall back to repeated manual fuel insertion."
+            },
         });
         let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(msg).await
@@ -5556,9 +6075,92 @@ impl FactorioMcp {
         self.with_player_messages(msg).await
     }
 
-    /// Build one output belt plus inserter from an assembling machine.
+    /// Plan a machine/furnace output belt and inserter without hand-authored geometry.
     #[tool(
-        description = "Execute a durable output from an assembling machine: route a belt from the output inserter drop tile to a target belt tile, place the inserter extracting from the assembler, then verify production. Use this to move automation-science-pack output toward lab feed instead of hand-extracting assembler products. Use dry_run=true during planner turns."
+        description = "Read-only layout planner for extracting output from a crafting machine or furnace. Takes a source unit, item name, target belt tile, and output side; returns ready_to_call build_assembler_output args. Use this before build_assembler_output instead of hand-deriving inserter/drop coordinates."
+    )]
+    async fn plan_machine_output(
+        &self,
+        Parameters(params): Parameters<PlanMachineOutputParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let source_machine = match client.get_entity(params.source_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let build_args = match machine_output_build_args(
+            &source_machine,
+            params.item_name.clone(),
+            params.to_x,
+            params.to_y,
+            &params.output_side,
+            params.belt_type,
+            params.search_radius,
+            params.respect_zones,
+            params.allow_underground,
+            params.extend_existing,
+            params.verify_radius,
+        ) {
+            Ok(args) => args,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let route_params = RouteBeltParams {
+            from_x: build_args.drop_x,
+            from_y: build_args.drop_y,
+            to_x: build_args.to_x,
+            to_y: build_args.to_y,
+            belt_type: build_args.belt_type.clone(),
+            search_radius: build_args.search_radius,
+            dry_run: true,
+            respect_zones: build_args.respect_zones,
+            allow_underground: build_args.allow_underground,
+            extend_existing: build_args.extend_existing,
+        };
+        let route = match self.route_belt_core(&mut client, &route_params).await {
+            Ok(report) => report,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let mut execute_args =
+            serde_json::to_value(&build_args).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(object) = execute_args.as_object_mut() {
+            object.insert("dry_run".to_string(), serde_json::json!(false));
+        }
+        let success = route
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            && route
+                .get("materials_sufficient")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+        let result = serde_json::json!({
+            "success": success,
+            "dry_run": true,
+            "item_name": params.item_name,
+            "source_machine": {
+                "unit_number": source_machine.unit_number,
+                "name": source_machine.name,
+                "position": source_machine.position,
+            },
+            "output_side": params.output_side,
+            "route": route,
+            "ready_to_call": {
+                "tool": "build_assembler_output",
+                "dry_run_args": build_args,
+                "execute_args": execute_args,
+            },
+            "guidance": "If success is true, call build_assembler_output with ready_to_call.execute_args. If false, choose a different output_side or target belt tile; do not hand-extract products.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
+    /// Build one output belt plus inserter from a crafting machine or furnace.
+    #[tool(
+        description = "Execute a durable output from a crafting machine or furnace: route a belt from the output inserter drop tile to a target belt tile, place the inserter extracting from the machine, then verify production. Use this for furnace plate output, assembler ingredient/output belts, and automation-science-pack output instead of hand-extracting products. Use dry_run=true during planner turns."
     )]
     async fn build_assembler_output(
         &self,
@@ -5569,15 +6171,15 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let assembler = match client.get_entity(params.assembler_unit_number).await {
+        let source_machine = match client.get_entity(params.assembler_unit_number).await {
             Ok(entity) => entity,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
-        if !assembler.name.starts_with("assembling-machine") {
+        if !is_machine_output_source(&source_machine) {
             return self
                 .with_player_messages(format!(
-                    "Error: unit {} is {}, not an assembling machine",
-                    params.assembler_unit_number, assembler.name
+                    "Error: unit {} is {}, not a supported output machine/furnace",
+                    params.assembler_unit_number, source_machine.name
                 ))
                 .await;
         }
@@ -5623,10 +6225,15 @@ impl FactorioMcp {
                 "success": true,
                 "dry_run": true,
                 "item_name": params.item_name.clone(),
+                "source_machine": {
+                    "unit_number": source_machine.unit_number,
+                    "name": source_machine.name,
+                    "position": source_machine.position,
+                },
                 "assembler": {
-                    "unit_number": assembler.unit_number,
-                    "name": assembler.name,
-                    "position": assembler.position,
+                    "unit_number": source_machine.unit_number,
+                    "name": source_machine.name,
+                    "position": source_machine.position,
                 },
                 "route": route,
                 "steps": [{
@@ -5638,12 +6245,12 @@ impl FactorioMcp {
                 }, {
                     "tool": "verify_production",
                     "args": {
-                        "x": assembler.position.x,
-                        "y": assembler.position.y,
+                        "x": source_machine.position.x,
+                        "y": source_machine.position.y,
                         "radius": params.verify_radius,
                     },
                 }],
-                "guidance": "If route.materials_sufficient is true and inserter placement is clear, call build_assembler_output again with dry_run=false, then connect the target belt to build_lab_feed.",
+                "guidance": "If route.materials_sufficient is true and inserter placement is clear, call build_assembler_output again with dry_run=false. For furnace plates, use the target belt as the plate source for assembler feeds; for science output, connect the target belt to build_lab_feed.",
             });
             let msg =
                 serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
@@ -5665,10 +6272,10 @@ impl FactorioMcp {
 
         let verify_radius = params.verify_radius.clamp(1, 50) as f64;
         let verify_area = Area::new(
-            assembler.position.x - verify_radius,
-            assembler.position.y - verify_radius,
-            assembler.position.x + verify_radius,
-            assembler.position.y + verify_radius,
+            source_machine.position.x - verify_radius,
+            source_machine.position.y - verify_radius,
+            source_machine.position.x + verify_radius,
+            source_machine.position.y + verify_radius,
         );
         let (verification, verification_call_ok, _) =
             match client.verify_production(verify_area).await {
@@ -5691,7 +6298,7 @@ impl FactorioMcp {
             .unwrap_or(false);
         let repair_hint = automation_repair_hint(
             "build_assembler_output",
-            "assembler output belt",
+            "machine output belt",
             verification_call_ok,
             &verification,
             &placed_unit_statuses,
@@ -5705,10 +6312,15 @@ impl FactorioMcp {
             "placement_success": inserter.is_ok(),
             "dry_run": false,
             "item_name": params.item_name.clone(),
+            "source_machine": {
+                "unit_number": source_machine.unit_number,
+                "name": source_machine.name,
+                "position": source_machine.position,
+            },
             "assembler": {
-                "unit_number": assembler.unit_number,
-                "name": assembler.name,
-                "position": assembler.position,
+                "unit_number": source_machine.unit_number,
+                "name": source_machine.name,
+                "position": source_machine.position,
             },
             "route": route,
             "inserter": inserter_report,
@@ -5720,7 +6332,7 @@ impl FactorioMcp {
             },
             "verification": verification,
             "repair_hint": repair_hint,
-            "guidance": "If success is true, assembler output is on the routed belt. Use build_lab_feed to consume science packs from that belt.",
+            "guidance": "If success is true, machine output is on the routed belt. For furnace plates, use that belt as an assembler input source; for science packs, use build_lab_feed to consume from that belt.",
         });
         let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(msg).await
