@@ -35,6 +35,7 @@ TOOL_PARAM_TYPES = {
 }
 FACTORIO_MCP_TOOL_PREFIX = "mcp__factorioctl__"
 FACTORIO_MUTATING_TOOLS = frozenset({
+    "bootstrap_smelting_once",
     "build_assembler_feed",
     "build_assembler_output",
     "build_automation_science",
@@ -112,6 +113,7 @@ FACTORIO_READ_ONLY_TOOLS = frozenset({
     "verify_production",
 })
 FACTORIO_DRY_RUN_SAFE_MUTATING_TOOLS = frozenset({
+    "bootstrap_smelting_once",
     "build_assembler_feed",
     "build_assembler_output",
     "build_automation_science",
@@ -5216,7 +5218,8 @@ class PreToolUseGuardBlock(BridgeModel):
                 f"{BRIDGE_MANUAL_AUTOMATION_GUARD_PREFIX} {self.tool_name}. "
                 "The active ledger plan is stale because it relies on manual "
                 "transfer loops. Replace it with durable automation controllers "
-                "such as repair_fuel_sustainability, build_fuel_supply, execute_direct_smelter, "
+                "such as bootstrap_smelting_once for first-inserter deadlocks, "
+                "repair_fuel_sustainability, build_fuel_supply, execute_direct_smelter, "
                 "plan_recipe_assembler_cell, build_recipe_assembler_cell, "
                 "build_automation_science, build_assembler_feed, "
                 "plan_machine_output, build_assembler_output for machine/furnace output belts, "

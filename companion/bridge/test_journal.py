@@ -1510,6 +1510,28 @@ progress: plan confirmed; awaiting execution
         ))
         self.assertEqual(allowed_output_plan, {})
 
+        allowed_bootstrap = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__bootstrap_smelting_once",
+                "tool_input": {
+                    "furnace_unit_number": 15,
+                    "fuel_item": "coal",
+                    "fuel_count": 5,
+                    "source_item": "iron-ore",
+                    "source_count": 20,
+                    "output_item": "iron-plate",
+                    "output_count": 5,
+                    "craft_recipe": "burner-inserter",
+                    "craft_count": 1,
+                    "wait_ticks": 1200,
+                    "dry_run": True,
+                },
+            },
+            "tool-5",
+            {},
+        ))
+        self.assertEqual(allowed_bootstrap, {})
+
     def test_factorio_tool_schema_gate_blocks_bad_schema_declarations(self):
         import pipe
 

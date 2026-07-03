@@ -21,6 +21,7 @@ STARTER_SKILLS = (
             "find_nearest_resource for resource_name",
             "call execute_edge_miner with dry_run=true for resource_name near the patch center; execute it with dry_run=false when success/ready are true",
             "call execute_direct_smelter with dry_run=true using the returned drill output tile before hand-authoring belt/inserter/furnace geometry; execute it when the plan is ready",
+            "if no inserter exists and first smelting is blocked only by fuel/ore insertion, call bootstrap_smelting_once exactly once to produce first plates or a burner-inserter, then stop using bootstrap and build durable fuel/output automation",
             "route coal to the burner mining drill with belt/inserter/chest fuel supply when coal is nearby; use temporary fuel inserts only for bootstrap recovery",
             "call repair_fuel_sustainability near the drill after bootstrap fuel; if it cannot select a repair, inspect diagnose_fuel_sustainability and execute build_fuel_supply with returned build_fuel_supply_args",
             "verify_production for the mined resource",
@@ -32,6 +33,7 @@ STARTER_SKILLS = (
         params=["ore_belt_pos", "furnace_count"],
         steps=[
             "call execute_direct_smelter when starting from a single drill output tile; use dry_run=true for planning and dry_run=false to build the cell",
+            "if missing burner-inserter creates a circular first-plate deadlock, call bootstrap_smelting_once exactly once, optionally with craft_recipe=burner-inserter, then immediately use the new inserter in durable fuel/output automation",
             "check_placement for furnace_count stone furnaces beside ore_belt_pos",
             "place_entity stone-furnace in a straight line",
             "get_machine_belt_positions for the furnaces",

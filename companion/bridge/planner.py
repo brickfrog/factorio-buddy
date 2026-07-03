@@ -90,7 +90,10 @@ EXECUTION_PROMPT = (
 STALE_MANUAL_AUTOMATION_ADVISORY = (
     "Planner correction: the current ledger plan relies on manual transfers "
     "inside an automation-capable factory. Do not reaffirm that plan. Replace "
-    "it with durable automation steps. For fuel, use repair_fuel_sustainability "
+    "it with durable automation steps. If the factory has no inserter and cannot "
+    "produce first plates because raw insert_items/extract_items are blocked, use "
+    "bootstrap_smelting_once exactly once to craft the first inserter or plate "
+    "batch, then continue with durable automation. For fuel, use repair_fuel_sustainability "
     "or diagnose_fuel_sustainability near the starving boiler/furnace/drill, then "
     "build_fuel_supply for the ranked consumer. For red science, use "
     "plan_recipe_assembler_cell and build_recipe_assembler_cell first when an "

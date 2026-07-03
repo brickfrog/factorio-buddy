@@ -1192,8 +1192,52 @@ pub struct HandFeedFurnaceParams {
     pub verify_radius: u32,
 }
 
+/// Parameters for bootstrap_smelting_once tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BootstrapSmeltingOnceParams {
+    /// Unit number of the furnace to bootstrap.
+    pub furnace_unit_number: u32,
+    /// Fuel item to insert, usually coal or wood.
+    #[serde(default = "default_fuel_item")]
+    pub fuel_item: String,
+    /// Small temporary fuel buffer. This is not durable fuel automation.
+    #[serde(default = "default_bootstrap_fuel_count")]
+    pub fuel_count: u32,
+    /// Source item to smelt, usually iron-ore or copper-ore.
+    #[serde(default = "default_furnace_source_item")]
+    pub source_item: String,
+    /// Source item count to insert.
+    #[serde(default = "default_furnace_source_count")]
+    pub source_count: u32,
+    /// Output item to extract after waiting.
+    #[serde(default = "default_bootstrap_output_item")]
+    pub output_item: String,
+    /// Target output count to extract into inventory.
+    #[serde(default = "default_bootstrap_output_count")]
+    pub output_count: u32,
+    /// Optional recipe to craft after extracting plates, such as burner-inserter.
+    #[serde(default)]
+    pub craft_recipe: String,
+    /// Optional craft count.
+    #[serde(default = "default_count")]
+    pub craft_count: u32,
+    /// Ticks to wait for smelting before extraction.
+    #[serde(default = "default_bootstrap_wait_ticks")]
+    pub wait_ticks: u32,
+    /// Verification radius around the furnace after feeding.
+    #[serde(default = "default_verify_radius")]
+    pub verify_radius: u32,
+    /// If true, only return the bounded bootstrap plan.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 fn default_fuel_item() -> String {
     "coal".to_string()
+}
+
+fn default_bootstrap_fuel_count() -> u32 {
+    5
 }
 
 fn default_furnace_fuel_count() -> u32 {
@@ -1206,6 +1250,18 @@ fn default_furnace_source_item() -> String {
 
 fn default_furnace_source_count() -> u32 {
     20
+}
+
+fn default_bootstrap_output_item() -> String {
+    "iron-plate".to_string()
+}
+
+fn default_bootstrap_output_count() -> u32 {
+    5
+}
+
+fn default_bootstrap_wait_ticks() -> u32 {
+    1200
 }
 
 fn default_verify_radius() -> u32 {
@@ -4854,6 +4910,224 @@ impl FactorioMcp {
         .await
     }
 
+    /// Perform one bounded bootstrap smelt to create the first automation parts.
+    #[tool(
+        description = "Bounded bootstrap controller for breaking first-inserter deadlocks. Internally walks to one furnace, inserts a short fuel/ore buffer, waits for smelting, extracts a small plate batch, and optionally crafts one bootstrap component such as burner-inserter. Use this instead of raw insert_items/extract_items/hand_feed_furnace when no inserter exists yet; after it succeeds, immediately build durable fuel/output automation."
+    )]
+    async fn bootstrap_smelting_once(
+        &self,
+        Parameters(params): Parameters<BootstrapSmeltingOnceParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+
+        let furnace = match client.get_entity(params.furnace_unit_number).await {
+            Ok(entity) => entity,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let verify_radius = params.verify_radius.clamp(1, 25) as f64;
+        let wait_ticks = params.wait_ticks.clamp(1, 7200);
+        let output_count = params.output_count.clamp(1, params.source_count.max(1));
+        let craft_recipe = params.craft_recipe.trim().to_string();
+        let verify_area = Area::new(
+            furnace.position.x - verify_radius,
+            furnace.position.y - verify_radius,
+            furnace.position.x + verify_radius,
+            furnace.position.y + verify_radius,
+        );
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "bounded_bootstrap": true,
+                "furnace": {
+                    "unit_number": furnace.unit_number,
+                    "name": furnace.name,
+                    "position": furnace.position,
+                },
+                "steps": [
+                    {"tool": "walk_to", "args": {"x": furnace.position.x, "y": furnace.position.y}},
+                    {"tool": "insert_items", "internal": true, "args": {"unit_number": params.furnace_unit_number, "item": params.fuel_item, "count": params.fuel_count, "inventory_type": "fuel"}},
+                    {"tool": "insert_items", "internal": true, "args": {"unit_number": params.furnace_unit_number, "item": params.source_item, "count": params.source_count, "inventory_type": "furnace_source"}},
+                    {"tool": "wait_ticks", "internal": true, "args": {"ticks": wait_ticks}},
+                    {"tool": "extract_items", "internal": true, "args": {"unit_number": params.furnace_unit_number, "item": params.output_item, "count": output_count, "inventory_type": "furnace_result"}},
+                    {"tool": "craft", "internal": true, "args": {"recipe": craft_recipe, "count": params.craft_count}, "skipped_if_empty_recipe": true},
+                    {"tool": "verify_production", "args": {"x": furnace.position.x, "y": furnace.position.y, "radius": params.verify_radius}}
+                ],
+                "guidance": "If dry_run looks right, call bootstrap_smelting_once with dry_run=false once. Do not repeat it as production; use the resulting plates/component for build_fuel_supply, execute_direct_smelter, plan_machine_output/build_assembler_output, or assembler cells.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+
+        let mut actions = Vec::new();
+        let mut success = true;
+
+        let walk = client.walk_to(furnace.position, false).await;
+        success &= walk.is_ok();
+        actions.push(serde_json::json!({
+            "tool": "walk_to",
+            "success": walk.is_ok(),
+            "error": walk.as_ref().err().map(|e| e.to_string()),
+        }));
+
+        let fuel = if walk.is_ok() {
+            client
+                .insert_items(
+                    params.furnace_unit_number,
+                    &params.fuel_item,
+                    params.fuel_count,
+                    "fuel",
+                )
+                .await
+        } else {
+            Err(anyhow::anyhow!("walk_to failed"))
+        };
+        success &= fuel.is_ok();
+        actions.push(serde_json::json!({
+            "tool": "insert_items",
+            "internal": true,
+            "inventory_type": "fuel",
+            "item": params.fuel_item,
+            "count": params.fuel_count,
+            "success": fuel.is_ok(),
+            "error": fuel.as_ref().err().map(|e| e.to_string()),
+        }));
+
+        let source = if fuel.is_ok() {
+            client
+                .insert_items(
+                    params.furnace_unit_number,
+                    &params.source_item,
+                    params.source_count,
+                    "furnace_source",
+                )
+                .await
+        } else {
+            Err(anyhow::anyhow!("fuel insert failed"))
+        };
+        success &= source.is_ok();
+        actions.push(serde_json::json!({
+            "tool": "insert_items",
+            "internal": true,
+            "inventory_type": "furnace_source",
+            "item": params.source_item,
+            "count": params.source_count,
+            "success": source.is_ok(),
+            "error": source.as_ref().err().map(|e| e.to_string()),
+        }));
+
+        let waited = if source.is_ok() {
+            client.wait_ticks(wait_ticks).await
+        } else {
+            Err(anyhow::anyhow!("source insert failed"))
+        };
+        success &= waited.is_ok();
+        actions.push(serde_json::json!({
+            "tool": "wait_ticks",
+            "internal": true,
+            "ticks": wait_ticks,
+            "success": waited.is_ok(),
+            "error": waited.as_ref().err().map(|e| e.to_string()),
+        }));
+
+        let extracted = if waited.is_ok() {
+            client
+                .extract_items(
+                    params.furnace_unit_number,
+                    &params.output_item,
+                    output_count,
+                    "furnace_result",
+                )
+                .await
+        } else {
+            Err(anyhow::anyhow!("wait_ticks failed"))
+        };
+        success &= extracted.is_ok();
+        actions.push(serde_json::json!({
+            "tool": "extract_items",
+            "internal": true,
+            "inventory_type": "furnace_result",
+            "item": params.output_item,
+            "requested_count": output_count,
+            "success": extracted.is_ok(),
+            "result": extracted.as_ref().ok(),
+            "error": extracted.as_ref().err().map(|e| e.to_string()),
+        }));
+
+        let craft = if craft_recipe.is_empty() {
+            None
+        } else if extracted.is_ok() {
+            Some(client.craft(&craft_recipe, params.craft_count).await)
+        } else {
+            Some(Err(anyhow::anyhow!("plate extraction failed")))
+        };
+        if let Some(craft_result) = &craft {
+            success &= craft_result.is_ok();
+            actions.push(serde_json::json!({
+                "tool": "craft",
+                "internal": true,
+                "recipe": craft_recipe,
+                "count": params.craft_count,
+                "success": craft_result.is_ok(),
+                "result": craft_result.as_ref().ok(),
+                "error": craft_result.as_ref().err().map(|e| e.to_string()),
+            }));
+            if craft_result.is_ok() {
+                let wait_craft = client.wait_for_crafting().await;
+                success &= wait_craft.is_ok();
+                actions.push(serde_json::json!({
+                    "tool": "wait_for_crafting",
+                    "internal": true,
+                    "success": wait_craft.is_ok(),
+                    "error": wait_craft.as_ref().err().map(|e| e.to_string()),
+                }));
+            }
+        } else {
+            actions.push(serde_json::json!({
+                "tool": "craft",
+                "skipped": true,
+                "reason": "craft_recipe empty",
+            }));
+        }
+
+        let (verification, verification_call_ok, _) =
+            match client.verify_production(verify_area).await {
+                Ok(entities) => production_verification_json(entities),
+                Err(e) => (
+                    serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                    false,
+                    false,
+                ),
+            };
+
+        let inventory = client.character_inventory().await.ok();
+        let result = serde_json::json!({
+            "success": success,
+            "bounded_bootstrap": true,
+            "temporary_recovery_not_automation": true,
+            "furnace": {
+                "unit_number": furnace.unit_number,
+                "name": furnace.name,
+                "position": furnace.position,
+            },
+            "actions": actions,
+            "verification": verification,
+            "verification_call_ok": verification_call_ok,
+            "inventory_after": inventory,
+            "guidance": "This is a one-shot bootstrap, not durable production. Next call should build automation: build_fuel_supply for fuel, execute_direct_smelter for ore input, plan_machine_output/build_assembler_output for plate output, or plan/build assembler cells. Do not loop bootstrap_smelting_once as a production strategy.",
+        });
+        let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+        self.with_player_messages(msg).await
+    }
+
     /// Extract items from an entity into player inventory.
     #[tool(
         description = "Extract items from an entity (furnace, chest, etc) into character inventory."
@@ -5388,6 +5662,10 @@ impl FactorioMcp {
             .get("success")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        let route_materials_sufficient = route
+            .get("materials_sufficient")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
 
         let inserter_args = serde_json::json!({
             "entity_name": params.inserter_name,
@@ -5420,8 +5698,10 @@ impl FactorioMcp {
                         "radius": params.verify_radius,
                     },
                 }],
-                "guidance": if route_success {
+                "guidance": if route_success && route_materials_sufficient {
                     "If route.materials_sufficient is true and inserter placement is clear, call build_fuel_supply again with dry_run=false."
+                } else if route_success {
+                    "Route is geometrically viable but materials are missing. If the missing item is the first inserter or belts needed to escape bootstrap, call bootstrap_smelting_once exactly once to make the first plates/component, then retry build_fuel_supply. Do not execute this build_fuel_supply yet."
                 } else {
                     "Route planning failed. Follow route.guidance; for long coal-to-boiler paths, build shorter route_belt segments from the coal output toward the consumer, then call build_fuel_supply for the final consumer feed."
                 },
@@ -5444,6 +5724,29 @@ impl FactorioMcp {
                     "args": inserter_args,
                 },
                 "guidance": "No inserter placed because the fuel belt route failed. If route.next_segment is present, call route_belt with route.next_segment.route_belt_args, then retry build_fuel_supply for the final consumer feed.",
+            }));
+        }
+
+        if !route_materials_sufficient {
+            return Ok(serde_json::json!({
+                "success": false,
+                "dry_run": false,
+                "consumer": {
+                    "unit_number": consumer.unit_number,
+                    "name": consumer.name,
+                    "position": consumer.position,
+                },
+                "route": route,
+                "inserter": {
+                    "skipped": true,
+                    "reason": "route materials insufficient",
+                    "args": inserter_args,
+                },
+                "next_tool": {
+                    "tool": "bootstrap_smelting_once",
+                    "reason": "first inserter or belt materials are missing; make a bounded plate/component batch before durable fuel routing",
+                },
+                "guidance": "Do not test-place a fuel supply when route.materials_sufficient is false. If this is a first-inserter deadlock, call bootstrap_smelting_once exactly once, optionally craft_recipe=burner-inserter, then retry build_fuel_supply.",
             }));
         }
 

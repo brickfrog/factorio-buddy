@@ -409,6 +409,24 @@ _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
         },
         "optional": {"inventory_type": TOOL_PARAM_STRING},
     },
+    "bootstrap_smelting_once": {
+        "required": {
+            "furnace_unit_number": TOOL_PARAM_INTEGER,
+        },
+        "optional": {
+            "fuel_item": TOOL_PARAM_STRING,
+            "fuel_count": TOOL_PARAM_INTEGER,
+            "source_item": TOOL_PARAM_STRING,
+            "source_count": TOOL_PARAM_INTEGER,
+            "output_item": TOOL_PARAM_STRING,
+            "output_count": TOOL_PARAM_INTEGER,
+            "craft_recipe": TOOL_PARAM_STRING,
+            "craft_count": TOOL_PARAM_INTEGER,
+            "wait_ticks": TOOL_PARAM_INTEGER,
+            "verify_radius": TOOL_PARAM_INTEGER,
+            "dry_run": TOOL_PARAM_BOOLEAN,
+        },
+    },
     "build_fuel_supply": {
         "required": {
             "consumer_unit_number": TOOL_PARAM_INTEGER,
