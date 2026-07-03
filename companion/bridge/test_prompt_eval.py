@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import prompt_eval
 from models import (
@@ -167,6 +169,177 @@ class PromptEvalScenarioTest(unittest.TestCase):
         self.assertEqual(result["scenario_name"], scenario.name)
         self.assertTrue(result["passed"])
         self.assertEqual(result["score"], 1.0)
+
+    def test_load_log_records_accepts_plain_bridge_log_and_time_filters(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge.log"
+            path.write_text(
+                "\n".join([
+                    "2026-07-02 20:00:00.000 | INFO     | system | before",
+                    "continuation before",
+                    "2026-07-02 20:10:00.000 | DEBUG    | DOUG-NAUVIS | tool: walk_to({})",
+                    "continuation kept with selected line",
+                    "2026-07-02 20:20:00.000 | INFO     | DOUG-NAUVIS | after",
+                    "continuation after",
+                ]),
+                encoding="utf-8",
+            )
+
+            records = prompt_eval.load_log_records_model(
+                [path],
+                since="2026-07-02 20:05:00",
+                until="2026-07-02 20:15:00",
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            records[0].message,
+            "tool: walk_to({})\ncontinuation kept with selected line",
+        )
+        self.assertEqual(records[0].agent, "DOUG-NAUVIS")
+
+    def test_mine_prompt_scenarios_detects_first_inserter_deadlock(self):
+        records = [
+            BridgeLogRecord(
+                message=(
+                    "Bridge permanently blocks insert_items/extract_items. "
+                    "All durable fuel paths require burner-inserter. "
+                    "Deadlock persists."
+                ),
+            ),
+        ]
+
+        scenarios = prompt_eval.mine_prompt_scenarios_model(records)
+
+        self.assertEqual(
+            [scenario.name for scenario in scenarios],
+            ["candidate_first_inserter_deadlock_from_logs"],
+        )
+        self.assertEqual(scenarios[0].expected_tools, ("bootstrap_smelting_once",))
+        self.assertEqual(scenarios[0].forbidden_tools, (
+            "insert_items",
+            "extract_items",
+            "hand_feed_furnace",
+        ))
+
+    def test_mine_prompt_scenarios_detects_build_fuel_supply_missing_materials(self):
+        records = [
+            BridgeLogRecord(
+                message=(
+                    "build_fuel_supply dry_run route succeeded but "
+                    "burner-inserter inventory: 0 and materials are missing."
+                ),
+            ),
+            BridgeLogRecord(
+                message='tool: build_fuel_supply({"consumer_unit_number":19})',
+            ),
+        ]
+
+        scenarios = prompt_eval.mine_prompt_scenarios_model(records)
+
+        self.assertIn(
+            "candidate_build_fuel_supply_missing_materials_from_logs",
+            [scenario.name for scenario in scenarios],
+        )
+        mined = next(
+            scenario
+            for scenario in scenarios
+            if scenario.name == "candidate_build_fuel_supply_missing_materials_from_logs"
+        )
+        self.assertEqual(mined.expected_tool_prefix, ("bootstrap_smelting_once",))
+        self.assertEqual(mined.forbidden_tools, ("build_fuel_supply",))
+
+    def test_mine_prompt_scenarios_detects_manual_coal_babysitting(self):
+        records = [
+            BridgeLogRecord(
+                message='tool: insert_items({"item":"coal","inventory_type":"fuel"})',
+            ),
+            BridgeLogRecord(
+                message='tool: insert_items({"item":"coal","inventory_type":"fuel"})',
+            ),
+            BridgeLogRecord(message='tool: hand_feed_furnace({"fuel_item":"coal"})'),
+        ]
+
+        scenarios = prompt_eval.mine_prompt_scenarios_model(records)
+
+        self.assertEqual(
+            [scenario.name for scenario in scenarios],
+            ["candidate_manual_coal_babysitting_from_logs"],
+        )
+        self.assertEqual(
+            scenarios[0].expected_tools,
+            ("repair_fuel_sustainability", "build_fuel_supply"),
+        )
+
+    def test_mine_prompt_scenarios_detects_repeated_plan_ready_stall(self):
+        records = [
+            BridgeLogRecord(message="PLAN RE-AFFIRMED — READY FOR EXECUTION"),
+            BridgeLogRecord(message="awaiting execution tick"),
+            BridgeLogRecord(message="No state drift. awaiting execution"),
+        ]
+
+        scenarios = prompt_eval.mine_prompt_scenarios_model(records)
+
+        self.assertEqual(
+            [scenario.name for scenario in scenarios],
+            ["candidate_plan_ready_stall_from_logs"],
+        )
+        self.assertEqual(scenarios[0].forbidden_tools, ("situation_report",))
+
+    def test_mine_prompt_scenarios_detects_repeated_game_rejections(self):
+        records = [
+            BridgeLogRecord(
+                message="tool_result game_rejected: Error: Cannot place entity here",
+            ),
+            BridgeLogRecord(
+                message="tool_result game_rejected: Error: Cannot place entity here",
+            ),
+            BridgeLogRecord(
+                message="tool_result game_rejected: Error: Cannot place entity here",
+            ),
+        ]
+
+        scenarios = prompt_eval.mine_prompt_scenarios_model(records)
+
+        self.assertEqual(
+            [scenario.name for scenario in scenarios],
+            ["candidate_repeated_game_rejection_from_logs"],
+        )
+        self.assertEqual(scenarios[0].expected_tools, ("check_placement",))
+
+    def test_scenario_file_round_trips(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prompt_scenarios.json"
+            prompt_eval.save_scenarios(path, prompt_eval.DEFAULT_SCENARIOS[:1])
+            loaded = prompt_eval.load_scenarios_model(path)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(
+            loaded[0].name,
+            "first_inserter_deadlock_uses_bounded_bootstrap",
+        )
+
+    def test_cli_mine_logs_and_extract_transcript_emit_json(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bridge.log"
+            path.write_text(
+                "\n".join([
+                    "2026-07-02 20:00:00.000 | INFO | DOUG-NAUVIS | PLAN RE-AFFIRMED",
+                    "2026-07-02 20:00:01.000 | INFO | DOUG-NAUVIS | awaiting execution",
+                    "2026-07-02 20:00:02.000 | INFO | DOUG-NAUVIS | no state drift",
+                    "2026-07-02 20:00:03.000 | DEBUG | DOUG-NAUVIS | tool: situation_report({})",
+                ]),
+                encoding="utf-8",
+            )
+            records = prompt_eval.load_log_records_model([path])
+            transcript = prompt_eval.transcript_from_log_records_model(records)
+            scenarios = prompt_eval.mine_prompt_scenarios_model(records)
+
+        self.assertEqual(transcript.tool_calls, ("situation_report",))
+        self.assertEqual(
+            [scenario.name for scenario in scenarios],
+            ["candidate_plan_ready_stall_from_logs"],
+        )
 
 
 if __name__ == "__main__":
