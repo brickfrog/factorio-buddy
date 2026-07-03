@@ -3741,6 +3741,193 @@ class EvalResult(BridgeModel):
         return other is None or self.production_score > other.production_score
 
 
+class PromptEvalScenario(BridgeModel):
+    """Frozen prompt/tool-choice scenario for offline prompt regression tests."""
+
+    name: str
+    prompt_surface: str = "autonomy"
+    input_text: str = ""
+    expected_tools: tuple[str, ...] = ()
+    expected_tool_prefix: tuple[str, ...] = ()
+    forbidden_tools: tuple[str, ...] = ()
+    required_text: tuple[str, ...] = ()
+    forbidden_text: tuple[str, ...] = ()
+    notes: str = ""
+
+    @field_validator("name", "prompt_surface", "input_text", "notes", mode="before")
+    @classmethod
+    def _coerce_text(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+    @field_validator(
+        "expected_tools",
+        "expected_tool_prefix",
+        "forbidden_tools",
+        "required_text",
+        "forbidden_text",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_text_tuple(cls, value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            raw_items = [value]
+        elif isinstance(value, (list, tuple)):
+            raw_items = list(value)
+        else:
+            raw_items = []
+        return tuple(str(item).strip() for item in raw_items if str(item).strip())
+
+    @classmethod
+    def coerce(cls, value: Any) -> "PromptEvalScenario":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            return cls(name="")
+        return cls.model_validate(value)
+
+    def expected_behavior(self) -> str:
+        parts: list[str] = []
+        if self.expected_tool_prefix:
+            parts.append(
+                "first tool calls: " + " -> ".join(self.expected_tool_prefix)
+            )
+        if self.expected_tools:
+            parts.append("must call: " + ", ".join(self.expected_tools))
+        if self.forbidden_tools:
+            parts.append("must not call: " + ", ".join(self.forbidden_tools))
+        if self.required_text:
+            parts.append("must mention: " + "; ".join(self.required_text))
+        if self.forbidden_text:
+            parts.append("must not mention: " + "; ".join(self.forbidden_text))
+        return " | ".join(parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "prompt_surface": self.prompt_surface,
+            "input_text": self.input_text,
+            "expected_tools": list(self.expected_tools),
+            "expected_tool_prefix": list(self.expected_tool_prefix),
+            "forbidden_tools": list(self.forbidden_tools),
+            "required_text": list(self.required_text),
+            "forbidden_text": list(self.forbidden_text),
+            "notes": self.notes,
+        }
+
+
+class PromptEvalTranscript(BridgeModel):
+    """Observed tool calls and text emitted by a candidate prompt/program."""
+
+    tool_calls: tuple[str, ...] = ()
+    text: str = ""
+
+    @field_validator("tool_calls", mode="before")
+    @classmethod
+    def _coerce_tool_calls(cls, value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            raw_items = [value]
+        elif isinstance(value, (list, tuple)):
+            raw_items = list(value)
+        else:
+            raw_items = []
+        return tuple(str(item).strip() for item in raw_items if str(item).strip())
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def _coerce_text(cls, value: Any) -> str:
+        return str(value or "")
+
+    @classmethod
+    def coerce(cls, value: Any) -> "PromptEvalTranscript":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls.model_validate(value)
+        if isinstance(value, (list, tuple)):
+            return cls(tool_calls=value)
+        return cls(text=str(value or ""))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool_calls": list(self.tool_calls),
+            "text": self.text,
+        }
+
+
+class PromptEvalScenarioResult(BridgeModel):
+    scenario_name: str
+    score: float = 0.0
+    passed: bool = False
+    missing_expected_tools: tuple[str, ...] = ()
+    prefix_mismatches: tuple[str, ...] = ()
+    forbidden_tools_seen: tuple[str, ...] = ()
+    missing_required_text: tuple[str, ...] = ()
+    forbidden_text_seen: tuple[str, ...] = ()
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        scenario_name: Any,
+        checks: dict[str, bool],
+        missing_expected_tools: list[str],
+        prefix_mismatches: list[str],
+        forbidden_tools_seen: list[str],
+        missing_required_text: list[str],
+        forbidden_text_seen: list[str],
+    ) -> "PromptEvalScenarioResult":
+        total = max(len(checks), 1)
+        score = sum(1 for passed in checks.values() if passed) / total
+        return cls(
+            scenario_name=str(scenario_name or "").strip(),
+            score=round(score, 6),
+            passed=all(checks.values()) if checks else True,
+            missing_expected_tools=tuple(missing_expected_tools),
+            prefix_mismatches=tuple(prefix_mismatches),
+            forbidden_tools_seen=tuple(forbidden_tools_seen),
+            missing_required_text=tuple(missing_required_text),
+            forbidden_text_seen=tuple(forbidden_text_seen),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scenario_name": self.scenario_name,
+            "score": self.score,
+            "passed": self.passed,
+            "missing_expected_tools": list(self.missing_expected_tools),
+            "prefix_mismatches": list(self.prefix_mismatches),
+            "forbidden_tools_seen": list(self.forbidden_tools_seen),
+            "missing_required_text": list(self.missing_required_text),
+            "forbidden_text_seen": list(self.forbidden_text_seen),
+        }
+
+
+class PromptEvalSuiteResult(BridgeModel):
+    results: tuple[PromptEvalScenarioResult, ...] = ()
+    score: float = 0.0
+    passed: bool = True
+
+    @classmethod
+    def from_results(cls, results: list[PromptEvalScenarioResult]) -> "PromptEvalSuiteResult":
+        score = (
+            sum(result.score for result in results) / len(results)
+            if results
+            else 0.0
+        )
+        return cls(
+            results=tuple(results),
+            score=round(score, 6),
+            passed=all(result.passed for result in results),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "score": self.score,
+            "passed": self.passed,
+            "results": [result.to_dict() for result in self.results],
+        }
+
+
 class PowerGeneratorSummary(RemotePayloadModel):
     name: str = "unknown"
     count: Any = "?"
