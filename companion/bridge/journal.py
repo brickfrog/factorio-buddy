@@ -1119,10 +1119,6 @@ def default_reflection_model() -> ReflectionMemory:
     return ReflectionMemory()
 
 
-def default_reflection() -> dict:
-    return default_reflection_model().to_dict()
-
-
 def coalesce_events_model(
     events: JournalWindow | list[dict | JournalEvent],
     max_items: int = MAX_RENDERED_EVENTS,
@@ -1138,13 +1134,6 @@ def coalesce_events_model(
         text_limit=MAX_RENDERED_EVENT_TEXT,
         useful_kinds=USEFUL_EVENT_KINDS,
     )
-
-
-def coalesce_events(
-    events: JournalWindow | list[dict | JournalEvent],
-    max_items: int = MAX_RENDERED_EVENTS,
-) -> list[dict]:
-    return [event.to_dict() for event in coalesce_events_model(events, max_items)]
 
 
 def append_event(
@@ -1198,10 +1187,6 @@ def load_events_model(agent_name: str, limit: int = 20) -> JournalWindow:
     return JournalWindow(events=events[-limit:])
 
 
-def load_events(agent_name: str, limit: int = 20) -> list[dict]:
-    return [event.to_dict() for event in load_events_model(agent_name, limit).events]
-
-
 def count_events(agent_name: str) -> int:
     try:
         raw_lines = BridgeTextLines.from_text(
@@ -1238,10 +1223,6 @@ def load_reflection_model(agent_name: str) -> ReflectionMemory:
     return memory
 
 
-def load_reflection(agent_name: str) -> dict:
-    return load_reflection_model(agent_name).to_dict()
-
-
 def save_reflection_model(agent_name: str, reflection: ReflectionMemory | dict) -> None:
     path = _reflection_file(agent_name)
     tmp = path.with_name(path.name + ".tmp")
@@ -1267,21 +1248,12 @@ def save_reflection_model(agent_name: str, reflection: ReflectionMemory | dict) 
     return None
 
 
-def save_reflection(agent_name: str, reflection: dict) -> None:
-    return save_reflection_model(agent_name, reflection)
-
-
 def parse_reflection_model(source: str | ReflectionDraft) -> ReflectionDraft | None:
     return ReflectionDraft.from_trailer_text(
         source,
         max_items=MAX_REFLECTION_ITEMS,
         max_len=MAX_REFLECTION_ITEM_TEXT,
     )
-
-
-def parse_reflection(source: str | ReflectionDraft) -> dict | None:
-    draft = parse_reflection_model(source)
-    return draft.to_sparse_dict() if draft is not None else None
 
 
 def apply_reflection_update_model(
@@ -1301,10 +1273,6 @@ def apply_reflection_update_model(
     )
     save_reflection_model(agent_name, reflection)
     return reflection
-
-
-def apply_reflection_update(agent_name: str, source: str | ReflectionDraft) -> dict:
-    return apply_reflection_update_model(agent_name, source).to_dict()
 
 
 def strip_reflection_trailer(text: str) -> str:

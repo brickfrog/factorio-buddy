@@ -896,10 +896,6 @@ def default_ledger_model() -> LedgerState:
     return LedgerState.default()
 
 
-def default_ledger() -> dict:
-    return default_ledger_model().to_dict()
-
-
 def _stale_bootstrap_max_age_s() -> float:
     return LedgerRuntimeSettings.from_env(os.environ).stale_bootstrap_ledger_max_age_s
 
@@ -922,10 +918,6 @@ def load_ledger_model(agent_name: str) -> LedgerState:
     if _is_stale_bootstrap_ledger(ledger):
         return default_ledger_model()
     return ledger
-
-
-def load_ledger(agent_name: str) -> dict:
-    return load_ledger_model(agent_name).to_dict()
 
 
 def save_ledger_model(agent_name: str, ledger: LedgerState | dict) -> None:
@@ -952,17 +944,8 @@ def save_ledger_model(agent_name: str, ledger: LedgerState | dict) -> None:
     return None
 
 
-def save_ledger(agent_name: str, ledger: dict) -> None:
-    return save_ledger_model(agent_name, ledger)
-
-
 def parse_ledger_trailer_model(source: str | LedgerUpdate) -> LedgerUpdate | None:
     return LedgerUpdate.from_trailer_text(source)
-
-
-def parse_ledger_trailer(source: str | LedgerUpdate) -> dict | None:
-    update = parse_ledger_trailer_model(source)
-    return update.to_dict() if update is not None else None
 
 
 def apply_ledger_update_model(agent_name: str, source: str | LedgerUpdate) -> LedgerState:
@@ -978,10 +961,6 @@ def apply_ledger_update_model(agent_name: str, source: str | LedgerUpdate) -> Le
     )
     save_ledger_model(agent_name, ledger)
     return ledger
-
-
-def apply_ledger_update(agent_name: str, source: str | LedgerUpdate) -> dict:
-    return apply_ledger_update_model(agent_name, source).to_dict()
 
 
 def strip_ledger_trailer(text: str) -> str:

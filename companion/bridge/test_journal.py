@@ -54,31 +54,29 @@ class JournalTests(unittest.TestCase):
         journal.append_event("doug", "unknown", "Fallback kind is progress")
         journal.append_event("doug", "milestone", "Starter power is online")
 
-        events = journal.load_events("doug", limit=2)
+        events = journal.load_events_model("doug", limit=2)
 
-        self.assertEqual([event["kind"] for event in events], ["progress", "milestone"])
+        self.assertEqual([event.kind for event in events.events], ["progress", "milestone"])
         self.assertEqual(
-            [event["text"] for event in events],
+            [event.text for event in events.events],
             ["Fallback kind is progress", "Starter power is online"],
         )
-        self.assertTrue(all(event["ts"] for event in events))
+        self.assertTrue(all(event.ts for event in events.events))
         self.assertEqual(journal.count_events("doug"), 3)
 
-    def test_model_event_loader_preserves_typed_window_and_legacy_wrapper(self):
+    def test_model_event_loader_preserves_typed_window(self):
         journal.append_event("doug", "discovery", "Found copper east of spawn")
         journal.append_event("doug", "unknown", "Fallback kind is progress")
         journal.append_event("doug", "milestone", "Starter power is online")
 
         window = journal.load_events_model("doug", limit=2)
-        legacy = journal.load_events("doug", limit=2)
 
         self.assertIsInstance(window, JournalWindow)
         self.assertEqual([event.kind for event in window.events], ["progress", "milestone"])
-        self.assertEqual([event.to_dict() for event in window.events], legacy)
 
     def test_load_events_and_reflection_are_total_for_missing_and_corrupt_files(self):
-        self.assertEqual(journal.load_events("doug"), [])
-        self.assertEqual(journal.load_reflection("doug"), journal.default_reflection())
+        self.assertEqual(journal.load_events_model("doug"), JournalWindow())
+        self.assertEqual(journal.load_reflection_model("doug"), journal.default_reflection_model())
         self.assertEqual(journal.load_events_model("doug"), JournalWindow())
         self.assertEqual(journal.load_reflection_model("doug"), journal.default_reflection_model())
 
@@ -89,8 +87,8 @@ class JournalTests(unittest.TestCase):
         )
         (self.base / ".reflection-doug.json").write_text("{not json")
 
-        self.assertEqual(len(journal.load_events("doug")), 2)
-        self.assertEqual(journal.load_reflection("doug"), journal.default_reflection())
+        self.assertEqual(len(journal.load_events_model("doug").events), 2)
+        self.assertEqual(journal.load_reflection_model("doug"), journal.default_reflection_model())
 
     def test_transient_provider_failures_do_not_pollute_memory(self):
         path = self.base / ".journal-doug.jsonl"
@@ -116,10 +114,10 @@ class JournalTests(unittest.TestCase):
         journal.append_event("doug", "failure", "API Error: The model has reached its context window limit.")
         journal.append_event("doug", "failure", '{"error": "No electric poles found in area"}')
         journal.append_event("doug", "progress", "situation assessed; no infrastructure yet deployed")
-        events = journal.load_events("doug")
-        rendered = journal.render_memory(events, journal.default_reflection())
+        events = journal.load_events_model("doug")
+        rendered = journal.render_memory(events, journal.default_reflection_model())
 
-        self.assertEqual([event["text"] for event in events], [
+        self.assertEqual([event.text for event in events.events], [
             "situation assessed; no infrastructure yet deployed",
             "Inserter faced the wrong way",
             "situation assessed; no infrastructure yet deployed",
@@ -145,7 +143,7 @@ class JournalTests(unittest.TestCase):
         self.assertFalse(journal.should_reflect(16, interval=0))
 
     def test_parse_reflection_extracts_two_buckets_and_tolerates_partial_blocks(self):
-        parsed = journal.parse_reflection(
+        parsed = journal.parse_reflection_model(
             """Visible text.
 <reflection>
 structures:
@@ -159,17 +157,17 @@ error_tips:
         )
 
         self.assertEqual(
-            parsed["structures"],
+            parsed.structures,
             ["Smelting line west of spawn", "Labs near the bus"],
         )
         self.assertEqual(
-            parsed["error_tips"],
+            parsed.error_tips,
             ["Verify inserter direction after placement", "Check power before expanding"],
         )
-        self.assertIsNone(journal.parse_reflection("No reflection here."))
+        self.assertIsNone(journal.parse_reflection_model("No reflection here."))
         self.assertEqual(
-            journal.parse_reflection("<reflection>\nerror_tips:\n- Avoid dead belts\n</reflection>"),
-            {"error_tips": ["Avoid dead belts"]},
+            journal.parse_reflection_model("<reflection>\nerror_tips:\n- Avoid dead belts\n</reflection>"),
+            ReflectionDraft(error_tips=["Avoid dead belts"], saw_error_tips=True),
         )
 
     def test_reflection_model_api_round_trips_and_render_accepts_models(self):
@@ -196,23 +194,23 @@ error_tips:
         self.assertEqual(loaded, updated)
         self.assertEqual(updated.structures, ["Iron smelter at spawn"])
         self.assertIn("Iron smelter at spawn", rendered)
-        self.assertEqual(journal.load_reflection("doug"), updated.to_dict())
+        self.assertEqual(journal.load_reflection_model("doug"), updated)
 
     def test_apply_reflection_update_replaces_persists_and_strip_is_idempotent(self):
-        journal.apply_reflection_update(
+        journal.apply_reflection_update_model(
             "doug",
             "<reflection>\nstructures:\n- Old base\nerror_tips:\n- Old tip\n</reflection>",
         )
 
-        updated = journal.apply_reflection_update(
+        updated = journal.apply_reflection_update_model(
             "doug",
             "Done.\n<reflection>\nstructures:\n- New mall\nerror_tips:\n- New tip\n</reflection>",
         )
 
-        self.assertEqual(updated["structures"], ["New mall"])
-        self.assertEqual(updated["error_tips"], ["New tip"])
-        self.assertTrue(updated["updated_at"])
-        self.assertEqual(journal.load_reflection("doug")["structures"], ["New mall"])
+        self.assertEqual(updated.structures, ["New mall"])
+        self.assertEqual(updated.error_tips, ["New tip"])
+        self.assertTrue(updated.updated_at)
+        self.assertEqual(journal.load_reflection_model("doug").structures, ["New mall"])
 
         text = "Before.\n\n<reflection>\nerror_tips:\n- Hidden\n</reflection>\n\nAfter."
         self.assertEqual(journal.strip_reflection_trailer(text), "Before.\n\nAfter.")
@@ -224,7 +222,7 @@ error_tips:
     def test_reflection_update_filters_noise_dedupes_and_caps_items(self):
         long_tip = "Use route_belt diagnostics before rebuilding " + ("again " * 80)
 
-        updated = journal.apply_reflection_update(
+        updated = journal.apply_reflection_update_model(
             "doug",
             "\n".join([
                 "<reflection>",
@@ -242,20 +240,20 @@ error_tips:
         )
 
         self.assertEqual(
-            updated["structures"],
+            updated.structures,
             ["Steam power at (-40, 26) feeds the lab bus"],
         )
-        self.assertEqual(len(updated["error_tips"]), 2)
+        self.assertEqual(len(updated.error_tips), 2)
         self.assertIn(
             "Check inserter direction with rotate_entity before rebuilding",
-            updated["error_tips"],
+            updated.error_tips,
         )
-        self.assertTrue(updated["error_tips"][1].endswith("..."))
+        self.assertTrue(updated.error_tips[1].endswith("..."))
         self.assertLessEqual(
-            len(updated["error_tips"][1]),
+            len(updated.error_tips[1]),
             journal.MAX_REFLECTION_ITEM_TEXT + 3,
         )
-        rendered = journal.render_memory([], journal.load_reflection("doug"))
+        rendered = journal.render_memory([], journal.load_reflection_model("doug"))
         self.assertNotIn("context-window", rendered)
         self.assertNotIn("Provider usage limit", rendered)
         self.assertEqual(rendered.count("Steam power at"), 1)
@@ -275,19 +273,19 @@ error_tips:
             "updated_at": "old",
         }))
 
-        loaded = journal.load_reflection("doug")
+        loaded = journal.load_reflection_model("doug")
 
         self.assertEqual(
-            loaded["structures"],
+            loaded.structures,
             ["Lab and steam power near the west lake"],
         )
         self.assertEqual(
-            loaded["error_tips"],
+            loaded.error_tips,
             ["Use find_entity_placements before placing furnaces on ore"],
         )
 
     def test_render_memory_empty_and_populated(self):
-        self.assertEqual(journal.render_memory([], journal.default_reflection()), "")
+        self.assertEqual(journal.render_memory([], journal.default_reflection_model()), "")
         from models import ReflectionMemory
 
         rendered = journal.render_memory(
@@ -316,7 +314,7 @@ error_tips:
             {"kind": "progress", "text": "Queued logistics research"},
         ]
 
-        rendered = journal.render_memory(events, journal.default_reflection())
+        rendered = journal.render_memory(events, journal.default_reflection_model())
 
         self.assertIn("progress: Coal drill built", rendered)
         self.assertIn("failure (x3): game_rejected: Cannot place belt at 56,-24", rendered)
@@ -332,7 +330,7 @@ error_tips:
         ]
 
         window = JournalWindow.coerce(events)
-        rendered = journal.render_memory(window, journal.default_reflection())
+        rendered = journal.render_memory(window, journal.default_reflection_model())
 
         self.assertEqual([event.text for event in window.events], [
             "Plan ready",
@@ -353,7 +351,7 @@ error_tips:
                     ),
                 },
             ],
-            journal.default_reflection(),
+            journal.default_reflection_model(),
         )
 
         self.assertNotIn("TestPlayer", rendered)
@@ -367,7 +365,7 @@ error_tips:
             for i in range(journal.MAX_RENDERED_EVENTS + 1)
         )
 
-        rendered = journal.render_memory(events, journal.default_reflection())
+        rendered = journal.render_memory(events, journal.default_reflection_model())
 
         self.assertIn("progress: Lab powered", rendered)
         self.assertIn("failure: game_rejected: Cannot place belt 5", rendered)
@@ -380,7 +378,7 @@ error_tips:
     def test_render_memory_truncates_large_events(self):
         rendered = journal.render_memory(
             [{"kind": "failure", "text": "x" * (journal.MAX_RENDERED_EVENT_TEXT + 50)}],
-            journal.default_reflection(),
+            journal.default_reflection_model(),
         )
 
         self.assertLess(len(rendered), journal.MAX_RENDERED_EVENT_TEXT + 80)
@@ -422,10 +420,10 @@ error_tips:
 
     def test_journal_helpers_are_total_on_bad_input(self):
         # None/non-str/non-dict inputs must never raise (audit round 1).
-        self.assertIsNone(journal.parse_reflection(None))
+        self.assertIsNone(journal.parse_reflection_model(None))
         self.assertEqual(journal.strip_reflection_trailer(None), "")
-        journal.save_reflection("doug", None)  # must not raise
-        self.assertEqual(journal.load_reflection("doug"), journal.default_reflection())
+        journal.save_reflection_model("doug", None)  # must not raise
+        self.assertEqual(journal.load_reflection_model("doug"), journal.default_reflection_model())
         self.assertEqual(journal.render_memory("oops", "nope"), "")
         self.assertEqual(journal.render_memory(["notadict", 42], None), "")
         self.assertIsInstance(journal.render_memory([{"bad": 1}], None), str)
@@ -435,7 +433,7 @@ error_tips:
         path.write_text('{not json\n{"ts":"t","kind":"progress","text":"ok"}\n')
 
         self.assertEqual(journal.count_events("doug"), 1)
-        self.assertEqual(len(journal.load_events("doug")), 1)
+        self.assertEqual(len(journal.load_events_model("doug").events), 1)
 
     def test_finalize_reply_applies_reflection_and_journals_ledger_progress(self):
         import pipe
@@ -457,10 +455,10 @@ error_tips:
 
         self.assertEqual(finalized, "I placed the first drill.")
         self.assertEqual(
-            journal.load_reflection("doug")["structures"],
+            journal.load_reflection_model("doug").structures,
             ["Drill on the northern iron patch"],
         )
-        self.assertEqual(journal.load_events("doug")[-1]["text"], "Placed the first drill")
+        self.assertEqual(journal.load_events_model("doug").events[-1].text, "Placed the first drill")
 
     def test_finalize_reply_persists_structured_ledger_signal(self):
         import pipe
@@ -478,9 +476,9 @@ signal: new_objective
             "doug",
         )
 
-        event = journal.load_events("doug")[-1]
-        self.assertEqual(event["text"], "previous objective complete; second furnace selected")
-        self.assertEqual(event["signal"], "new_objective")
+        event = journal.load_events_model("doug").events[-1]
+        self.assertEqual(event.text, "previous objective complete; second furnace selected")
+        self.assertEqual(event.signal.value, "new_objective")
 
     def test_finalize_reply_infers_plan_ready_when_signal_omitted(self):
         import pipe
@@ -498,9 +496,9 @@ progress: plan confirmed; awaiting execution
             "doug",
         )
 
-        event = journal.load_events("doug")[-1]
-        self.assertEqual(event["text"], "plan confirmed; awaiting execution")
-        self.assertEqual(event["signal"], "plan_ready")
+        event = journal.load_events_model("doug").events[-1]
+        self.assertEqual(event.text, "plan confirmed; awaiting execution")
+        self.assertEqual(event.signal.value, "plan_ready")
 
     def test_signal_bearing_progress_survives_low_value_filter(self):
         journal.append_event(
@@ -510,10 +508,10 @@ progress: plan confirmed; awaiting execution
             signal="plan_ready",
         )
 
-        events = journal.load_events("doug")
+        events = journal.load_events_model("doug")
 
-        self.assertEqual(events[-1]["text"], "plan validated and ready for execution")
-        self.assertEqual(events[-1]["signal"], "plan_ready")
+        self.assertEqual(events.events[-1].text, "plan validated and ready for execution")
+        self.assertEqual(events.events[-1].signal.value, "plan_ready")
 
     def test_finalize_reply_journals_meaningful_anomaly_discovery(self):
         import pipe
@@ -532,9 +530,9 @@ progress: plan confirmed; awaiting execution
         )
 
         self.assertIn("CLASSIFICATION", finalized)
-        events = journal.load_events("doug")
-        self.assertEqual(events[-1]["kind"], "discovery")
-        self.assertEqual(events[-1]["text"], "belt route failed across water")
+        events = journal.load_events_model("doug")
+        self.assertEqual(events.events[-1].kind, "discovery")
+        self.assertEqual(events.events[-1].text, "belt route failed across water")
 
     def test_tool_error_detection_flags_factorio_failures(self):
         import pipe
@@ -2262,7 +2260,7 @@ progress: plan confirmed; awaiting execution
                 StubRCON(), 0, pipe.logger.bind(agent="doug"),
             ))
 
-        self.assertEqual(journal.load_events("doug"), [])
+        self.assertEqual(journal.load_events_model("doug"), JournalWindow())
         self.assertIsNotNone(pipe._get_usage_limit_cooldown("doug"))
         self.assertTrue(transcript.usage_limit_seen)
         self.assertFalse(transcript.context_window_limit)
@@ -2299,7 +2297,7 @@ progress: plan confirmed; awaiting execution
 
         self.assertEqual(new_session, "old-session")
         self.assertIsNotNone(pipe._get_usage_limit_cooldown("doug"))
-        self.assertEqual(journal.load_events("doug"), [])
+        self.assertEqual(journal.load_events_model("doug"), JournalWindow())
 
     def test_handle_message_clears_session_on_context_window_limit(self):
         import pipe
@@ -2351,7 +2349,7 @@ progress: plan confirmed; awaiting execution
         self.assertIsNone(pipe.load_session("doug"))
         self.assertIsNone(pipe._get_context_window_cooldown("doug"))
         self.assertEqual(json.loads(pipe.SESSIONS_FILE.read_text()), {"other": "keep-me"})
-        self.assertEqual(journal.load_events("doug"), [])
+        self.assertEqual(journal.load_events_model("doug"), JournalWindow())
 
     def test_handle_message_clears_session_when_context_result_stream_raises(self):
         import pipe
@@ -2399,7 +2397,7 @@ progress: plan confirmed; awaiting execution
         self.assertEqual(new_session, pipe.SESSION_RESET)
         self.assertIsNone(pipe.load_session("doug"))
         self.assertIsNone(pipe._get_context_window_cooldown("doug"))
-        self.assertEqual(journal.load_events("doug"), [])
+        self.assertEqual(journal.load_events_model("doug"), JournalWindow())
 
     def test_session_persistence_uses_typed_current_and_legacy_shapes(self):
         import pipe
@@ -2513,7 +2511,7 @@ evidence:
             ledger.load_ledger_model("doug").progress_notes,
         )
         self.assertEqual(
-            journal.load_reflection("doug")["structures"],
+            journal.load_reflection_model("doug").structures,
             ["Coal belt endpoint at x=66"],
         )
         self.assertEqual(
@@ -2655,7 +2653,7 @@ progress: tick timeout progress survived
 
         self.assertEqual(new_session, pipe.SESSION_RESET)
         self.assertIsNotNone(pipe._get_context_window_cooldown("doug"))
-        self.assertEqual(journal.load_events("doug"), [])
+        self.assertEqual(journal.load_events_model("doug"), JournalWindow())
 
     def test_context_window_cooldown_blocks_human_message_without_model_call(self):
         import queue as std_queue
@@ -2734,12 +2732,12 @@ progress: tick timeout progress survived
             )
 
         self.assertEqual(new_session, "old-session")
-        events = journal.load_events("doug")
+        events = journal.load_events_model("doug")
         self.assertTrue(any(
-            "watchdog_abort: repeated same game rejection" in event["text"]
-            for event in events
+            "watchdog_abort: repeated same game rejection" in event.text
+            for event in events.events
         ))
-        self.assertFalse(any("context window" in event["text"].lower() for event in events))
+        self.assertFalse(any("context window" in event.text.lower() for event in events.events))
 
     def test_watchdog_no_progress_timeout_reason_reaches_next_autonomy_prompt(self):
         import ledger
@@ -2783,7 +2781,7 @@ progress: tick timeout progress survived
             )
 
         self.assertEqual(new_session, "kept-session")
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "Fix stuck smelter",
             "plan_steps": ["place_entity transport-belt"],
             "progress_notes": [],
@@ -3060,7 +3058,7 @@ progress: tick timeout progress survived
         from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
 
         consumed_after_factorio_result = []
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "Route coal",
             "plan_steps": ["route_belt from coal to furnace"],
             "progress_notes": [],
@@ -3160,14 +3158,14 @@ progress: tick timeout progress survived
         self.assertEqual(len(StubClaudeSDKClient.instances), 1)
         self.assertTrue(StubClaudeSDKClient.instances[0].interrupted)
         self.assertTrue(StubClaudeSDKClient.instances[0].disconnected)
-        events = journal.load_events("doug")
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["kind"], "progress")
-        self.assertIn("autonomy_step_complete: situation_report ok", events[0]["text"])
-        updated = ledger.load_ledger("doug")
-        self.assertEqual(updated["next_required_mode"], "plan")
-        self.assertEqual(updated["status"], "ready")
-        self.assertIn("situation_report ok", updated["progress_notes"][-1])
+        events = journal.load_events_model("doug")
+        self.assertEqual(len(events.events), 1)
+        self.assertEqual(events.events[0].kind, "progress")
+        self.assertIn("autonomy_step_complete: situation_report ok", events.events[0].text)
+        updated = ledger.load_ledger_model("doug")
+        self.assertEqual(updated.next_required_mode.value, "plan")
+        self.assertEqual(updated.status.value, "ready")
+        self.assertIn("situation_report ok", updated.progress_notes[-1])
 
     def test_agent_thread_coerces_inbound_message_before_model_call(self):
         import queue as std_queue
@@ -3355,7 +3353,7 @@ progress: tick timeout progress survived
                 StubRCON(), 0, pipe.logger.bind(agent="doug"),
             ))
 
-        texts = [event["text"] for event in journal.load_events("doug")]
+        texts = [event.text for event in journal.load_events_model("doug").events]
         # is_error=True, error-text list-blocks, and string-wrapped error -> 4 failures
         self.assertEqual(len(texts), 4)
         self.assertTrue(any(t.startswith("sdk_failure:") and "boom" in t for t in texts))
@@ -3388,7 +3386,7 @@ progress: tick timeout progress survived
         )
         ledger_patch.start()
         self.addCleanup(ledger_patch.stop)
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "Build starter power",
             "plan_steps": ["Place boiler"],
             "progress_notes": [],
@@ -3396,7 +3394,7 @@ progress: tick timeout progress survived
         })
         for i in range(2):
             journal.append_event("doug", "failure", f"failure {i}")
-        journal.save_reflection("doug", {
+        journal.save_reflection_model("doug", {
             "structures": ["Boiler area near water"],
             "error_tips": ["Confirm offshore pump water connection"],
             "updated_at": "now",
@@ -3438,7 +3436,7 @@ progress: tick timeout progress survived
         )
         ledger_patch.start()
         self.addCleanup(ledger_patch.stop)
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "Fix iron smelting",
             "plan_steps": ["place_entity transport-belt"],
             "progress_notes": [],
@@ -3474,7 +3472,7 @@ progress: tick timeout progress survived
         import ledger
         import pipe
 
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "Power the lab",
             "plan_steps": ["insert science packs", "start research"],
             "progress_notes": [],
@@ -3512,7 +3510,7 @@ progress: tick timeout progress survived
         import ledger
         import pipe
 
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "Power the lab",
             "plan_steps": ["insert science packs", "start research"],
             "progress_notes": [],
@@ -3543,7 +3541,7 @@ progress: tick timeout progress survived
         import ledger
         import pipe
 
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "Energize the existing smelting array",
             "plan_steps": [
                 "walk_to(-41, 26)",

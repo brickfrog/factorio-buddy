@@ -43,7 +43,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_choose_autonomy_mode_plans_without_objective(self):
         self.assertEqual(
-            planner.choose_autonomy_mode(ledger.default_ledger(), 0, 5),
+            planner.choose_autonomy_mode(ledger.default_ledger_model(), 0, 5),
             "plan",
         )
 
@@ -1024,7 +1024,7 @@ class PlannerTests(unittest.TestCase):
         self.assertIn(planner.PLANNER_PROMPT, prompt)
 
     def test_agent_thread_executes_active_plan_past_interval(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "Build a smelting column",
             "plan_steps": ["Place furnaces", "Lay the belt"],
             "progress_notes": ["Cleared the build site"],
@@ -1067,7 +1067,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(tick["model"], "strong-planner")
 
     def test_agent_thread_replans_when_live_state_satisfies_objective(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": (
                 "complete steam power deployment, power the lab, start "
                 "automation research"
@@ -1096,7 +1096,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, 0)
 
     def test_agent_thread_replans_when_json_live_state_satisfies_objective(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": (
                 "complete steam power deployment, power the lab, start "
                 "automation research"
@@ -1133,7 +1133,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, 0)
 
     def test_agent_thread_replans_manual_boiler_refill_when_factory_exists(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": (
                 "energize the power grid to activate the existing automated "
                 "iron smelting array"
@@ -1171,7 +1171,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, 0)
 
     def test_agent_thread_executes_belt_plan_despite_old_power_progress(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": (
                 "establish iron ore flow from electric drill at (53.5, -21.5) "
                 "through belt line to inserter at (59.5, -22.5) so furnaces "
@@ -1210,7 +1210,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, 1)
 
     def test_agent_thread_replans_hand_fed_new_objective_after_old_complete_event(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": (
                 "activate second stone-furnace unit 15 at (42, -22) with "
                 "hand-fed fuel and ore"
@@ -1257,7 +1257,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, 0)
 
     def test_agent_thread_executes_plan_ready_signal_even_when_planner_due(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "activate second stone-furnace unit 15",
             "plan_steps": [
                 "walk_to (42, -21)",
@@ -1283,7 +1283,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, thread._planner_interval + 1)
 
     def test_agent_thread_executes_plan_ready_ledger_without_journal_signal(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "activate second stone-furnace unit 15",
             "plan_steps": [
                 "walk_to (42, -21)",
@@ -1309,7 +1309,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, thread._planner_interval + 1)
 
     def test_agent_thread_executes_repeated_ready_ledger_without_signal(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "activate second stone-furnace unit 15",
             "plan_steps": [
                 "walk_to (42, -21)",
@@ -1331,15 +1331,15 @@ class PlannerTests(unittest.TestCase):
         self.assertNotIn("read_only_tools", tick)
         self.assertIn("walk_to (42, -21)", tick["message"])
         self.assertEqual(thread._exec_ticks_since_plan, thread._planner_interval + 1)
-        events = journal.load_events("doug", 5)
-        self.assertEqual(events[-1]["kind"], "progress")
+        events = journal.load_events_model("doug", 5)
+        self.assertEqual(events.events[-1].kind, "progress")
         self.assertIn(
             "scheduler override: repeated read-only planning produced no mutation",
-            events[-1]["text"],
+            events.events[-1].text,
         )
 
     def test_agent_thread_executes_after_varied_ready_planner_churn(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "activate second stone-furnace unit 15",
             "plan_steps": [
                 "walk_to (42, -21)",
@@ -1374,7 +1374,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, thread._planner_interval + 1)
 
     def test_agent_thread_executes_plan_ready_ledger_signal_without_progress_noise(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "activate second stone-furnace unit 15",
             "plan_steps": [
                 "walk_to (42, -21)",
@@ -1395,7 +1395,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, thread._planner_interval + 1)
 
     def test_execution_ready_ledger_overrides_stale_complete_journal_event(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "activate second stone-furnace unit 15",
             "plan_steps": [
                 "walk_to (42, -21)",
@@ -1425,7 +1425,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(thread._exec_ticks_since_plan, thread._planner_interval + 1)
 
     def test_plan_ready_signal_defers_reflection_to_execute_next_step(self):
-        ledger.save_ledger("doug", {
+        ledger.save_ledger_model("doug", {
             "objective": "activate second stone-furnace unit 15",
             "plan_steps": [
                 "walk_to (42, -21)",

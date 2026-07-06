@@ -178,13 +178,11 @@ class ModelJournalTests(unittest.TestCase):
             side_effect=lambda agent_name: self.base / f".journal-{agent_name}.jsonl",
         ):
             journal.append_event("doug", "failure", "classified failure")
-            loaded = journal.load_events("doug")
+            loaded = journal.load_events_model("doug")
 
-        self.assertEqual(loaded, [{
-            "ts": loaded[0]["ts"],
-            "kind": "failure",
-            "text": "classified failure",
-        }])
+        self.assertEqual(len(loaded.events), 1)
+        self.assertEqual(loaded.events[0].kind, "failure")
+        self.assertEqual(loaded.events[0].text, "classified failure")
 
     def test_journal_event_model_round_trips_structured_signal(self):
         event = JournalEvent.create(
