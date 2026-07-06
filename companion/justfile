@@ -34,6 +34,10 @@ default:
 install:
     uv sync
 
+# Run the Python bridge test suite
+test:
+    uv run pytest
+
 # Build the Rust engine (factorioctl + mcp binaries) at the repo root
 build:
     cd .. && cargo build --release
