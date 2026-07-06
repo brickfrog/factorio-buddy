@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -2434,6 +2435,183 @@ progress: plan confirmed; awaiting execution
         pipe.clear_session("doug")
         self.assertFalse((self.base / ".session-doug.json").exists())
         self.assertEqual(json.loads(pipe.SESSIONS_FILE.read_text()), {"other": "keep-me"})
+
+    def test_save_session_uses_atomic_replace_and_leaves_no_tmp(self):
+        import pipe
+
+        session_patch = mock.patch(
+            "pipe._session_file",
+            side_effect=lambda agent_name: self.base / f".session-{agent_name}.json",
+        )
+        session_patch.start()
+        self.addCleanup(session_patch.stop)
+
+        with mock.patch("pipe.os.replace", wraps=os.replace) as replace:
+            pipe.save_session("doug", "new-session")
+
+        replace.assert_called_once()
+        tmp_arg, final_arg = replace.call_args.args
+        self.assertEqual(Path(tmp_arg), self.base / ".session-doug.json.tmp")
+        self.assertEqual(Path(final_arg), self.base / ".session-doug.json")
+        self.assertFalse((self.base / ".session-doug.json.tmp").exists())
+        self.assertEqual(pipe.load_session("doug"), "new-session")
+
+    def test_stream_idle_abort_finalizes_partial_trailers_and_session(self):
+        import ledger
+        import pipe
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        learning_dir = self.base / "learned"
+        partial_text = """Partial progress.
+<ledger>
+progress: recovered plates before idle abort
+</ledger>
+<reflection>
+structures:
+- Coal belt endpoint at x=66
+error_tips:
+- Resume from the partial belt endpoint
+</reflection>
+<diagnostic_proposal>
+name: inspect_partial_abort_recovery
+problem: aborts used to discard hidden progress trailers
+acceptance_tests:
+- ledger progress survives idle abort
+evidence:
+- idle timeout after partial text
+</diagnostic_proposal>
+"""
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                yield AssistantMessage(
+                    content=[TextBlock(partial_text)],
+                    model="test",
+                    session_id="new-session",
+                )
+                await asyncio.sleep(1)
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with (
+            mock.patch("pipe.query", scripted_query),
+            mock.patch.object(pipe, "_STREAM_IDLE_TIMEOUT_S", 0.01),
+            mock.patch.dict(os.environ, {"BRIDGE_LEARNING_DIR": str(learning_dir)}),
+        ):
+            result = pipe.handle_message_model(
+                "go", {}, "system", "old-session", StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+                tick_timeout_s=1,
+            )
+
+        self.assertEqual(result.session_id, "new-session")
+        self.assertIn(
+            "recovered plates before idle abort",
+            ledger.load_ledger_model("doug").progress_notes,
+        )
+        self.assertEqual(
+            journal.load_reflection("doug")["structures"],
+            ["Coal belt endpoint at x=66"],
+        )
+        self.assertEqual(
+            len(list((learning_dir / "pending").glob("*.json"))),
+            1,
+        )
+
+    def test_watchdog_abort_finalizes_partial_ledger(self):
+        import ledger
+        import pipe
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        class ImmediateNoProgressWatchdog:
+            def observe_text(self):
+                raise pipe.AgentTickWatchdogAbort(
+                    "no successful mutating progress for 12s during active tick"
+                )
+
+            def record_tool_use(self, *_args):
+                pass
+
+            def observe_tool_result(self, *_args, **_kwargs):
+                pass
+
+        partial_text = """Still moving.
+<ledger>
+progress: watchdog progress survived
+</ledger>
+"""
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                yield AssistantMessage(
+                    content=[TextBlock(partial_text)],
+                    model="test",
+                    session_id="watchdog-session",
+                )
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with (
+            mock.patch("pipe.AgentTickWatchdog", ImmediateNoProgressWatchdog),
+            mock.patch("pipe.query", scripted_query),
+        ):
+            result = pipe.handle_message_model(
+                "go", {}, "system", "old-session", StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+            )
+
+        self.assertEqual(result.session_id, "watchdog-session")
+        self.assertIn(
+            "watchdog progress survived",
+            ledger.load_ledger_model("doug").progress_notes,
+        )
+
+    def test_tick_timeout_finalizes_partial_ledger_and_session(self):
+        import ledger
+        import pipe
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        partial_text = """Timed out later.
+<ledger>
+progress: tick timeout progress survived
+</ledger>
+"""
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                yield AssistantMessage(
+                    content=[TextBlock(partial_text)],
+                    model="test",
+                    session_id="timeout-session",
+                )
+                await asyncio.sleep(1)
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with (
+            mock.patch("pipe.query", scripted_query),
+            mock.patch.object(pipe, "_STREAM_IDLE_TIMEOUT_S", 5),
+        ):
+            result = pipe.handle_message_model(
+                "go", {}, "system", "old-session", StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+                tick_timeout_s=0.01,
+            )
+
+        self.assertEqual(result.session_id, "timeout-session")
+        self.assertIn(
+            "tick timeout progress survived",
+            ledger.load_ledger_model("doug").progress_notes,
+        )
 
     def test_handle_message_backs_off_context_window_after_session_reset(self):
         import pipe

@@ -289,7 +289,13 @@ def load_session(agent_name: str) -> str | None:
 def save_session(agent_name: str, session_id: str):
     """Persist session ID for an agent (per-agent file, thread-safe)."""
     f = _session_file(agent_name)
-    f.write_text(AgentSessionState(session_id=session_id).to_json_line())
+    tmp = f.with_name(f"{f.name}.tmp")
+    tmp.write_text(AgentSessionState(session_id=session_id).to_json_line())
+    os.replace(tmp, f)
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def clear_session(agent_name: str) -> None:
@@ -1625,6 +1631,26 @@ def _agent_run_transcript(
     )
 
 
+class AgentRunProgress:
+    """Mutable progress captured while an SDK stream is still in flight."""
+
+    def __init__(self) -> None:
+        self.text_parts: list[str] = []
+        self.session_id: str | None = None
+        self.context_window_limit = False
+        self.usage_limit_seen = False
+        self.autonomy_step_progress = ""
+
+    def transcript(self) -> AgentRunTranscript:
+        return _agent_run_transcript(
+            text_parts=self.text_parts,
+            session_id=self.session_id,
+            context_window_limit=self.context_window_limit,
+            usage_limit_seen=self.usage_limit_seen,
+            autonomy_step_progress=self.autonomy_step_progress,
+        )
+
+
 async def _next_client_message(iterator: Any) -> Any:
     try:
         return await asyncio.wait_for(
@@ -1686,9 +1712,11 @@ async def _run_agent(
     player_index: int,
     log,
     stop_after_factorio_result: bool = False,
+    progress: AgentRunProgress | None = None,
 ) -> AgentRunTranscript:
-    text_parts: list[str] = []
-    new_session_id: str | None = None
+    progress = progress or AgentRunProgress()
+    text_parts = progress.text_parts
+    new_session_id = progress.session_id
     context_window_limit = False
     usage_limit_seen = False
     watchdog = AgentTickWatchdog()
@@ -1728,6 +1756,7 @@ async def _run_agent(
                 )
                 if assistant_message.session_id:
                     new_session_id = assistant_message.session_id
+                    progress.session_id = new_session_id
                 for event in assistant_message.events:
                     if event.is_text:
                         observation = SdkAssistantTextObservation.from_event(
@@ -1739,6 +1768,7 @@ async def _run_agent(
                         text_parts.append(observation.text)
                         if observation.usage_limit:
                             usage_limit_seen = True
+                            progress.usage_limit_seen = True
                             _set_usage_limit_cooldown_from_limit(
                                 agent_name,
                                 observation.usage_limit,
@@ -1803,6 +1833,7 @@ async def _run_agent(
                             classification=classification,
                             text=observation.text,
                         ).progress_text
+                        progress.autonomy_step_progress = autonomy_step_progress
                         if client is not None:
                             try:
                                 await client.interrupt()
@@ -1828,6 +1859,7 @@ async def _run_agent(
                     ).usage_limit_reset_utc_offset,
                 )
                 new_session_id = observation.session_id or new_session_id
+                progress.session_id = new_session_id
                 if (
                     observation.has_transcript_text
                     and observation.transcript_text not in text_parts
@@ -1836,6 +1868,7 @@ async def _run_agent(
                 if observation.is_error:
                     if observation.context_window_limit:
                         context_window_limit = True
+                        progress.context_window_limit = True
                         log.warning(
                             "result sdk_context_window: {}; clearing SDK session before next attempt",
                             observation.error_detail,
@@ -1854,6 +1887,7 @@ async def _run_agent(
                         log,
                     ):
                         usage_limit_seen = True
+                        progress.usage_limit_seen = True
                     elif observation.failure_classification:
                         log.warning(
                             "result {}: {}",
@@ -1921,13 +1955,10 @@ async def _run_agent(
                 if "already running" not in str(exc):
                     raise
 
-    return _agent_run_transcript(
-        text_parts=text_parts,
-        session_id=new_session_id,
-        context_window_limit=context_window_limit,
-        usage_limit_seen=usage_limit_seen,
-        autonomy_step_progress=autonomy_step_progress,
-    )
+    progress.context_window_limit = context_window_limit
+    progress.usage_limit_seen = usage_limit_seen
+    progress.autonomy_step_progress = autonomy_step_progress
+    return progress.transcript()
 
 
 def _finalize_reply(reply: str, agent_name: str) -> str:
@@ -1954,6 +1985,22 @@ def _finalize_reply(reply: str, agent_name: str) -> str:
     if not reply.strip():
         return "(action complete)"
     return reply
+
+
+def _finalize_partial_run_progress(
+    progress: AgentRunProgress,
+    agent_name: str,
+    log: Any,
+) -> None:
+    if not progress.text_parts:
+        return
+    reply = sanitize_response("\n\n".join(progress.text_parts))
+    _finalize_reply(reply, agent_name)
+    log.debug(
+        "finalized partial SDK reply after abort (text_parts={}, session={})",
+        len(progress.text_parts),
+        progress.session_id or "none",
+    )
 
 
 def _load_live_state_for_agent(
@@ -2076,6 +2123,7 @@ def handle_message_model(
         stderr=_stderr_callback(log),
     )
     resolved_tick_timeout_s = _TICK_TIMEOUT_S if tick_timeout_s is None else tick_timeout_s
+    partial_run = AgentRunProgress()
     try:
         run = asyncio.run(
             asyncio.wait_for(
@@ -2089,6 +2137,7 @@ def handle_message_model(
                     player_index,
                     log,
                     stop_after_factorio_result=stop_after_factorio_result,
+                    progress=partial_run,
                 ),
                 timeout=resolved_tick_timeout_s,
             )
@@ -2144,7 +2193,10 @@ def handle_message_model(
         if player_index > 0:
             send_response(rcon, player_index, rcon_target, error_msg)
             set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
-        return AgentMessageResult.keep_session(invocation.session_id)
+        _finalize_partial_run_progress(partial_run, invocation.agent_name, log)
+        return AgentMessageResult.keep_session(
+            partial_run.session_id or invocation.session_id
+        )
     except AgentTickWatchdogAbort as e:
         reason = BridgeLogMessage.single_line(str(e), limit=300)
         error_msg = f"Error: watchdog aborted stuck tick: {reason}"
@@ -2154,7 +2206,10 @@ def handle_message_model(
         if player_index > 0:
             send_response(rcon, player_index, rcon_target, error_msg)
             set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
-        return AgentMessageResult.keep_session(invocation.session_id)
+        _finalize_partial_run_progress(partial_run, invocation.agent_name, log)
+        return AgentMessageResult.keep_session(
+            partial_run.session_id or invocation.session_id
+        )
     except (asyncio.TimeoutError, TimeoutError):
         error_msg = (
             f"Error: agent tick exceeded {resolved_tick_timeout_s:.0f}s "
@@ -2175,7 +2230,10 @@ def handle_message_model(
         if player_index > 0:
             send_response(rcon, player_index, rcon_target, error_msg)
             set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
-        return AgentMessageResult.keep_session(invocation.session_id)
+        _finalize_partial_run_progress(partial_run, invocation.agent_name, log)
+        return AgentMessageResult.keep_session(
+            partial_run.session_id or invocation.session_id
+        )
     except FileNotFoundError:
         error_msg = "Error: claude CLI not installed"
         log.error("'claude' CLI not found. Install: npm install -g @anthropic-ai/claude-code")
@@ -2183,7 +2241,9 @@ def handle_message_model(
         if player_index > 0:
             send_response(rcon, player_index, rcon_target, error_msg)
             set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
-        return AgentMessageResult.keep_session(invocation.session_id)
+        return AgentMessageResult.keep_session(
+            partial_run.session_id or invocation.session_id
+        )
     except Exception as e:
         exception_signal = AgentInvocationExceptionSignal.from_exception(
             e,
@@ -2227,7 +2287,10 @@ def handle_message_model(
         if player_index > 0:
             send_response(rcon, player_index, rcon_target, error_msg)
             set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
-        return AgentMessageResult.keep_session(invocation.session_id)
+        _finalize_partial_run_progress(partial_run, invocation.agent_name, log)
+        return AgentMessageResult.keep_session(
+            partial_run.session_id or invocation.session_id
+        )
 
     # Send response — join all text parts so intermediate messages aren't lost
     reply = "\n\n".join(text_parts) if text_parts else "(action complete)"
