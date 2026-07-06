@@ -21,7 +21,7 @@ import shutil
 import sys
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -120,10 +120,6 @@ from models import (
     LedgerUpdate,
     LiveState,
     ParsedAgentResponse,
-    PreToolUseDecision,
-    PreToolUseGuardBlock,
-    PreToolUseHookResponse,
-    ProviderUsageLimit,
     ProviderUsageLimitSettings,
     RawLuaPolicy,
     RconRemoteCall,
@@ -138,18 +134,12 @@ from models import (
     TelemetryEvent,
     TelemetryRelaySettings,
     AutonomyPromptInput,
-    TOOL_PARAM_BOOLEAN,
-    TOOL_PARAM_INTEGER,
-    TOOL_PARAM_NUMBER,
-    TOOL_PARAM_STRING,
     ToolResultOutcome,
     ToolResultClassification,
     ToolResultContent,
     ToolResultLogLevel,
     ToolResultLogRecord,
-    ToolParamSchemaRegistry,
     ToolCallRequest,
-    WatchdogToolObservation,
 )
 from planner import (
     build_autonomy_prompt_model,
@@ -166,6 +156,27 @@ from transport import (InputWatcher, send_response, send_tool_status, set_status
                        set_spectator_mode)
 from paths import find_mod_source, find_mods_dir
 from telemetry import SSEBroadcaster, start_sse_server, RelayPusher, Telemetry, emit_chat, emit_tool_call, emit_error, emit_status
+from cooldowns import (
+    _CONTEXT_WINDOW_COOLDOWNS,
+    _USAGE_LIMIT_COOLDOWNS,
+    _context_window_backoff_s,
+    _context_window_message,
+    _format_local_time,
+    _get_context_window_cooldown,
+    _get_usage_limit_cooldown,
+    _set_context_window_cooldown,
+    _set_usage_limit_cooldown_from_limit,
+    _usage_limit_message,
+)
+from pre_tool_gates import (
+    AgentTickWatchdog,
+    AgentTickWatchdogAbort,
+    FactorioSkillGate,
+    FactorioToolSchemaGate,
+    ManualAutomationDriftGate,
+    MutatingToolBatchGate,
+    PlannerReadOnlyToolGate,
+)
 
 _BRIDGE_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _BRIDGE_DIR.parent.parent
@@ -175,10 +186,6 @@ DEFAULT_AUTONOMY_EXEC_MAX_TURNS = 4
 DEFAULT_AUTONOMY_EXEC_TIMEOUT_S = 60.0
 DEFAULT_SDK_SKILLS = "factorio-control"
 SESSIONS_FILE = _BRIDGE_DIR / ".sessions.json"
-_USAGE_LIMIT_COOLDOWNS: dict[str, datetime] = {}
-_USAGE_LIMIT_COOLDOWNS_LOCK = threading.Lock()
-_CONTEXT_WINDOW_COOLDOWNS: dict[str, datetime] = {}
-_CONTEXT_WINDOW_COOLDOWNS_LOCK = threading.Lock()
 
 # ── Agent profiles ───────────────────────────────────────────
 
@@ -361,467 +368,6 @@ def _result_text_and_player_messages(
     return result.text, result.player_message_text
 
 
-_FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
-    "walk_to": {
-        "required": {"x": TOOL_PARAM_NUMBER, "y": TOOL_PARAM_NUMBER},
-    },
-    "place_entity": {
-        "required": {
-            "entity_name": TOOL_PARAM_STRING,
-            "x": TOOL_PARAM_NUMBER,
-            "y": TOOL_PARAM_NUMBER,
-        },
-        "optional": {"direction": TOOL_PARAM_STRING},
-    },
-    "check_placement": {
-        "required": {
-            "entity_name": TOOL_PARAM_STRING,
-            "x": TOOL_PARAM_NUMBER,
-            "y": TOOL_PARAM_NUMBER,
-        },
-        "optional": {"direction": TOOL_PARAM_STRING},
-    },
-    "find_entity_placements": {
-        "required": {
-            "entity_name": TOOL_PARAM_STRING,
-            "x": TOOL_PARAM_NUMBER,
-            "y": TOOL_PARAM_NUMBER,
-        },
-        "optional": {
-            "radius": TOOL_PARAM_INTEGER,
-            "limit": TOOL_PARAM_INTEGER,
-        },
-    },
-    "mine_at": {
-        "required": {"x": TOOL_PARAM_NUMBER, "y": TOOL_PARAM_NUMBER},
-        "optional": {"count": TOOL_PARAM_INTEGER},
-    },
-    "craft": {
-        "required": {"recipe": TOOL_PARAM_STRING},
-        "optional": {"count": TOOL_PARAM_INTEGER},
-    },
-    "insert_items": {
-        "required": {
-            "unit_number": TOOL_PARAM_INTEGER,
-            "item": TOOL_PARAM_STRING,
-            "count": TOOL_PARAM_INTEGER,
-        },
-        "optional": {"inventory_type": TOOL_PARAM_STRING},
-    },
-    "extract_items": {
-        "required": {
-            "unit_number": TOOL_PARAM_INTEGER,
-            "item": TOOL_PARAM_STRING,
-            "count": TOOL_PARAM_INTEGER,
-        },
-        "optional": {"inventory_type": TOOL_PARAM_STRING},
-    },
-    "bootstrap_smelting_once": {
-        "required": {
-            "furnace_unit_number": TOOL_PARAM_INTEGER,
-        },
-        "optional": {
-            "fuel_item": TOOL_PARAM_STRING,
-            "fuel_count": TOOL_PARAM_INTEGER,
-            "source_item": TOOL_PARAM_STRING,
-            "source_count": TOOL_PARAM_INTEGER,
-            "output_item": TOOL_PARAM_STRING,
-            "output_count": TOOL_PARAM_INTEGER,
-            "craft_recipe": TOOL_PARAM_STRING,
-            "craft_count": TOOL_PARAM_INTEGER,
-            "wait_ticks": TOOL_PARAM_INTEGER,
-            "verify_radius": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-        },
-    },
-    "build_fuel_supply": {
-        "required": {
-            "consumer_unit_number": TOOL_PARAM_INTEGER,
-            "from_x": TOOL_PARAM_INTEGER,
-            "from_y": TOOL_PARAM_INTEGER,
-            "pickup_x": TOOL_PARAM_INTEGER,
-            "pickup_y": TOOL_PARAM_INTEGER,
-            "inserter_x": TOOL_PARAM_NUMBER,
-            "inserter_y": TOOL_PARAM_NUMBER,
-            "inserter_direction": TOOL_PARAM_STRING,
-        },
-        "optional": {
-            "inserter_name": TOOL_PARAM_STRING,
-            "inserter_fuel_item": TOOL_PARAM_STRING,
-            "inserter_fuel_count": TOOL_PARAM_INTEGER,
-            "belt_type": TOOL_PARAM_STRING,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "repair_fuel_sustainability": {
-        "required": {},
-        "optional": {
-            "x": TOOL_PARAM_NUMBER,
-            "y": TOOL_PARAM_NUMBER,
-            "radius": TOOL_PARAM_INTEGER,
-            "limit": TOOL_PARAM_INTEGER,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "feed_lab_from_inventory": {
-        "required": {
-            "lab_unit_number": TOOL_PARAM_INTEGER,
-            "science_pack": TOOL_PARAM_STRING,
-            "count": TOOL_PARAM_INTEGER,
-        },
-        "optional": {"dry_run": TOOL_PARAM_BOOLEAN},
-    },
-    "plan_automation_science": {
-        "required": {
-            "assembler_unit_number": TOOL_PARAM_INTEGER,
-            "lab_unit_number": TOOL_PARAM_INTEGER,
-            "gear_from_x": TOOL_PARAM_INTEGER,
-            "gear_from_y": TOOL_PARAM_INTEGER,
-            "copper_from_x": TOOL_PARAM_INTEGER,
-            "copper_from_y": TOOL_PARAM_INTEGER,
-        },
-        "optional": {
-            "gear_side": TOOL_PARAM_STRING,
-            "copper_side": TOOL_PARAM_STRING,
-            "output_side": TOOL_PARAM_STRING,
-            "lab_side": TOOL_PARAM_STRING,
-            "belt_type": TOOL_PARAM_STRING,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "build_automation_science": {
-        "required": {
-            "assembler_unit_number": TOOL_PARAM_INTEGER,
-            "lab_unit_number": TOOL_PARAM_INTEGER,
-            "gear_from_x": TOOL_PARAM_INTEGER,
-            "gear_from_y": TOOL_PARAM_INTEGER,
-            "gear_pickup_x": TOOL_PARAM_INTEGER,
-            "gear_pickup_y": TOOL_PARAM_INTEGER,
-            "gear_inserter_x": TOOL_PARAM_NUMBER,
-            "gear_inserter_y": TOOL_PARAM_NUMBER,
-            "gear_inserter_direction": TOOL_PARAM_STRING,
-            "copper_from_x": TOOL_PARAM_INTEGER,
-            "copper_from_y": TOOL_PARAM_INTEGER,
-            "copper_pickup_x": TOOL_PARAM_INTEGER,
-            "copper_pickup_y": TOOL_PARAM_INTEGER,
-            "copper_inserter_x": TOOL_PARAM_NUMBER,
-            "copper_inserter_y": TOOL_PARAM_NUMBER,
-            "copper_inserter_direction": TOOL_PARAM_STRING,
-            "science_drop_x": TOOL_PARAM_INTEGER,
-            "science_drop_y": TOOL_PARAM_INTEGER,
-            "science_to_x": TOOL_PARAM_INTEGER,
-            "science_to_y": TOOL_PARAM_INTEGER,
-            "output_inserter_x": TOOL_PARAM_NUMBER,
-            "output_inserter_y": TOOL_PARAM_NUMBER,
-            "output_inserter_direction": TOOL_PARAM_STRING,
-            "lab_from_x": TOOL_PARAM_INTEGER,
-            "lab_from_y": TOOL_PARAM_INTEGER,
-            "lab_pickup_x": TOOL_PARAM_INTEGER,
-            "lab_pickup_y": TOOL_PARAM_INTEGER,
-            "lab_inserter_x": TOOL_PARAM_NUMBER,
-            "lab_inserter_y": TOOL_PARAM_NUMBER,
-            "lab_inserter_direction": TOOL_PARAM_STRING,
-        },
-        "optional": {
-            "belt_type": TOOL_PARAM_STRING,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "plan_machine_output": {
-        "required": {
-            "source_unit_number": TOOL_PARAM_INTEGER,
-            "item_name": TOOL_PARAM_STRING,
-            "to_x": TOOL_PARAM_INTEGER,
-            "to_y": TOOL_PARAM_INTEGER,
-        },
-        "optional": {
-            "output_side": TOOL_PARAM_STRING,
-            "belt_type": TOOL_PARAM_STRING,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "build_assembler_output": {
-        "required": {
-            "assembler_unit_number": TOOL_PARAM_INTEGER,
-            "item_name": TOOL_PARAM_STRING,
-            "drop_x": TOOL_PARAM_INTEGER,
-            "drop_y": TOOL_PARAM_INTEGER,
-            "to_x": TOOL_PARAM_INTEGER,
-            "to_y": TOOL_PARAM_INTEGER,
-            "inserter_x": TOOL_PARAM_NUMBER,
-            "inserter_y": TOOL_PARAM_NUMBER,
-            "inserter_direction": TOOL_PARAM_STRING,
-        },
-        "optional": {
-            "belt_type": TOOL_PARAM_STRING,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "plan_recipe_assembler_cell": {
-        "required": {
-            "assembler_unit_number": TOOL_PARAM_INTEGER,
-            "recipe": TOOL_PARAM_STRING,
-            "input_item_name": TOOL_PARAM_STRING,
-            "output_item_name": TOOL_PARAM_STRING,
-            "input_from_x": TOOL_PARAM_INTEGER,
-            "input_from_y": TOOL_PARAM_INTEGER,
-            "output_to_x": TOOL_PARAM_INTEGER,
-            "output_to_y": TOOL_PARAM_INTEGER,
-        },
-        "optional": {
-            "input_side": TOOL_PARAM_STRING,
-            "output_side": TOOL_PARAM_STRING,
-            "belt_type": TOOL_PARAM_STRING,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "build_recipe_assembler_cell": {
-        "required": {
-            "assembler_unit_number": TOOL_PARAM_INTEGER,
-            "recipe": TOOL_PARAM_STRING,
-            "input_item_name": TOOL_PARAM_STRING,
-            "output_item_name": TOOL_PARAM_STRING,
-            "input_from_x": TOOL_PARAM_INTEGER,
-            "input_from_y": TOOL_PARAM_INTEGER,
-            "input_pickup_x": TOOL_PARAM_INTEGER,
-            "input_pickup_y": TOOL_PARAM_INTEGER,
-            "input_inserter_x": TOOL_PARAM_NUMBER,
-            "input_inserter_y": TOOL_PARAM_NUMBER,
-            "input_inserter_direction": TOOL_PARAM_STRING,
-            "output_drop_x": TOOL_PARAM_INTEGER,
-            "output_drop_y": TOOL_PARAM_INTEGER,
-            "output_to_x": TOOL_PARAM_INTEGER,
-            "output_to_y": TOOL_PARAM_INTEGER,
-            "output_inserter_x": TOOL_PARAM_NUMBER,
-            "output_inserter_y": TOOL_PARAM_NUMBER,
-            "output_inserter_direction": TOOL_PARAM_STRING,
-        },
-        "optional": {
-            "belt_type": TOOL_PARAM_STRING,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "route_belt": {
-        "required": {
-            "from_x": TOOL_PARAM_INTEGER,
-            "from_y": TOOL_PARAM_INTEGER,
-            "to_x": TOOL_PARAM_INTEGER,
-            "to_y": TOOL_PARAM_INTEGER,
-        },
-        "optional": {
-            "belt_type": TOOL_PARAM_STRING,
-            "search_radius": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-            "respect_zones": TOOL_PARAM_BOOLEAN,
-            "allow_underground": TOOL_PARAM_BOOLEAN,
-            "extend_existing": TOOL_PARAM_BOOLEAN,
-        },
-    },
-    "get_entities": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {
-            "radius": TOOL_PARAM_INTEGER,
-            "name": TOOL_PARAM_STRING,
-            "entity_type": TOOL_PARAM_STRING,
-            "limit": TOOL_PARAM_INTEGER,
-        },
-    },
-    "get_resources": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {
-            "radius": TOOL_PARAM_INTEGER,
-            "resource_type": TOOL_PARAM_STRING,
-        },
-    },
-    "find_nearest_resource": {
-        "required": {"resource_type": TOOL_PARAM_STRING},
-        "optional": {"x": TOOL_PARAM_NUMBER, "y": TOOL_PARAM_NUMBER},
-    },
-    "get_recipe": {
-        "required": {"name": TOOL_PARAM_STRING},
-    },
-    "get_recipes_for_item": {
-        "required": {"item": TOOL_PARAM_STRING},
-    },
-    "get_recipes_by_category": {
-        "required": {"category": TOOL_PARAM_STRING},
-    },
-    "set_recipe": {
-        "required": {
-            "unit_number": TOOL_PARAM_INTEGER,
-            "recipe": TOOL_PARAM_STRING,
-        },
-    },
-    "remove_entity": {
-        "required": {"unit_number": TOOL_PARAM_INTEGER},
-    },
-    "rotate_entity": {
-        "required": {
-            "unit_number": TOOL_PARAM_INTEGER,
-            "direction": TOOL_PARAM_STRING,
-        },
-    },
-    "get_machine_belt_positions": {
-        "required": {"unit_number": TOOL_PARAM_INTEGER},
-    },
-    "execute_entity_placement_near": {
-        "required": {
-            "entity_name": TOOL_PARAM_STRING,
-            "x": TOOL_PARAM_NUMBER,
-            "y": TOOL_PARAM_NUMBER,
-        },
-        "optional": {
-            "radius": TOOL_PARAM_INTEGER,
-            "limit": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-        },
-    },
-    "build_edge_miner": {
-        "required": {
-            "resource_type": TOOL_PARAM_STRING,
-            "x": TOOL_PARAM_NUMBER,
-            "y": TOOL_PARAM_NUMBER,
-        },
-        "optional": {
-            "radius": TOOL_PARAM_INTEGER,
-            "drill_name": TOOL_PARAM_STRING,
-            "limit": TOOL_PARAM_INTEGER,
-        },
-    },
-    "execute_edge_miner": {
-        "required": {
-            "resource_type": TOOL_PARAM_STRING,
-            "x": TOOL_PARAM_NUMBER,
-            "y": TOOL_PARAM_NUMBER,
-        },
-        "optional": {
-            "radius": TOOL_PARAM_INTEGER,
-            "drill_name": TOOL_PARAM_STRING,
-            "limit": TOOL_PARAM_INTEGER,
-            "dry_run": TOOL_PARAM_BOOLEAN,
-            "fuel_item": TOOL_PARAM_STRING,
-            "fuel_count": TOOL_PARAM_INTEGER,
-            "verify_radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "build_direct_smelter": {
-        "optional": {
-            "drill_unit_number": TOOL_PARAM_INTEGER,
-            "output_x": TOOL_PARAM_NUMBER,
-            "output_y": TOOL_PARAM_NUMBER,
-            "output_direction": TOOL_PARAM_STRING,
-            "furnace_name": TOOL_PARAM_STRING,
-            "inserter_name": TOOL_PARAM_STRING,
-            "belt_name": TOOL_PARAM_STRING,
-            "radius": TOOL_PARAM_INTEGER,
-        },
-    },
-    "plan_steam_power": {
-        "required": {
-            "water_x1": TOOL_PARAM_NUMBER,
-            "water_y1": TOOL_PARAM_NUMBER,
-            "water_x2": TOOL_PARAM_NUMBER,
-            "water_y2": TOOL_PARAM_NUMBER,
-            "target_x": TOOL_PARAM_NUMBER,
-            "target_y": TOOL_PARAM_NUMBER,
-        },
-    },
-    "repair_steam_power": {
-        "required": {
-            "x": TOOL_PARAM_INTEGER,
-            "y": TOOL_PARAM_INTEGER,
-            "target_x": TOOL_PARAM_NUMBER,
-            "target_y": TOOL_PARAM_NUMBER,
-        },
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "extend_power_to": {
-        "required": {
-            "x": TOOL_PARAM_INTEGER,
-            "y": TOOL_PARAM_INTEGER,
-            "target_x": TOOL_PARAM_NUMBER,
-            "target_y": TOOL_PARAM_NUMBER,
-        },
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "diagnose_steam_power": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "get_power_status": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "get_power_networks": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "find_power_issues": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "get_power_coverage": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "analyze_inserters": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "get_alerts": {
-        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
-        "optional": {"radius": TOOL_PARAM_INTEGER},
-    },
-    "start_research": {
-        "required": {"technology": TOOL_PARAM_STRING},
-    },
-})
-
-
-def _tool_request_from_hook_input(hook_input: Any) -> ToolCallRequest | None:
-    try:
-        return ToolCallRequest.from_hook_input(hook_input)
-    except BridgeValidationError:
-        return None
-
-
 def _log_tool_result(
     agent_name: str,
     log,
@@ -851,442 +397,6 @@ def _log_tool_result_record(
         append_event(agent_name, "failure", record.journal_failure_text)
     return record.classification
 
-
-class MutatingToolBatchGate:
-    """Block same-message mutating MCP batches before they race inventory state."""
-
-    def __init__(self, log, window_s: float | None = None):
-        self.log = log
-        runtime = _runtime_settings()
-        self.window_s = BridgeRuntimeSettings(
-            mutating_tool_batch_window_s=(
-                window_s
-                if window_s is not None
-                else runtime.mutating_tool_batch_window_s
-            )
-        ).mutating_tool_batch_window_s
-        self._lock = asyncio.Lock()
-        self._last_at = 0.0
-        self._last_tool_use_id: str | None = None
-        self._last_tool_name: str | None = None
-
-    async def hook(
-        self,
-        hook_input: Any,
-        tool_use_id: str | None,
-        context: Any,
-    ) -> dict[str, Any]:
-        request = _tool_request_from_hook_input(hook_input)
-        if request is None or not request.is_mutating_factorio_tool:
-            return PreToolUseHookResponse.noop().to_dict()
-
-        now = time.monotonic()
-        short_name = request.short_name
-        async with self._lock:
-            if (
-                self._last_tool_use_id
-                and tool_use_id != self._last_tool_use_id
-                and now - self._last_at < self.window_s
-            ):
-                previous = ToolCallRequest.short_factorio_tool_name(
-                    self._last_tool_name or "",
-                )
-                block = PreToolUseGuardBlock.parallel_mutation(
-                    tool_name=short_name,
-                    previous_tool_name=previous,
-                    elapsed_s=now - self._last_at,
-                )
-                self.log.debug(block.debug_message)
-                return PreToolUseHookResponse.block(block).to_dict()
-
-            self._last_at = now
-            self._last_tool_use_id = tool_use_id
-            self._last_tool_name = request.tool_name
-        return PreToolUseHookResponse.allow().to_dict()
-
-
-class PlannerReadOnlyToolGate:
-    """Block Factorio MCP mutations while the bridge is running a planning turn."""
-
-    def __init__(self, log, enabled: bool = False):
-        self.log = log
-        self.enabled = enabled
-
-    async def hook(
-        self,
-        hook_input: Any,
-        tool_use_id: str | None,
-        context: Any,
-    ) -> dict[str, Any]:
-        if not self.enabled:
-            return PreToolUseHookResponse.noop().to_dict()
-
-        request = _tool_request_from_hook_input(hook_input)
-        if request is None or not request.is_factorio_mcp_tool:
-            return PreToolUseHookResponse.noop().to_dict()
-        if request.is_read_only_factorio_tool:
-            return PreToolUseHookResponse.noop().to_dict()
-        if request.is_read_only_dry_run:
-            return PreToolUseHookResponse.noop().to_dict()
-
-        block = PreToolUseGuardBlock.read_only_turn(tool_name=request.short_name)
-        self.log.debug(block.debug_message)
-        return PreToolUseHookResponse.block(block).to_dict()
-
-
-class ManualAutomationDriftGate:
-    """Block manual transfer tools when the committed plan is stale automation."""
-
-    MANUAL_TRANSFER_TOOLS = frozenset({
-        "craft",
-        "extract_items",
-        "feed_lab_from_inventory",
-        "hand_feed_furnace",
-        "insert_items",
-    })
-
-    def __init__(
-        self,
-        log,
-        agent_name: str,
-        ledger_loader: Any = load_ledger_model,
-        live_state_loader: Any | None = None,
-        block_all_manual_transfers: bool = False,
-    ):
-        self.log = log
-        self.agent_name = str(agent_name or "")
-        self.ledger_loader = ledger_loader
-        self.live_state_loader = live_state_loader
-        self.block_all_manual_transfers = bool(block_all_manual_transfers)
-
-    async def hook(
-        self,
-        hook_input: Any,
-        tool_use_id: str | None,
-        context: Any,
-    ) -> dict[str, Any]:
-        request = _tool_request_from_hook_input(hook_input)
-        if request is None or not request.is_factorio_mcp_tool:
-            return PreToolUseHookResponse.noop().to_dict()
-        if request.short_name not in self.MANUAL_TRANSFER_TOOLS:
-            return PreToolUseHookResponse.noop().to_dict()
-
-        if self.block_all_manual_transfers:
-            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-
-        try:
-            ledger = self.ledger_loader(self.agent_name)
-        except Exception as exc:
-            self.log.debug("manual automation guard ledger lookup failed: {}", exc)
-            return PreToolUseHookResponse.noop().to_dict()
-        live_state = None
-        if self.live_state_loader is not None:
-            try:
-                live_state = self.live_state_loader(self.agent_name)
-            except Exception as exc:
-                self.log.debug("manual automation guard live-state lookup failed: {}", exc)
-        durable_recovery_context = self._ledger_has_durable_recovery_context(ledger)
-        has_assembler_or_lab = live_state is not None and live_state.has_any((
-            "assembling-machine-1",
-            "assembling-machine-2",
-            "assembling-machine-3",
-            "lab",
-        ))
-        has_automation_footprint = (
-            live_state is not None and live_state.has_automation_capable_footprint()
-        )
-        if durable_recovery_context and (
-            request.is_manual_fuel_transfer or request.is_manual_material_transfer
-        ):
-            return PreToolUseHookResponse.noop().to_dict()
-        automation_setup_context = self._ledger_has_automation_enabling_setup_context(ledger)
-        if (
-            automation_setup_context
-            and request.is_manual_material_transfer
-            and not has_automation_footprint
-        ):
-            return PreToolUseHookResponse.noop().to_dict()
-        if (
-            request.is_bootstrap_infrastructure_craft
-            and automation_setup_context
-        ):
-            return PreToolUseHookResponse.noop().to_dict()
-        if (
-            request.is_manual_fuel_transfer
-            and has_automation_footprint
-        ):
-            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-        if (
-            request.is_manual_science_transfer
-            and (has_assembler_or_lab or self._ledger_is_science_automation_context(ledger))
-        ):
-            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-        if (
-            request.is_manual_material_transfer
-            and has_automation_footprint
-        ):
-            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-        if (
-            request.is_manual_component_craft
-            and live_state is not None
-            and live_state.has_any((
-                "assembling-machine-1",
-                "assembling-machine-2",
-                "assembling-machine-3",
-            ))
-            and self._ledger_is_science_automation_context(ledger)
-        ):
-            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-        if not ledger.has_stale_manual_automation_plan(live_state):
-            return PreToolUseHookResponse.noop().to_dict()
-
-        block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
-        self.log.debug(block.debug_message)
-        return PreToolUseHookResponse.block(block).to_dict()
-
-    @staticmethod
-    def _ledger_is_science_automation_context(ledger: Any) -> bool:
-        try:
-            text = str(ledger.active_text() or "")
-        except Exception:
-            text = ""
-        if not text:
-            return False
-        return any(
-            marker in text
-            for marker in (
-                "automation-science",
-                "science pack",
-                "red science",
-                "plan_automation_science",
-                "build_automation_science",
-                "build_lab_feed",
-            )
-        )
-
-    @staticmethod
-    def _ledger_has_durable_recovery_context(ledger: Any) -> bool:
-        checker = getattr(ledger, "has_durable_recovery_context", None)
-        if callable(checker):
-            try:
-                return bool(checker())
-            except Exception:
-                return False
-        return False
-
-    @staticmethod
-    def _ledger_has_automation_enabling_setup_context(ledger: Any) -> bool:
-        checker = getattr(ledger, "has_automation_enabling_setup_context", None)
-        if callable(checker):
-            try:
-                return bool(checker())
-            except Exception:
-                return False
-        return False
-
-
-class FactorioToolSchemaGate:
-    """Reject clearly malformed Factorio MCP parameters before Rust deserialization."""
-
-    def __init__(self, log, schema_registry: Any = None):
-        self.log = log
-        try:
-            self.schema_registry = ToolParamSchemaRegistry.from_mapping(
-                _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY
-                if schema_registry is None
-                else schema_registry
-            )
-            self.schema_registry_error: BridgeValidationError | None = None
-        except BridgeValidationError as exc:
-            self.schema_registry = ToolParamSchemaRegistry()
-            self.schema_registry_error = exc
-
-    async def hook(
-        self,
-        hook_input: Any,
-        tool_use_id: str | None,
-        context: Any,
-    ) -> dict[str, Any]:
-        try:
-            request = ToolCallRequest.from_hook_input(hook_input)
-        except BridgeValidationError as exc:
-            block = PreToolUseGuardBlock.param_schema(detail=str(exc))
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-
-        if not request.is_factorio_mcp_tool:
-            return PreToolUseHookResponse.noop().to_dict()
-
-        if self.schema_registry_error:
-            block = PreToolUseGuardBlock.param_schema(
-                detail=str(self.schema_registry_error),
-                tool_name=request.short_name,
-            )
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-
-        try:
-            self.schema_registry.validate_request(request)
-        except BridgeValidationError as exc:
-            block = PreToolUseGuardBlock.param_schema(
-                detail=str(exc),
-                tool_name=request.short_name,
-            )
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-
-        return PreToolUseHookResponse.noop().to_dict()
-
-
-class FactorioSkillGate:
-    """Require the SDK control skill before exposing Factorio MCP actions."""
-
-    def __init__(self, log, required: bool = True):
-        self.log = log
-        self.required = required
-        self._lock = asyncio.Lock()
-        self._saw_skill = False
-
-    async def hook(
-        self,
-        hook_input: Any,
-        tool_use_id: str | None,
-        context: Any,
-    ) -> dict[str, Any]:
-        request = _tool_request_from_hook_input(hook_input)
-        if not self.required or request is None:
-            return PreToolUseHookResponse.noop().to_dict()
-
-        async with self._lock:
-            if request.tool_name == "Skill":
-                self._saw_skill = True
-                return PreToolUseHookResponse.allow().to_dict()
-
-            if request.is_factorio_mcp_tool and not self._saw_skill:
-                block = PreToolUseGuardBlock.skill_required(
-                    tool_name=request.short_name,
-                )
-                self.log.debug(block.debug_message)
-                return PreToolUseHookResponse.block(block).to_dict()
-
-        return PreToolUseHookResponse.noop().to_dict()
-
-
-class AgentTickWatchdog:
-    """Abort a single SDK tick that is looping without useful game progress."""
-
-    def __init__(
-        self,
-        *,
-        same_failure_limit: int | None = None,
-        no_progress_timeout_s: float | None = None,
-        clock=time.monotonic,
-    ):
-        runtime = _runtime_settings()
-        resolved = BridgeRuntimeSettings(
-            watchdog_same_failure_limit=(
-                same_failure_limit
-                if same_failure_limit is not None
-                else runtime.watchdog_same_failure_limit
-            ),
-            watchdog_no_progress_timeout_s=(
-                no_progress_timeout_s
-                if no_progress_timeout_s is not None
-                else runtime.watchdog_no_progress_timeout_s
-            ),
-        )
-        self.same_failure_limit = resolved.watchdog_same_failure_limit
-        self.no_progress_timeout_s = resolved.watchdog_no_progress_timeout_s
-        self.clock = clock
-        self.started_at = self.clock()
-        self.last_progress_at = self.started_at
-        self._tool_names: dict[str, str] = {}
-        self._last_failure_signature: str | None = None
-        self._same_failure_count = 0
-
-    def record_tool_use(self, tool_use_id: str | None, tool_name: str) -> None:
-        if tool_use_id:
-            self._tool_names[str(tool_use_id)] = str(tool_name)
-        self.check_no_progress()
-
-    def observe_text(self) -> None:
-        self.check_no_progress()
-
-    def observe_tool_result(
-        self,
-        tool_use_id: str | None,
-        classification: ToolResultClassification | str,
-        text: str,
-        *,
-        indicates_progress: bool | None = None,
-    ) -> None:
-        tool_name = self._tool_names.get(str(tool_use_id), "") if tool_use_id else ""
-        observation = WatchdogToolObservation.from_result(
-            tool_use_id=tool_use_id,
-            tool_name=tool_name,
-            classification=classification,
-            text=text,
-            indicates_progress=indicates_progress,
-        )
-        if observation.is_ok:
-            if (
-                observation.is_mutating_tool
-                and observation.indicates_mutating_progress()
-            ):
-                self.mark_progress()
-            self._last_failure_signature = None
-            self._same_failure_count = 0
-            self.check_no_progress()
-            return
-
-        if observation.is_expected_miss:
-            self.check_no_progress()
-            return
-
-        if observation.is_game_rejected:
-            signature = observation.failure_signature()
-            if signature == self._last_failure_signature:
-                self._same_failure_count += 1
-            else:
-                self._last_failure_signature = signature
-                self._same_failure_count = 1
-            if (
-                self.same_failure_limit > 0
-                and self._same_failure_count >= self.same_failure_limit
-            ):
-                short_tool = observation.short_tool_name or "tool"
-                raise AgentTickWatchdogAbort(
-                    "repeated same game rejection "
-                    f"({self._same_failure_count}x) from {short_tool}: "
-                    f"{BridgeLogMessage.single_line(observation.text, limit=300)}"
-                )
-            self.check_no_progress()
-            return
-
-        self.check_no_progress()
-
-    def mark_progress(self) -> None:
-        self.last_progress_at = self.clock()
-
-    def check_no_progress(self) -> None:
-        if self.no_progress_timeout_s <= 0:
-            return
-        elapsed = self.clock() - self.last_progress_at
-        if elapsed >= self.no_progress_timeout_s:
-            raise AgentTickWatchdogAbort(
-                "no successful mutating progress for "
-                f"{elapsed:.0f}s during active tick"
-            )
 
 def _handle_context_window_limit(
     *,
@@ -1391,146 +501,6 @@ def _is_skill_tool(block: ToolUseBlock) -> bool:
     return SdkToolUse.from_sdk_block(block).is_skill_tool
 
 
-def _format_local_time(moment: datetime) -> str:
-    local = moment.astimezone()
-    zone = local.tzname() or local.strftime("%z")
-    return f"{local:%Y-%m-%d %H:%M:%S} {zone}"
-
-
-def _usage_limit_message(reset_at: datetime) -> str:
-    return (
-        "Provider usage limit is active. "
-        f"Agent attempts will resume after {_format_local_time(reset_at)}."
-    )
-
-
-def _context_window_backoff_s() -> float:
-    return _runtime_settings().context_window_backoff_s
-
-
-def _context_window_message(reset_at: datetime) -> str:
-    return (
-        "SDK context-window limit repeated after session reset. "
-        f"Agent attempts will resume after {_format_local_time(reset_at)}."
-    )
-
-
-def _set_context_window_cooldown(
-    agent_name: str,
-    log=None,
-    now: datetime | None = None,
-    seconds: float | None = None,
-) -> datetime:
-    if now is None:
-        now = datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.astimezone()
-    delay_s = seconds if seconds is not None else _context_window_backoff_s()
-    reset_at = now + timedelta(seconds=delay_s)
-
-    changed = False
-    with _CONTEXT_WINDOW_COOLDOWNS_LOCK:
-        existing = _CONTEXT_WINDOW_COOLDOWNS.get(agent_name)
-        if existing is None or reset_at > existing:
-            _CONTEXT_WINDOW_COOLDOWNS[agent_name] = reset_at
-            changed = True
-        else:
-            reset_at = existing
-    if log and changed:
-        log.info(
-            "sdk context-window cooldown active until {}; pausing agent attempts",
-            _format_local_time(reset_at),
-        )
-    return reset_at
-
-
-def _get_context_window_cooldown(
-    agent_name: str,
-    now: datetime | None = None,
-) -> datetime | None:
-    if now is None:
-        now = datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.astimezone()
-    with _CONTEXT_WINDOW_COOLDOWNS_LOCK:
-        reset_at = _CONTEXT_WINDOW_COOLDOWNS.get(agent_name)
-        if not reset_at:
-            return None
-        if reset_at <= now:
-            _CONTEXT_WINDOW_COOLDOWNS.pop(agent_name, None)
-            return None
-        return reset_at
-
-
-def _set_usage_limit_cooldown(
-    agent_name: str,
-    text: str,
-    log=None,
-    now: datetime | None = None,
-) -> datetime | None:
-    settings = ProviderUsageLimitSettings.from_env(os.environ)
-    return _set_usage_limit_cooldown_from_limit(
-        agent_name,
-        ProviderUsageLimit.from_text(
-            text,
-            now=now,
-            default_utc_offset=settings.usage_limit_reset_utc_offset,
-        ),
-        log=log,
-        now=now,
-    )
-
-
-def _set_usage_limit_cooldown_from_limit(
-    agent_name: str,
-    limit: ProviderUsageLimit | None,
-    log=None,
-    now: datetime | None = None,
-) -> datetime | None:
-    if limit is None:
-        return None
-    reset_at = limit.reset_at
-    if now is None:
-        now = datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.astimezone()
-    if reset_at <= now:
-        return None
-
-    changed = False
-    with _USAGE_LIMIT_COOLDOWNS_LOCK:
-        existing = _USAGE_LIMIT_COOLDOWNS.get(agent_name)
-        if existing is None or reset_at > existing:
-            _USAGE_LIMIT_COOLDOWNS[agent_name] = reset_at
-            changed = True
-        else:
-            reset_at = existing
-    if log and changed:
-        log.info(
-            "provider usage limit active until {}; pausing agent attempts",
-            _format_local_time(reset_at),
-        )
-    return reset_at
-
-
-def _get_usage_limit_cooldown(
-    agent_name: str,
-    now: datetime | None = None,
-) -> datetime | None:
-    if now is None:
-        now = datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.astimezone()
-    with _USAGE_LIMIT_COOLDOWNS_LOCK:
-        reset_at = _USAGE_LIMIT_COOLDOWNS.get(agent_name)
-        if not reset_at:
-            return None
-        if reset_at <= now:
-            _USAGE_LIMIT_COOLDOWNS.pop(agent_name, None)
-            return None
-        return reset_at
-
-
 def _record_anomaly(reply: str, agent_name: str) -> None:
     text = parse_response_model(reply).meaningful_anomaly_text()
     if text:
@@ -1582,10 +552,6 @@ _WATCHDOG_NO_PROGRESS_TIMEOUT_S = _RUNTIME_SETTINGS.watchdog_no_progress_timeout
 
 
 class AgentStreamIdleTimeout(TimeoutError):
-    pass
-
-
-class AgentTickWatchdogAbort(TimeoutError):
     pass
 
 
@@ -1789,7 +755,13 @@ async def _run_agent(
                                 emit_chat(telemetry, "agent", thought, agent=telemetry_name)
                         if player_index > 0 and tool_use.should_send_tool_status:
                             try:
-                                send_tool_status(rcon, player_index, agent_name, display)
+                                await asyncio.to_thread(
+                                    send_tool_status,
+                                    rcon,
+                                    player_index,
+                                    agent_name,
+                                    display,
+                                )
                             except Exception as e:
                                 log.debug("tool status update failed: {}", e)
                     elif event.is_thinking:
@@ -2036,6 +1008,7 @@ def handle_message_model(
     read_only_tools: bool = False,
     stop_after_factorio_result: bool = False,
     tick_timeout_s: float | None = None,
+    event_loop: asyncio.AbstractEventLoop | None = None,
 ) -> AgentMessageResult:
     """Pipe a message through the Claude SDK. Returns a typed session result.
     agent_name: registered agent name (for RCON/mod).
@@ -2084,7 +1057,8 @@ def handle_message_model(
         log,
         agent_name=invocation.agent_name,
         block_all_manual_transfers=stop_after_factorio_result,
-        live_state_loader=lambda agent_name: _load_live_state_for_agent(
+        live_state_loader=lambda agent_name: asyncio.to_thread(
+            _load_live_state_for_agent,
             rcon,
             agent_name,
             log,
@@ -2120,23 +1094,25 @@ def handle_message_model(
     resolved_tick_timeout_s = _TICK_TIMEOUT_S if tick_timeout_s is None else tick_timeout_s
     partial_run = AgentRunProgress()
     try:
-        run = asyncio.run(
-            asyncio.wait_for(
-                _run_agent(
-                    prompt,
-                    options,
-                    invocation.agent_name,
-                    telemetry,
-                    tname,
-                    rcon,
-                    player_index,
-                    log,
-                    stop_after_factorio_result=stop_after_factorio_result,
-                    progress=partial_run,
-                ),
-                timeout=resolved_tick_timeout_s,
-            )
+        run_coro = asyncio.wait_for(
+            _run_agent(
+                prompt,
+                options,
+                invocation.agent_name,
+                telemetry,
+                tname,
+                rcon,
+                player_index,
+                log,
+                stop_after_factorio_result=stop_after_factorio_result,
+                progress=partial_run,
+            ),
+            timeout=resolved_tick_timeout_s,
         )
+        if event_loop is None:
+            run = asyncio.run(run_coro)
+        else:
+            run = event_loop.run_until_complete(run_coro)
         if run.context_window_limit:
             return _handle_context_window_limit(
                 agent_name=invocation.agent_name,
@@ -2473,6 +1449,7 @@ class AgentThread:
         self.autonomy_requires_player = runtime.autonomy_requires_player
         self.session_id = load_session(self.agent_name)
         self.inbox: queue.Queue[BridgeInputMessage | AutonomyTickMessage] = queue.Queue()
+        self._event_loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run, name=f"agent-{self.agent_name}", daemon=True,
         )
@@ -2530,6 +1507,13 @@ class AgentThread:
     def _compose_autonomy_prompt(self) -> str:
         """Assemble the autonomy-tick prompt for the current plan/execute mode."""
         return self._autonomy_tick().message
+
+    def _agent_event_loop(self) -> asyncio.AbstractEventLoop:
+        loop = getattr(self, "_event_loop", None)
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            self._event_loop = loop
+        return loop
 
     def _autonomy_tick(self) -> AutonomyTickMessage:
         """Choose plan/execute mode, update cadence state, and build the message."""
@@ -2732,6 +1716,7 @@ class AgentThread:
             read_only_tools=msg.read_only_tools,
             stop_after_factorio_result=stop_after_factorio_result,
             tick_timeout_s=tick_timeout_s,
+            event_loop=self._agent_event_loop(),
         )
         if message_result.reset_session:
             self.session_id = None
@@ -2767,7 +1752,8 @@ def main_multi(args, agent_profiles: list[AgentProfile | dict]):
             label = agent.registration_label
             register_agent(rcon, agent.name, label=label)
             log.info("Registered agent: {} [{}]", agent.name, label)
-        unregister_agent(rcon, "default")
+        if all(agent.name != "default" for agent in agent_profiles):
+            unregister_agent(rcon, "default")
     else:
         log.warning("claude-interface mod not detected")
 
@@ -2976,144 +1962,8 @@ def main():
         main_multi(args, profiles)
         return
 
-    # Single-agent mode
-    profile = load_agent(args.agent or "default")
-    runtime = AgentRuntimeConfig.from_sources(
-        profile,
-        cli_model=args.model,
-        cli_max_turns=args.max_turns,
-        cli_sdk_skills=args.sdk_skills,
-        default_sdk_skills=DEFAULT_SDK_SKILLS,
-        env=os.environ,
-    )
-    agent_name = runtime.agent_name
-    system_prompt = runtime.system_prompt
-    model = runtime.model
-    max_turns = runtime.max_turns
-    sdk_skills = runtime.sdk_skills
-    telemetry_name = runtime.telemetry_name
-    log = logger.bind(agent=telemetry_name)
-
-    # Load persisted session
-    session_id = load_session(agent_name)
-
-    # Resolve paths
-    script_output = Path(args.script_output) if args.script_output else find_script_output()
-    mcp_bin = args.factorioctl_mcp or find_factorioctl_mcp()
-
-    input_file = script_output / "claude-chat" / "input.jsonl"
-    input_file.parent.mkdir(parents=True, exist_ok=True)
-
-    # Banner
-    log.info("Factorio companion - {}", agent_name)
-    log.info("Agent: {}", agent_name)
-    log.info("RCON: {}:{}", args.rcon_host, args.rcon_port)
-    log.info("Input: {}", input_file)
-    if session_id:
-        log.info("Session: {}... (resumed)", session_id[:12])
-    else:
-        log.info("Session: (new)")
-    if model:
-        log.info("Model: {}", model)
-    log.info("SDK skills: {}", sdk_skills if sdk_skills else "disabled")
-    if mcp_bin:
-        log.info("MCP server: {}", mcp_bin)
-    else:
-        log.warning("MCP server not found (chat-only)")
-
-    # RCON
-    log.info("Connecting to Factorio RCON...")
-    rcon = RCONClient(args.rcon_host, args.rcon_port, args.rcon_password, log=log)
-    log.info("RCON connected")
-    if check_mod_loaded(rcon):
-        log.info("claude-interface mod detected")
-        register_agent(rcon, agent_name)
-        log.info("Registered agent: {}", agent_name)
-    else:
-        log.warning("claude-interface mod not detected")
-
-    # Pre-place character on correct planet
-    planet = runtime.planet_name
-    result = pre_place_character_model(rcon, agent_name, planet, spawn_offset=0)
-    log.info("Character: {} -> {}: {}", result.agent_name, result.planet, result.status)
-
-    # Telemetry
-    telemetry = build_telemetry(args)
-
-    # MCP config
-    mcp_config = None
-    if mcp_bin:
-        mcp_config = build_mcp_servers(
-            mcp_bin, args.rcon_host, args.rcon_port,
-            args.rcon_password, agent_id=agent_name,
-        )
-
-    # Watcher
-    watcher = InputWatcher(input_file)
-
-    log.info("Watching for messages... (Ctrl+C to stop)")
-
-    try:
-        while True:
-            time.sleep(args.poll_interval)
-
-            for msg in watcher.poll_model():
-                target = msg.target_agent
-                if target != agent_name:
-                    continue
-
-                player_index = msg.player_index
-                player_name = msg.player_name
-                message = msg.message
-
-                log.info("{} -> {}: {}", player_name, agent_name, message)
-                emit_chat(telemetry, "player", message, agent=telemetry_name)
-
-                cooldown_message = ""
-                cooldown_until = _get_usage_limit_cooldown(agent_name)
-                if cooldown_until:
-                    cooldown_message = _usage_limit_message(cooldown_until)
-                context_cooldown_until = _get_context_window_cooldown(agent_name)
-                if context_cooldown_until:
-                    cooldown_message = _context_window_message(context_cooldown_until)
-                if cooldown_message:
-                    if player_index > 0:
-                        send_response(rcon, player_index, agent_name, cooldown_message)
-                        set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
-                    continue
-
-                if player_index > 0:
-                    try:
-                        set_status(rcon, player_index, "[color=1,0.8,0.2]Thinking...[/color]")
-                    except Exception as e:
-                        log.debug("status update failed: {}", e)
-
-                if not mcp_config:
-                    log.error("factorioctl MCP not found")
-                    if player_index > 0:
-                        send_response(rcon, player_index, agent_name, "Error: factorioctl MCP not found")
-                    continue
-
-                message_result = handle_message_model(
-                    message, mcp_config, system_prompt, session_id,
-                    rcon, player_index, telemetry,
-                    agent_name=agent_name, telemetry_name=telemetry_name,
-                    model=model, max_turns=max_turns,
-                    sdk_skills=sdk_skills,
-                    read_only_tools=msg.read_only_tools,
-                )
-                if message_result.reset_session:
-                    session_id = None
-                    continue
-                if message_result.session_id:
-                    session_id = message_result.session_id
-                    save_session(agent_name, session_id)
-
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Shutting down...")
-    finally:
-        rcon.close()
-        log.info("Done")
+    # Single-agent mode is the same runtime as multi-agent with one profile.
+    main_multi(args, [load_agent(args.agent or "default")])
 
 
 if __name__ == "__main__":
