@@ -18,6 +18,8 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
+from tool_metadata import FACTORIO_TOOL_METADATA
+
 
 TOOL_PARAM_STRING = "string"
 TOOL_PARAM_NUMBER = "number"
@@ -34,98 +36,9 @@ TOOL_PARAM_TYPES = {
     TOOL_PARAM_LIST,
 }
 FACTORIO_MCP_TOOL_PREFIX = "mcp__factorioctl__"
-FACTORIO_MUTATING_TOOLS = frozenset({
-    "bootstrap_smelting_once",
-    "build_assembler_feed",
-    "build_assembler_output",
-    "build_automation_science",
-    "build_recipe_assembler_cell",
-    "clear_area",
-    "build_lab_feed",
-    "craft",
-    "create_zone",
-    "build_fuel_supply",
-    "delete_zone",
-    "extract_items",
-    "execute_direct_smelter",
-    "execute_edge_miner",
-    "execute_entity_placement_near",
-    "feed_lab_from_inventory",
-    "hand_feed_furnace",
-    "insert_items",
-    "mine_at",
-    "place_entity",
-    "remove_entity",
-    "repair_fuel_sustainability",
-    "route_belt",
-    "rotate_entity",
-    "set_recipe",
-    "start_research",
-    "update_zone",
-    "walk_to",
-})
-FACTORIO_READ_ONLY_TOOLS = frozenset({
-    "analyze_belt_gaps",
-    "analyze_item_flow",
-    "analyze_belt_networks",
-    "analyze_belt_reach",
-    "analyze_inserters",
-    "build_direct_smelter",
-    "build_edge_miner",
-    "check_placement",
-    "detect_sushi_belts",
-    "diagnose_factory_blockers",
-    "diagnose_fuel_sustainability",
-    "diagnose_steam_power",
-    "extend_power_to",
-    "find_build_area",
-    "find_entity_placements",
-    "find_nearest_resource",
-    "get_alerts",
-    "get_available_research",
-    "get_belt_lane_contents",
-    "get_blank_slate",
-    "get_character",
-    "get_entities",
-    "get_inventory",
-    "get_machine_belt_positions",
-    "get_power_coverage",
-    "get_power_networks",
-    "get_power_status",
-    "get_protected_resources",
-    "get_recipe",
-    "get_recipes_by_category",
-    "get_recipes_for_item",
-    "get_research_status",
-    "get_resources",
-    "get_tick",
-    "get_zone",
-    "list_zones",
-    "plan_steam_power",
-    "plan_machine_output",
-    "plan_automation_science",
-    "plan_recipe_assembler_cell",
-    "repair_steam_power",
-    "render_map",
-    "scan_resources",
-    "situation_report",
-    "trace_belt_sources",
-    "verify_production",
-})
-FACTORIO_DRY_RUN_SAFE_MUTATING_TOOLS = frozenset({
-    "bootstrap_smelting_once",
-    "build_assembler_feed",
-    "build_assembler_output",
-    "build_automation_science",
-    "build_recipe_assembler_cell",
-    "build_fuel_supply",
-    "repair_fuel_sustainability",
-    "execute_edge_miner",
-    "execute_entity_placement_near",
-    "build_lab_feed",
-    "clear_area",
-    "route_belt",
-})
+FACTORIO_MUTATING_TOOLS = FACTORIO_TOOL_METADATA.mutating_tools
+FACTORIO_READ_ONLY_TOOLS = FACTORIO_TOOL_METADATA.read_only_tools
+FACTORIO_DRY_RUN_SAFE_MUTATING_TOOLS = FACTORIO_TOOL_METADATA.dry_run_safe_mutating_tools
 
 _BRIDGE_LOG_OBJECTIVE_RE = re.compile(
     r"Continuity ledger: continue the committed objective, do not restart it:\s*([^\n]+)"

@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -154,6 +155,7 @@ from models import (
     ToolResultOutcome,
     ToolCallRequest,
 )
+from tool_metadata import FACTORIO_TOOL_METADATA
 
 
 
@@ -218,6 +220,52 @@ class ModelToolSchemaSdkTests(unittest.TestCase):
         self.assertEqual(request.tool_input, {})
         with self.assertRaisesRegex(ValueError, "tool_name"):
             ToolCallRequest(tool_name="", tool_input={})
+
+    def test_factorio_tool_metadata_covers_rust_mcp_tools(self):
+        project_root = Path(__file__).resolve().parents[2]
+        rust_mcp = (project_root / "src" / "bin" / "mcp.rs").read_text()
+        rust_tool_names = {
+            match.group(1)
+            for match in re.finditer(
+                r"#\[tool(?:\([^\]]*\))?\]\s*(?://[^\n]*\n|\s)*"
+                r"async fn ([A-Za-z0-9_]+)\s*\(",
+                rust_mcp,
+            )
+        }
+
+        self.assertEqual(FACTORIO_TOOL_METADATA.missing(rust_tool_names), frozenset())
+        self.assertEqual(FACTORIO_TOOL_METADATA.names - rust_tool_names, frozenset())
+
+    def test_tool_call_request_uses_generated_tool_metadata(self):
+        self.assertTrue(
+            ToolCallRequest.is_mutating_factorio_tool_name(
+                "mcp__factorioctl__unstuck",
+            )
+        )
+        self.assertTrue(ToolCallRequest(
+            tool_name="mcp__factorioctl__unstuck",
+            tool_input={"dry_run": True},
+        ).is_read_only_dry_run)
+        self.assertTrue(
+            ToolCallRequest.is_read_only_factorio_tool_name(
+                "mcp__factorioctl__plan_entity_placement_near",
+            )
+        )
+        self.assertTrue(
+            ToolCallRequest.is_read_only_factorio_tool_name(
+                "mcp__factorioctl__debug_wedged_state",
+            )
+        )
+        self.assertTrue(
+            ToolCallRequest.is_mutating_factorio_tool_name(
+                "mcp__factorioctl__execute_lua",
+            )
+        )
+        self.assertTrue(
+            ToolCallRequest.is_read_only_factorio_tool_name(
+                "mcp__factorioctl__broadcast_thought",
+            )
+        )
         with self.assertRaisesRegex(ValueError, "tool_input"):
             ToolCallRequest(tool_name="mcp__factorioctl__mine_at", tool_input=[])
 
