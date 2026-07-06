@@ -47,6 +47,14 @@ EOF
 # Ensure mod is symlinked/copied into server mods
 MOD_SRC="$PROJECT_ROOT/mod/claude-interface"
 MOD_DST="$WRITE_DATA/mods/claude-interface"
+if [ -L "$MOD_DST" ]; then
+    MOD_LINK_TARGET="$(readlink "$MOD_DST")"
+    if [ "$MOD_LINK_TARGET" != "$MOD_SRC" ] || [ ! -e "$MOD_DST" ]; then
+        rm -f "$MOD_DST"
+    fi
+elif [ -e "$MOD_DST" ] && [ ! -d "$MOD_DST" ]; then
+    rm -rf "$MOD_DST"
+fi
 if [ ! -e "$MOD_DST" ]; then
     # Try symlink first, fall back to copy (Flatpak can't follow symlinks)
     ln -s "$MOD_SRC" "$MOD_DST" 2>/dev/null || cp -r "$MOD_SRC" "$MOD_DST"
