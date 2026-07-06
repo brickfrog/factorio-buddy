@@ -15,6 +15,7 @@ _USAGE_LIMIT_COOLDOWNS: dict[str, datetime] = {}
 _USAGE_LIMIT_COOLDOWNS_LOCK = threading.Lock()
 _CONTEXT_WINDOW_COOLDOWNS: dict[str, datetime] = {}
 _CONTEXT_WINDOW_COOLDOWNS_LOCK = threading.Lock()
+_PROVIDER_USAGE_LIMIT_SETTINGS = ProviderUsageLimitSettings.from_env(os.environ)
 
 
 def _runtime_settings(env: Any = None) -> BridgeRuntimeSettings:
@@ -98,13 +99,12 @@ def _set_usage_limit_cooldown(
     log=None,
     now: datetime | None = None,
 ) -> datetime | None:
-    settings = ProviderUsageLimitSettings.from_env(os.environ)
     return _set_usage_limit_cooldown_from_limit(
         agent_name,
         ProviderUsageLimit.from_text(
             text,
             now=now,
-            default_utc_offset=settings.usage_limit_reset_utc_offset,
+            default_utc_offset=_PROVIDER_USAGE_LIMIT_SETTINGS.usage_limit_reset_utc_offset,
         ),
         log=log,
         now=now,

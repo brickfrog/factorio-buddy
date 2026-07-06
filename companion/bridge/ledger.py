@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from pydantic import Field, field_validator
 
+from runtime_paths import read_candidates, state_file
 from models.base import (
     AutonomyMode,
     BridgeModel,
@@ -889,7 +890,17 @@ class LedgerUpdate(BridgeModel):
 
 
 def _ledger_file(agent_name: str) -> Path:
-    return Path(__file__).resolve().parent / f".ledger-{agent_name}.json"
+    return state_file(f".ledger-{agent_name}.json")
+
+
+def _ledger_read_files(agent_name: str) -> tuple[Path, ...]:
+    primary = _ledger_file(agent_name)
+    candidates = [primary]
+    candidates.extend(
+        path for path in read_candidates(f".ledger-{agent_name}.json")
+        if path not in candidates
+    )
+    return tuple(candidates)
 
 
 def default_ledger_model() -> LedgerState:
@@ -909,15 +920,15 @@ def _is_stale_bootstrap_ledger(ledger: LedgerState | dict) -> bool:
 def load_ledger_model(agent_name: str) -> LedgerState:
     # json.JSONDecodeError and UnicodeDecodeError are both ValueError subclasses,
     # so (ValueError, OSError) covers corrupt JSON and non-UTF8/unreadable files.
-    try:
-        ledger = LedgerState.from_file_text(
-            _ledger_file(agent_name).read_text(),
-        )
-    except (ValueError, OSError):
-        return default_ledger_model()
-    if _is_stale_bootstrap_ledger(ledger):
-        return default_ledger_model()
-    return ledger
+    for path in _ledger_read_files(agent_name):
+        try:
+            ledger = LedgerState.from_file_text(path.read_text())
+        except (ValueError, OSError):
+            continue
+        if _is_stale_bootstrap_ledger(ledger):
+            return default_ledger_model()
+        return ledger
+    return default_ledger_model()
 
 
 def save_ledger_model(agent_name: str, ledger: LedgerState | dict) -> None:
@@ -933,6 +944,7 @@ def save_ledger_model(agent_name: str, ledger: LedgerState | dict) -> None:
               f"{agent_name}: {e}")
         return None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(payload)
         os.replace(tmp, path)
     except OSError as e:
@@ -956,7 +968,7 @@ def apply_ledger_update_model(agent_name: str, source: str | LedgerUpdate) -> Le
 
     ledger = current.merged_with(
         parsed,
-        updated_at=datetime.now().isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
         max_progress_notes=10,
     )
     save_ledger_model(agent_name, ledger)

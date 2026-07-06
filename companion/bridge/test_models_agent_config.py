@@ -777,28 +777,33 @@ class ModelAgentConfigTests(unittest.TestCase):
             "FACTORIO_SERVER_DATA": " /tmp/server-data ",
             "FACTORIO_MODS_DIR": " /tmp/mods ",
             "FACTORIOCTL_MCP_BIN": " /tmp/mcp ",
+            "FACTORIOCTL_BRIDGE_STATE_DIR": " /tmp/bridge-state ",
         })
         defaulted = FactorioPathSettings.from_env({
             "FACTORIO_SERVER_DATA": " ",
             "FACTORIO_MODS_DIR": "",
             "FACTORIOCTL_MCP_BIN": None,
+            "FACTORIOCTL_BRIDGE_STATE_DIR": "",
         })
 
         self.assertEqual(settings.server_data, "/tmp/server-data")
         self.assertEqual(settings.script_output_dir, Path("/tmp/server-data/script-output"))
         self.assertEqual(settings.mods_dir_path, Path("/tmp/mods"))
         self.assertEqual(settings.mcp_bin_path, Path("/tmp/mcp"))
+        self.assertEqual(settings.bridge_state_dir_path, Path("/tmp/bridge-state"))
         self.assertIs(FactorioPathSettings.from_env(settings), settings)
         self.assertIsNone(defaulted.server_data)
         self.assertIsNone(defaulted.script_output_dir)
         self.assertIsNone(defaulted.mods_dir_path)
         self.assertIsNone(defaulted.mcp_bin_path)
+        self.assertIsNone(defaulted.bridge_state_dir_path)
 
     def test_factorio_path_settings_uses_typed_env_bindings(self):
         fields = FactorioPathSettings.env_fields()
 
         self.assertTrue(all(isinstance(field, BridgeRuntimeEnvField) for field in fields))
         self.assertIn("FACTORIOCTL_MCP_BIN", {field.env_name for field in fields})
+        self.assertIn("FACTORIOCTL_BRIDGE_STATE_DIR", {field.env_name for field in fields})
         with mock.patch.object(
             FactorioPathSettings,
             "ENV_FIELDS",

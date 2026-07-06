@@ -350,14 +350,19 @@ class FactorioPathSettings(BridgeModel):
     server_data: str | None = None
     mods_dir: str | None = None
     mcp_bin: str | None = None
+    bridge_state_dir: str | None = None
 
     ENV_FIELDS: ClassVar[tuple[BridgeRuntimeEnvField, ...]] = (
         BridgeRuntimeEnvField(env_name="FACTORIO_SERVER_DATA", field_name="server_data"),
         BridgeRuntimeEnvField(env_name="FACTORIO_MODS_DIR", field_name="mods_dir"),
         BridgeRuntimeEnvField(env_name="FACTORIOCTL_MCP_BIN", field_name="mcp_bin"),
+        BridgeRuntimeEnvField(
+            env_name="FACTORIOCTL_BRIDGE_STATE_DIR",
+            field_name="bridge_state_dir",
+        ),
     )
 
-    @field_validator("server_data", "mods_dir", "mcp_bin", mode="before")
+    @field_validator("server_data", "mods_dir", "mcp_bin", "bridge_state_dir", mode="before")
     @classmethod
     def _coerce_optional_path(cls, value: Any) -> str | None:
         text = str(value).strip() if value is not None else ""
@@ -387,6 +392,10 @@ class FactorioPathSettings(BridgeModel):
     @property
     def mcp_bin_path(self) -> Path | None:
         return Path(self.mcp_bin) if self.mcp_bin else None
+
+    @property
+    def bridge_state_dir_path(self) -> Path | None:
+        return Path(self.bridge_state_dir) if self.bridge_state_dir else None
 
 
 class FactorioModInfo(BridgeModel):

@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Iterable
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from runtime_paths import read_candidates, state_file
 from models.base import (
     BridgeModel,
     BridgeTextLines,
@@ -1108,11 +1109,31 @@ USEFUL_EVENT_KINDS = {"progress", "discovery", "milestone"}
 
 
 def _journal_file(agent_name: str) -> Path:
-    return Path(__file__).resolve().parent / f".journal-{agent_name}.jsonl"
+    return state_file(f".journal-{agent_name}.jsonl")
+
+
+def _journal_read_files(agent_name: str) -> tuple[Path, ...]:
+    primary = _journal_file(agent_name)
+    candidates = [primary]
+    candidates.extend(
+        path for path in read_candidates(f".journal-{agent_name}.jsonl")
+        if path not in candidates
+    )
+    return tuple(candidates)
 
 
 def _reflection_file(agent_name: str) -> Path:
-    return Path(__file__).resolve().parent / f".reflection-{agent_name}.json"
+    return state_file(f".reflection-{agent_name}.json")
+
+
+def _reflection_read_files(agent_name: str) -> tuple[Path, ...]:
+    primary = _reflection_file(agent_name)
+    candidates = [primary]
+    candidates.extend(
+        path for path in read_candidates(f".reflection-{agent_name}.json")
+        if path not in candidates
+    )
+    return tuple(candidates)
 
 
 def default_reflection_model() -> ReflectionMemory:
@@ -1144,7 +1165,7 @@ def append_event(
     signal: ProgressSignal | str | None = None,
 ) -> None:
     event = JournalEvent.create(
-        ts=datetime.now().isoformat(),
+        ts=datetime.now(timezone.utc).isoformat(),
         kind=kind,
         text=text,
         signal=signal,
@@ -1153,6 +1174,7 @@ def append_event(
         return None
     path = _journal_file(agent_name)
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(event.to_json_line())
     except OSError as e:
@@ -1161,12 +1183,17 @@ def append_event(
 
 
 def load_events_model(agent_name: str, limit: int = 20) -> JournalWindow:
-    try:
-        raw_lines = BridgeTextLines.from_text(
-            _journal_file(agent_name).read_text(),
-            keep_blank=False,
-        ).lines
-    except (ValueError, OSError):
+    raw_lines: tuple[str, ...] = ()
+    for path in _journal_read_files(agent_name):
+        try:
+            raw_lines = BridgeTextLines.from_text(
+                path.read_text(),
+                keep_blank=False,
+            ).lines
+            break
+        except (ValueError, OSError):
+            continue
+    if not raw_lines:
         return JournalWindow()
 
     events = []
@@ -1188,12 +1215,17 @@ def load_events_model(agent_name: str, limit: int = 20) -> JournalWindow:
 
 
 def count_events(agent_name: str) -> int:
-    try:
-        raw_lines = BridgeTextLines.from_text(
-            _journal_file(agent_name).read_text(),
-            keep_blank=False,
-        ).lines
-    except (ValueError, OSError):
+    raw_lines: tuple[str, ...] = ()
+    for path in _journal_read_files(agent_name):
+        try:
+            raw_lines = BridgeTextLines.from_text(
+                path.read_text(),
+                keep_blank=False,
+            ).lines
+            break
+        except (ValueError, OSError):
+            continue
+    if not raw_lines:
         return 0
     count = 0
     for line in raw_lines:
@@ -1212,15 +1244,16 @@ def should_reflect(event_count: int, interval: int = 16) -> bool:
 
 
 def load_reflection_model(agent_name: str) -> ReflectionMemory:
-    try:
-        memory = ReflectionMemory.from_file_text(
-            _reflection_file(agent_name).read_text(),
-            max_items=MAX_REFLECTION_ITEMS,
-            max_len=MAX_REFLECTION_ITEM_TEXT,
-        )
-    except (ValueError, OSError):
-        return default_reflection_model()
-    return memory
+    for path in _reflection_read_files(agent_name):
+        try:
+            return ReflectionMemory.from_file_text(
+                path.read_text(),
+                max_items=MAX_REFLECTION_ITEMS,
+                max_len=MAX_REFLECTION_ITEM_TEXT,
+            )
+        except (ValueError, OSError):
+            continue
+    return default_reflection_model()
 
 
 def save_reflection_model(agent_name: str, reflection: ReflectionMemory | dict) -> None:
@@ -1237,6 +1270,7 @@ def save_reflection_model(agent_name: str, reflection: ReflectionMemory | dict) 
               f"{agent_name}: {e}")
         return None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(payload)
         os.replace(tmp, path)
     except OSError as e:
@@ -1267,7 +1301,7 @@ def apply_reflection_update_model(
 
     reflection = current.merged_with(
         parsed,
-        updated_at=datetime.now().isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
         max_items=MAX_REFLECTION_ITEMS,
         max_len=MAX_REFLECTION_ITEM_TEXT,
     )

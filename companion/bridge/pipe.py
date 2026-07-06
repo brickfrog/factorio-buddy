@@ -21,7 +21,7 @@ import shutil
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from models import DotEnvFile
+from runtime_paths import read_candidates, state_file
 
 # Load .env
 _env_file = Path(__file__).parent / ".env"
@@ -57,7 +58,7 @@ def _shutdown_handler(signum, frame):
 def setup_logging(log_dir: Path) -> Path | None:
     """Configure loguru console, human file, and structured JSONL sinks."""
     log_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     log_path = log_dir / f"bridge-{stamp}.log"
     jsonl_path = log_dir / f"bridge-{stamp}.jsonl"
     console_format = (
@@ -185,7 +186,7 @@ DEFAULT_MAX_TURNS = 200
 DEFAULT_AUTONOMY_EXEC_MAX_TURNS = 4
 DEFAULT_AUTONOMY_EXEC_TIMEOUT_S = 60.0
 DEFAULT_SDK_SKILLS = "factorio-control"
-SESSIONS_FILE = _BRIDGE_DIR / ".sessions.json"
+SESSIONS_FILE = state_file(".sessions.json")
 
 # ── Agent profiles ───────────────────────────────────────────
 
@@ -267,24 +268,43 @@ def sanitize_response(text: str) -> str:
 SESSION_RESET = "__factorioctl_session_reset__"
 
 def _session_file(agent_name: str) -> Path:
-    return _BRIDGE_DIR / f".session-{agent_name}.json"
+    return state_file(f".session-{agent_name}.json")
+
+
+def _session_read_files(agent_name: str) -> tuple[Path, ...]:
+    primary = _session_file(agent_name)
+    candidates = [primary]
+    candidates.extend(
+        path for path in read_candidates(f".session-{agent_name}.json")
+        if path not in candidates
+    )
+    return tuple(candidates)
+
+
+def _session_index_read_files() -> tuple[Path, ...]:
+    candidates = [SESSIONS_FILE]
+    candidates.extend(path for path in read_candidates(".sessions.json") if path not in candidates)
+    return tuple(candidates)
 
 
 def load_session(agent_name: str) -> str | None:
     """Load persisted session ID for an agent."""
     # Per-agent file (preferred)
-    f = _session_file(agent_name)
-    if f.exists():
+    for f in _session_read_files(agent_name):
+        if not f.exists():
+            continue
         try:
             return AgentSessionState.from_file_text(f.read_text()).session_id
         except (BridgeValidationError, OSError):
             return None
     # Backward compat: check old shared file
-    if SESSIONS_FILE.exists():
+    for f in _session_index_read_files():
         try:
-            return AgentSessionIndex.from_file_text(SESSIONS_FILE.read_text()).get(agent_name)
+            session_id = AgentSessionIndex.from_file_text(f.read_text()).get(agent_name)
+            if session_id:
+                return session_id
         except (BridgeValidationError, OSError):
-            return None
+            continue
     return None
 
 
@@ -292,6 +312,7 @@ def save_session(agent_name: str, session_id: str):
     """Persist session ID for an agent (per-agent file, thread-safe)."""
     f = _session_file(agent_name)
     tmp = f.with_name(f"{f.name}.tmp")
+    f.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(AgentSessionState(session_id=session_id).to_json_line())
     os.replace(tmp, f)
     try:
@@ -302,24 +323,27 @@ def save_session(agent_name: str, session_id: str):
 
 def clear_session(agent_name: str) -> None:
     """Forget a stale SDK session ID for an agent."""
-    try:
-        _session_file(agent_name).unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
+    for path in _session_read_files(agent_name):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
     # Backward compat: older bridge versions stored all agents in one file.
-    if not SESSIONS_FILE.exists():
+    session_index_file = next((path for path in _session_index_read_files() if path.exists()), None)
+    if session_index_file is None:
         return
     try:
-        sessions = AgentSessionIndex.from_file_text(SESSIONS_FILE.read_text())
+        sessions = AgentSessionIndex.from_file_text(session_index_file.read_text())
     except (BridgeValidationError, OSError):
         return
     if agent_name not in sessions.sessions:
         return
     sessions = sessions.without(agent_name)
     try:
+        SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SESSIONS_FILE.write_text(sessions.to_legacy_json_line())
     except OSError:
         pass
@@ -435,12 +459,14 @@ def _disallowed_tools_for_env(env: dict[str, str]) -> list[str]:
 
 
 def _runtime_settings(env: Any = None) -> BridgeRuntimeSettings:
+    if env is None and "_RUNTIME_SETTINGS" in globals():
+        return _RUNTIME_SETTINGS
     return BridgeRuntimeSettings.from_env(os.environ if env is None else env)
 
 
 def _resolve_max_turns(value: Any = None) -> int:
     if value is None:
-        return _runtime_settings().max_turns
+        return BridgeRuntimeSettings.from_env(os.environ).max_turns
     return BridgeRuntimeSettings(max_turns=value).max_turns
 
 
@@ -522,7 +548,7 @@ def _mark_autonomy_step_needs_plan(agent_name: str, progress: str) -> None:
                     status=LedgerStatus.READY,
                     next_required_mode=LedgerNextRequiredMode.PLAN,
                 ),
-                updated_at=datetime.now().isoformat(),
+                updated_at=datetime.now(timezone.utc).isoformat(),
                 max_progress_notes=10,
             ),
         )
@@ -537,6 +563,7 @@ def _mark_autonomy_step_needs_plan(agent_name: str, progress: str) -> None:
 # turns, not a stalled TCP connection or a model response that never yields, so
 # a tick is also wrapped in asyncio.wait_for. Override via BRIDGE_TICK_TIMEOUT_S.
 _RUNTIME_SETTINGS = _runtime_settings()
+_PROVIDER_USAGE_LIMIT_SETTINGS = ProviderUsageLimitSettings.from_env(os.environ)
 _TICK_TIMEOUT_S = _RUNTIME_SETTINGS.tick_timeout_s
 
 # A long tick is fine if the SDK keeps emitting messages, but a long silent gap
@@ -722,9 +749,9 @@ async def _run_agent(
                     if event.is_text:
                         observation = SdkAssistantTextObservation.from_event(
                             event,
-                            default_utc_offset=ProviderUsageLimitSettings.from_env(
-                                os.environ,
-                            ).usage_limit_reset_utc_offset,
+                            default_utc_offset=(
+                                _PROVIDER_USAGE_LIMIT_SETTINGS.usage_limit_reset_utc_offset
+                            ),
                         )
                         text_parts.append(observation.text)
                         if observation.usage_limit:
@@ -821,9 +848,9 @@ async def _run_agent(
             elif isinstance(msg, ResultMessage):
                 result_message = SdkResultMessage.from_sdk_message(msg)
                 observation = result_message.observation(
-                    default_utc_offset=ProviderUsageLimitSettings.from_env(
-                        os.environ,
-                    ).usage_limit_reset_utc_offset,
+                    default_utc_offset=(
+                        _PROVIDER_USAGE_LIMIT_SETTINGS.usage_limit_reset_utc_offset
+                    ),
                 )
                 new_session_id = observation.session_id or new_session_id
                 progress.session_id = new_session_id
@@ -891,9 +918,9 @@ async def _run_agent(
             if autonomy_step_progress:
                 exception_signal = AgentInvocationExceptionSignal.from_exception(
                     exc,
-                    default_utc_offset=ProviderUsageLimitSettings.from_env(
-                        os.environ,
-                    ).usage_limit_reset_utc_offset,
+                    default_utc_offset=(
+                        _PROVIDER_USAGE_LIMIT_SETTINGS.usage_limit_reset_utc_offset
+                    ),
                 )
                 if exception_signal.terminal_result_echo:
                     log.debug(
@@ -1218,9 +1245,7 @@ def handle_message_model(
     except Exception as e:
         exception_signal = AgentInvocationExceptionSignal.from_exception(
             e,
-            default_utc_offset=ProviderUsageLimitSettings.from_env(
-                os.environ,
-            ).usage_limit_reset_utc_offset,
+            default_utc_offset=_PROVIDER_USAGE_LIMIT_SETTINGS.usage_limit_reset_utc_offset,
         )
         error_msg = exception_signal.error_message
         cooldown_until = (

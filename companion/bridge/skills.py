@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 from pydantic import Field, ValidationError, field_validator
 
+from runtime_paths import read_candidates, state_file
 from models.base import BridgeModel, BridgeValidationError, CommaSeparatedItems, _json_object_from_text
 from models.rcon_models import HiddenTrailerBlock
 from models.tool_schema import _coerce_str_or_list
@@ -374,7 +375,14 @@ STARTER_SKILLS = (
 
 
 def _skills_file() -> Path:
-    return Path(__file__).resolve().parent / ".skills.json"
+    return state_file(".skills.json")
+
+
+def _skills_read_files() -> tuple[Path, ...]:
+    primary = _skills_file()
+    candidates = [primary]
+    candidates.extend(path for path in read_candidates(".skills.json") if path not in candidates)
+    return tuple(candidates)
 
 
 def _starter_library_model() -> SkillLibrary:
@@ -383,12 +391,17 @@ def _starter_library_model() -> SkillLibrary:
 
 def load_library_model() -> SkillLibrary:
     starters = _starter_library_model()
-    try:
-        saved = SkillLibrary.from_file_text(
-            _skills_file().read_text(),
-            max_skills=MAX_SKILLS,
-        )
-    except (BridgeValidationError, OSError):
+    saved = None
+    for path in _skills_read_files():
+        try:
+            saved = SkillLibrary.from_file_text(
+                path.read_text(),
+                max_skills=MAX_SKILLS,
+            )
+            break
+        except (BridgeValidationError, OSError):
+            continue
+    if saved is None:
         return starters
     if not saved.skills:
         return starters
@@ -400,6 +413,7 @@ def save_library_model(library: dict | SkillLibrary) -> None:
     tmp = path.with_name(path.name + ".tmp")
     payload = SkillLibrary.normalized(library, max_skills=MAX_SKILLS).to_json_line()
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(payload)
         os.replace(tmp, path)
     except OSError as e:

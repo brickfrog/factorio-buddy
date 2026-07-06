@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest import mock
 
 import paths
+import runtime_paths
 
 
 class PathDiscoveryTests(unittest.TestCase):
@@ -39,6 +40,38 @@ class PathDiscoveryTests(unittest.TestCase):
 
         with mock.patch.dict("os.environ", {"FACTORIOCTL_MCP_BIN": f" {mcp} "}):
             self.assertEqual(paths.find_factorioctl_mcp(), str(mcp))
+
+    def test_bridge_state_dir_uses_env_or_server_data(self):
+        configured = self.base / "configured-state"
+        server_data = self.base / "server-data"
+
+        self.assertEqual(
+            runtime_paths.bridge_state_dir(
+                env={"FACTORIOCTL_BRIDGE_STATE_DIR": f" {configured} "},
+            ),
+            configured,
+        )
+        self.assertTrue(configured.is_dir())
+        self.assertEqual(
+            runtime_paths.bridge_state_dir(env={"FACTORIO_SERVER_DATA": str(server_data)}),
+            server_data / "bridge-state",
+        )
+        self.assertTrue((server_data / "bridge-state").is_dir())
+
+    def test_read_candidates_prefers_state_file_then_existing_legacy(self):
+        state_dir = self.base / "state"
+        legacy = runtime_paths.BRIDGE_DIR / ".unit-test-legacy-state"
+        self.addCleanup(lambda: legacy.unlink(missing_ok=True))
+        legacy.write_text("legacy")
+
+        with mock.patch.dict(
+            "os.environ",
+            {"FACTORIOCTL_BRIDGE_STATE_DIR": str(state_dir)},
+        ):
+            candidates = runtime_paths.read_candidates(".unit-test-legacy-state")
+
+        self.assertEqual(candidates[0], state_dir / ".unit-test-legacy-state")
+        self.assertEqual(candidates[1], legacy)
 
 
 if __name__ == "__main__":
