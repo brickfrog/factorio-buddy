@@ -381,10 +381,6 @@ def _starter_library_model() -> SkillLibrary:
     return SkillLibrary(skills=list(STARTER_SKILLS))
 
 
-def default_library() -> dict:
-    return _starter_library_model().to_dict()
-
-
 def load_library_model() -> SkillLibrary:
     starters = _starter_library_model()
     try:
@@ -397,10 +393,6 @@ def load_library_model() -> SkillLibrary:
     if not saved.skills:
         return starters
     return starters.merged_with(saved, max_skills=MAX_SKILLS)
-
-
-def load_library() -> dict:
-    return load_library_model().to_dict()
 
 
 def save_library_model(library: dict | SkillLibrary) -> None:
@@ -419,19 +411,10 @@ def save_library_model(library: dict | SkillLibrary) -> None:
     return None
 
 
-def save_library(library: dict | SkillLibrary) -> None:
-    return save_library_model(library)
-
-
 def parse_skill_trailer_model(
     source: str | SkillDefinition | SkillDefinitionDraft,
 ) -> SkillDefinition | None:
     return SkillDefinition.from_trailer_text(source)
-
-
-def parse_skill_trailer(source: str | SkillDefinition | SkillDefinitionDraft) -> dict | None:
-    skill = parse_skill_trailer_model(source)
-    return skill.to_sparse_dict() if skill else None
 
 
 def apply_skill_update_model(source: str | SkillDefinition | SkillDefinitionDraft) -> SkillLibrary:
@@ -445,10 +428,6 @@ def apply_skill_update_model(source: str | SkillDefinition | SkillDefinitionDraf
     return library
 
 
-def apply_skill_update(source: str | SkillDefinition | SkillDefinitionDraft) -> dict:
-    return apply_skill_update_model(source).to_dict()
-
-
 def strip_skill_trailer(text: str) -> str:
     return SkillDefinition.strip_trailer_text(text)
 
@@ -459,8 +438,3 @@ def render_skills(library: dict | SkillLibrary) -> str:
 
 def get_skill_model(library: dict | SkillLibrary, name: str) -> SkillDefinition | None:
     return SkillLibrary.normalized(library, max_skills=MAX_SKILLS).get(name)
-
-
-def get_skill(library: dict | SkillLibrary, name: str) -> dict | None:
-    skill = get_skill_model(library, name)
-    return skill.to_dict() if skill else None

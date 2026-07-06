@@ -717,12 +717,6 @@ def _candidate_hash(candidate: dict | LearningProposal) -> str:
     return proposal.stable_content_hash()
 
 
-def parse_learning_trailers(
-    source: object,
-) -> list[dict]:
-    return [proposal.to_dict() for proposal in parse_learning_trailer_models(source)]
-
-
 def strip_learning_trailers(text: str) -> str:
     return LearningProposal.strip_trailer_text(text, tags=LEARNING_TAGS)
 
@@ -866,11 +860,6 @@ def _load_candidate_model(
     return _proposal_with_hash(proposal)
 
 
-def _load_candidate_file(path: Path) -> dict | None:
-    proposal = _load_candidate_model(path)
-    return proposal.to_dict() if proposal else None
-
-
 def load_accepted_learning_model(
     limit: int = MAX_RENDERED_ACCEPTED,
 ) -> list[LearningProposal]:
@@ -892,10 +881,6 @@ def load_accepted_learning_model(
     if limit <= 0:
         return []
     return candidates[-limit:]
-
-
-def load_accepted_learning(limit: int = MAX_RENDERED_ACCEPTED) -> list[dict]:
-    return [candidate.to_dict() for candidate in load_accepted_learning_model(limit)]
 
 
 def render_accepted_learning(candidates: object) -> str:

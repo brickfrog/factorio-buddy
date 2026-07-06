@@ -39,7 +39,7 @@ class LearningTests(unittest.TestCase):
         self.addCleanup(self.reflection_patch.stop)
 
     def test_parse_learning_trailer_extracts_structured_skill_proposal(self):
-        parsed = learning.parse_learning_trailers(
+        parsed = learning.parse_learning_trailer_models(
             """Visible.
 <skill_proposal>
 name: repair_steam_power
@@ -60,11 +60,11 @@ evidence:
 
         self.assertEqual(len(parsed), 1)
         proposal = parsed[0]
-        self.assertEqual(proposal["kind"], "skill_proposal")
-        self.assertEqual(proposal["name"], "repair_steam_power")
-        self.assertIn("boiler_no_water", proposal["trigger"])
-        self.assertEqual(proposal["steps"][0], "fix water path before steam path")
-        self.assertEqual(proposal["anti_steps"], ["do not place duplicate offshore pumps"])
+        self.assertEqual(proposal.kind, "skill_proposal")
+        self.assertEqual(proposal.name, "repair_steam_power")
+        self.assertIn("boiler_no_water", proposal.trigger)
+        self.assertEqual(proposal.steps[0], "fix water path before steam path")
+        self.assertEqual(proposal.anti_steps, ["do not place duplicate offshore pumps"])
 
     def test_parse_learning_trailer_models_returns_typed_proposals(self):
         parsed = learning.parse_learning_trailer_models(
@@ -224,7 +224,7 @@ evidence:
         learning.save_candidate(pending, status="pending")
         learning.save_candidate(accepted, status="accepted")
 
-        rendered = learning.render_accepted_learning(learning.load_accepted_learning())
+        rendered = learning.render_accepted_learning(learning.load_accepted_learning_model())
 
         self.assertIn("Accepted learned procedures", rendered)
         self.assertIn("repair_steam_power", rendered)
@@ -245,15 +245,11 @@ evidence:
             "steps": ["run analyze_belt_gaps"],
         }, status="accepted")
 
-        loaded = learning.load_accepted_learning()
         loaded_models = learning.load_accepted_learning_model()
 
-        self.assertEqual(len(loaded), 1)
-        self.assertEqual(loaded[0]["name"], "belt_gap")
         self.assertEqual(len(loaded_models), 1)
         self.assertIsInstance(loaded_models[0], LearningProposal)
         self.assertEqual(loaded_models[0].name, "belt_gap")
-        self.assertEqual([model.to_dict() for model in loaded_models], loaded)
 
     def test_render_accepted_learning_accepts_typed_proposals(self):
         candidates = (
@@ -309,7 +305,7 @@ evidence:
         }, status="pending")
 
         promoted = learning.promote_candidate(source)
-        rendered = learning.render_accepted_learning(learning.load_accepted_learning())
+        rendered = learning.render_accepted_learning(learning.load_accepted_learning_model())
 
         self.assertIsNotNone(promoted)
         self.assertFalse(source.exists())
