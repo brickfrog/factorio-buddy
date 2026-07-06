@@ -627,6 +627,33 @@ progress: plan confirmed; awaiting execution
             mutating["hookSpecificOutput"]["permissionDecision"], "allow"
         )
 
+    def test_manual_automation_gate_blocks_manual_transfer_when_forced(self):
+        import pipe
+
+        gate = pipe.ManualAutomationDriftGate(
+            pipe.logger.bind(agent="test"),
+            agent_name="doug",
+            block_all_manual_transfers=True,
+        )
+
+        blocked = asyncio.run(gate.hook({
+            "tool_name": "mcp__factorioctl__extract_items",
+            "tool_input": {
+                "unit_number": 14,
+                "item": "iron-plate",
+                "count": 5,
+                "inventory_type": "furnace_result",
+            },
+        }, "tool-1", {}))
+        read_only = asyncio.run(gate.hook({
+            "tool_name": "mcp__factorioctl__situation_report",
+            "tool_input": {"radius": 10},
+        }, "tool-2", {}))
+
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("blocked stale manual automation tool", blocked["reason"])
+        self.assertEqual(read_only, {})
+
     def test_hook_gates_accept_sdk_object_hook_input(self):
         import pipe
 
@@ -1478,6 +1505,21 @@ progress: plan confirmed; awaiting execution
             blocked_fuel["reason"],
         )
 
+        blocked_inserter_analysis = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__analyze_inserters",
+                "tool_input": {"x": 54.5, "y": 9, "radius": 12},
+            },
+            "tool-3",
+            {},
+        ))
+
+        self.assertEqual(blocked_inserter_analysis["decision"], "block")
+        self.assertIn(
+            "analyze_inserters: tool_input.x: expected integer",
+            blocked_inserter_analysis["reason"],
+        )
+
         allowed_repair = asyncio.run(gate.hook(
             {
                 "tool_name": "mcp__factorioctl__repair_fuel_sustainability",
@@ -2310,6 +2352,54 @@ progress: plan confirmed; awaiting execution
         self.assertEqual(json.loads(pipe.SESSIONS_FILE.read_text()), {"other": "keep-me"})
         self.assertEqual(journal.load_events("doug"), [])
 
+    def test_handle_message_clears_session_when_context_result_stream_raises(self):
+        import pipe
+        from claude_agent_sdk import ResultMessage
+
+        pipe._CONTEXT_WINDOW_COOLDOWNS.clear()
+        self.addCleanup(pipe._CONTEXT_WINDOW_COOLDOWNS.clear)
+        session_patch = mock.patch(
+            "pipe._session_file",
+            side_effect=lambda agent_name: self.base / f".session-{agent_name}.json",
+        )
+        sessions_patch = mock.patch.object(pipe, "SESSIONS_FILE", self.base / ".sessions.json")
+        session_patch.start()
+        sessions_patch.start()
+        self.addCleanup(session_patch.stop)
+        self.addCleanup(sessions_patch.stop)
+
+        pipe.save_session("doug", "old-session")
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                yield ResultMessage(
+                    subtype="error",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=True,
+                    num_turns=1,
+                    session_id="old-session",
+                    result="API Error: The model has reached its context window limit.",
+                    total_cost_usd=0.0,
+                )
+                raise RuntimeError("Claude Code returned an error result: success")
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with mock.patch("pipe.query", scripted_query):
+            new_session = pipe.handle_message(
+                "go", {}, "system", "old-session", StubRCON(), 0, None,
+                agent_name="doug", sdk_skills=["factorio-control"],
+            )
+
+        self.assertEqual(new_session, pipe.SESSION_RESET)
+        self.assertIsNone(pipe.load_session("doug"))
+        self.assertIsNone(pipe._get_context_window_cooldown("doug"))
+        self.assertEqual(journal.load_events("doug"), [])
+
     def test_session_persistence_uses_typed_current_and_legacy_shapes(self):
         import pipe
 
@@ -2636,6 +2726,270 @@ progress: plan confirmed; awaiting execution
 
         self.assertIsNone(thread.session_id)
         save_session.assert_not_called()
+
+    def test_agent_thread_summarizes_autonomy_prompt_in_operator_log(self):
+        import queue as std_queue
+
+        import pipe
+        from models import AutonomyTickMessage
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        class CapturingLog:
+            def __init__(self):
+                self.info_messages = []
+                self.debug_messages = []
+
+            def info(self, template, *args):
+                self.info_messages.append(template.format(*args))
+
+            def debug(self, template, *args):
+                self.debug_messages.append(template.format(*args))
+
+        prompt = (
+            "(execution tick) Do the next unfinished step in your plan now: "
+            "call the tool, do not describe it.\n<ledger>\nprogress: x\n</ledger>"
+        )
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.telemetry_name = "doug"
+        thread.telemetry = object()
+        thread.rcon = StubRCON()
+        thread.log = CapturingLog()
+        thread.heartbeat_interval = 0
+        thread.inbox = std_queue.Queue()
+        thread.inbox.put(AutonomyTickMessage.create(prompt))
+        thread.mcp_config = {"factorioctl": {}}
+        thread.system_prompt = "system"
+        thread.session_id = None
+        thread.model = "haiku"
+        thread.max_turns = 200
+        thread.sdk_skills = ["factorio-control"]
+
+        with (
+            mock.patch(
+                "pipe.handle_message_model",
+                return_value=pipe.AgentMessageResult.keep_session("new-session"),
+            ) as handle_message,
+            mock.patch("pipe.save_session"),
+            mock.patch("pipe.emit_chat") as emit_chat,
+        ):
+            thread._run_once()
+
+        args, kwargs = handle_message.call_args
+        self.assertEqual(args[0], prompt)
+        info_text = "\n".join(thread.log.info_messages)
+        debug_text = "\n".join(thread.log.debug_messages)
+        self.assertIn("autonomy -> doug: mode=execute", info_text)
+        self.assertIn("prompt_chars=", info_text)
+        self.assertNotIn("Do the next unfinished step", info_text)
+        self.assertIn("Do the next unfinished step", debug_text)
+        emit_chat.assert_not_called()
+
+    def test_agent_thread_caps_autonomy_execute_turn_budget(self):
+        import queue as std_queue
+
+        import pipe
+        from models import AutonomyTickMessage
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.telemetry_name = "doug"
+        thread.telemetry = None
+        thread.rcon = StubRCON()
+        thread.log = pipe.logger.bind(agent="doug")
+        thread.heartbeat_interval = 0
+        thread.inbox = std_queue.Queue()
+        thread.inbox.put(AutonomyTickMessage.create("execute next step"))
+        thread.mcp_config = {"factorioctl": {}}
+        thread.system_prompt = "system"
+        thread.session_id = None
+        thread.model = "haiku"
+        thread.max_turns = 200
+        thread.sdk_skills = ["factorio-control"]
+
+        with (
+            mock.patch(
+                "pipe.handle_message_model",
+                return_value=pipe.AgentMessageResult.keep_session("new-session"),
+            ) as handle_message,
+            mock.patch("pipe.save_session"),
+        ):
+            thread._run_once()
+
+        self.assertEqual(
+            handle_message.call_args.kwargs["max_turns"],
+            pipe.DEFAULT_AUTONOMY_EXEC_MAX_TURNS,
+        )
+        self.assertTrue(handle_message.call_args.kwargs["stop_after_factorio_result"])
+        self.assertEqual(
+            handle_message.call_args.kwargs["tick_timeout_s"],
+            pipe.DEFAULT_AUTONOMY_EXEC_TIMEOUT_S,
+        )
+
+    def test_agent_thread_keeps_planner_turn_budget(self):
+        import queue as std_queue
+
+        import pipe
+        from models import AutonomyTickMessage
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        thread = pipe.AgentThread.__new__(pipe.AgentThread)
+        thread.agent_name = "doug"
+        thread.telemetry_name = "doug"
+        thread.telemetry = None
+        thread.rcon = StubRCON()
+        thread.log = pipe.logger.bind(agent="doug")
+        thread.heartbeat_interval = 0
+        thread.inbox = std_queue.Queue()
+        thread.inbox.put(AutonomyTickMessage.create(
+            "plan next steps",
+            read_only_tools=True,
+            model="sonnet",
+        ))
+        thread.mcp_config = {"factorioctl": {}}
+        thread.system_prompt = "system"
+        thread.session_id = None
+        thread.model = "haiku"
+        thread.max_turns = 200
+        thread.sdk_skills = ["factorio-control"]
+
+        with (
+            mock.patch(
+                "pipe.handle_message_model",
+                return_value=pipe.AgentMessageResult.keep_session("new-session"),
+            ) as handle_message,
+            mock.patch("pipe.save_session"),
+        ):
+            thread._run_once()
+
+        self.assertEqual(handle_message.call_args.kwargs["max_turns"], 200)
+        self.assertFalse(handle_message.call_args.kwargs["stop_after_factorio_result"])
+        self.assertIsNone(handle_message.call_args.kwargs["tick_timeout_s"])
+
+    def test_autonomy_execute_stops_after_first_factorio_tool_result(self):
+        import ledger
+        import pipe
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
+
+        consumed_after_factorio_result = []
+        ledger.save_ledger("doug", {
+            "objective": "Route coal",
+            "plan_steps": ["route_belt from coal to furnace"],
+            "progress_notes": [],
+            "status": "executing",
+            "next_required_mode": "execute",
+        })
+
+        class StubClaudeSDKClient:
+            instances = []
+
+            def __init__(self, *, options):
+                self.options = options
+                self.prompt = None
+                self.interrupted = False
+                self.disconnected = False
+                self.__class__.instances.append(self)
+
+            async def connect(self, prompt):
+                self.prompt = prompt
+
+            def receive_messages(self):
+                async def gen():
+                    yield AssistantMessage(
+                        content=[ToolUseBlock(
+                            id="skill-1",
+                            name="Skill",
+                            input={"skill": "factorio-control"},
+                        )],
+                        model="test",
+                    )
+                    yield UserMessage(content=[ToolResultBlock(
+                        tool_use_id="skill-1",
+                        content="Launching skill: factorio-control",
+                        is_error=False,
+                    )])
+                    yield AssistantMessage(
+                        content=[ToolUseBlock(
+                            id="tool-1",
+                            name="mcp__factorioctl__situation_report",
+                            input={"radius": 10},
+                        )],
+                        model="test",
+                    )
+                    yield UserMessage(content=[ToolResultBlock(
+                        tool_use_id="tool-1",
+                        content='{"position":{"x":0,"y":0}}',
+                        is_error=False,
+                    )])
+                    consumed_after_factorio_result.append(True)
+                    yield AssistantMessage(
+                        content=[TextBlock("should not be consumed")],
+                        model="test",
+                    )
+                    yield ResultMessage(
+                        subtype="error",
+                        duration_ms=1,
+                        duration_api_ms=1,
+                        is_error=True,
+                        num_turns=4,
+                        session_id="old-session",
+                        result="Reached maximum number of turns (4)",
+                        total_cost_usd=0.0,
+                    )
+                return gen()
+
+            async def interrupt(self):
+                self.interrupted = True
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with (
+            mock.patch("pipe.ClaudeSDKClient", StubClaudeSDKClient),
+            mock.patch("pipe.query", side_effect=AssertionError("query should not be used")),
+            mock.patch("pipe.clear_session") as clear_session,
+        ):
+            result = pipe.handle_message_model(
+                "go",
+                {},
+                "system",
+                "old-session",
+                StubRCON(),
+                0,
+                None,
+                agent_name="doug",
+                sdk_skills=["factorio-control"],
+                stop_after_factorio_result=True,
+            )
+
+        self.assertTrue(result.reset_session)
+        clear_session.assert_called_once_with("doug")
+        self.assertEqual(consumed_after_factorio_result, [])
+        self.assertEqual(len(StubClaudeSDKClient.instances), 1)
+        self.assertTrue(StubClaudeSDKClient.instances[0].interrupted)
+        self.assertTrue(StubClaudeSDKClient.instances[0].disconnected)
+        events = journal.load_events("doug")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "progress")
+        self.assertIn("autonomy_step_complete: situation_report ok", events[0]["text"])
+        updated = ledger.load_ledger("doug")
+        self.assertEqual(updated["next_required_mode"], "plan")
+        self.assertEqual(updated["status"], "ready")
+        self.assertIn("situation_report ok", updated["progress_notes"][-1])
 
     def test_agent_thread_coerces_inbound_message_before_model_call(self):
         import queue as std_queue

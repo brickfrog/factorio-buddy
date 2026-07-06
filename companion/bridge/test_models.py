@@ -449,12 +449,17 @@ class ModelTests(unittest.TestCase):
             session_id=" session-1 ",
             context_window_limit="yes",
             usage_limit_seen="true",
+            autonomy_step_progress=" autonomy_step_complete: route_belt ok ",
         )
 
         self.assertEqual(transcript.text_parts, ["first", "3"])
         self.assertEqual(transcript.session_id, "session-1")
         self.assertTrue(transcript.context_window_limit)
         self.assertTrue(transcript.usage_limit_seen)
+        self.assertEqual(
+            transcript.autonomy_step_progress,
+            "autonomy_step_complete: route_belt ok",
+        )
         self.assertEqual(transcript.session_or("fallback"), "session-1")
         self.assertEqual(transcript.reply_text, "first\n\n3")
 
@@ -3358,6 +3363,12 @@ After.
             ),
             text="Error: invalid type: map, expected a sequence",
         )
+        huge_dry_run = ToolResultLogRecord.from_outcome(
+            ToolResultOutcome.from_text(
+                '[{"type":"text","text":"{\\"success\\":false,\\"candidates\\":[]}"}]'
+            ),
+            text='{"success":false,"candidates":[' + ('{"x":1,"y":2},' * 80) + "]}",
+        )
 
         self.assertEqual(ok.log_level, ToolResultLogLevel.DEBUG)
         self.assertEqual(ok.log_label, "tool_result")
@@ -3381,6 +3392,8 @@ After.
             invalid_request.journal_failure_text,
             "invalid_request: Error: invalid type: map, expected a sequence",
         )
+        self.assertLessEqual(len(huge_dry_run.text), 300)
+        self.assertNotIn("\n", huge_dry_run.text)
 
     def test_tool_result_outcome_default_text_classifier_handles_bridge_shapes(self):
         cases = {

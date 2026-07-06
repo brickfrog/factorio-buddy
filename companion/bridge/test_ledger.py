@@ -310,6 +310,21 @@ progress: Started the science plan
         self.assertIn("1. Find break", rendered)
         self.assertIn("Reached the blackout area", rendered)
 
+    def test_render_ledger_caps_prompt_lines(self):
+        rendered = ledger.render_ledger({
+            "objective": "Repair power " + ("objective-detail " * 40),
+            "plan_steps": ["Replace pole " + ("step-detail " * 40)],
+            "progress_notes": ["Recovered after rejection " + ("payload-detail " * 80)],
+            "blocker": "blocked by " + ("blocker-detail " * 40),
+            "updated_at": "now",
+        })
+
+        self.assertLess(len(rendered), 1000)
+        self.assertTrue(all(len(line) < 260 for line in rendered.splitlines()))
+        self.assertIn("Repair power", rendered)
+        self.assertIn("Replace pole", rendered)
+        self.assertIn("Recovered after rejection", rendered)
+
     def test_autonomy_prompts_keep_continuity_and_ledger_protocol(self):
         planner = importlib.import_module("planner")
 

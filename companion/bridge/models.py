@@ -2363,6 +2363,7 @@ class ToolResultLogRecord(BridgeModel):
         *,
         text: Any = "",
         text_limit: int = 500,
+        log_text_limit: int = 300,
     ) -> "ToolResultLogRecord":
         raw_text = str(text or "")
         classification = outcome.classification
@@ -2380,7 +2381,7 @@ class ToolResultLogRecord(BridgeModel):
             classification=classification,
             log_level=outcome.log_level,
             log_label=label,
-            text=raw_text,
+            text=_single_line_text(raw_text, limit=log_text_limit),
             journal_failure_text=journal_text,
         )
 
@@ -6137,17 +6138,23 @@ class AgentRunTranscript(BridgeModel):
     session_id: str | None = None
     context_window_limit: bool = False
     usage_limit_seen: bool = False
+    autonomy_step_progress: str = ""
 
     @field_validator("text_parts", mode="before")
     @classmethod
     def _coerce_text_parts(cls, value: Any) -> list[str]:
         return [part for part in _coerce_str_list(value) if part]
 
-    @field_validator("session_id", mode="before")
+    @field_validator("session_id", "autonomy_step_progress", mode="before")
     @classmethod
-    def _coerce_session_id(cls, value: Any) -> str | None:
+    def _coerce_text(cls, value: Any) -> str:
         text = str(value or "").strip()
-        return text or None
+        return text
+
+    @field_validator("session_id", mode="after")
+    @classmethod
+    def _empty_session_to_none(cls, value: str) -> str | None:
+        return value or None
 
     @field_validator("context_window_limit", "usage_limit_seen", mode="before")
     @classmethod
@@ -6164,12 +6171,14 @@ class AgentRunTranscript(BridgeModel):
         session_id: Any = None,
         context_window_limit: Any = False,
         usage_limit_seen: Any = False,
+        autonomy_step_progress: Any = "",
     ) -> "AgentRunTranscript":
         return cls(
             text_parts=text_parts or [],
             session_id=session_id,
             context_window_limit=context_window_limit,
             usage_limit_seen=usage_limit_seen,
+            autonomy_step_progress=autonomy_step_progress,
         )
 
     def with_text_parts(self, text_parts: Any) -> "AgentRunTranscript":
@@ -8604,7 +8613,7 @@ class LedgerState(BridgeModel):
         return LiveCompletionEvidence.from_ledger_and_live_state(self, live_state)
 
     def render(self, *, recent_progress_count: int = 3) -> str:
-        objective = self.objective.strip()
+        objective = BridgeLogMessage.single_line(self.objective, limit=160)
         if not objective:
             return ""
 
@@ -8616,16 +8625,19 @@ class LedgerState(BridgeModel):
         if self.next_required_mode != LedgerNextRequiredMode.NONE:
             lines.append(f"Next required mode: {self.next_required_mode.value}")
         if self.blocker:
-            lines.append(f"Blocker: {self.blocker}")
+            blocker = BridgeLogMessage.single_line(self.blocker, limit=160)
+            lines.append(f"Blocker: {blocker}")
         if self.plan_steps:
             lines.append("Plan:")
             for index, step in enumerate(self.plan_steps, start=1):
-                lines.append(f"{index}. {step}")
+                rendered_step = BridgeLogMessage.single_line(step, limit=160)
+                lines.append(f"{index}. {rendered_step}")
         progress_notes = self.progress_notes[-recent_progress_count:]
         if progress_notes:
             lines.append("Recent progress:")
             for note in progress_notes:
-                lines.append(f"- {note}")
+                rendered_note = BridgeLogMessage.single_line(note, limit=180)
+                lines.append(f"- {rendered_note}")
         return "\n".join(lines)
 
 

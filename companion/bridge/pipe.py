@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
-    query, ClaudeAgentOptions,
+    query, ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, UserMessage, ResultMessage, SystemMessage,
     TextBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock,
 )
@@ -87,6 +87,7 @@ def setup_logging(log_dir: Path) -> Path | None:
 
 
 from ledger import (apply_ledger_update_model, load_ledger_model,
+                    save_ledger_model,
                     parse_ledger_trailer_model, strip_ledger_trailer)
 from journal import (append_event, apply_reflection_update_model, count_events,
                      load_events_model, load_reflection_model, render_memory,
@@ -114,6 +115,9 @@ from models import (
     ConnectedPlayerCountResult,
     FactorioMcpServerConfig,
     FactorioModInfo,
+    LedgerNextRequiredMode,
+    LedgerStatus,
+    LedgerUpdate,
     LiveState,
     ParsedAgentResponse,
     PreToolUseDecision,
@@ -167,6 +171,8 @@ _BRIDGE_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _BRIDGE_DIR.parent.parent
 _PLAYER_MESSAGES_MARKER = "\n\n--- Player Messages ---\n"
 DEFAULT_MAX_TURNS = 200
+DEFAULT_AUTONOMY_EXEC_MAX_TURNS = 4
+DEFAULT_AUTONOMY_EXEC_TIMEOUT_S = 60.0
 DEFAULT_SDK_SKILLS = "factorio-control"
 SESSIONS_FILE = _BRIDGE_DIR / ".sessions.json"
 _USAGE_LIMIT_COOLDOWNS: dict[str, datetime] = {}
@@ -794,6 +800,10 @@ _FACTORIO_TOOL_PARAM_SCHEMA_REGISTRY = ToolParamSchemaRegistry.from_mapping({
         "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
         "optional": {"radius": TOOL_PARAM_INTEGER},
     },
+    "analyze_inserters": {
+        "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
+        "optional": {"radius": TOOL_PARAM_INTEGER},
+    },
     "get_alerts": {
         "required": {"x": TOOL_PARAM_INTEGER, "y": TOOL_PARAM_INTEGER},
         "optional": {"radius": TOOL_PARAM_INTEGER},
@@ -940,11 +950,13 @@ class ManualAutomationDriftGate:
         agent_name: str,
         ledger_loader: Any = load_ledger_model,
         live_state_loader: Any | None = None,
+        block_all_manual_transfers: bool = False,
     ):
         self.log = log
         self.agent_name = str(agent_name or "")
         self.ledger_loader = ledger_loader
         self.live_state_loader = live_state_loader
+        self.block_all_manual_transfers = bool(block_all_manual_transfers)
 
     async def hook(
         self,
@@ -957,6 +969,11 @@ class ManualAutomationDriftGate:
             return PreToolUseHookResponse.noop().to_dict()
         if request.short_name not in self.MANUAL_TRANSFER_TOOLS:
             return PreToolUseHookResponse.noop().to_dict()
+
+        if self.block_all_manual_transfers:
+            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
+            self.log.debug(block.debug_message)
+            return PreToolUseHookResponse.block(block).to_dict()
 
         try:
             ledger = self.ledger_loader(self.agent_name)
@@ -1316,6 +1333,14 @@ def _resolve_max_turns(value: Any = None) -> int:
     return BridgeRuntimeSettings(max_turns=value).max_turns
 
 
+def _autonomy_execute_max_turns(max_turns: int) -> int:
+    return min(max_turns, DEFAULT_AUTONOMY_EXEC_MAX_TURNS)
+
+
+def _autonomy_execute_timeout_s(timeout_s: float) -> float:
+    return min(timeout_s, DEFAULT_AUTONOMY_EXEC_TIMEOUT_S)
+
+
 def _resolve_sdk_skills(value: Any = None) -> list[str] | str:
     return _sdk_skill_config(value).sdk_value
 
@@ -1515,6 +1540,28 @@ def _record_anomaly(reply: str, agent_name: str) -> None:
         )
 
 
+def _mark_autonomy_step_needs_plan(agent_name: str, progress: str) -> None:
+    try:
+        ledger = load_ledger_model(agent_name)
+        save_ledger_model(
+            agent_name,
+            ledger.merged_with(
+                LedgerUpdate(
+                    progress=progress,
+                    status=LedgerStatus.READY,
+                    next_required_mode=LedgerNextRequiredMode.PLAN,
+                ),
+                updated_at=datetime.now().isoformat(),
+                max_progress_notes=10,
+            ),
+        )
+    except Exception as exc:
+        logger.bind(agent=agent_name).debug(
+            "failed to mark autonomy step for planner refresh: {}",
+            exc,
+        )
+
+
 # Hard wall-clock cap on a single agent tick. The SDK's max_turns bounds tool
 # turns, not a stalled TCP connection or a model response that never yields, so
 # a tick is also wrapped in asyncio.wait_for. Override via BRIDGE_TICK_TIMEOUT_S.
@@ -1541,6 +1588,55 @@ class AgentTickWatchdogAbort(TimeoutError):
     pass
 
 
+class AgentAutonomyStepComplete:
+    def __init__(
+        self,
+        *,
+        tool_name: str,
+        classification: ToolResultClassification,
+        text: str,
+    ):
+        self.tool_name = ToolCallRequest.short_factorio_tool_name(tool_name)
+        self.classification = classification
+        self.text = BridgeLogMessage.single_line(text, limit=240)
+    @property
+    def progress_text(self) -> str:
+        suffix = f": {self.text}" if self.text else ""
+        return (
+            "autonomy_step_complete: "
+            f"{self.tool_name} {self.classification.value}{suffix}"
+        )
+
+
+def _agent_run_transcript(
+    *,
+    text_parts: list[str],
+    session_id: str | None,
+    context_window_limit: bool,
+    usage_limit_seen: bool,
+    autonomy_step_progress: str,
+) -> AgentRunTranscript:
+    return AgentRunTranscript.from_parts(
+        text_parts=text_parts,
+        session_id=session_id,
+        context_window_limit=context_window_limit,
+        usage_limit_seen=usage_limit_seen,
+        autonomy_step_progress=autonomy_step_progress,
+    )
+
+
+async def _next_client_message(iterator: Any) -> Any:
+    try:
+        return await asyncio.wait_for(
+            iterator.__anext__(),
+            timeout=_STREAM_IDLE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError as exc:
+        raise AgentStreamIdleTimeout(
+            f"agent stream idle for {_STREAM_IDLE_TIMEOUT_S:.0f}s"
+        ) from exc
+
+
 async def _query_with_idle_timeout(prompt: str, options: ClaudeAgentOptions):
     stream = query(prompt=prompt, options=options)
     iterator = stream.__aiter__()
@@ -1561,7 +1657,11 @@ async def _query_with_idle_timeout(prompt: str, options: ClaudeAgentOptions):
     finally:
         aclose = getattr(iterator, "aclose", None)
         if callable(aclose):
-            await aclose()
+            try:
+                await aclose()
+            except RuntimeError as exc:
+                if "already running" not in str(exc):
+                    raise
 
 
 def _stderr_callback(log):
@@ -1585,145 +1685,248 @@ async def _run_agent(
     rcon: RCONClient,
     player_index: int,
     log,
+    stop_after_factorio_result: bool = False,
 ) -> AgentRunTranscript:
     text_parts: list[str] = []
     new_session_id: str | None = None
     context_window_limit = False
     usage_limit_seen = False
     watchdog = AgentTickWatchdog()
+    tool_names_by_id: dict[str, str] = {}
+    autonomy_step_progress = ""
+    client: ClaudeSDKClient | None = None
+    client_iterator: Any = None
 
-    async for msg in _query_with_idle_timeout(prompt=prompt, options=options):
-        if isinstance(msg, AssistantMessage):
-            assistant_message = SdkAssistantMessage.from_sdk_message(
-                msg,
-                text_block_type=TextBlock,
-                tool_use_block_type=ToolUseBlock,
-                thinking_block_type=ThinkingBlock,
-            )
-            if assistant_message.session_id:
-                new_session_id = assistant_message.session_id
-            for event in assistant_message.events:
-                if event.is_text:
-                    observation = SdkAssistantTextObservation.from_event(
-                        event,
-                        default_utc_offset=ProviderUsageLimitSettings.from_env(
-                            os.environ,
-                        ).usage_limit_reset_utc_offset,
-                    )
-                    text_parts.append(observation.text)
-                    if observation.usage_limit:
-                        usage_limit_seen = True
-                        _set_usage_limit_cooldown_from_limit(
-                            agent_name,
-                            observation.usage_limit,
-                            log,
-                        )
-                    elif observation.counts_as_watchdog_progress:
-                        watchdog.observe_text()
-                    log.info("text: {}", observation.text.strip())
-                elif event.is_tool_use and event.tool_use is not None:
-                    tool_use = event.tool_use
-                    watchdog.record_tool_use(event.tool_use_id, tool_use.name)
-                    display = tool_use.display_name
-                    if tool_use.is_skill_tool:
-                        log.info("skill: {}({})", display, tool_use.log_input_text)
-                    else:
-                        log.debug("tool: {}({})", display, tool_use.log_input_text)
-                    emit_tool_call(telemetry, display, tool_use.tool_input, agent=telemetry_name)
-                    if tool_use.is_broadcast_thought:
-                        thought = tool_use.thought_message
-                        if thought:
-                            emit_chat(telemetry, "agent", thought, agent=telemetry_name)
-                    if player_index > 0 and tool_use.should_send_tool_status:
-                        try:
-                            send_tool_status(rcon, player_index, agent_name, display)
-                        except Exception as e:
-                            log.debug("tool status update failed: {}", e)
-                elif event.is_thinking:
-                    log.debug("thinking: {}", event.text)
-        elif isinstance(msg, UserMessage):
-            tool_results = SdkUserToolResultMessage.from_sdk_message(
-                msg,
-                tool_result_block_type=ToolResultBlock,
-                player_marker=_PLAYER_MESSAGES_MARKER,
-            )
-            for result in tool_results.results:
-                observation = result.observation()
-                classification = _log_tool_result_record(
-                    agent_name,
-                    log,
-                    observation.log_record,
-                )
-                watchdog.observe_tool_result(
-                    observation.tool_use_id,
-                    classification,
-                    observation.text,
-                    indicates_progress=observation.indicates_progress,
-                )
-                if observation.player_message_text:
-                    log.info("player_messages: {}", observation.player_message_text)
-        elif isinstance(msg, ResultMessage):
-            result_message = SdkResultMessage.from_sdk_message(msg)
-            observation = result_message.observation(
-                default_utc_offset=ProviderUsageLimitSettings.from_env(
-                    os.environ,
-                ).usage_limit_reset_utc_offset,
-            )
-            new_session_id = observation.session_id or new_session_id
-            if (
-                observation.has_transcript_text
-                and observation.transcript_text not in text_parts
-            ):
-                text_parts.append(observation.transcript_text)
-            if observation.is_error:
-                if observation.context_window_limit:
-                    context_window_limit = True
-                    log.warning(
-                        "result sdk_context_window: {}; clearing SDK session before next attempt",
-                        observation.error_detail,
-                    )
-                elif _set_usage_limit_cooldown_from_limit(
-                    agent_name,
-                    observation.usage_limit,
-                    log,
-                ):
-                    usage_limit_seen = True
-                elif observation.failure_classification:
-                    log.warning(
-                        "result {}: {}",
-                        observation.failure_classification.value,
-                        observation.error_detail,
-                    )
-                    append_event(
-                        agent_name,
-                        "failure",
-                        observation.failure_journal_text,
-                    )
-            if observation.has_cost:
-                log.info(
-                    "done: ${:.4f} | {} turns | {:.1f}s",
-                    observation.total_cost_usd,
-                    observation.num_turns,
-                    observation.duration_s,
-                )
-                if telemetry:
-                    telemetry.emit(TelemetryEvent.compute_cost(
-                        observation.compute_cost_payload,
-                        agent=telemetry_name,
-                    ))
-        elif isinstance(msg, SystemMessage):
-            system_message = SdkSystemMessage.from_sdk_message(msg)
-            if not _log_sdk_init(system_message, options, log):
-                if system_message.should_log:
-                    log.debug("system: {}", msg)
+    try:
+        if stop_after_factorio_result:
+            client = ClaudeSDKClient(options=options)
+            await client.connect(prompt)
+            client_iterator = client.receive_messages().__aiter__()
+            message_iter = None
         else:
-            log.debug("stream event: {}", msg)
+            message_iter = _query_with_idle_timeout(prompt=prompt, options=options)
 
-    return AgentRunTranscript.from_parts(
+        while True:
+            if client_iterator is not None:
+                try:
+                    msg = await _next_client_message(client_iterator)
+                except StopAsyncIteration:
+                    break
+            else:
+                assert message_iter is not None
+                try:
+                    msg = await message_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+
+            if isinstance(msg, AssistantMessage):
+                assistant_message = SdkAssistantMessage.from_sdk_message(
+                    msg,
+                    text_block_type=TextBlock,
+                    tool_use_block_type=ToolUseBlock,
+                    thinking_block_type=ThinkingBlock,
+                )
+                if assistant_message.session_id:
+                    new_session_id = assistant_message.session_id
+                for event in assistant_message.events:
+                    if event.is_text:
+                        observation = SdkAssistantTextObservation.from_event(
+                            event,
+                            default_utc_offset=ProviderUsageLimitSettings.from_env(
+                                os.environ,
+                            ).usage_limit_reset_utc_offset,
+                        )
+                        text_parts.append(observation.text)
+                        if observation.usage_limit:
+                            usage_limit_seen = True
+                            _set_usage_limit_cooldown_from_limit(
+                                agent_name,
+                                observation.usage_limit,
+                                log,
+                            )
+                        elif observation.counts_as_watchdog_progress:
+                            watchdog.observe_text()
+                        log.info("text: {}", observation.text.strip())
+                    elif event.is_tool_use and event.tool_use is not None:
+                        tool_use = event.tool_use
+                        watchdog.record_tool_use(event.tool_use_id, tool_use.name)
+                        if event.tool_use_id:
+                            tool_names_by_id[str(event.tool_use_id)] = tool_use.name
+                        display = tool_use.display_name
+                        if tool_use.is_skill_tool:
+                            log.info("skill: {}({})", display, tool_use.log_input_text)
+                        else:
+                            log.debug("tool: {}({})", display, tool_use.log_input_text)
+                        emit_tool_call(telemetry, display, tool_use.tool_input, agent=telemetry_name)
+                        if tool_use.is_broadcast_thought:
+                            thought = tool_use.thought_message
+                            if thought:
+                                emit_chat(telemetry, "agent", thought, agent=telemetry_name)
+                        if player_index > 0 and tool_use.should_send_tool_status:
+                            try:
+                                send_tool_status(rcon, player_index, agent_name, display)
+                            except Exception as e:
+                                log.debug("tool status update failed: {}", e)
+                    elif event.is_thinking:
+                        log.debug("thinking: {}", event.text)
+            elif isinstance(msg, UserMessage):
+                tool_results = SdkUserToolResultMessage.from_sdk_message(
+                    msg,
+                    tool_result_block_type=ToolResultBlock,
+                    player_marker=_PLAYER_MESSAGES_MARKER,
+                )
+                for result in tool_results.results:
+                    observation = result.observation()
+                    classification = _log_tool_result_record(
+                        agent_name,
+                        log,
+                        observation.log_record,
+                    )
+                    watchdog.observe_tool_result(
+                        observation.tool_use_id,
+                        classification,
+                        observation.text,
+                        indicates_progress=observation.indicates_progress,
+                    )
+                    tool_name = (
+                        tool_names_by_id.get(str(observation.tool_use_id), "")
+                        if observation.tool_use_id
+                        else ""
+                    )
+                    if (
+                        stop_after_factorio_result
+                        and ToolCallRequest.is_factorio_mcp_tool_name(tool_name)
+                        and not autonomy_step_progress
+                    ):
+                        autonomy_step_progress = AgentAutonomyStepComplete(
+                            tool_name=tool_name,
+                            classification=classification,
+                            text=observation.text,
+                        ).progress_text
+                        if client is not None:
+                            try:
+                                await client.interrupt()
+                            except Exception as exc:
+                                log.debug(
+                                    "sdk interrupt after autonomy step failed: {}",
+                                    exc,
+                                )
+                        return _agent_run_transcript(
+                            text_parts=text_parts,
+                            session_id=new_session_id,
+                            context_window_limit=context_window_limit,
+                            usage_limit_seen=usage_limit_seen,
+                            autonomy_step_progress=autonomy_step_progress,
+                        )
+                    if observation.player_message_text:
+                        log.info("player_messages: {}", observation.player_message_text)
+            elif isinstance(msg, ResultMessage):
+                result_message = SdkResultMessage.from_sdk_message(msg)
+                observation = result_message.observation(
+                    default_utc_offset=ProviderUsageLimitSettings.from_env(
+                        os.environ,
+                    ).usage_limit_reset_utc_offset,
+                )
+                new_session_id = observation.session_id or new_session_id
+                if (
+                    observation.has_transcript_text
+                    and observation.transcript_text not in text_parts
+                ):
+                    text_parts.append(observation.transcript_text)
+                if observation.is_error:
+                    if observation.context_window_limit:
+                        context_window_limit = True
+                        log.warning(
+                            "result sdk_context_window: {}; clearing SDK session before next attempt",
+                            observation.error_detail,
+                        )
+                    elif (
+                        autonomy_step_progress
+                        and "reached maximum number of turns" in observation.error_detail.lower()
+                    ):
+                        log.debug(
+                            "sdk turn limit ended completed autonomy step: {}",
+                            autonomy_step_progress,
+                        )
+                    elif _set_usage_limit_cooldown_from_limit(
+                        agent_name,
+                        observation.usage_limit,
+                        log,
+                    ):
+                        usage_limit_seen = True
+                    elif observation.failure_classification:
+                        log.warning(
+                            "result {}: {}",
+                            observation.failure_classification.value,
+                            observation.error_detail,
+                        )
+                        append_event(
+                            agent_name,
+                            "failure",
+                            observation.failure_journal_text,
+                        )
+                if observation.has_cost:
+                    log.info(
+                        "done: ${:.4f} | {} turns | {:.1f}s",
+                        observation.total_cost_usd,
+                        observation.num_turns,
+                        observation.duration_s,
+                    )
+                    if telemetry:
+                        telemetry.emit(TelemetryEvent.compute_cost(
+                            observation.compute_cost_payload,
+                            agent=telemetry_name,
+                        ))
+                break
+            elif isinstance(msg, SystemMessage):
+                system_message = SdkSystemMessage.from_sdk_message(msg)
+                if not _log_sdk_init(system_message, options, log):
+                    if system_message.should_log:
+                        log.debug("system: {}", msg)
+            else:
+                log.debug("stream event: {}", msg)
+    except Exception as exc:
+        if not context_window_limit:
+            if autonomy_step_progress:
+                exception_signal = AgentInvocationExceptionSignal.from_exception(
+                    exc,
+                    default_utc_offset=ProviderUsageLimitSettings.from_env(
+                        os.environ,
+                    ).usage_limit_reset_utc_offset,
+                )
+                if exception_signal.terminal_result_echo:
+                    log.debug(
+                        "sdk terminal echo ended completed autonomy step: {}",
+                        autonomy_step_progress,
+                    )
+                    return AgentRunTranscript.from_parts(
+                        text_parts=text_parts,
+                        session_id=new_session_id,
+                        context_window_limit=context_window_limit,
+                        usage_limit_seen=usage_limit_seen,
+                        autonomy_step_progress=autonomy_step_progress,
+                    )
+                else:
+                    raise
+            else:
+                raise
+        log.debug(
+            "sdk stream raised after context-window result; preserving session reset"
+        )
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except RuntimeError as exc:
+                if "already running" not in str(exc):
+                    raise
+
+    return _agent_run_transcript(
         text_parts=text_parts,
         session_id=new_session_id,
         context_window_limit=context_window_limit,
         usage_limit_seen=usage_limit_seen,
+        autonomy_step_progress=autonomy_step_progress,
     )
 
 
@@ -1789,6 +1992,8 @@ def handle_message_model(
     max_turns: int | None = None,
     sdk_skills: list[str] | str | None = None,
     read_only_tools: bool = False,
+    stop_after_factorio_result: bool = False,
+    tick_timeout_s: float | None = None,
 ) -> AgentMessageResult:
     """Pipe a message through the Claude SDK. Returns a typed session result.
     agent_name: registered agent name (for RCON/mod).
@@ -1836,6 +2041,7 @@ def handle_message_model(
     manual_automation_gate = ManualAutomationDriftGate(
         log,
         agent_name=invocation.agent_name,
+        block_all_manual_transfers=stop_after_factorio_result,
         live_state_loader=lambda agent_name: _load_live_state_for_agent(
             rcon,
             agent_name,
@@ -1869,6 +2075,7 @@ def handle_message_model(
         },
         stderr=_stderr_callback(log),
     )
+    resolved_tick_timeout_s = _TICK_TIMEOUT_S if tick_timeout_s is None else tick_timeout_s
     try:
         run = asyncio.run(
             asyncio.wait_for(
@@ -1881,8 +2088,9 @@ def handle_message_model(
                     rcon,
                     player_index,
                     log,
+                    stop_after_factorio_result=stop_after_factorio_result,
                 ),
-                timeout=_TICK_TIMEOUT_S,
+                timeout=resolved_tick_timeout_s,
             )
         )
         if run.context_window_limit:
@@ -1896,6 +2104,20 @@ def handle_message_model(
                 player_index=player_index,
                 rcon_target=rcon_target,
             )
+
+        if run.autonomy_step_progress:
+            progress = run.autonomy_step_progress
+            tool_name = progress.split(":", 1)[-1].strip().split(" ", 1)[0]
+            log.info("autonomy execute step complete: {}", progress)
+            append_event(invocation.agent_name, "progress", progress)
+            _mark_autonomy_step_needs_plan(invocation.agent_name, progress)
+            emit_status(
+                telemetry,
+                {"message": f"autonomy execute step complete: {tool_name}"},
+                agent=tname,
+            )
+            clear_session(invocation.agent_name)
+            return AgentMessageResult.reset()
 
         cooldown_until = _get_usage_limit_cooldown(invocation.agent_name)
         if cooldown_until and run.usage_limit_seen:
@@ -1934,12 +2156,18 @@ def handle_message_model(
             set_status(rcon, player_index, "[color=0.4,0.8,0.4]Ready[/color]")
         return AgentMessageResult.keep_session(invocation.session_id)
     except (asyncio.TimeoutError, TimeoutError):
-        error_msg = f"Error: agent tick exceeded {_TICK_TIMEOUT_S:.0f}s and was aborted"
-        log.error("agent tick timed out after {:.0f}s; aborting", _TICK_TIMEOUT_S)
+        error_msg = (
+            f"Error: agent tick exceeded {resolved_tick_timeout_s:.0f}s "
+            "and was aborted"
+        )
+        log.error(
+            "agent tick timed out after {:.0f}s; aborting",
+            resolved_tick_timeout_s,
+        )
         append_event(
             invocation.agent_name, "failure",
             BridgeLogMessage.single_line(
-                f"tick timeout after {_TICK_TIMEOUT_S:.0f}s",
+                f"tick timeout after {resolved_tick_timeout_s:.0f}s",
                 limit=300,
             ),
         )
@@ -2353,15 +2581,25 @@ class AgentThread:
             msg = raw_msg.to_bridge_input()
         else:
             msg = raw_msg
-        if msg.autonomy:
-            self.log.info("{} autonomy tick", self.agent_name)
         player_index = msg.player_index
         player_name = msg.player_name
         message = msg.message
         response_to = msg.response_to  # Group chat routing
 
         target_label = response_to or self.agent_name
-        if response_to:
+        if msg.autonomy:
+            mode = "plan" if msg.read_only_tools else "execute"
+            self.log.info("{} autonomy tick", self.agent_name)
+            self.log.info(
+                "autonomy -> {}: mode={} read_only={} model={} prompt_chars={}",
+                self.agent_name,
+                mode,
+                msg.read_only_tools,
+                msg.model or self.model or "default",
+                len(message),
+            )
+            self.log.debug("autonomy prompt -> {}: {}", self.agent_name, message)
+        elif response_to:
             self.log.info(
                 "{} -> {}:{}: {}",
                 player_name,
@@ -2369,9 +2607,10 @@ class AgentThread:
                 self.agent_name,
                 message,
             )
+            emit_chat(self.telemetry, "player", message, agent=self.telemetry_name)
         else:
             self.log.info("{} -> {}: {}", player_name, self.agent_name, message)
-        emit_chat(self.telemetry, "player", message, agent=self.telemetry_name)
+            emit_chat(self.telemetry, "player", message, agent=self.telemetry_name)
 
         cooldown_until = _get_usage_limit_cooldown(self.agent_name)
         if cooldown_until:
@@ -2418,13 +2657,23 @@ class AgentThread:
                               "Error: factorioctl MCP not found")
             return
 
+        max_turns = self.max_turns
+        tick_timeout_s: float | None = None
+        stop_after_factorio_result = False
+        if msg.autonomy and not msg.read_only_tools:
+            max_turns = _autonomy_execute_max_turns(max_turns)
+            tick_timeout_s = _autonomy_execute_timeout_s(_TICK_TIMEOUT_S)
+            stop_after_factorio_result = True
+
         message_result = handle_message_model(
             message, self.mcp_config, self.system_prompt, self.session_id,
             self.rcon, player_index, self.telemetry,
             agent_name=self.agent_name, telemetry_name=self.telemetry_name,
             response_to=response_to, model=msg.model or self.model,
-            max_turns=self.max_turns, sdk_skills=self.sdk_skills,
+            max_turns=max_turns, sdk_skills=self.sdk_skills,
             read_only_tools=msg.read_only_tools,
+            stop_after_factorio_result=stop_after_factorio_result,
+            tick_timeout_s=tick_timeout_s,
         )
         if message_result.reset_session:
             self.session_id = None
