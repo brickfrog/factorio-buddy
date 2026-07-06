@@ -2693,11 +2693,26 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
             && control_lua
                 .contains("character.mining_state = {mining = true, position = target.position}")
             && control_lua.contains("items = inventory_contents(inv)")
+            && control_lua.contains("local iteration_before_count = inventory_item_total(inv)")
+            && control_lua.contains("local inventory_progress = iteration_after_count > iteration_before_count")
+            && control_lua.contains("local resource_progress = target.valid and target_amount_before")
             && control_lua.contains("picked_up = picked_up + pick_up_item_entity")
             && control_lua.contains("local trees = surface.find_entities_filtered{type = \"tree\", area = area}")
             && control_lua.contains("local entities = surface.find_entities_filtered{type = \"simple-entity\", area = area}")
             && control_lua.contains("find_entities_filtered{"),
-        "control.lua should own mining scans, inventory reads, and mine_entity calls"
+        "control.lua should own mining scans and measure mining progress from state changes"
+    );
+    let mine_at_impl = control_lua
+        .split("local function mine_at_impl")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("local function find_nearest_minable_impl")
+                .next()
+        })
+        .expect("mine_at_impl should exist before find_nearest_minable_impl");
+    assert!(
+        !mine_at_impl.contains("if character.mine_entity(target, true) then"),
+        "mine_at_impl must not trust LuaControl.mine_entity's boolean for resource mining progress"
     );
 }
 

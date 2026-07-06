@@ -1128,6 +1128,28 @@ class ModelToolSchemaSdkTests(unittest.TestCase):
         self.assertFalse(craft_belts.is_manual_component_craft)
         self.assertFalse(durable_controller.is_manual_component_craft)
 
+    def test_tool_call_request_identifies_bootstrap_infrastructure_crafting(self):
+        bootstrap_recipes = (
+            "stone-furnace",
+            "burner-mining-drill",
+            "burner-inserter",
+            "transport-belt",
+        )
+
+        for recipe in bootstrap_recipes:
+            with self.subTest(recipe=recipe):
+                request = ToolCallRequest.from_hook_input({
+                    "tool_name": "mcp__factorioctl__craft",
+                    "tool_input": {"recipe": recipe, "count": 1},
+                })
+                self.assertTrue(request.is_bootstrap_infrastructure_craft)
+
+        science = ToolCallRequest.from_hook_input({
+            "tool_name": "mcp__factorioctl__craft",
+            "tool_input": {"recipe": "automation-science-pack", "count": 1},
+        })
+        self.assertFalse(science.is_bootstrap_infrastructure_craft)
+
     def test_agent_session_state_models_current_and_legacy_files(self):
         current = AgentSessionState.from_file_text(
             '{"session_id": " abc123 "} \n'

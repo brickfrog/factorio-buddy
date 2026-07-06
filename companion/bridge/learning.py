@@ -831,6 +831,67 @@ def pending_candidates() -> list[Path]:
         return []
 
 
+def _candidate_title(proposal: LearningProposal) -> str:
+    return proposal.name or proposal.problem or proposal.kind
+
+
+def _candidate_preview(proposal: LearningProposal) -> str:
+    for value in (proposal.problem, proposal.trigger):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return LearningProposal.short_items(
+        [
+            *proposal.steps,
+            *proposal.evidence,
+            *proposal.acceptance_tests,
+        ],
+        1,
+    )
+
+
+def _relative_candidate_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(_project_root()))
+    except ValueError:
+        return str(path)
+
+
+def format_pending_triage(paths: Iterable[Path] | None = None) -> str:
+    candidate_paths = list(paths) if paths is not None else pending_candidates()
+    loaded: list[tuple[Path, LearningProposal]] = []
+    for path in candidate_paths:
+        proposal = _load_candidate_model(path, default_status="pending")
+        if proposal:
+            loaded.append((path, proposal))
+    if not loaded:
+        return "No pending learning candidates."
+
+    counts: dict[str, int] = {}
+    for _, proposal in loaded:
+        counts[proposal.kind] = counts.get(proposal.kind, 0) + 1
+    count_text = ", ".join(
+        f"{kind}={count}" for kind, count in sorted(counts.items())
+    )
+    lines = [
+        "Pending learning candidates",
+        f"total={len(loaded)} {count_text}".strip(),
+        "",
+    ]
+    for path, proposal in loaded:
+        lines.append(f"- {proposal.kind}: {_candidate_title(proposal)}")
+        lines.append(f"  path: {_relative_candidate_path(path)}")
+        if proposal.agent:
+            lines.append(f"  agent: {proposal.agent}")
+        preview = _candidate_preview(proposal)
+        if preview:
+            lines.append(f"  why: {preview}")
+        tests = LearningProposal.short_items(proposal.acceptance_tests, 2)
+        if tests:
+            lines.append(f"  acceptance: {tests}")
+    return "\n".join(lines)
+
+
 def apply_learning_update(
     agent_name: str,
     source: object,
@@ -928,6 +989,9 @@ def main(argv: list[str] | None = None) -> int:
         for path in pending_candidates():
             _print_candidate(path)
         return 0
+    if command in {"triage", "report"}:
+        print(format_pending_triage())
+        return 0
     if command in {"accept", "promote"} and len(argv) == 2:
         target = promote_candidate(argv[1])
         if not target:
@@ -943,7 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
         print(target)
         return 0
     print(
-        "usage: learning.py [list] | accept <pending.json> | reject <pending.json>",
+        "usage: learning.py [list|triage] | accept <pending.json> | reject <pending.json>",
         file=sys.stderr,
     )
     return 2

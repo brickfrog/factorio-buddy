@@ -541,7 +541,54 @@ def _record_anomaly(reply: str, agent_name: str) -> None:
         )
 
 
-def _mark_autonomy_step_needs_plan(agent_name: str, progress: str) -> None:
+_EXECUTE_STEP_READ_ONLY_TOOLS = {
+    "situation_report",
+    "get_inventory",
+    "get_recipe",
+    "get_recipes_by_category",
+    "get_recipes_for_item",
+    "get_prototype",
+    "find_nearest_resource",
+    "render_map",
+    "can_place_entity",
+    "check_collision",
+    "verify_production",
+    "diagnose_fuel_sustainability",
+    "analyze_item_flow",
+    "analyze_belt_reach",
+    "analyze_belt_gaps",
+    "analyze_belt_networks",
+    "analyze_inserters",
+    "analyze_entity_reach",
+    "analyze_belt_contents",
+    "analyze_sushi_belts",
+    "analyze_belt_sources",
+    "find_entity_placements",
+    "plan_machine_output",
+    "plan_recipe_assembler_cell",
+    "plan_automation_science",
+    "plan_steam_power",
+}
+
+
+def _mark_autonomy_step_followup(
+    agent_name: str,
+    *,
+    tool_name: str,
+    classification: ToolResultClassification,
+    progress: str,
+) -> None:
+    short_name = ToolCallRequest.short_factorio_tool_name(tool_name)
+    continue_executing = (
+        classification == ToolResultClassification.OK
+        and short_name not in _EXECUTE_STEP_READ_ONLY_TOOLS
+    )
+    next_mode = (
+        LedgerNextRequiredMode.EXECUTE
+        if continue_executing
+        else LedgerNextRequiredMode.PLAN
+    )
+    status = LedgerStatus.EXECUTING if continue_executing else LedgerStatus.READY
     try:
         ledger = load_ledger_model(agent_name)
         save_ledger_model(
@@ -549,8 +596,8 @@ def _mark_autonomy_step_needs_plan(agent_name: str, progress: str) -> None:
             ledger.merged_with(
                 LedgerUpdate(
                     progress=progress,
-                    status=LedgerStatus.READY,
-                    next_required_mode=LedgerNextRequiredMode.PLAN,
+                    status=status,
+                    next_required_mode=next_mode,
                 ),
                 updated_at=datetime.now(timezone.utc).isoformat(),
                 max_progress_notes=10,
@@ -558,7 +605,7 @@ def _mark_autonomy_step_needs_plan(agent_name: str, progress: str) -> None:
         )
     except Exception as exc:
         logger.bind(agent=agent_name).debug(
-            "failed to mark autonomy step for planner refresh: {}",
+            "failed to mark autonomy step follow-up mode: {}",
             exc,
         )
 
@@ -1008,7 +1055,9 @@ def _finalize_reply(reply: str, agent_name: str) -> str:
     ledger_update = parse_ledger_trailer_model(reply)
     apply_ledger_update_model(agent_name, reply)
     apply_reflection_update_model(agent_name, reply)
-    apply_learning_update(agent_name, reply)
+    learning_updates = apply_learning_update(agent_name, reply)
+    for path in learning_updates:
+        logger.bind(agent=agent_name).info("filed learning candidate: {}", path)
     if ledger_update and ledger_update.progress:
         append_event(
             agent_name,
@@ -1195,10 +1244,25 @@ def handle_message_model(
 
         if run.autonomy_step_progress:
             progress = run.autonomy_step_progress
-            tool_name = progress.split(":", 1)[-1].strip().split(" ", 1)[0]
+            progress_tail = progress.split(":", 1)[-1].strip()
+            progress_parts = progress_tail.split(" ", 2)
+            tool_name = progress_parts[0] if progress_parts else ""
+            classification = ToolResultClassification.OK
+            if len(progress_parts) > 1:
+                try:
+                    classification = ToolResultClassification(
+                        progress_parts[1].rstrip(":")
+                    )
+                except ValueError:
+                    classification = ToolResultClassification.OK
             log.info("autonomy execute step complete: {}", progress)
             append_event(invocation.agent_name, "progress", progress)
-            _mark_autonomy_step_needs_plan(invocation.agent_name, progress)
+            _mark_autonomy_step_followup(
+                invocation.agent_name,
+                tool_name=tool_name,
+                classification=classification,
+                progress=progress,
+            )
             emit_status(
                 telemetry,
                 {"message": f"autonomy execute step complete: {tool_name}"},

@@ -696,6 +696,9 @@ class HiddenTrailerBodyLine(BridgeModel):
             return cls()
         if text.startswith("- "):
             return cls(text=text, bullet=text[2:].strip())
+        numbered = re.match(r"^\d+[.)]\s+(.+)$", text)
+        if numbered:
+            return cls(text=text, bullet=numbered.group(1).strip())
         split = KeyValueTextSplit.from_text(text)
         if split.matched:
             return cls(

@@ -1148,6 +1148,7 @@ local function mine_at_impl(agent_id, x, y, count, radius)
     local search_radius = radius or 3
 
     for _ = 1, count do
+        local iteration_before_count = inventory_item_total(inv)
         local items_on_ground = surface.find_entities_filtered{
             position = {x, y},
             radius = search_radius,
@@ -1159,7 +1160,15 @@ local function mine_at_impl(agent_id, x, y, count, radius)
         else
             local target = find_minable_at(surface, character, x, y, search_radius)
             if not target then break end
-            if character.mine_entity(target, true) then
+            local target_amount_before = nil
+            if target.type == "resource" then
+                target_amount_before = target.amount
+            end
+            character.mine_entity(target, true)
+            local iteration_after_count = inventory_item_total(inv)
+            local inventory_progress = iteration_after_count > iteration_before_count
+            local resource_progress = target.valid and target_amount_before and target.amount < target_amount_before
+            if inventory_progress or resource_progress then
                 mined = mined + 1
             else
                 break

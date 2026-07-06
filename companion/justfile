@@ -82,6 +82,10 @@ logs:
 report *ARGS:
     cd bridge && ../.venv/bin/python report.py {{ARGS}}
 
+# Show pending learned bug reports, diagnostics, and skill/script proposals
+learning:
+    cd bridge && ../.venv/bin/python learning.py triage
+
 # Tail the Factorio server log
 logs-server:
     tail -f logs/server.log

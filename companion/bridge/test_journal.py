@@ -1265,6 +1265,60 @@ progress: plan confirmed; awaiting execution
         self.assertEqual(blocked_science["decision"], "block")
         self.assertEqual(blocked_boiler_refuel["decision"], "block")
 
+    def test_manual_automation_drift_gate_allows_cold_start_furnace_and_drill_crafts(self):
+        import pipe
+        from models import LedgerState
+
+        cold_start_plan = LedgerState(
+            objective="Bootstrap automated iron mining and smelting on the iron patch",
+            plan_steps=[
+                "craft recipe=stone-furnace count=2",
+                "execute_entity_placement_near entity_name=stone-furnace x=57 y=-15",
+                "bootstrap_smelting_once furnace_unit_number=<step2.unit>",
+                "craft recipe=burner-mining-drill count=1",
+                "execute_edge_miner resource_type=iron-ore x=57 y=-21",
+                "execute_direct_smelter drill_unit_number=<step5.drill>",
+            ],
+        )
+        zero_infrastructure = LiveState(
+            found=True,
+            surface="nauvis",
+            x=75.7,
+            y=-18.5,
+            entity_counts={},
+        )
+        gate = pipe.ManualAutomationDriftGate(
+            pipe.logger.bind(agent="test"),
+            agent_name="doug",
+            ledger_loader=lambda agent_name: cold_start_plan,
+            live_state_loader=lambda agent_name: zero_infrastructure,
+        )
+
+        allowed_furnace = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__craft",
+                "tool_input": {
+                    "recipe": "stone-furnace",
+                    "count": 2,
+                },
+            },
+            "tool-1",
+            {},
+        ))
+        allowed_drill = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__craft",
+                "tool_input": {
+                    "recipe": "burner-mining-drill",
+                    "count": 1,
+                },
+            },
+            "tool-2",
+            {},
+        ))
+        self.assertEqual(allowed_furnace, {})
+        self.assertEqual(allowed_drill, {})
+
     def test_manual_automation_drift_gate_blocks_bootstrap_manual_flow_after_assembler(self):
         import pipe
         from models import LedgerState
@@ -3255,6 +3309,60 @@ progress: tick timeout progress survived
         self.assertEqual(updated.next_required_mode.value, "plan")
         self.assertEqual(updated.status.value, "ready")
         self.assertIn("situation_report ok", updated.progress_notes[-1])
+
+    def test_autonomy_step_complete_continues_after_successful_mutation(self):
+        import ledger
+        import pipe
+
+        ledger.save_ledger_model("doug", {
+            "objective": "Mine coal buffer",
+            "plan_steps": ["mine_at x=78 y=-19 count=15"],
+            "progress_notes": [],
+            "status": "ready",
+            "next_required_mode": "execute",
+        })
+
+        pipe._mark_autonomy_step_followup(
+            "doug",
+            tool_name="mine_at",
+            classification=ToolResultClassification.OK,
+            progress=(
+                'autonomy_step_complete: mine_at ok: '
+                '{"success":true,"mined_count":15}'
+            ),
+        )
+
+        updated = ledger.load_ledger_model("doug")
+        self.assertEqual(updated.next_required_mode.value, "execute")
+        self.assertEqual(updated.status.value, "executing")
+        self.assertIn("mine_at ok", updated.progress_notes[-1])
+
+    def test_autonomy_step_complete_replans_after_rejected_mutation(self):
+        import ledger
+        import pipe
+
+        ledger.save_ledger_model("doug", {
+            "objective": "Place drill",
+            "plan_steps": ["place_entity burner-mining-drill"],
+            "progress_notes": [],
+            "status": "executing",
+            "next_required_mode": "execute",
+        })
+
+        pipe._mark_autonomy_step_followup(
+            "doug",
+            tool_name="place_entity",
+            classification=ToolResultClassification.GAME_REJECTED,
+            progress=(
+                'autonomy_step_complete: place_entity game_rejected: '
+                '{"success":false,"error":"Cannot place entity here"}'
+            ),
+        )
+
+        updated = ledger.load_ledger_model("doug")
+        self.assertEqual(updated.next_required_mode.value, "plan")
+        self.assertEqual(updated.status.value, "ready")
+        self.assertIn("place_entity game_rejected", updated.progress_notes[-1])
 
     def test_autonomy_step_complete_ignores_status_tool_guard_denials(self):
         import ledger

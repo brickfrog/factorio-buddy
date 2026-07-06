@@ -387,12 +387,14 @@ class ToolCallRequest(BridgeModel):
         recipe = str(self.tool_input.get("recipe") or "").strip().lower()
         return recipe in {
             "assembling-machine-1",
+            "burner-mining-drill",
             "burner-inserter",
             "copper-cable",
             "electronic-circuit",
             "inserter",
             "iron-gear-wheel",
             "small-electric-pole",
+            "stone-furnace",
             "transport-belt",
         }
 

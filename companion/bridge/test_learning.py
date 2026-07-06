@@ -117,6 +117,33 @@ steps:
             ["typed_gap", "typed_diagnostic", "dict_gap"],
         )
 
+    def test_numbered_learning_lists_parse_as_steps(self):
+        [proposal] = learning.parse_learning_trailer_models(
+            """Visible.
+
+<bug_report>
+name: bootstrap_craft_block
+problem: craft is blocked during bootstrap
+steps:
+1. mine raw stone
+2. craft stone-furnace
+3. place furnace
+acceptance_tests:
+1) first furnace craft succeeds
+2) drill craft succeeds
+</bug_report>
+"""
+        )
+
+        self.assertEqual(
+            proposal.steps,
+            ["mine raw stone", "craft stone-furnace", "place furnace"],
+        )
+        self.assertEqual(
+            proposal.acceptance_tests,
+            ["first furnace craft succeeds", "drill craft succeeds"],
+        )
+
     def test_apply_learning_update_persists_pending_and_strip_hides_block(self):
         text = """Done.
 
@@ -354,6 +381,23 @@ evidence:
         self.assertIn("avoid duplicate pumps", prompt)
         self.assertIn("<skill_proposal>", prompt)
         self.assertNotIn("pending_noise", prompt)
+
+    def test_format_pending_triage_surfaces_actionable_candidates(self):
+        path = learning.save_candidate({
+            "agent": "doug",
+            "kind": "bug_report",
+            "name": "bootstrap_craft_block",
+            "problem": "craft was blocked even though no durable path exists",
+            "acceptance_tests": ["craft stone-furnace succeeds"],
+        }, status="pending")
+
+        rendered = learning.format_pending_triage([path])
+
+        self.assertIn("Pending learning candidates", rendered)
+        self.assertIn("total=1 bug_report=1", rendered)
+        self.assertIn("bug_report: bootstrap_craft_block", rendered)
+        self.assertIn("craft was blocked", rendered)
+        self.assertIn("craft stone-furnace succeeds", rendered)
 
 
 if __name__ == "__main__":
