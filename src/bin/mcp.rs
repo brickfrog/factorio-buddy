@@ -11,13 +11,13 @@ use rmcp::{
     schemars::{self, JsonSchema},
     tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 use factorioctl::analyze::{
     analyze_belt_reach, analyze_inserters, analyze_item_flow, detect_sushi_belts, find_belt_gaps,
     find_belt_networks, trace_belt_sources, BeltGraph, EntityLookup,
 };
-use factorioctl::client::{lua::LuaCommand, AgentId, FactorioClient};
+use factorioctl::client::{AgentId, FactorioClient};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
 use factorioctl::world::{
     build_production_report, build_situation_report, entity_size, find_belt_route_with_options,
@@ -56,6 +56,20 @@ fn route_belt_failure_json(
         "search_radius": params.search_radius,
         "materials_sufficient": false,
     })
+}
+
+fn deserialize_tile_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if !value.is_finite() {
+        return Err(de::Error::custom("tile coordinate must be finite"));
+    }
+    if value < i32::MIN as f64 || value > i32::MAX as f64 {
+        return Err(de::Error::custom("tile coordinate out of i32 range"));
+    }
+    Ok(value.floor() as i32)
 }
 
 fn placed_units_not_dead(
@@ -274,7 +288,7 @@ mod tests {
         automation_repair_hint, execute_lua_refusal, flow_lookup, flow_scan_area,
         is_machine_output_source, machine_output_build_args, machine_side_layout,
         placed_unit_working, placed_units_not_dead, raw_lua_enabled, ready_fuel_supply_args,
-        route_belt_failure_json, route_segment_waypoint, RouteBeltParams,
+        route_belt_failure_json, route_segment_waypoint, BuildFuelSupplyParams, RouteBeltParams,
     };
     use factorioctl::analyze::EntityLookup;
     use factorioctl::world::{Area, Entity, GridPos, Position, TilePos};
@@ -608,6 +622,26 @@ mod tests {
         assert_eq!(args.inserter_name, "burner-inserter");
         assert_eq!(args.belt_type, "transport-belt");
         assert!(args.extend_existing);
+    }
+
+    #[test]
+    fn build_fuel_supply_params_accept_factorio_center_coordinates_for_tiles() {
+        let args: BuildFuelSupplyParams = serde_json::from_value(serde_json::json!({
+            "consumer_unit_number": 49,
+            "from_x": 73.5,
+            "from_y": -27.5,
+            "pickup_x": 54.5,
+            "pickup_y": -9.5,
+            "inserter_x": 54.5,
+            "inserter_y": -8.5,
+            "inserter_direction": "north"
+        }))
+        .expect("half-tile Factorio centers should deserialize as tile coords");
+
+        assert_eq!(args.from_x, 73);
+        assert_eq!(args.from_y, -28);
+        assert_eq!(args.pickup_x, 54);
+        assert_eq!(args.pickup_y, -10);
     }
 
     #[test]
@@ -1139,6 +1173,10 @@ fn default_furnace_name() -> String {
     "stone-furnace".to_string()
 }
 
+fn default_surface_name() -> String {
+    "nauvis".to_string()
+}
+
 fn default_inserter_name() -> String {
     "burner-inserter".to_string()
 }
@@ -1356,12 +1394,20 @@ pub struct SetRecipeParams {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RouteBeltParams {
     /// Starting X coordinate (integer tile)
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub from_x: i32,
     /// Starting Y coordinate (integer tile)
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub from_y: i32,
     /// Destination X coordinate (integer tile)
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub to_x: i32,
     /// Destination Y coordinate (integer tile)
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub to_y: i32,
     /// Belt type (e.g., 'transport-belt', 'fast-transport-belt')
     #[serde(default = "default_belt_type")]
@@ -1413,12 +1459,20 @@ pub struct BuildFuelSupplyParams {
     /// Fuel consumer to supply, used for verification context.
     pub consumer_unit_number: u32,
     /// Coal source or existing coal belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub from_x: i32,
     /// Coal source or existing coal belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub from_y: i32,
     /// Inserter pickup belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub pickup_x: i32,
     /// Inserter pickup belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub pickup_y: i32,
     /// Inserter placement X coordinate.
     pub inserter_x: f64,
@@ -1495,12 +1549,20 @@ pub struct BuildLabFeedParams {
     /// Target lab unit number, used for research verification context.
     pub lab_unit_number: u32,
     /// Science source or existing science belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub from_x: i32,
     /// Science source or existing science belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub from_y: i32,
     /// Inserter pickup belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub pickup_x: i32,
     /// Inserter pickup belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub pickup_y: i32,
     /// Inserter placement X coordinate.
     pub inserter_x: f64,
@@ -1539,12 +1601,20 @@ pub struct BuildAssemblerFeedParams {
     /// Item expected on this feed lane, used for reporting and guidance.
     pub item_name: String,
     /// Item source or existing item belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub from_x: i32,
     /// Item source or existing item belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub from_y: i32,
     /// Inserter pickup belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub pickup_x: i32,
     /// Inserter pickup belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub pickup_y: i32,
     /// Inserter placement X coordinate.
     pub inserter_x: f64,
@@ -1583,12 +1653,20 @@ pub struct BuildAssemblerOutputParams {
     /// Item expected on this output lane, used for reporting and guidance.
     pub item_name: String,
     /// Inserter drop belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub drop_x: i32,
     /// Inserter drop belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub drop_y: i32,
     /// Target belt X tile to route the output toward.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub to_x: i32,
     /// Target belt Y tile to route the output toward.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub to_y: i32,
     /// Inserter placement X coordinate.
     pub inserter_x: f64,
@@ -1627,8 +1705,12 @@ pub struct PlanMachineOutputParams {
     /// Item expected on the output belt, such as iron-plate or automation-science-pack.
     pub item_name: String,
     /// Target belt X tile to route the output toward.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub to_x: i32,
     /// Target belt Y tile to route the output toward.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub to_y: i32,
     /// Side of the machine to extract output from.
     #[serde(default = "default_recipe_output_side")]
@@ -1673,12 +1755,20 @@ pub struct PlanRecipeAssemblerCellParams {
     /// Product item expected on the output belt.
     pub output_item_name: String,
     /// Input item source or existing input belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub input_from_x: i32,
     /// Input item source or existing input belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub input_from_y: i32,
     /// Target belt X tile to route the product toward.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub output_to_x: i32,
     /// Target belt Y tile to route the product toward.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub output_to_y: i32,
     /// Side of the assembler to feed input from.
     #[serde(default = "default_recipe_input_side")]
@@ -1718,12 +1808,20 @@ pub struct BuildRecipeAssemblerCellParams {
     /// Product item expected on the output belt.
     pub output_item_name: String,
     /// Input item source or existing input belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub input_from_x: i32,
     /// Input item source or existing input belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub input_from_y: i32,
     /// Input inserter pickup belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub input_pickup_x: i32,
     /// Input inserter pickup belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub input_pickup_y: i32,
     /// Input inserter placement X coordinate.
     pub input_inserter_x: f64,
@@ -1732,12 +1830,20 @@ pub struct BuildRecipeAssemblerCellParams {
     /// Input inserter direction feeding the assembler.
     pub input_inserter_direction: String,
     /// Assembler output inserter drop belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub output_drop_x: i32,
     /// Assembler output inserter drop belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub output_drop_y: i32,
     /// Target belt X tile to route the product toward.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub output_to_x: i32,
     /// Target belt Y tile to route the product toward.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub output_to_y: i32,
     /// Output inserter placement X coordinate.
     pub output_inserter_x: f64,
@@ -1776,12 +1882,20 @@ pub struct BuildAutomationScienceParams {
     /// Lab that should receive the science belt.
     pub lab_unit_number: u32,
     /// Iron gear source or existing gear belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub gear_from_x: i32,
     /// Iron gear source or existing gear belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub gear_from_y: i32,
     /// Gear inserter pickup belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub gear_pickup_x: i32,
     /// Gear inserter pickup belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub gear_pickup_y: i32,
     /// Gear inserter placement X coordinate.
     pub gear_inserter_x: f64,
@@ -1790,12 +1904,20 @@ pub struct BuildAutomationScienceParams {
     /// Gear inserter direction feeding the assembler.
     pub gear_inserter_direction: String,
     /// Copper plate source or existing copper belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub copper_from_x: i32,
     /// Copper plate source or existing copper belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub copper_from_y: i32,
     /// Copper inserter pickup belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub copper_pickup_x: i32,
     /// Copper inserter pickup belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub copper_pickup_y: i32,
     /// Copper inserter placement X coordinate.
     pub copper_inserter_x: f64,
@@ -1804,12 +1926,20 @@ pub struct BuildAutomationScienceParams {
     /// Copper inserter direction feeding the assembler.
     pub copper_inserter_direction: String,
     /// Assembler output inserter drop belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub science_drop_x: i32,
     /// Assembler output inserter drop belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub science_drop_y: i32,
     /// Intermediate science belt target X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub science_to_x: i32,
     /// Intermediate science belt target Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub science_to_y: i32,
     /// Output inserter placement X coordinate.
     pub output_inserter_x: f64,
@@ -1818,12 +1948,20 @@ pub struct BuildAutomationScienceParams {
     /// Output inserter direction extracting science from the assembler.
     pub output_inserter_direction: String,
     /// Science belt source X tile for the lab-feed leg, usually science_to_x.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub lab_from_x: i32,
     /// Science belt source Y tile for the lab-feed leg, usually science_to_y.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub lab_from_y: i32,
     /// Lab inserter pickup belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub lab_pickup_x: i32,
     /// Lab inserter pickup belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub lab_pickup_y: i32,
     /// Lab inserter placement X coordinate.
     pub lab_inserter_x: f64,
@@ -1878,12 +2016,20 @@ pub struct PlanAutomationScienceParams {
     /// Lab that should receive the science belt.
     pub lab_unit_number: u32,
     /// Iron gear source or existing gear belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub gear_from_x: i32,
     /// Iron gear source or existing gear belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub gear_from_y: i32,
     /// Copper plate source or existing copper belt X tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub copper_from_x: i32,
     /// Copper plate source or existing copper belt Y tile.
+    #[serde(deserialize_with = "deserialize_tile_i32")]
+    #[schemars(with = "f64")]
     pub copper_from_y: i32,
     /// Side of the assembler to feed iron gears from.
     #[serde(default = "default_automation_gear_side")]
@@ -2327,6 +2473,93 @@ pub struct AlertsParams {
     pub radius: u32,
 }
 
+/// Parameters for sending an agent response to the in-game chat UI.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SendChatResponseParams {
+    /// Player index receiving the response.
+    pub player_index: u32,
+    /// Agent/tab name to route the response under.
+    pub agent_name: String,
+    /// Text to display.
+    pub text: String,
+}
+
+/// Parameters for updating the visible tool status for an agent.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ToolStatusParams {
+    /// Player index whose UI receives the status.
+    pub player_index: u32,
+    /// Agent/tab name.
+    pub agent_name: String,
+    /// Tool name to display.
+    pub tool_name: String,
+}
+
+/// Parameters for setting the visible bridge status text.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SetStatusParams {
+    /// Player index whose UI receives the status.
+    pub player_index: u32,
+    /// Formatted status text.
+    pub status: String,
+}
+
+/// Parameters for registering an agent tab in the companion UI.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RegisterAgentParams {
+    /// Agent name.
+    pub agent_name: String,
+    /// Optional UI label.
+    pub label: Option<String>,
+}
+
+/// Parameters for unregistering an agent tab in the companion UI.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct UnregisterAgentParams {
+    /// Agent name.
+    pub agent_name: String,
+}
+
+/// Parameters for ensuring a planet surface exists.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EnsureSurfaceParams {
+    /// Surface/planet name.
+    pub planet: String,
+}
+
+/// Parameters for pre-placing an agent character.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlaceCharacterParams {
+    /// Agent id/name.
+    pub agent_name: String,
+    /// Surface/planet name.
+    pub planet: String,
+    /// Spawn X coordinate to avoid overlapping other agents.
+    pub spawn_x: f64,
+}
+
+/// Parameters for toggling spectator mode for connecting players.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SetSpectatorModeParams {
+    /// Whether spectator mode should be enabled.
+    pub enabled: bool,
+}
+
+/// Parameters for querying compact live state for an agent.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct LiveStateParams {
+    /// Agent id/name.
+    pub agent_name: String,
+}
+
+/// Parameters for querying force production statistics for eval/report tools.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EvalProductionSnapshotParams {
+    /// Surface name to inspect.
+    #[serde(default = "default_surface_name")]
+    pub surface_name: String,
+}
+
 // === Zone Management Parameters ===
 
 /// Parameters for create_zone tool
@@ -2565,10 +2798,8 @@ impl FactorioMcp {
     async fn fetch_player_messages(&self) -> Option<String> {
         let mut client = self.connect().await.ok()?;
 
-        // First ensure the chat handler is registered
-        let register_lua = factorioctl::client::lua::LuaCommand::register_chat_handler();
         let mut warning: Option<String> = None;
-        if let Err(err) = client.execute_lua(&register_lua).await {
+        if let Err(err) = client.call_remote("chat_capture_status", &[]).await {
             eprintln!("Failed to register chat handler: {}", err);
             warning = Some(format!(
                 "\n\n[warning: chat handler registration failed: {}]",
@@ -2577,8 +2808,7 @@ impl FactorioMcp {
         }
 
         // Then fetch and clear messages
-        let fetch_lua = factorioctl::client::lua::LuaCommand::get_and_clear_chat_messages();
-        let formatted_messages = match client.execute_lua(&fetch_lua).await {
+        let formatted_messages = match client.call_remote("get_chat_messages", &[]).await {
             Ok(response) => match serde_json::from_str::<Vec<ChatMessage>>(&response) {
                 Ok(messages) if !messages.is_empty() => {
                     let formatted: Vec<String> = messages
@@ -2611,6 +2841,18 @@ impl FactorioMcp {
         }
     }
 
+    async fn call_lifecycle_remote(&self, fn_name: &str, args: &[serde_json::Value]) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return format!("Error: {}", e),
+        };
+        match client.call_remote(fn_name, args).await {
+            Ok(result) if result.trim().is_empty() => "{\"success\":true}".to_string(),
+            Ok(result) => result,
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
     async fn render_ascii_map_snapshot(
         &self,
         client: &mut FactorioClient,
@@ -2638,8 +2880,17 @@ impl FactorioMcp {
         };
 
         let power_coverage = if show_power {
-            let lua = LuaCommand::get_power_coverage(center.x as i32, center.y as i32, radius);
-            match client.execute_lua(&lua).await {
+            match client
+                .call_remote(
+                    "get_power_coverage",
+                    &[
+                        serde_json::json!(center.x as i32),
+                        serde_json::json!(center.y as i32),
+                        serde_json::json!(radius),
+                    ],
+                )
+                .await
+            {
                 Ok(result) => serde_json::from_str::<serde_json::Value>(&result)
                     .ok()
                     .and_then(|value| value.get("coverage").cloned())
@@ -2682,6 +2933,153 @@ impl FactorioMcp {
 
 #[tool_router]
 impl FactorioMcp {
+    /// Send an agent response to the in-game chat UI.
+    #[tool(
+        description = "Bridge lifecycle tool: send an agent response to the Factorio companion UI."
+    )]
+    async fn send_chat_response(
+        &self,
+        Parameters(params): Parameters<SendChatResponseParams>,
+    ) -> String {
+        self.call_lifecycle_remote(
+            "receive_response",
+            &[
+                serde_json::json!(params.player_index),
+                serde_json::json!(params.agent_name),
+                serde_json::json!(params.text),
+            ],
+        )
+        .await
+    }
+
+    /// Update the visible tool status in the companion UI.
+    #[tool(
+        description = "Bridge lifecycle tool: update the visible tool status in the Factorio companion UI."
+    )]
+    async fn tool_status(&self, Parameters(params): Parameters<ToolStatusParams>) -> String {
+        self.call_lifecycle_remote(
+            "tool_status",
+            &[
+                serde_json::json!(params.player_index),
+                serde_json::json!(params.agent_name),
+                serde_json::json!(params.tool_name),
+            ],
+        )
+        .await
+    }
+
+    /// Set the visible status in the companion UI.
+    #[tool(
+        description = "Bridge lifecycle tool: set the visible status in the Factorio companion UI."
+    )]
+    async fn set_status(&self, Parameters(params): Parameters<SetStatusParams>) -> String {
+        self.call_lifecycle_remote(
+            "set_status",
+            &[
+                serde_json::json!(params.player_index),
+                serde_json::json!(params.status),
+            ],
+        )
+        .await
+    }
+
+    /// Register an agent tab in the companion UI.
+    #[tool(
+        description = "Bridge lifecycle tool: register an agent tab in the Factorio companion UI."
+    )]
+    async fn register_agent(&self, Parameters(params): Parameters<RegisterAgentParams>) -> String {
+        let mut args = vec![serde_json::json!(params.agent_name)];
+        if let Some(label) = params.label {
+            args.push(serde_json::json!(label));
+        }
+        self.call_lifecycle_remote("register_agent", &args).await
+    }
+
+    /// Unregister an agent tab from the companion UI.
+    #[tool(
+        description = "Bridge lifecycle tool: unregister an agent tab from the Factorio companion UI."
+    )]
+    async fn unregister_agent(
+        &self,
+        Parameters(params): Parameters<UnregisterAgentParams>,
+    ) -> String {
+        self.call_lifecycle_remote("unregister_agent", &[serde_json::json!(params.agent_name)])
+            .await
+    }
+
+    /// Ensure a planet surface exists.
+    #[tool(
+        description = "Bridge lifecycle tool: ensure a planet surface exists and return its status."
+    )]
+    async fn ensure_surface(&self, Parameters(params): Parameters<EnsureSurfaceParams>) -> String {
+        self.call_lifecycle_remote("ensure_surface_result", &[serde_json::json!(params.planet)])
+            .await
+    }
+
+    /// Pre-place an agent character on a planet surface.
+    #[tool(
+        description = "Bridge lifecycle tool: create or teleport an agent character on a planet surface."
+    )]
+    async fn place_character(
+        &self,
+        Parameters(params): Parameters<PlaceCharacterParams>,
+    ) -> String {
+        self.call_lifecycle_remote(
+            "pre_place_character_result",
+            &[
+                serde_json::json!(params.agent_name),
+                serde_json::json!(params.planet),
+                serde_json::json!(params.spawn_x),
+            ],
+        )
+        .await
+    }
+
+    /// Toggle spectator mode for connecting players.
+    #[tool(description = "Bridge lifecycle tool: toggle spectator mode for connecting players.")]
+    async fn set_spectator_mode(
+        &self,
+        Parameters(params): Parameters<SetSpectatorModeParams>,
+    ) -> String {
+        self.call_lifecycle_remote("set_spectator_mode", &[serde_json::json!(params.enabled)])
+            .await
+    }
+
+    /// Ping the companion mod dispatcher.
+    #[tool(description = "Bridge lifecycle tool: ping the companion mod dispatcher.")]
+    async fn ping(&self) -> String {
+        self.call_lifecycle_remote("ping", &[]).await
+    }
+
+    /// Get compact live state for an agent.
+    #[tool(description = "Bridge lifecycle tool: get compact live state for an agent.")]
+    async fn live_state(&self, Parameters(params): Parameters<LiveStateParams>) -> String {
+        self.call_lifecycle_remote("live_state_result", &[serde_json::json!(params.agent_name)])
+            .await
+    }
+
+    /// Count currently connected human players.
+    #[tool(description = "Bridge lifecycle tool: count currently connected human players.")]
+    async fn connected_player_count(&self) -> String {
+        self.call_lifecycle_remote("connected_player_count_result", &[])
+            .await
+    }
+
+    /// Query production statistics snapshot for eval/report scoring.
+    #[tool(
+        description = "Read force item production totals and one-minute rates for eval/report scoring."
+    )]
+    async fn eval_production_snapshot(
+        &self,
+        Parameters(params): Parameters<EvalProductionSnapshotParams>,
+    ) -> String {
+        self.call_lifecycle_remote(
+            "eval_production_snapshot",
+            &[serde_json::json!(params.surface_name)],
+        )
+        .await
+    }
+
     // --- Query Tools ---
 
     /// Get all entities in an area. Returns entity names, positions, and types.
@@ -2801,9 +3199,13 @@ impl FactorioMcp {
 
         if is_drill {
             // For drills, query the actual drop_position from Factorio
-            let lua = LuaCommand::get_entity_drop_position(params.unit_number);
-
-            let drop_result = match client.execute_lua(&lua).await {
+            let drop_result = match client
+                .call_remote(
+                    "get_entity_drop_position",
+                    &[serde_json::json!(params.unit_number)],
+                )
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     return self
@@ -3781,13 +4183,19 @@ impl FactorioMcp {
             }
         };
 
-        let lua = LuaCommand::place_entity(
-            &client.agent_id().clone(),
-            &params.entity_name,
-            position,
-            direction,
-        );
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "place_entity",
+                &[
+                    serde_json::json!(client.agent_id().as_str()),
+                    serde_json::json!(params.entity_name),
+                    serde_json::json!(position.x),
+                    serde_json::json!(position.y),
+                    serde_json::json!(direction.to_factorio()),
+                ],
+            )
+            .await
+        {
             Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
                 Ok(value) => {
                     serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
@@ -4750,8 +5158,10 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = LuaCommand::get_recipe(&params.name);
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote("get_recipe", &[serde_json::json!(params.name)])
+            .await
+        {
             Ok(response) => response,
             Err(e) => format!("Error: {}", e),
         };
@@ -5257,8 +5667,16 @@ impl FactorioMcp {
             }
         };
 
-        let lua = LuaCommand::rotate_entity(params.unit_number, direction.to_factorio());
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "rotate_entity",
+                &[
+                    serde_json::json!(params.unit_number),
+                    serde_json::json!(direction.to_factorio()),
+                ],
+            )
+            .await
+        {
             Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
                 Ok(value) => {
                     serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
@@ -6197,8 +6615,7 @@ impl FactorioMcp {
             Some(route_success),
         );
 
-        let research_lua = LuaCommand::get_research_status();
-        let research_status = match client.execute_lua(&research_lua).await {
+        let research_status = match client.call_remote("get_research_status", &[]).await {
             Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
                 Ok(report) => serde_json::json!({
                     "success": true,
@@ -7729,8 +8146,7 @@ impl FactorioMcp {
         let (inserters_ready, placed_unit_statuses) =
             placed_units_not_dead(&verification, &placed_units);
 
-        let research_lua = LuaCommand::get_research_status();
-        let research_status = match client.execute_lua(&research_lua).await {
+        let research_status = match client.call_remote("get_research_status", &[]).await {
             Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
                 Ok(report) => serde_json::json!({
                     "success": true,
@@ -7989,8 +8405,7 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::get_research_status();
-        let result = match client.execute_lua(&lua).await {
+        let result = match client.call_remote("get_research_status", &[]).await {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };
@@ -8010,8 +8425,13 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::get_available_research(client.agent_id());
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "get_available_research",
+                &[serde_json::json!(client.agent_id().as_str())],
+            )
+            .await
+        {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };
@@ -8061,8 +8481,10 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::start_research(&params.technology);
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote("start_research", &[serde_json::json!(params.technology)])
+            .await
+        {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };
@@ -8082,12 +8504,17 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::get_power_status(
-            params.x,
-            params.y,
-            params.radius,
-        );
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "get_power_status",
+                &[
+                    serde_json::json!(params.x),
+                    serde_json::json!(params.y),
+                    serde_json::json!(params.radius),
+                ],
+            )
+            .await
+        {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };
@@ -8105,12 +8532,17 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::get_power_networks(
-            params.x,
-            params.y,
-            params.radius,
-        );
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "get_power_networks",
+                &[
+                    serde_json::json!(params.x),
+                    serde_json::json!(params.y),
+                    serde_json::json!(params.radius),
+                ],
+            )
+            .await
+        {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };
@@ -8132,12 +8564,17 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::find_power_issues(
-            params.x,
-            params.y,
-            params.radius,
-        );
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "find_power_issues",
+                &[
+                    serde_json::json!(params.x),
+                    serde_json::json!(params.y),
+                    serde_json::json!(params.radius),
+                ],
+            )
+            .await
+        {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };
@@ -8154,12 +8591,17 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua = factorioctl::client::lua::LuaCommand::diagnose_steam_power(
-            params.x,
-            params.y,
-            params.radius,
-        );
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "diagnose_steam_power",
+                &[
+                    serde_json::json!(params.x),
+                    serde_json::json!(params.y),
+                    serde_json::json!(params.radius),
+                ],
+            )
+            .await
+        {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };
@@ -8257,9 +8699,17 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let lua =
-            factorioctl::client::lua::LuaCommand::get_alerts(params.x, params.y, params.radius);
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "get_alerts",
+                &[
+                    serde_json::json!(params.x),
+                    serde_json::json!(params.y),
+                    serde_json::json!(params.radius),
+                ],
+            )
+            .await
+        {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };
@@ -8314,8 +8764,10 @@ impl FactorioMcp {
             };
 
             if broadcast_config.console {
-                let lua = factorioctl::client::lua::LuaCommand::broadcast_console(&params.message);
-                if let Err(e) = client.execute_lua(&lua).await {
+                if let Err(e) = client
+                    .call_remote("broadcast_console", &[serde_json::json!(params.message)])
+                    .await
+                {
                     results.push(format!("Console error: {}", e));
                 } else {
                     results.push("Console: displayed".to_string());
@@ -8323,9 +8775,13 @@ impl FactorioMcp {
             }
 
             if broadcast_config.flying_text {
-                let lua =
-                    factorioctl::client::lua::LuaCommand::broadcast_flying_text(&params.message);
-                if let Err(e) = client.execute_lua(&lua).await {
+                if let Err(e) = client
+                    .call_remote(
+                        "broadcast_flying_text",
+                        &[serde_json::json!(params.message)],
+                    )
+                    .await
+                {
                     results.push(format!("Flying text error: {}", e));
                 } else {
                     results.push("Flying text: displayed".to_string());
@@ -8964,15 +9420,22 @@ impl FactorioMcp {
         };
 
         let area = Area::new(params.x1, params.y1, params.x2, params.y2);
-        let lua = factorioctl::client::lua::LuaCommand::clear_area(
-            client.agent_id(),
-            area,
-            params.clear_trees,
-            params.clear_rocks,
-            params.dry_run,
-        );
-
-        let result = match client.execute_lua(&lua).await {
+        let result = match client
+            .call_remote(
+                "clear_area",
+                &[
+                    serde_json::json!(client.agent_id().as_str()),
+                    serde_json::json!(area.left_top.x),
+                    serde_json::json!(area.left_top.y),
+                    serde_json::json!(area.right_bottom.x),
+                    serde_json::json!(area.right_bottom.y),
+                    serde_json::json!(params.clear_trees),
+                    serde_json::json!(params.clear_rocks),
+                    serde_json::json!(params.dry_run),
+                ],
+            )
+            .await
+        {
             Ok(result) => result,
             Err(e) => format!("Error: {}", e),
         };

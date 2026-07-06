@@ -2,7 +2,7 @@
 
 The CI-testable seam is pure: score snapshots and milestone predicates without
 touching a live game. The live harness reads Factorio force production
-statistics over RCON and feeds the same pure evaluator.
+statistics through factorioctl MCP and feeds the same pure evaluator.
 
 Scoring policy: production_score is computed from one-minute production rates
 when evaluate() receives rate_per_min data. If no rates are present, evaluate()
@@ -25,9 +25,9 @@ from models import (
     EvalMilestoneSpec,
     EvalProductionSnapshot,
     EvalResult,
-    RconRemoteCall,
 )
-from rcon import RCONClient, lua_long_string
+from paths import find_factorioctl_mcp
+from transport import McpLifecycleClient
 
 
 Milestone = tuple[str, Callable[[Any], bool]]
@@ -516,17 +516,13 @@ def evaluate_model(snapshot: EvalProductionSnapshot | dict[str, Any]) -> EvalRes
 
 
 def query_snapshot_model(rcon: Any, surface: str = "nauvis") -> EvalProductionSnapshot:
-    """Read force item production statistics over RCON.
+    """Read force item production statistics through the factorioctl MCP.
 
     Errors return an empty snapshot so the benchmark can keep running and report
-    a zero score instead of crashing on transient RCON or Lua issues.
+    a zero score instead of crashing on transient game transport issues.
     """
-    surface_literal = lua_long_string(surface)
     try:
-        response = rcon.execute(RconRemoteCall.command(
-            "eval_production_snapshot",
-            surface_literal,
-        ))
+        response = rcon.eval_production_snapshot(surface_name=surface)
         return EvalProductionSnapshot.from_rcon_text(response)
     except Exception:
         return EvalProductionSnapshot()
@@ -597,13 +593,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Factorio production eval harness")
     parser.add_argument("--duration", type=float, default=300.0, help="Run duration in seconds")
     parser.add_argument("--interval", type=float, default=30.0, help="Sample interval in seconds")
-    parser.add_argument("--host", default="localhost", help="RCON host")
-    parser.add_argument("--port", type=int, default=27015, help="RCON port")
-    parser.add_argument("--password", default="", help="RCON password")
+    parser.add_argument("--host", default="localhost", help="RCON host passed to factorioctl MCP")
+    parser.add_argument("--port", type=int, default=27015, help="RCON port passed to factorioctl MCP")
+    parser.add_argument("--password", default="", help="RCON password passed to factorioctl MCP")
+    parser.add_argument("--factorioctl-mcp", default=None, help="Path to factorioctl MCP binary")
     parser.add_argument("--surface", default="nauvis", help="Surface to read")
     args = parser.parse_args()
 
-    rcon = RCONClient(args.host, args.port, args.password)
+    mcp_bin = args.factorioctl_mcp or find_factorioctl_mcp()
+    if not mcp_bin:
+        raise FileNotFoundError(
+            "factorioctl MCP not found; eval live sampling must go through Rust MCP"
+        )
+    rcon = McpLifecycleClient(
+        mcp_bin,
+        rcon_host=args.host,
+        rcon_port=args.port,
+        rcon_password=args.password,
+        agent_id="bridge-eval",
+    )
     try:
         run_model(rcon, args.duration, args.interval, surface=args.surface)
     finally:

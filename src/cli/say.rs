@@ -6,7 +6,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use super::ResolvedConnectionArgs;
-use crate::client::{lua::LuaCommand, FactorioClient};
+use crate::client::FactorioClient;
 use crate::config::{Config, TtsConfig};
 
 #[derive(Args, Debug)]
@@ -59,16 +59,18 @@ pub async fn execute(cmd: SayCommand, conn: &ResolvedConnectionArgs) -> Result<(
 async fn display_console(client: &mut FactorioClient, message: &str) -> Result<()> {
     // Unescape shell-escaped exclamation marks (bash escapes ! as \!)
     let unescaped = message.replace("\\!", "!");
-    let lua = LuaCommand::broadcast_console(&unescaped);
-    client.execute_lua(&lua).await?;
+    client
+        .call_remote("broadcast_console", &[serde_json::json!(unescaped)])
+        .await?;
     Ok(())
 }
 
 async fn display_flying_text(client: &mut FactorioClient, message: &str) -> Result<()> {
     // Unescape shell-escaped exclamation marks (bash escapes ! as \!)
     let unescaped = message.replace("\\!", "!");
-    let lua = LuaCommand::broadcast_flying_text(&unescaped);
-    client.execute_lua(&lua).await?;
+    client
+        .call_remote("broadcast_flying_text", &[serde_json::json!(unescaped)])
+        .await?;
     Ok(())
 }
 

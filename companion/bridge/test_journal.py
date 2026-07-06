@@ -1480,6 +1480,26 @@ progress: plan confirmed; awaiting execution
         self.assertIn("invalid Factorio tool parameters", blocked["reason"])
         self.assertFalse(ToolResultOutcome.from_text(blocked["reason"]).indicates_failure)
 
+        allowed_half_tile_fuel = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__build_fuel_supply",
+                "tool_input": {
+                    "consumer_unit_number": 49,
+                    "from_x": 73.5,
+                    "from_y": -27.5,
+                    "pickup_x": 54.5,
+                    "pickup_y": -9.5,
+                    "inserter_x": 54.5,
+                    "inserter_y": -8.5,
+                    "inserter_direction": "north",
+                },
+            },
+            "tool-fuel-float",
+            {},
+        ))
+
+        self.assertEqual(allowed_half_tile_fuel, {})
+
         blocked_fuel = asyncio.run(gate.hook(
             {
                 "tool_name": "mcp__factorioctl__build_fuel_supply",
@@ -1718,6 +1738,18 @@ progress: plan confirmed; awaiting execution
             "tool-lab-feed",
             {},
         ))
+        valid_lifecycle = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__send_chat_response",
+                "tool_input": {
+                    "player_index": 1,
+                    "agent_name": "doug",
+                    "text": "ok",
+                },
+            },
+            "tool-lifecycle",
+            {},
+        ))
         automation_science_input = {
             "assembler_unit_number": 80,
             "lab_unit_number": 69,
@@ -1902,6 +1934,18 @@ progress: plan confirmed; awaiting execution
             "tool-execute-placement-bad",
             {},
         ))
+        bad_lifecycle = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__place_character",
+                "tool_input": {
+                    "agent_name": "doug",
+                    "planet": "nauvis",
+                    "spawn_x": {"bad": True},
+                },
+            },
+            "tool-lifecycle-bad",
+            {},
+        ))
         unknown = asyncio.run(gate.hook(
             {
                 "tool_name": "mcp__factorioctl__future_tool",
@@ -1927,6 +1971,7 @@ progress: plan confirmed; awaiting execution
         self.assertEqual(valid_execute_placement, {})
         self.assertEqual(valid_direct_smelter, {})
         self.assertEqual(valid_lab_feed, {})
+        self.assertEqual(valid_lifecycle, {})
         self.assertEqual(valid_automation_science, {})
         self.assertEqual(valid_automation_science_plan, {})
         self.assertEqual(valid_recipe_cell, {})
@@ -1938,7 +1983,7 @@ progress: plan confirmed; awaiting execution
         )
         self.assertEqual(bad_automation_science_plan["decision"], "block")
         self.assertIn(
-            "plan_automation_science: tool_input.gear_from_x: expected integer",
+            "plan_automation_science: tool_input.gear_from_x: expected number",
             bad_automation_science_plan["reason"],
         )
         self.assertEqual(bad_recipe_cell["decision"], "block")
@@ -1948,7 +1993,7 @@ progress: plan confirmed; awaiting execution
         )
         self.assertEqual(bad_recipe_cell_plan["decision"], "block")
         self.assertIn(
-            "plan_recipe_assembler_cell: tool_input.input_from_x: expected integer",
+            "plan_recipe_assembler_cell: tool_input.input_from_x: expected number",
             bad_recipe_cell_plan["reason"],
         )
         self.assertEqual(bad_execute_edge_miner["decision"], "block")
@@ -1960,6 +2005,11 @@ progress: plan confirmed; awaiting execution
         self.assertIn(
             "execute_entity_placement_near: tool_input.y: expected number",
             bad_execute_placement["reason"],
+        )
+        self.assertEqual(bad_lifecycle["decision"], "block")
+        self.assertIn(
+            "place_character: tool_input.spawn_x: expected number",
+            bad_lifecycle["reason"],
         )
         self.assertEqual(unknown, {})
         self.assertEqual(non_factorio, {})
@@ -2186,8 +2236,12 @@ progress: plan confirmed; awaiting execution
             def __init__(self):
                 self.commands = []
 
-            def execute(self, cmd):
-                self.commands.append(cmd)
+            def send_chat_response(self, player_index, agent, message):
+                self.commands.append(message)
+                return ""
+
+            def set_status(self, player_index, status):
+                self.commands.append(status)
                 return ""
 
         reset = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -2665,8 +2719,12 @@ progress: tick timeout progress survived
             def __init__(self):
                 self.commands = []
 
-            def execute(self, cmd):
-                self.commands.append(cmd)
+            def send_chat_response(self, player_index, agent, message):
+                self.commands.append(message)
+                return ""
+
+            def set_status(self, player_index, status):
+                self.commands.append(status)
                 return ""
 
         reset = datetime.now(timezone.utc) + timedelta(minutes=15)
@@ -2839,6 +2897,31 @@ progress: tick timeout progress survived
 
         with self.assertRaises(pipe.AgentTickWatchdogAbort):
             watchdog.observe_text()
+
+    def test_autonomy_step_completion_ignores_guard_denial_even_when_sdk_labels_ok(self):
+        import pipe
+
+        self.assertFalse(
+            pipe._autonomy_tool_result_completes_step(
+                tool_name="mcp__factorioctl__broadcast_thought",
+                classification=ToolResultClassification.OK,
+                text=(
+                    "Factorioctl bridge blocked Factorio tool before control "
+                    "skill: broadcast_thought. Call Skill(factorio-control) "
+                    "before using Factorio MCP tools."
+                ),
+            )
+        )
+        self.assertFalse(
+            pipe._autonomy_tool_result_completes_step(
+                tool_name="mcp__factorioctl__place_entity",
+                classification=ToolResultClassification.OK,
+                text=(
+                    "Factorioctl bridge blocked invalid Factorio tool parameters: "
+                    "failed to deserialize parameters"
+                ),
+            )
+        )
 
     def test_tick_watchdog_coerces_legacy_string_classifications(self):
         import pipe
@@ -3075,6 +3158,7 @@ progress: tick timeout progress survived
                 self.prompt = None
                 self.interrupted = False
                 self.disconnected = False
+                self.stream_closed = False
                 self.__class__.instances.append(self)
 
             async def connect(self, prompt):
@@ -3082,47 +3166,50 @@ progress: tick timeout progress survived
 
             def receive_messages(self):
                 async def gen():
-                    yield AssistantMessage(
-                        content=[ToolUseBlock(
-                            id="skill-1",
-                            name="Skill",
-                            input={"skill": "factorio-control"},
-                        )],
-                        model="test",
-                    )
-                    yield UserMessage(content=[ToolResultBlock(
-                        tool_use_id="skill-1",
-                        content="Launching skill: factorio-control",
-                        is_error=False,
-                    )])
-                    yield AssistantMessage(
-                        content=[ToolUseBlock(
-                            id="tool-1",
-                            name="mcp__factorioctl__situation_report",
-                            input={"radius": 10},
-                        )],
-                        model="test",
-                    )
-                    yield UserMessage(content=[ToolResultBlock(
-                        tool_use_id="tool-1",
-                        content='{"position":{"x":0,"y":0}}',
-                        is_error=False,
-                    )])
-                    consumed_after_factorio_result.append(True)
-                    yield AssistantMessage(
-                        content=[TextBlock("should not be consumed")],
-                        model="test",
-                    )
-                    yield ResultMessage(
-                        subtype="error",
-                        duration_ms=1,
-                        duration_api_ms=1,
-                        is_error=True,
-                        num_turns=4,
-                        session_id="old-session",
-                        result="Reached maximum number of turns (4)",
-                        total_cost_usd=0.0,
-                    )
+                    try:
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(
+                                id="skill-1",
+                                name="Skill",
+                                input={"skill": "factorio-control"},
+                            )],
+                            model="test",
+                        )
+                        yield UserMessage(content=[ToolResultBlock(
+                            tool_use_id="skill-1",
+                            content="Launching skill: factorio-control",
+                            is_error=False,
+                        )])
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(
+                                id="tool-1",
+                                name="mcp__factorioctl__situation_report",
+                                input={"radius": 10},
+                            )],
+                            model="test",
+                        )
+                        yield UserMessage(content=[ToolResultBlock(
+                            tool_use_id="tool-1",
+                            content='{"position":{"x":0,"y":0}}',
+                            is_error=False,
+                        )])
+                        consumed_after_factorio_result.append(True)
+                        yield AssistantMessage(
+                            content=[TextBlock("should not be consumed")],
+                            model="test",
+                        )
+                        yield ResultMessage(
+                            subtype="error",
+                            duration_ms=1,
+                            duration_api_ms=1,
+                            is_error=True,
+                            num_turns=4,
+                            session_id="old-session",
+                            result="Reached maximum number of turns (4)",
+                            total_cost_usd=0.0,
+                        )
+                    finally:
+                        self.stream_closed = True
                 return gen()
 
             async def interrupt(self):
@@ -3159,6 +3246,7 @@ progress: tick timeout progress survived
         self.assertEqual(len(StubClaudeSDKClient.instances), 1)
         self.assertTrue(StubClaudeSDKClient.instances[0].interrupted)
         self.assertTrue(StubClaudeSDKClient.instances[0].disconnected)
+        self.assertTrue(StubClaudeSDKClient.instances[0].stream_closed)
         events = journal.load_events_model("doug")
         self.assertEqual(len(events.events), 1)
         self.assertEqual(events.events[0].kind, "progress")
@@ -3167,6 +3255,115 @@ progress: tick timeout progress survived
         self.assertEqual(updated.next_required_mode.value, "plan")
         self.assertEqual(updated.status.value, "ready")
         self.assertIn("situation_report ok", updated.progress_notes[-1])
+
+    def test_autonomy_step_complete_ignores_status_tool_guard_denials(self):
+        import ledger
+        import pipe
+        from claude_agent_sdk import AssistantMessage, ToolResultBlock, ToolUseBlock, UserMessage
+
+        ledger.save_ledger_model("doug", {
+            "objective": "Continue execution",
+            "plan_steps": ["call a real tool"],
+            "progress_notes": [],
+            "status": "executing",
+            "next_required_mode": "execute",
+        })
+
+        class StubClaudeSDKClient:
+            def __init__(self, *, options):
+                self.options = options
+                self.interrupted = False
+                self.disconnected = False
+
+            async def connect(self, _prompt):
+                pass
+
+            def receive_messages(self):
+                async def gen():
+                    yield AssistantMessage(
+                        content=[ToolUseBlock(
+                            id="thought-1",
+                            name="mcp__factorioctl__broadcast_thought",
+                            input={"message": "still thinking"},
+                        )],
+                        model="test",
+                    )
+                    yield UserMessage(content=[ToolResultBlock(
+                        tool_use_id="thought-1",
+                        content=(
+                            "Factorioctl bridge blocked Factorio tool before "
+                            "control skill: broadcast_thought. Call "
+                            "Skill(factorio-control) before using Factorio MCP tools."
+                        ),
+                        is_error=True,
+                    )])
+                    yield AssistantMessage(
+                        content=[ToolUseBlock(
+                            id="skill-1",
+                            name="Skill",
+                            input={"skill": "factorio-control"},
+                        )],
+                        model="test",
+                    )
+                    yield UserMessage(content=[ToolResultBlock(
+                        tool_use_id="skill-1",
+                        content="Launching skill: factorio-control",
+                        is_error=False,
+                    )])
+                    yield AssistantMessage(
+                        content=[ToolUseBlock(
+                            id="tool-1",
+                            name="mcp__factorioctl__situation_report",
+                            input={"radius": 10},
+                        )],
+                        model="test",
+                    )
+                    yield UserMessage(content=[ToolResultBlock(
+                        tool_use_id="tool-1",
+                        content='{"position":{"x":1,"y":2}}',
+                        is_error=False,
+                    )])
+                return gen()
+
+            async def interrupt(self):
+                self.interrupted = True
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with (
+            mock.patch("pipe.ClaudeSDKClient", StubClaudeSDKClient),
+            mock.patch("pipe.query", side_effect=AssertionError("query should not be used")),
+            mock.patch("pipe.clear_session") as clear_session,
+        ):
+            result = pipe.handle_message_model(
+                "go",
+                {},
+                "system",
+                "old-session",
+                StubRCON(),
+                0,
+                None,
+                agent_name="doug",
+                sdk_skills=["factorio-control"],
+                stop_after_factorio_result=True,
+            )
+
+        self.assertTrue(result.reset_session)
+        clear_session.assert_called_once_with("doug")
+        events = journal.load_events_model("doug")
+        self.assertTrue(any(
+            "autonomy_step_complete: situation_report ok" in event.text
+            for event in events.events
+        ))
+        self.assertFalse(any(
+            "autonomy_step_complete: broadcast_thought" in event.text
+            for event in events.events
+        ))
 
     def test_agent_thread_coerces_inbound_message_before_model_call(self):
         import queue as std_queue

@@ -6,8 +6,6 @@ import os
 from pathlib import Path
 from typing import Iterable
 
-from models.settings_models import FactorioPathSettings
-
 BRIDGE_DIR = Path(__file__).resolve().parent
 COMPANION_ROOT = BRIDGE_DIR.parent
 
@@ -18,6 +16,8 @@ def bridge_state_dir(
     cwd: Path | None = None,
     create: bool = True,
 ) -> Path:
+    from models.settings_models import FactorioPathSettings
+
     settings = FactorioPathSettings.from_env(os.environ if env is None else env)
     if settings.bridge_state_dir_path:
         return _ensure_dir(settings.bridge_state_dir_path, create=create)

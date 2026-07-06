@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use super::ResolvedConnectionArgs;
-use crate::client::lua::LuaCommand;
 
 fn empty_object_as_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
@@ -74,8 +73,7 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
 
     match cmd.command {
         ResearchSubcommand::Status => {
-            let lua = LuaCommand::get_research_status();
-            let response = client.execute_lua(&lua).await?;
+            let response = client.call_remote("get_research_status", &[]).await?;
 
             #[derive(serde::Deserialize)]
             struct Labs {
@@ -139,8 +137,12 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
         }
 
         ResearchSubcommand::Available => {
-            let lua = LuaCommand::get_available_research(client.agent_id());
-            let response = client.execute_lua(&lua).await?;
+            let response = client
+                .call_remote(
+                    "get_available_research",
+                    &[serde_json::json!(client.agent_id().as_str())],
+                )
+                .await?;
 
             #[derive(serde::Deserialize)]
             struct Ingredient {
@@ -207,8 +209,7 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
         }
 
         ResearchSubcommand::Current => {
-            let lua = LuaCommand::get_research_status();
-            let response = client.execute_lua(&lua).await?;
+            let response = client.call_remote("get_research_status", &[]).await?;
 
             #[derive(serde::Deserialize)]
             struct CurrentResearch {
@@ -237,8 +238,9 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
         }
 
         ResearchSubcommand::Start { tech } => {
-            let lua = LuaCommand::start_research(&tech);
-            let response = client.execute_lua(&lua).await?;
+            let response = client
+                .call_remote("start_research", &[serde_json::json!(tech)])
+                .await?;
 
             #[derive(serde::Deserialize)]
             struct StartResult {

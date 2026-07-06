@@ -1506,48 +1506,45 @@ class PlannerTests(unittest.TestCase):
         self.assertFalse(thread.autonomy_requires_player)
         self.assertEqual(thread.sdk_skills, ["factorio-control", "verify"])
 
-    def test_agent_thread_human_connected_uses_validated_remote_call(self):
-        class StubRCON:
+    def test_agent_thread_human_connected_uses_lifecycle_mcp_tool(self):
+        class StubLifecycle:
             def __init__(self):
-                self.commands = []
+                self.calls = []
 
-            def execute(self, command):
-                self.commands.append(command)
+            def connected_player_count(self):
+                self.calls.append(("connected_player_count", {}))
                 return '{"count":1}\n'
 
         thread = pipe.AgentThread.__new__(pipe.AgentThread)
-        thread.rcon = StubRCON()
+        thread.rcon = StubLifecycle()
 
         self.assertTrue(thread._human_connected())
-        self.assertEqual(thread.rcon.commands, [
-            '/silent-command rcon.print(remote.call("claude_interface", '
-            '"connected_player_count_result"))',
-        ])
+        self.assertEqual(thread.rcon.calls, [("connected_player_count", {})])
 
     def test_agent_thread_human_connected_false_for_empty_or_malformed_payload(self):
-        class StubRCON:
+        class StubLifecycle:
             def __init__(self, response):
                 self.response = response
 
-            def execute(self, _command):
+            def connected_player_count(self):
                 return self.response
 
         thread = pipe.AgentThread.__new__(pipe.AgentThread)
         thread.log = pipe.logger.bind(agent="test")
 
-        thread.rcon = StubRCON('{"count":0}\n')
+        thread.rcon = StubLifecycle('{"count":0}\n')
         self.assertFalse(thread._human_connected())
 
-        thread.rcon = StubRCON("not json\n")
+        thread.rcon = StubLifecycle("not json\n")
         self.assertFalse(thread._human_connected())
 
-    def test_agent_thread_live_state_uses_validated_remote_call(self):
-        class StubRCON:
+    def test_agent_thread_live_state_uses_lifecycle_mcp_tool(self):
+        class StubLifecycle:
             def __init__(self):
-                self.commands = []
+                self.calls = []
 
-            def execute(self, command):
-                self.commands.append(command)
+            def live_state(self, agent_name):
+                self.calls.append(("live_state", {"agent_name": agent_name}))
                 return json.dumps({
                     "found": True,
                     "surface": "nauvis",
@@ -1558,15 +1555,14 @@ class PlannerTests(unittest.TestCase):
 
         thread = pipe.AgentThread.__new__(pipe.AgentThread)
         thread.agent_name = 'doug"]]'
-        thread.rcon = StubRCON()
+        thread.rcon = StubLifecycle()
 
         self.assertEqual(
             thread._live_state_line(),
             "Live state: nauvis @ 5.0,0.0; player entities: stone-furnace=2",
         )
-        self.assertEqual(thread.rcon.commands, [
-            '/silent-command rcon.print(remote.call("claude_interface", '
-            '"live_state_result", [=[doug"]]]=]))',
+        self.assertEqual(thread.rcon.calls, [
+            ("live_state", {"agent_name": 'doug"]]'}),
         ])
 
     def _thread(self, live_state=""):
@@ -1574,7 +1570,7 @@ class PlannerTests(unittest.TestCase):
             def __init__(self, response):
                 self.response = response
 
-            def execute(self, _cmd):
+            def live_state(self, agent_name):
                 return self.response
 
         thread = pipe.AgentThread.__new__(pipe.AgentThread)

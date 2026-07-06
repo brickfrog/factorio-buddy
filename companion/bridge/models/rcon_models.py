@@ -185,63 +185,6 @@ class ModInterfaceStatus(BridgeModel):
             ) from exc
 
 
-class RconRemoteCall(BridgeModel):
-    """Validated claude_interface remote call rendered for Factorio RCON."""
-
-    remote_name: str
-    args: list[str] = Field(default_factory=list)
-    print_result: bool = True
-    stringify_result: bool = False
-
-    @field_validator("remote_name", mode="before")
-    @classmethod
-    def _coerce_remote_name(cls, value: Any) -> str:
-        remote_name = str(value or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9_]+", remote_name):
-            raise ValueError(f"invalid remote name: {value}")
-        return remote_name
-
-    @field_validator("args", mode="before")
-    @classmethod
-    def _coerce_args(cls, value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, (list, tuple)):
-            return [str(item) for item in value]
-        return [str(value)]
-
-    @classmethod
-    def command(cls, remote_name: Any, *args: Any) -> str:
-        return cls(remote_name=remote_name, args=list(args)).to_command()
-
-    @classmethod
-    def side_effect_command(cls, remote_name: Any, *args: Any) -> str:
-        return cls(
-            remote_name=remote_name,
-            args=list(args),
-            print_result=False,
-        ).to_command()
-
-    @classmethod
-    def string_command(cls, remote_name: Any, *args: Any) -> str:
-        return cls(
-            remote_name=remote_name,
-            args=list(args),
-            stringify_result=True,
-        ).to_command()
-
-    def to_command(self) -> str:
-        suffix = "".join(f", {arg}" for arg in self.args)
-        call = f'remote.call("claude_interface", "{self.remote_name}"{suffix})'
-        if self.print_result and self.stringify_result:
-            body = f"rcon.print(tostring({call}))"
-        elif self.print_result:
-            body = f"rcon.print({call})"
-        else:
-            body = call
-        return f"/silent-command {body}"
-
-
 def _expected_payload_text(value: Any, field_path: str) -> str:
     text = str(value or "").strip()
     if not text:

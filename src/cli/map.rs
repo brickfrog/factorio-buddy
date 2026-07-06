@@ -90,12 +90,17 @@ impl MapCommand {
 
         // Query power coverage if requested
         let power_coverage = if self.show_power {
-            let lua = crate::client::lua::LuaCommand::get_power_coverage(
-                center.x as i32,
-                center.y as i32,
-                self.radius,
-            );
-            match client.execute_lua(&lua).await {
+            match client
+                .call_remote(
+                    "get_power_coverage",
+                    &[
+                        serde_json::json!(center.x as i32),
+                        serde_json::json!(center.y as i32),
+                        serde_json::json!(self.radius),
+                    ],
+                )
+                .await
+            {
                 Ok(result) => {
                     // Parse the coverage data
                     serde_json::from_str::<serde_json::Value>(&result)

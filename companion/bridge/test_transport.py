@@ -15,57 +15,103 @@ from models import (
 import transport
 
 
-class FakeRcon:
+class FakeLifecycle:
     def __init__(self, responses=None):
-        self.commands = []
+        self.calls = []
         self.responses = list(responses or [])
 
-    def execute(self, command):
-        self.commands.append(command)
+    def _record(self, tool, **arguments):
+        self.calls.append((tool, arguments))
         if self.responses:
             return self.responses.pop(0)
         return ""
 
+    def send_chat_response(self, player_index, agent_name, text):
+        return self._record(
+            "send_chat_response",
+            player_index=player_index,
+            agent_name=agent_name,
+            text=text,
+        )
+
+    def tool_status(self, player_index, agent_name, tool_name):
+        return self._record(
+            "tool_status",
+            player_index=player_index,
+            agent_name=agent_name,
+            tool_name=tool_name,
+        )
+
+    def set_status(self, player_index, status):
+        return self._record("set_status", player_index=player_index, status=status)
+
+    def register_agent(self, agent_name, label=None):
+        arguments = {"agent_name": agent_name}
+        if label is not None:
+            arguments["label"] = label
+        return self._record("register_agent", **arguments)
+
+    def unregister_agent(self, agent_name):
+        return self._record("unregister_agent", agent_name=agent_name)
+
+    def ensure_surface(self, planet):
+        return self._record("ensure_surface", planet=planet)
+
+    def place_character(self, agent_name, planet, spawn_x):
+        return self._record(
+            "place_character",
+            agent_name=agent_name,
+            planet=planet,
+            spawn_x=spawn_x,
+        )
+
+    def set_spectator_mode(self, enabled=True):
+        return self._record("set_spectator_mode", enabled=enabled)
+
+    def ping(self):
+        return self._record("ping")
+
 
 class TransportTests(unittest.TestCase):
-    def test_send_response_uses_validated_side_effect_remote_call(self):
-        rcon = FakeRcon()
+    def test_send_response_uses_lifecycle_mcp_tool(self):
+        lifecycle = FakeLifecycle()
 
         transport.send_response(
-            rcon,
+            lifecycle,
             3,
             'doug") game.print("oops',
             'hello ]=] world',
         )
 
-        self.assertEqual(len(rcon.commands), 1)
-        command = rcon.commands[0]
-        self.assertEqual(
-            command,
-            '/silent-command remote.call("claude_interface", '
-            '"receive_response", 3, [[doug") game.print("oops]], '
-            '[[hello ]=] world]])',
-        )
-        self.assertNotIn("rcon.print", command)
+        self.assertEqual(lifecycle.calls, [(
+            "send_chat_response",
+            {
+                "player_index": 3,
+                "agent_name": 'doug") game.print("oops',
+                "text": "hello ]=] world",
+            },
+        )])
 
-    def test_status_helpers_use_validated_side_effect_remote_calls(self):
-        rcon = FakeRcon()
+    def test_status_helpers_use_lifecycle_mcp_tools(self):
+        lifecycle = FakeLifecycle()
 
-        transport.send_tool_status(rcon, 2, "doug", "walk_to")
-        transport.set_status(rcon, 2, "running")
-        transport.register_agent(rcon, "doug", label="Nauvis")
-        transport.unregister_agent(rcon, "doug")
-        transport.set_spectator_mode(rcon, enabled=False)
+        transport.send_tool_status(lifecycle, 2, "doug", "walk_to")
+        transport.set_status(lifecycle, 2, "running")
+        transport.register_agent(lifecycle, "doug", label="Nauvis")
+        transport.unregister_agent(lifecycle, "doug")
+        transport.set_spectator_mode(lifecycle, enabled=False)
 
-        self.assertEqual(len(rcon.commands), 5)
-        for command in rcon.commands:
-            self.assertIn('remote.call("claude_interface"', command)
-            self.assertNotIn("rcon.print", command)
-        self.assertIn('"tool_status"', rcon.commands[0])
-        self.assertIn('"set_status"', rcon.commands[1])
-        self.assertIn('"register_agent"', rcon.commands[2])
-        self.assertIn('"unregister_agent"', rcon.commands[3])
-        self.assertIn('"set_spectator_mode", false)', rcon.commands[4])
+        self.assertEqual(lifecycle.calls, [
+            ("tool_status", {
+                "player_index": 2,
+                "agent_name": "doug",
+                "tool_name": "walk_to",
+            }),
+            ("set_status", {"player_index": 2, "status": "running"}),
+            ("register_agent", {"agent_name": "doug", "label": "Nauvis"}),
+            ("unregister_agent", {"agent_name": "doug"}),
+            ("set_spectator_mode", {"enabled": False}),
+        ])
 
     def test_input_watcher_coerces_and_filters_inbound_messages(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,29 +179,27 @@ class TransportTests(unittest.TestCase):
             "target_agent": "default",
         }])
 
-    def test_setup_surfaces_uses_mod_remote(self):
-        rcon = FakeRcon([
+    def test_setup_surfaces_uses_lifecycle_mcp_tool(self):
+        lifecycle = FakeLifecycle([
             '{"planet":"vulcanus","status":"created"}\n',
             '{"planet":"nauvis","status":"exists"}\n',
         ])
 
-        result = transport.setup_surfaces_model(rcon, ["vulcanus", "nauvis"])
+        result = transport.setup_surfaces_model(lifecycle, ["vulcanus", "nauvis"])
 
         self.assertEqual(result.to_dict(), {"vulcanus": "created", "nauvis": "exists"})
-        self.assertEqual(len(rcon.commands), 2)
-        self.assertIn('remote.call("claude_interface", "ensure_surface_result"', rcon.commands[0])
-        for command in rcon.commands:
-            self.assertNotIn("game.planets", command)
-            self.assertNotIn("game.surfaces", command)
-            self.assertNotIn("create_surface", command)
+        self.assertEqual(lifecycle.calls, [
+            ("ensure_surface", {"planet": "vulcanus"}),
+            ("ensure_surface", {"planet": "nauvis"}),
+        ])
 
     def test_setup_surfaces_model_returns_typed_results(self):
-        rcon = FakeRcon([
+        lifecycle = FakeLifecycle([
             '{"planet":"vulcanus","status":"created"}\n',
             '{"planet":"nauvis","status":"exists"}\n',
         ])
 
-        result = transport.setup_surfaces_model(rcon, ["vulcanus", "nauvis"])
+        result = transport.setup_surfaces_model(lifecycle, ["vulcanus", "nauvis"])
 
         self.assertIsInstance(result, SurfaceSetupResults)
         self.assertEqual(result.items(), (
@@ -249,34 +293,31 @@ class TransportTests(unittest.TestCase):
                 planet="nauvis",
             )
 
-    def test_pre_place_character_uses_mod_remote(self):
-        rcon = FakeRcon(['{"agent_name":"doug-nauvis","planet":"nauvis","status":"created"}\n'])
+    def test_pre_place_character_uses_lifecycle_mcp_tool(self):
+        lifecycle = FakeLifecycle([
+            '{"agent_name":"doug-nauvis","planet":"nauvis","status":"created"}\n'
+        ])
 
-        result = transport.pre_place_character_model(rcon, "doug-nauvis", "nauvis", spawn_offset=2)
+        result = transport.pre_place_character_model(
+            lifecycle,
+            "doug-nauvis",
+            "nauvis",
+            spawn_offset=2,
+        )
 
         self.assertEqual(result.status, "created")
-        self.assertEqual(len(rcon.commands), 1)
-        command = rcon.commands[0]
-        self.assertIn('remote.call("claude_interface", "pre_place_character_result"', command)
-        self.assertIn("doug-nauvis", command)
-        self.assertIn("nauvis", command)
-        self.assertIn(", 15))", command)
-        for forbidden in [
-            "request_to_generate_chunks",
-            "force_generate_chunk_requests",
-            "create_entity",
-            "storage.factorioctl_characters",
-            "storage.factorioctl_entities",
-        ]:
-            self.assertNotIn(forbidden, command)
+        self.assertEqual(lifecycle.calls, [(
+            "place_character",
+            {"agent_name": "doug-nauvis", "planet": "nauvis", "spawn_x": 15},
+        )])
 
     def test_pre_place_character_model_returns_typed_result(self):
-        rcon = FakeRcon([
+        lifecycle = FakeLifecycle([
             '{"agent_name":"doug-nauvis","planet":"nauvis","status":"teleported"}\n',
         ])
 
         result = transport.pre_place_character_model(
-            rcon,
+            lifecycle,
             "doug-nauvis",
             "nauvis",
             spawn_offset=1,
@@ -298,21 +339,16 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(result.planet, "fulgora")
         self.assertEqual(result.status, "created")
 
-    def test_check_mod_loaded_uses_typed_json_probe(self):
-        rcon = FakeRcon(['{"loaded":true}\n'])
+    def test_check_mod_loaded_uses_lifecycle_mcp_tool(self):
+        lifecycle = FakeLifecycle(["pong\n"])
 
-        self.assertTrue(transport.check_mod_loaded(rcon))
+        self.assertTrue(transport.check_mod_loaded(lifecycle))
 
-        self.assertEqual(len(rcon.commands), 1)
-        command = rcon.commands[0]
-        self.assertIn('"loaded"', command)
-        self.assertIn('remote.interfaces["claude_interface"] ~= nil', command)
-        self.assertNotIn('"yes"', command)
-        self.assertNotIn('"no"', command)
+        self.assertEqual(lifecycle.calls, [("ping", {})])
 
     def test_check_mod_loaded_false_and_malformed_are_false(self):
-        self.assertFalse(transport.check_mod_loaded(FakeRcon(['{"loaded":false}\n'])))
-        self.assertFalse(transport.check_mod_loaded(FakeRcon(["not json\n"])))
+        self.assertFalse(transport.check_mod_loaded(FakeLifecycle(["not pong\n"])))
+        self.assertFalse(transport.check_mod_loaded(FakeLifecycle(["not json\n"])))
 
     def test_mod_interface_status_validates_rcon_json_payload(self):
         status = ModInterfaceStatus.from_rcon_response("noise\n{\"loaded\":true}\n")

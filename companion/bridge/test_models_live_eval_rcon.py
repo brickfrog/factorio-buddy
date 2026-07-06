@@ -101,7 +101,6 @@ from models import (
     ResponseFormatSectionCollection,
     RconConnectionSettings,
     RconJsonResponse,
-    RconRemoteCall,
     RconTextResponse,
     SdkAssistantMessage,
     SdkContentBlocks,
@@ -501,41 +500,6 @@ class ModelLiveEvalRconTests(unittest.TestCase):
         self.assertEqual(response.raw_text, "noise\n\n  final state  \n")
         self.assertEqual(response.text, "final state")
         self.assertEqual(RconTextResponse.final_line("\n\n"), "")
-
-    def test_rcon_remote_call_validates_name_and_renders_command(self):
-        command = RconRemoteCall.command("get_power_status", "-41", "26", "500")
-
-        self.assertEqual(
-            command,
-            '/silent-command rcon.print(remote.call("claude_interface", '
-            '"get_power_status", -41, 26, 500))',
-        )
-        with self.assertRaisesRegex(ValueError, "invalid remote name"):
-            RconRemoteCall.command('bad") game.print("oops')
-
-    def test_rcon_remote_call_renders_side_effect_command_without_printing_result(self):
-        command = RconRemoteCall.side_effect_command(
-            "receive_response",
-            1,
-            "[=[doug]=]",
-            "[=[ok]=]",
-        )
-
-        self.assertEqual(
-            command,
-            '/silent-command remote.call("claude_interface", '
-            '"receive_response", 1, [=[doug]=], [=[ok]=])',
-        )
-        self.assertNotIn("rcon.print", command)
-
-    def test_rcon_remote_call_can_stringify_printed_result(self):
-        command = RconRemoteCall.string_command("connected_player_count")
-
-        self.assertEqual(
-            command,
-            '/silent-command rcon.print(tostring(remote.call("claude_interface", '
-            '"connected_player_count")))',
-        )
 
     def test_connected_player_count_result_validates_json_payload(self):
         result = ConnectedPlayerCountResult.from_rcon_response('noise\n{"count":"2"}\n')

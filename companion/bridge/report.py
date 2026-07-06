@@ -21,10 +21,10 @@ from models import (
     PowerStatus,
     RconConnectionSettings,
     RconJsonResponse,
-    RconRemoteCall,
     SteamPowerDiagnostic,
 )
-from rcon import RCONClient, lua_long_string
+from paths import find_factorioctl_mcp
+from transport import McpLifecycleClient
 
 
 COMPANION_ROOT = Path(__file__).resolve().parents[1]
@@ -198,7 +198,7 @@ def analyze_records(
 
 def enrich_live_state(
     report: BridgeRunReport,
-    rcon: Any,
+    lifecycle: Any,
     *,
     agent_id: str = "doug-nauvis",
     power_x: float = 0.0,
@@ -208,32 +208,26 @@ def enrich_live_state(
     """Add compact current-save state to a log-derived report.
 
     This is deliberately best-effort: report generation should remain useful
-    when the headless server is down, RCON is unavailable, or one diagnostic
+    when the headless server is down, the MCP transport is unavailable, or one diagnostic
     remote fails.
     """
     report.live_attempted = True
     errors: list[str] = []
 
     try:
-        state_payload = _remote_json(
-            rcon,
-            "live_state_result",
-            lua_long_string(agent_id),
-        )
+        state_payload = RconJsonResponse.parse_value(lifecycle.live_state(agent_id))
         state = LiveState.from_payload(state_payload)
         report.live_state = _single_line(state.to_line())
         report.live_entities = state.entity_summary
     except Exception as exc:  # pragma: no cover - exact socket failures vary
-        errors.append(f"live_state_result: {_error_message(exc)}")
+        errors.append(f"live_state: {_error_message(exc)}")
 
     try:
-        power_payload = _remote_json(
-            rcon,
-            "get_power_status",
-            _lua_number(power_x),
-            _lua_number(power_y),
-            _lua_number(power_radius),
-        )
+        power_payload = RconJsonResponse.parse_value(lifecycle.get_power_status(
+            power_x,
+            power_y,
+            power_radius,
+        ))
         report.live_power = (
             _live_power_summary(power_payload)
             or BridgeLogMessage.single_line(str(power_payload))
@@ -317,24 +311,6 @@ def format_report(report: BridgeRunReport) -> str:
     return "\n".join(lines)
 
 
-def _remote_json(rcon: Any, remote_name: str, *args: str) -> Any:
-    response = rcon.execute(_remote_call_command(remote_name, *args))
-    return RconJsonResponse.parse_value(response)
-
-
-def _remote_call_command(remote_name: str, *args: str) -> str:
-    return RconRemoteCall.command(remote_name, *args)
-
-
-def _lua_number(value: float) -> str:
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"not a finite Lua number: {value!r}")
-    if number.is_integer():
-        return str(int(number))
-    return repr(number)
-
-
 def _error_message(exc: Exception) -> str:
     message = str(exc)
     if not message:
@@ -409,23 +385,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--live",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Best-effort enrichment from the currently running Factorio RCON server",
+        help="Best-effort enrichment from the currently running Factorio server via MCP",
     )
     parser.add_argument(
         "--rcon-host",
         default=rcon_defaults.host,
-        help="RCON host for --live",
+        help="RCON host passed to factorioctl MCP for --live",
     )
     parser.add_argument(
         "--rcon-port",
         type=int,
         default=rcon_defaults.port,
-        help="RCON port for --live",
+        help="RCON port passed to factorioctl MCP for --live",
     )
     parser.add_argument(
         "--rcon-password",
         default=rcon_defaults.password,
-        help="RCON password for --live",
+        help="RCON password passed to factorioctl MCP for --live",
+    )
+    parser.add_argument(
+        "--factorioctl-mcp",
+        default=None,
+        help="Path to factorioctl MCP binary used for --live",
     )
     parser.add_argument(
         "--live-agent",
@@ -454,7 +435,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--live-timeout",
         type=float,
         default=2.0,
-        help="Seconds before giving up on live RCON report enrichment",
+        help="Seconds before giving up on live MCP report enrichment",
     )
     return parser.parse_args(argv)
 
@@ -468,19 +449,22 @@ def main(argv: list[str] | None = None) -> int:
     report = analyze_log(path, recent_progress_window_s=args.recent_minutes * 60.0)
     if args.live:
         report.live_attempted = True
-        rcon = None
+        lifecycle = None
         try:
-            rcon = RCONClient(
-                args.rcon_host,
-                args.rcon_port,
-                args.rcon_password,
-                timeout=max(0.1, args.live_timeout),
-                retry_forever=False,
-                reconnect_initial_delay=0.0,
+            mcp_bin = args.factorioctl_mcp or find_factorioctl_mcp()
+            if not mcp_bin:
+                raise FileNotFoundError("factorioctl MCP not found")
+            lifecycle = McpLifecycleClient(
+                mcp_bin,
+                rcon_host=args.rcon_host,
+                rcon_port=args.rcon_port,
+                rcon_password=args.rcon_password,
+                agent_id="bridge-report",
+                timeout_s=max(0.1, args.live_timeout),
             )
             enrich_live_state(
                 report,
-                rcon,
+                lifecycle,
                 agent_id=args.live_agent,
                 power_x=args.live_power_x,
                 power_y=args.live_power_y,
@@ -490,8 +474,8 @@ def main(argv: list[str] | None = None) -> int:
             report.live_connected = False
             report.live_error = _error_message(exc)
         finally:
-            if rcon is not None:
-                rcon.close()
+            if lifecycle is not None:
+                lifecycle.close()
     if args.json:
         print(report.to_json_text(indent=2, sort_keys=True))
     else:

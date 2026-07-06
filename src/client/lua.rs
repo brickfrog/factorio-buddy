@@ -1,72 +1,41 @@
-//! Lua command builders for Factorio interactions
+//! Legacy remote command builders for Factorio interactions.
 //!
-//! These builders generate Lua code that can be executed via RCON.
-//! All commands use rcon.print() to return JSON-formatted results.
+//! The public facade is still named `LuaCommand` because many tests and older
+//! callers refer to it, but these builders emit the mod's `/claude` JSON
+//! command envelope instead of generated Lua.
 
 use crate::client::AgentId;
 use crate::world::{Area, Direction, Position};
+use serde_json::{json, Value};
 
 /// Builder for Lua commands
 pub struct LuaCommand;
 
 impl LuaCommand {
-    /// Escape text for safe embedding inside a Lua string literal.
-    ///
-    /// Escapes both quote styles so the result is safe in either a double- or
-    /// single-quoted Lua literal (`"..."` or `'...'`). `\'` and `\"` are valid
-    /// escapes regardless of the surrounding quote, so over-escaping is harmless.
-    pub fn lua_escape(s: &str) -> String {
-        let mut escaped = String::with_capacity(s.len());
-        for ch in s.chars() {
-            match ch {
-                '\\' => escaped.push_str("\\\\"),
-                '"' => escaped.push_str("\\\""),
-                '\'' => escaped.push_str("\\'"),
-                '\n' => escaped.push_str("\\n"),
-                '\r' => escaped.push_str("\\r"),
-                '\t' => escaped.push_str("\\t"),
-                c if c.is_control() => escaped.push_str(&format!("\\{:03}", c as u32)),
-                c => escaped.push(c),
-            }
-        }
-        escaped
-    }
-
-    fn claude_interface_json_call(function_name: &str, args: &[String], guidance: &str) -> String {
-        let function_name = Self::lua_escape(function_name);
-        let guidance = Self::lua_escape(guidance);
-        let args = args.join(", ");
-        let call_args = if args.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", args)
-        };
-        format!(
-            r#"
-if remote.interfaces["claude_interface"] and remote.interfaces["claude_interface"]["{}"] then
-    rcon.print(remote.call("claude_interface", "{}"{}))
-else
-    rcon.print(helpers.table_to_json({{
-        error = "claude-interface mod does not expose {}",
-        action_needed = "sync_or_restart_mod",
-        guidance = "{}"
-    }}))
-end
-"#,
-            function_name, function_name, call_args, function_name, guidance
-        )
-        .trim()
-        .to_string()
+    fn claude_interface_json_call(function_name: &str, args: &[String], _guidance: &str) -> String {
+        let args: Vec<Value> = args
+            .iter()
+            .map(|arg| match arg.as_str() {
+                "nil" => Value::Null,
+                other => serde_json::from_str(other).unwrap_or_else(|_| Value::String(arg.clone())),
+            })
+            .collect();
+        let request = json!({
+            "fn": function_name,
+            "args": args,
+            "n": args.len(),
+        });
+        format!("/claude {}", request)
     }
 
     fn lua_string_arg(value: &str) -> String {
-        format!(r#""{}""#, Self::lua_escape(value))
+        serde_json::to_string(value).expect("string JSON serialization cannot fail")
     }
 
     fn optional_lua_string_arg(value: Option<&str>) -> String {
         value
             .map(Self::lua_string_arg)
-            .unwrap_or_else(|| "nil".to_string())
+            .unwrap_or_else(|| "null".to_string())
     }
 
     fn character_storage_key(agent_id: &AgentId) -> &str {
@@ -314,18 +283,11 @@ end
     }
 
     pub fn walk_target_active(agent_id: &AgentId) -> String {
-        format!(
-            r#"
-if remote.interfaces["claude_interface"] and remote.interfaces["claude_interface"]["has_walk_target"] then
-    rcon.print(remote.call("claude_interface", "has_walk_target", "{}") and "true" or "false")
-else
-    rcon.print("false")
-end
-"#,
-            agent_id.as_str()
+        Self::claude_interface_json_call(
+            "has_walk_target",
+            &[Self::lua_string_arg(agent_id.as_str())],
+            "Run just sync/resume so the updated claude-interface mod is loaded before checking walk targets.",
         )
-        .trim()
-        .to_string()
     }
 
     /// Start walking character to position via the mod-owned deterministic target driver.
@@ -808,40 +770,36 @@ end
 
     /// Get a recipe by name
     pub fn get_recipe(name: &str) -> String {
-        let name = Self::lua_escape(name);
         Self::claude_interface_json_call(
             "get_recipe",
-            &[format!(r#""{}""#, name)],
+            &[Self::lua_string_arg(name)],
             "Run just sync/resume so the updated claude-interface mod is loaded before reading recipes.",
         )
     }
 
     /// Get all recipes in a category
     pub fn get_recipes_by_category(category: &str) -> String {
-        let category = Self::lua_escape(category);
         Self::claude_interface_json_call(
             "get_recipes_by_category",
-            &[format!(r#""{}""#, category)],
+            &[Self::lua_string_arg(category)],
             "Run just sync/resume so the updated claude-interface mod is loaded before listing recipes.",
         )
     }
 
     /// Get all recipes that produce a specific item
     pub fn get_recipes_for_item(item: &str) -> String {
-        let item = Self::lua_escape(item);
         Self::claude_interface_json_call(
             "get_recipes_for_item",
-            &[format!(r#""{}""#, item)],
+            &[Self::lua_string_arg(item)],
             "Run just sync/resume so the updated claude-interface mod is loaded before listing recipes.",
         )
     }
 
     /// Get an entity prototype by name
     pub fn get_prototype(name: &str) -> String {
-        let name = Self::lua_escape(name);
         Self::claude_interface_json_call(
             "get_prototype",
-            &[format!(r#""{}""#, name)],
+            &[Self::lua_string_arg(name)],
             "Run just sync/resume so the updated claude-interface mod is loaded before reading prototypes.",
         )
     }
@@ -1204,8 +1162,32 @@ end
 mod tests {
     use crate::client::AgentId;
     use crate::world::{Area, Position};
+    use serde_json::{json, Value};
 
     use super::LuaCommand;
+
+    fn remote_request(command: &str) -> Value {
+        let request = command
+            .strip_prefix("/claude ")
+            .unwrap_or_else(|| panic!("expected /claude command envelope, got:\n{command}"));
+        serde_json::from_str(request).expect("remote request envelope should be JSON")
+    }
+
+    fn remote_args(command: &str) -> Vec<Value> {
+        remote_request(command)["args"]
+            .as_array()
+            .expect("request args should be an array")
+            .clone()
+    }
+
+    fn assert_remote_request(command: &str, method: &str) {
+        let request = remote_request(command);
+        assert_eq!(request["fn"].as_str(), Some(method));
+        let args = request["args"]
+            .as_array()
+            .expect("request args should be an array");
+        assert_eq!(request["n"].as_u64(), Some(args.len() as u64));
+    }
 
     #[test]
     fn register_chat_handler_injects_no_level_script_event_handler() {
@@ -1214,7 +1196,7 @@ mod tests {
         // never emit script.on_event, or joining clients are refused with
         // "mod event handlers are not identical ... level".
         let lua = LuaCommand::register_chat_handler();
-        assert!(lua.contains(r#"remote.call("claude_interface", "chat_capture_status")"#));
+        assert_remote_request(&lua, "chat_capture_status");
         assert!(!lua.contains(r#"rcon.print("registered")"#));
         assert!(!lua.contains("script.on_event"));
         assert!(!lua.contains("on_console_chat"));
@@ -1223,7 +1205,7 @@ mod tests {
     #[test]
     fn get_and_clear_chat_messages_reads_via_mod_remote() {
         let lua = LuaCommand::get_and_clear_chat_messages();
-        assert!(lua.contains(r#"remote.call("claude_interface", "get_chat_messages")"#));
+        assert_remote_request(&lua, "get_chat_messages");
         for line in lua.lines() {
             if let Some(idx) = line.find("--") {
                 assert!(
@@ -1242,15 +1224,10 @@ mod tests {
         };
         let lua = LuaCommand::diagnose_factory_blockers(area, 7);
 
-        assert!(
-            lua.contains(r#"remote.interfaces["claude_interface"]["diagnose_factory_blockers"]"#),
-            "diagnostic should guard the mod remote path"
-        );
-        assert!(
-            lua.contains(
-                r#"remote.call("claude_interface", "diagnose_factory_blockers", 1, 2, 11, 12, 7)"#
-            ),
-            "diagnostic should pass area corners and limit through the mod"
+        assert_remote_request(&lua, "diagnose_factory_blockers");
+        assert_eq!(
+            remote_args(&lua),
+            vec![json!(1), json!(2), json!(11), json!(12), json!(7)]
         );
         assert!(!lua.contains("execute_lua"));
     }
@@ -1263,17 +1240,10 @@ mod tests {
         };
         let lua = LuaCommand::diagnose_fuel_sustainability(area, 9);
 
-        assert!(
-            lua.contains(
-                r#"remote.interfaces["claude_interface"]["diagnose_fuel_sustainability"]"#
-            ),
-            "fuel diagnostic should guard the mod remote path"
-        );
-        assert!(
-            lua.contains(
-                r#"remote.call("claude_interface", "diagnose_fuel_sustainability", 1, 2, 11, 12, 9)"#
-            ),
-            "fuel diagnostic should pass area corners and limit through the mod"
+        assert_remote_request(&lua, "diagnose_fuel_sustainability");
+        assert_eq!(
+            remote_args(&lua),
+            vec![json!(1), json!(2), json!(11), json!(12), json!(9)]
         );
         assert!(!lua.contains("execute_lua"));
     }
@@ -1283,14 +1253,8 @@ mod tests {
         let agent = AgentId::new(Some("doug")).expect("named agent id");
         let lua = LuaCommand::set_walk_target(&agent, Position::new(12.0, 13.0));
 
-        assert!(
-            lua.contains(r#"remote.interfaces["claude_interface"]"#),
-            "set_walk_target should guard the claude-interface remote path"
-        );
-        assert!(
-            lua.contains(r#"remote.call("claude_interface", "set_walk_target", "doug", 12, 13)"#),
-            "set_walk_target should route targets through the mod"
-        );
+        assert_remote_request(&lua, "set_walk_target");
+        assert_eq!(remote_args(&lua), vec![json!("doug"), json!(12), json!(13)]);
         for forbidden in [
             "storage.factorioctl_walk_targets",
             "remote.call(\"claude_interface\", \"register_character\"",
@@ -1309,18 +1273,8 @@ mod tests {
         let agent = AgentId::new(Some("doug")).expect("named agent id");
         let lua = LuaCommand::walk_target_active(&agent);
 
-        assert!(
-            lua.contains(r#"remote.interfaces["claude_interface"]["has_walk_target"]"#),
-            "walk_target_active should guard the mod active-target query"
-        );
-        assert!(
-            lua.contains(r#"remote.call("claude_interface", "has_walk_target", "doug")"#),
-            "walk_target_active should query the mod target state when available"
-        );
-        assert!(
-            lua.contains(r#"rcon.print("false")"#),
-            "walk_target_active should report inactive if the required mod backend is unavailable"
-        );
+        assert_remote_request(&lua, "has_walk_target");
+        assert_eq!(remote_args(&lua), vec![json!("doug")]);
         assert!(!lua.contains("storage.factorioctl_walk_targets"));
     }
 
@@ -1329,11 +1283,10 @@ mod tests {
         let agent = AgentId::new(None).expect("legacy agent id");
         let lua = LuaCommand::walk_character(&agent, Position::new(12.0, 13.0));
 
-        assert!(
-            lua.contains(
-                r#"remote.call("claude_interface", "set_walk_target", "__player__", 12, 13)"#
-            ),
-            "legacy/player walking should route through the same mod target backend"
+        assert_remote_request(&lua, "set_walk_target");
+        assert_eq!(
+            remote_args(&lua),
+            vec![json!("__player__"), json!(12), json!(13)]
         );
         assert!(!lua.contains("walking_state"));
         assert!(!lua.contains("storage.factorioctl_walk_targets"));

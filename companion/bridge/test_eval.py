@@ -4,13 +4,13 @@ import eval as eval_harness
 from models import BridgeLogRecord, EvalMilestoneSpec, EvalProductionSnapshot, EvalResult
 
 
-class FakeRcon:
+class FakeMcp:
     def __init__(self, response):
         self.response = response
-        self.commands = []
+        self.calls = []
 
-    def execute(self, command):
-        self.commands.append(command)
+    def eval_production_snapshot(self, surface_name="nauvis"):
+        self.calls.append(("eval_production_snapshot", {"surface_name": surface_name}))
         return self.response
 
 
@@ -315,7 +315,7 @@ class EvaluateTest(unittest.TestCase):
 
 class QuerySnapshotTest(unittest.TestCase):
     def test_query_snapshot_model_returns_typed_snapshot(self):
-        rcon = FakeRcon(
+        rcon = FakeMcp(
             '{"produced":{"iron-plate":12},"rate_per_min":{"iron-plate":16}}\n'
         )
 
@@ -326,7 +326,7 @@ class QuerySnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot.rate_per_min, {"iron-plate": 16.0})
 
     def test_query_snapshot_uses_validated_mod_remote_not_inline_world_lua(self):
-        rcon = FakeRcon(
+        rcon = FakeMcp(
             '{"produced":{"iron-plate":12},"rate_per_min":{"iron-plate":16}}\n'
         )
 
@@ -337,42 +337,31 @@ class QuerySnapshotTest(unittest.TestCase):
 
         self.assertEqual(snapshot.produced, {"iron-plate": 12.0})
         self.assertEqual(snapshot.rate_per_min, {"iron-plate": 16.0})
-        self.assertEqual(len(rcon.commands), 1)
-        command = rcon.commands[0]
-        self.assertEqual(
-            command,
-            '/silent-command rcon.print(remote.call("claude_interface", '
-            '"eval_production_snapshot", [=[nauvis") game.print("oops ]]]=]))',
-        )
-        for forbidden in [
-            "game.surfaces",
-            "game.forces.player",
-            "get_item_production_statistics",
-            "get_flow_count",
-            "defines.flow_precision_index",
-        ]:
-            self.assertNotIn(forbidden, command)
+        self.assertEqual(rcon.calls, [(
+            "eval_production_snapshot",
+            {"surface_name": 'nauvis") game.print("oops ]]'},
+        )])
 
     def test_query_snapshot_treats_empty_object_buckets_as_empty_maps(self):
-        rcon = FakeRcon('{"produced":{},"rate_per_min":{}}\n')
+        rcon = FakeMcp('{"produced":{},"rate_per_min":{}}\n')
 
         snapshot = eval_harness.query_snapshot_model(rcon)
 
         self.assertEqual(snapshot, EvalProductionSnapshot())
 
     def test_query_snapshot_errors_return_empty_snapshot(self):
-        class BrokenRcon:
-            def execute(self, command):
-                raise RuntimeError("rcon down")
+        class BrokenMcp:
+            def eval_production_snapshot(self, surface_name="nauvis"):
+                raise RuntimeError("mcp down")
 
-        snapshot = eval_harness.query_snapshot_model(BrokenRcon())
+        snapshot = eval_harness.query_snapshot_model(BrokenMcp())
 
         self.assertEqual(snapshot, EvalProductionSnapshot())
 
 
 class RunTest(unittest.TestCase):
     def test_run_model_returns_typed_result(self):
-        rcon = FakeRcon(
+        rcon = FakeMcp(
             '{"produced":{"iron-plate":1},"rate_per_min":{"iron-plate":16}}\n'
         )
 

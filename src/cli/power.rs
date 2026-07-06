@@ -5,7 +5,6 @@ use clap::{Args, Subcommand};
 
 use super::parsing::{parse_area, parse_position, parse_tile};
 use super::ResolvedConnectionArgs;
-use crate::client::lua::LuaCommand;
 use crate::world::Position;
 
 #[derive(Args, Debug)]
@@ -235,26 +234,58 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
         }
 
         PowerSubcommand::Status { x, y, radius } => {
-            let lua = LuaCommand::get_power_status(x, y, radius);
-            let response = client.execute_lua(&lua).await?;
+            let response = client
+                .call_remote(
+                    "get_power_status",
+                    &[
+                        serde_json::json!(x),
+                        serde_json::json!(y),
+                        serde_json::json!(radius),
+                    ],
+                )
+                .await?;
             println!("{}", response);
         }
 
         PowerSubcommand::Issues { x, y, radius } => {
-            let lua = LuaCommand::find_power_issues(x, y, radius);
-            let response = client.execute_lua(&lua).await?;
+            let response = client
+                .call_remote(
+                    "find_power_issues",
+                    &[
+                        serde_json::json!(x),
+                        serde_json::json!(y),
+                        serde_json::json!(radius),
+                    ],
+                )
+                .await?;
             println!("{}", response);
         }
 
         PowerSubcommand::Networks { x, y, radius } => {
-            let lua = LuaCommand::get_power_networks(x, y, radius);
-            let response = client.execute_lua(&lua).await?;
+            let response = client
+                .call_remote(
+                    "get_power_networks",
+                    &[
+                        serde_json::json!(x),
+                        serde_json::json!(y),
+                        serde_json::json!(radius),
+                    ],
+                )
+                .await?;
             println!("{}", response);
         }
 
         PowerSubcommand::Steam { x, y, radius } => {
-            let lua = LuaCommand::diagnose_steam_power(x, y, radius);
-            let response = client.execute_lua(&lua).await?;
+            let response = client
+                .call_remote(
+                    "diagnose_steam_power",
+                    &[
+                        serde_json::json!(x),
+                        serde_json::json!(y),
+                        serde_json::json!(radius),
+                    ],
+                )
+                .await?;
             println!("{}", response);
         }
 

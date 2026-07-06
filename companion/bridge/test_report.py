@@ -9,67 +9,69 @@ import report as bridge_report
 from models import BridgeLogMessage, BridgeLogRecord, McpTextPayload, RconJsonResponse
 
 
-class FakeRCON:
+class FakeMcp:
     def __init__(self):
-        self.commands = []
+        self.calls = []
 
-    def execute(self, command):
-        self.commands.append(command)
-        if "live_state_result" in command:
-            return json.dumps({
-                "found": True,
-                "surface": "nauvis",
-                "x": 46.7,
-                "y": -15.6,
-                "entity_counts": {
-                    "electric-mining-drill": 1,
-                    "stone-furnace": 2,
-                    "lab": 1,
-                },
-            })
-        if "get_power_status" in command:
-            return json.dumps({
-                "network_id": 7,
-                "pole_count": 15,
-                "generators": [{"name": "steam-engine", "count": 1}],
-                "consumers": {
-                    "working": 3,
-                    "low_power": 0,
-                    "no_power": 0,
-                    "total": 3,
-                },
-                "production_kw": 900,
-                "consumption_kw": 120,
-                "satisfaction": "ok",
-            })
-        raise AssertionError(command)
+    def live_state(self, agent_name):
+        self.calls.append(("live_state", {"agent_name": agent_name}))
+        return json.dumps({
+            "found": True,
+            "surface": "nauvis",
+            "x": 46.7,
+            "y": -15.6,
+            "entity_counts": {
+                "electric-mining-drill": 1,
+                "stone-furnace": 2,
+                "lab": 1,
+            },
+        })
+
+    def get_power_status(self, x, y, radius):
+        self.calls.append(("get_power_status", {"x": x, "y": y, "radius": radius}))
+        return json.dumps({
+            "network_id": 7,
+            "pole_count": 15,
+            "generators": [{"name": "steam-engine", "count": 1}],
+            "consumers": {
+                "working": 3,
+                "low_power": 0,
+                "no_power": 0,
+                "total": 3,
+            },
+            "production_kw": 900,
+            "consumption_kw": 120,
+            "satisfaction": "ok",
+        })
 
 
-class BrokenRCON:
-    def execute(self, command):
+class BrokenMcp:
+    def live_state(self, agent_name):
+        raise ConnectionError("server down")
+
+    def get_power_status(self, x, y, radius):
         raise ConnectionError("server down")
 
 
-class DiagnosticPowerRCON:
-    def execute(self, command):
-        if "live_state_result" in command:
-            return json.dumps({
-                "found": True,
-                "surface": "nauvis",
-                "x": 46.7,
-                "y": -15.6,
-                "entity_counts": {"boiler": 1},
-            })
-        if "get_power_status" in command:
-            return json.dumps({
-                "next_action": "repair_existing_steam_power",
-                "existing_plant": {
-                    "summary": {"issue_count": 1, "critical_issues": 1},
-                    "issues": [{"type": "boiler_no_fuel"}],
-                    "status": "critical",
-                },
-            })
-        raise AssertionError(command)
+class DiagnosticPowerMcp:
+    def live_state(self, agent_name):
+        return json.dumps({
+            "found": True,
+            "surface": "nauvis",
+            "x": 46.7,
+            "y": -15.6,
+            "entity_counts": {"boiler": 1},
+        })
+
+    def get_power_status(self, x, y, radius):
+        return json.dumps({
+            "next_action": "repair_existing_steam_power",
+            "existing_plant": {
+                "summary": {"issue_count": 1, "critical_issues": 1},
+                "issues": [{"type": "boiler_no_fuel"}],
+                "status": "critical",
+            },
+        })
 
 
 def log_line(message, ts, *, agent="DOUG-NAUVIS", level="INFO"):
@@ -807,7 +809,7 @@ class BridgeReportTest(unittest.TestCase):
 
     def test_enrich_live_state_uses_compact_mod_remotes(self):
         report = bridge_report.BridgeRunReport()
-        fake = FakeRCON()
+        fake = FakeMcp()
 
         bridge_report.enrich_live_state(
             report,
@@ -826,10 +828,10 @@ class BridgeReportTest(unittest.TestCase):
         )
         self.assertIn("steam-engine=1", report.live_power)
         self.assertIn("satisfaction=ok", report.live_power)
-        command_text = "\n".join(fake.commands)
-        self.assertIn('remote.call("claude_interface", "live_state_result"', command_text)
-        self.assertIn('remote.call("claude_interface", "get_power_status"', command_text)
-        self.assertNotIn("game.surfaces", command_text)
+        self.assertEqual(fake.calls, [
+            ("live_state", {"agent_name": "doug-nauvis"}),
+            ("get_power_status", {"x": 1, "y": -2, "radius": 300}),
+        ])
 
         formatted = bridge_report.format_report(report)
         self.assertIn("live_state: Live state: nauvis", formatted)
@@ -838,7 +840,7 @@ class BridgeReportTest(unittest.TestCase):
     def test_enrich_live_state_compacts_power_diagnostic_payload(self):
         report = bridge_report.BridgeRunReport()
 
-        bridge_report.enrich_live_state(report, DiagnosticPowerRCON())
+        bridge_report.enrich_live_state(report, DiagnosticPowerMcp())
 
         self.assertTrue(report.live_connected)
         self.assertIn("steam_power status=critical", report.live_power)
@@ -848,7 +850,7 @@ class BridgeReportTest(unittest.TestCase):
     def test_enrich_live_state_records_nonfatal_rcon_errors(self):
         report = bridge_report.BridgeRunReport()
 
-        bridge_report.enrich_live_state(report, BrokenRCON())
+        bridge_report.enrich_live_state(report, BrokenMcp())
 
         self.assertTrue(report.live_attempted)
         self.assertFalse(report.live_connected)

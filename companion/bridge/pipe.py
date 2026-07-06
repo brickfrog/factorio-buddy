@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import queue
@@ -113,6 +114,11 @@ from models import (
     BridgeInputMessage,
     BridgeLogMessage,
     BridgeRuntimeSettings,
+    BRIDGE_MANUAL_AUTOMATION_GUARD_PREFIX,
+    BRIDGE_PARALLEL_MUTATION_GUARD_PREFIX,
+    BRIDGE_PARAM_SCHEMA_GUARD_PREFIX,
+    BRIDGE_READ_ONLY_TURN_GUARD_PREFIX,
+    BRIDGE_SKILL_REQUIRED_GUARD_PREFIX,
     ConnectedPlayerCountResult,
     FactorioMcpServerConfig,
     FactorioModInfo,
@@ -123,7 +129,6 @@ from models import (
     ParsedAgentResponse,
     ProviderUsageLimitSettings,
     RawLuaPolicy,
-    RconRemoteCall,
     SdkAssistantMessage,
     SdkAssistantTextObservation,
     SdkResultMessage,
@@ -149,12 +154,11 @@ from planner import (
     planner_advisory_for_decision,
 )
 from skills import strip_skill_trailer
-from rcon import RCONClient, ThreadSafeRCON, lua_long_string
 from paths import find_script_output, find_factorioctl_mcp
-from transport import (InputWatcher, send_response, send_tool_status, set_status,
-                       check_mod_loaded, register_agent, unregister_agent,
-                       pre_place_character_model, setup_surfaces_model,
-                       set_spectator_mode)
+from transport import (InputWatcher, McpLifecycleClient, send_response,
+                       send_tool_status, set_status, check_mod_loaded,
+                       register_agent, unregister_agent, pre_place_character_model,
+                       setup_surfaces_model, set_spectator_mode)
 from paths import find_mod_source, find_mods_dir
 from telemetry import SSEBroadcaster, start_sse_server, RelayPusher, Telemetry, emit_chat, emit_tool_call, emit_error, emit_status
 from cooldowns import (
@@ -429,7 +433,7 @@ def _handle_context_window_limit(
     log,
     telemetry: Telemetry | None,
     telemetry_name: str,
-    rcon: RCONClient,
+    rcon,
     player_index: int,
     rcon_target: str,
 ) -> AgentMessageResult:
@@ -640,15 +644,63 @@ class AgentRunProgress:
 
 
 async def _next_client_message(iterator: Any) -> Any:
+    next_task = asyncio.create_task(iterator.__anext__())
     try:
         return await asyncio.wait_for(
-            iterator.__anext__(),
+            asyncio.shield(next_task),
             timeout=_STREAM_IDLE_TIMEOUT_S,
         )
     except asyncio.TimeoutError as exc:
+        next_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+            await next_task
         raise AgentStreamIdleTimeout(
             f"agent stream idle for {_STREAM_IDLE_TIMEOUT_S:.0f}s"
         ) from exc
+    except BaseException:
+        if not next_task.done():
+            next_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                await next_task
+        raise
+
+
+async def _close_async_iterator(iterator: Any, log: Any | None = None) -> None:
+    aclose = getattr(iterator, "aclose", None)
+    if not callable(aclose):
+        return
+    try:
+        await asyncio.wait_for(aclose(), timeout=5)
+    except RuntimeError as exc:
+        if "already running" not in str(exc):
+            raise
+        if log is not None:
+            log.debug("async iterator close raced active SDK stream: {}", exc)
+    except asyncio.TimeoutError:
+        if log is not None:
+            log.debug("async iterator close timed out")
+
+
+def _autonomy_tool_result_completes_step(
+    *,
+    tool_name: str,
+    classification: ToolResultClassification,
+    text: str,
+) -> bool:
+    if not ToolCallRequest.is_factorio_mcp_tool_name(tool_name):
+        return False
+    short_name = ToolCallRequest.short_factorio_tool_name(tool_name)
+    if short_name in {"broadcast_thought", "tool_status"}:
+        return False
+    if text.startswith((
+        BRIDGE_PARALLEL_MUTATION_GUARD_PREFIX,
+        BRIDGE_READ_ONLY_TURN_GUARD_PREFIX,
+        BRIDGE_SKILL_REQUIRED_GUARD_PREFIX,
+        BRIDGE_PARAM_SCHEMA_GUARD_PREFIX,
+        BRIDGE_MANUAL_AUTOMATION_GUARD_PREFIX,
+    )):
+        return False
+    return True
 
 
 async def _query_with_idle_timeout(prompt: str, options: ClaudeAgentOptions):
@@ -657,25 +709,12 @@ async def _query_with_idle_timeout(prompt: str, options: ClaudeAgentOptions):
     try:
         while True:
             try:
-                msg = await asyncio.wait_for(
-                    iterator.__anext__(),
-                    timeout=_STREAM_IDLE_TIMEOUT_S,
-                )
+                msg = await _next_client_message(iterator)
             except StopAsyncIteration:
                 break
-            except asyncio.TimeoutError as exc:
-                raise AgentStreamIdleTimeout(
-                    f"agent stream idle for {_STREAM_IDLE_TIMEOUT_S:.0f}s"
-                ) from exc
             yield msg
     finally:
-        aclose = getattr(iterator, "aclose", None)
-        if callable(aclose):
-            try:
-                await aclose()
-            except RuntimeError as exc:
-                if "already running" not in str(exc):
-                    raise
+        await _close_async_iterator(iterator)
 
 
 def _stderr_callback(log):
@@ -696,7 +735,7 @@ async def _run_agent(
     agent_name: str,
     telemetry: Telemetry | None,
     telemetry_name: str,
-    rcon: RCONClient,
+    rcon,
     player_index: int,
     log,
     stop_after_factorio_result: bool = False,
@@ -819,7 +858,11 @@ async def _run_agent(
                     )
                     if (
                         stop_after_factorio_result
-                        and ToolCallRequest.is_factorio_mcp_tool_name(tool_name)
+                        and _autonomy_tool_result_completes_step(
+                            tool_name=tool_name,
+                            classification=classification,
+                            text=observation.text,
+                        )
                         and not autonomy_step_progress
                     ):
                         autonomy_step_progress = AgentAutonomyStepComplete(
@@ -942,6 +985,8 @@ async def _run_agent(
             "sdk stream raised after context-window result; preserving session reset"
         )
     finally:
+        if client_iterator is not None:
+            await _close_async_iterator(client_iterator, log)
         if client is not None:
             try:
                 await client.disconnect()
@@ -998,17 +1043,13 @@ def _finalize_partial_run_progress(
 
 
 def _load_live_state_for_agent(
-    rcon: RCONClient,
+    rcon,
     agent_name: str,
     log: Any = logger,
 ) -> LiveState:
     """Best-effort live state for hook-time automation guards."""
     try:
-        agent = lua_long_string(agent_name)
-        out = rcon.execute(RconRemoteCall.command(
-            "live_state_result",
-            agent,
-        ))
+        out = rcon.live_state(agent_name)
         try:
             return LiveState.from_rcon_response(out)
         except BridgeValidationError:
@@ -1023,7 +1064,7 @@ def handle_message_model(
     mcp_config: McpServersConfig | str | Path,
     system_prompt: str,
     session_id: str | None,
-    rcon: RCONClient,
+    rcon,
     player_index: int,
     telemetry: Telemetry | None,
     agent_name: str = "default",
@@ -1320,7 +1361,7 @@ def handle_message(
     mcp_config: McpServersConfig | str | Path,
     system_prompt: str,
     session_id: str | None,
-    rcon: RCONClient,
+    rcon,
     player_index: int,
     telemetry: Telemetry | None,
     agent_name: str = "default",
@@ -1495,13 +1536,11 @@ class AgentThread:
         """True if at least one human player is connected.
 
         AI agents are orphan character entities, so the mod-side remote counts
-        only real client connections. On any RCON error, return False so we
+        only real client connections. On any game-client error, return False so we
         don't burn autonomy turns when we can't confirm a human is present.
         """
         try:
-            out = self.rcon.execute(RconRemoteCall.command(
-                "connected_player_count_result",
-            ))
+            out = self.rcon.connected_player_count()
             return ConnectedPlayerCountResult.from_rcon_response(
                 out,
             ).has_connected_players
@@ -1512,11 +1551,7 @@ class AgentThread:
     def _live_state(self) -> LiveState:
         """Best-effort typed live state for autonomy ticks."""
         try:
-            agent = lua_long_string(self.agent_name)
-            out = self.rcon.execute(RconRemoteCall.command(
-                "live_state_result",
-                agent,
-            ))
+            out = self.rcon.live_state(self.agent_name)
             try:
                 return LiveState.from_rcon_response(out)
             except BridgeValidationError:
@@ -1755,16 +1790,20 @@ def main_multi(args, agent_profiles: list[AgentProfile | dict]):
     """Multi-agent mode: one thread per agent, shared watcher."""
     log = logger.bind(agent="system")
     agent_profiles = [AgentProfile.coerce(agent) for agent in agent_profiles]
-    # Shared RCON (thread-safe)
-    log.info("Connecting to Factorio RCON...")
-    rcon_raw = RCONClient(
-        args.rcon_host,
-        args.rcon_port,
-        args.rcon_password,
-        log=log,
+    mcp_bin = args.factorioctl_mcp or find_factorioctl_mcp()
+    if not mcp_bin:
+        raise FileNotFoundError(
+            "factorioctl MCP not found; bridge lifecycle traffic must go through Rust MCP"
+        )
+    log.info("Connecting to Factorio lifecycle MCP...")
+    rcon = McpLifecycleClient(
+        mcp_bin,
+        rcon_host=args.rcon_host,
+        rcon_port=args.rcon_port,
+        rcon_password=args.rcon_password,
+        agent_id="bridge",
     )
-    rcon = ThreadSafeRCON(rcon_raw)
-    log.info("RCON connected")
+    log.info("Factorio lifecycle MCP connected")
 
     mod_loaded = check_mod_loaded(rcon)
     if mod_loaded:
@@ -1807,7 +1846,6 @@ def main_multi(args, agent_profiles: list[AgentProfile | dict]):
     telemetry = build_telemetry(args)
 
     # MCP configs and agent threads
-    mcp_bin = args.factorioctl_mcp or find_factorioctl_mcp()
     agents: dict[str, AgentThread] = {}
     for agent in agent_profiles:
         mcp_config = None
@@ -1834,7 +1872,7 @@ def main_multi(args, agent_profiles: list[AgentProfile | dict]):
     agent_names = ", ".join(agent.name for agent in agent_profiles)
     log.info("Factorio companion - multi-agent")
     log.info("Agents: {}", agent_names)
-    log.info("RCON: {}:{}", args.rcon_host, args.rcon_port)
+    log.info("Game transport: factorioctl MCP -> {}:{}", args.rcon_host, args.rcon_port)
     log.info("Input: {}", input_file)
     resolved_skill_sets = {
         agent_name: at.sdk_skills if at.sdk_skills else "disabled"
@@ -1844,7 +1882,7 @@ def main_multi(args, agent_profiles: list[AgentProfile | dict]):
     if mcp_bin:
         log.info("MCP server: {}", mcp_bin)
 
-    # Start agent threads with staggered delays to avoid RCON flood
+    # Start agent threads with staggered delays to avoid game-transport flood
     stagger = args.stagger_delay
     log.info("Starting agents (stagger: {}s)", stagger)
     for i, at in enumerate(agents.values()):
@@ -1865,7 +1903,7 @@ def main_multi(args, agent_profiles: list[AgentProfile | dict]):
                     for i, at in enumerate(agents.values()):
                         at.enqueue(msg.model_copy(update={"response_to": "all"}))
                         if i < len(agents) - 1:
-                            time.sleep(1)  # stagger to avoid RCON flood
+                            time.sleep(1)  # stagger to avoid game-transport flood
                 elif target in agents:
                     agents[target].enqueue(msg)
                 else:

@@ -3,8 +3,8 @@
 Runtime smoke checks for the real factorioctl/claude-interface surface.
 
 This runner is intentionally separate from Doug/the bridge. It is an
-operator-facing disposable-save test harness, so it may seed the smoke
-character with raw Lua through the CLI while keeping raw Lua disabled for MCP
+operator-facing disposable-save test harness, so it explicitly opts into raw
+Lua for trusted CLI fixture seeding while keeping raw Lua disabled for MCP
 agents by default.
 """
 
@@ -539,12 +539,16 @@ class CliRunner:
         allow_factorio_rejection: bool = False,
     ) -> tuple[StepResult, Any]:
         cmd = self.command(args, json_output=json_output)
+        env = os.environ.copy()
+        if args and args[0] == "exec":
+            env["FACTORIOCTL_ALLOW_RAW_LUA"] = "1"
         proc = subprocess.run(
             cmd,
             text=True,
             capture_output=True,
             timeout=self.timeout_s,
             check=False,
+            env=env,
         )
         combined = "\n".join(part for part in [proc.stdout, proc.stderr] if part)
         classification = classify_failure(combined, proc.returncode)

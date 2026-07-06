@@ -7,7 +7,8 @@ local INPUT_FILE = "claude-chat/input.jsonl"
 local characters = require("characters")
 local diagnostics = require("diagnostics")
 local entities = require("entities")
-local json_remote_call = require("json_response").remote_call
+local json_response = require("json_response")
+local json_remote_call = json_response.remote_call
 local inventory = require("inventory")
 local inventory_contents = inventory.contents
 local inventory_define_for = inventory.define_for
@@ -1735,7 +1736,7 @@ local function get_prototype_impl(name)
     return result
 end
 
-remote.add_interface("claude_interface", {
+local api = {
     receive_response = function(player_index, agent_name, text)
         table.insert(storage._rcon_queue, {
             type = "response", pi = player_index,
@@ -2232,7 +2233,36 @@ remote.add_interface("claude_interface", {
     ping = function()
         rcon.print("pong")
     end,
-})
+}
+
+remote.add_interface("claude_interface", api)
+
+commands.add_command("claude", "claude-interface dispatch", function(cmd)
+    local ok, request = pcall(helpers.json_to_table, cmd.parameter or "")
+    if not ok or type(request) ~= "table" or type(request.fn) ~= "string" then
+        rcon.print(json_response.error("bad_request", "expected {fn, args, n}"))
+        return
+    end
+    local handler = api[request.fn]
+    if not handler then
+        rcon.print(json_response.error("unknown_function", request.fn, {
+            action_needed = "sync_or_restart_mod",
+        }))
+        return
+    end
+    local args = request.args or {}
+    if type(args) ~= "table" then
+        rcon.print(json_response.error("bad_request", "args must be an array"))
+        return
+    end
+    local n = request.n or #args
+    local results = { pcall(handler, table.unpack(args, 1, n)) }
+    if not results[1] then
+        rcon.print(json_response.error("lua_error", tostring(results[2])))
+        return
+    end
+    if results[2] ~= nil then rcon.print(results[2]) end
+end)
 
 -- ============================================================
 -- Event Handlers

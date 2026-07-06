@@ -5,6 +5,7 @@ pub mod rcon;
 pub mod server;
 
 use anyhow::{bail, Result};
+use serde_json::{json, Value};
 
 use crate::world::{
     Area, BeltContentsResult, BeltLaneContentsResult, BeltLaneSummary, BuildResult,
@@ -12,7 +13,6 @@ use crate::world::{
     GridPos, Inventory, InventoryItem, LaneContents, MineResult, PlacementSpec, Position,
     Prototype, Recipe, RecipeSummary, ResourcePatch, Surface, Tick, Tile, TilePos, WalkResult,
 };
-use lua::LuaCommand;
 use rcon::RconClient;
 
 /// Maximum distance for placing entities
@@ -112,6 +112,40 @@ fn parse_entity_response(response: &str) -> Result<Entity> {
     Ok(serde_json::from_value(value)?)
 }
 
+fn claude_command(fn_name: &str, args: &[Value]) -> String {
+    let request = json!({
+        "fn": fn_name,
+        "args": args,
+        "n": args.len(),
+    });
+    format!("/claude {}", request)
+}
+
+fn old_mod_claude_command_skew_response(fn_name: &str, response: &str) -> Option<String> {
+    let normalized = response.to_ascii_lowercase();
+    if !(normalized.contains("unknown command") && normalized.contains("claude")) {
+        return None;
+    }
+    Some(
+        json!({
+            "success": false,
+            "error_kind": "unknown_function",
+            "error": format!("claude-interface mod does not expose /claude for {fn_name}"),
+            "action_needed": "sync_or_restart_mod",
+            "guidance": "Run just sync/resume so the updated claude-interface mod is loaded before using Factorio remotes.",
+        })
+        .to_string(),
+    )
+}
+
+fn character_storage_key(agent_id: &AgentId) -> &str {
+    if agent_id.is_legacy() {
+        "__player__"
+    } else {
+        agent_id.as_str()
+    }
+}
+
 impl FactorioClient {
     /// Connect to a Factorio server
     pub async fn connect(host: &str, port: u16, password: &str) -> Result<Self> {
@@ -176,20 +210,27 @@ impl FactorioClient {
             .await
     }
 
+    pub async fn call_remote(&mut self, fn_name: &str, args: &[Value]) -> Result<String> {
+        let command = claude_command(fn_name, args);
+        let response = self.rcon.execute(&command).await?;
+        if let Some(skew_response) = old_mod_claude_command_skew_response(fn_name, &response) {
+            return Ok(skew_response);
+        }
+        Ok(response)
+    }
+
     // --- Game State Queries ---
 
     /// Get current game tick
     pub async fn get_tick(&mut self) -> Result<Tick> {
-        let lua = LuaCommand::get_tick();
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("get_tick", &[]).await?;
         ensure_lua_success(&response)?;
         Ok(serde_json::from_str(&response)?)
     }
 
     /// Get list of surfaces
     pub async fn get_surfaces(&mut self) -> Result<Vec<Surface>> {
-        let lua = LuaCommand::get_surfaces();
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("get_surfaces", &[]).await?;
         let surfaces = parse_lua_array::<Surface>(&response)?;
         Ok(surfaces)
     }
@@ -203,31 +244,53 @@ impl FactorioClient {
         entity_type: Option<&str>,
         name: Option<&str>,
     ) -> Result<Vec<Entity>> {
-        let lua = LuaCommand::find_entities(area, entity_type, name);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "find_entities",
+                &[
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                    entity_type.map_or(Value::Null, |value| json!(value)),
+                    name.map_or(Value::Null, |value| json!(value)),
+                ],
+            )
+            .await?;
         let entities = parse_lua_array::<Entity>(&response)?;
         Ok(entities)
     }
 
     /// Get a specific entity by unit number
     pub async fn get_entity(&mut self, unit_number: u32) -> Result<Entity> {
-        let lua = LuaCommand::get_entity(unit_number);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("get_entity", &[json!(unit_number)])
+            .await?;
         parse_entity_response(&response)
     }
 
     /// Get an entity's inventories
     pub async fn get_entity_inventory(&mut self, unit_number: u32) -> Result<serde_json::Value> {
-        let lua = LuaCommand::get_entity_inventory(unit_number);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("get_entity_inventory", &[json!(unit_number)])
+            .await?;
         let result: serde_json::Value = serde_json::from_str(&response)?;
         Ok(result)
     }
 
     /// Verify production status for producing entities in an area
     pub async fn verify_production(&mut self, area: Area) -> Result<Vec<EntityProduction>> {
-        let lua = LuaCommand::verify_production(area);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "verify_production",
+                &[
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                ],
+            )
+            .await?;
         let entities = parse_lua_array::<EntityProduction>(&response)?;
         Ok(entities)
     }
@@ -238,8 +301,18 @@ impl FactorioClient {
         area: Area,
         limit: u32,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::diagnose_factory_blockers(area, limit);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "diagnose_factory_blockers",
+                &[
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                    json!(limit),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -249,8 +322,18 @@ impl FactorioClient {
         area: Area,
         limit: u32,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::diagnose_fuel_sustainability(area, limit);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "diagnose_fuel_sustainability",
+                &[
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                    json!(limit),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -262,8 +345,18 @@ impl FactorioClient {
         area: Area,
         resource_type: Option<&str>,
     ) -> Result<Vec<ResourcePatch>> {
-        let lua = LuaCommand::find_resources(area, resource_type);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "find_resources",
+                &[
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                    resource_type.map_or(Value::Null, |value| json!(value)),
+                ],
+            )
+            .await?;
         let resources = parse_lua_array::<ResourcePatch>(&response)?;
         Ok(resources)
     }
@@ -274,8 +367,12 @@ impl FactorioClient {
         resource_name: &str,
         from: Position,
     ) -> Result<ResourcePatch> {
-        let lua = LuaCommand::find_nearest_resource(resource_name, from);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "find_nearest_resource",
+                &[json!(resource_name), json!(from.x), json!(from.y)],
+            )
+            .await?;
         let resource: ResourcePatch = serde_json::from_str(&response)?;
         Ok(resource)
     }
@@ -284,16 +381,26 @@ impl FactorioClient {
 
     /// Get tiles in an area
     pub async fn get_tiles(&mut self, area: Area) -> Result<Vec<Tile>> {
-        let lua = LuaCommand::get_tiles(area);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "get_tiles",
+                &[
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                ],
+            )
+            .await?;
         let tiles = parse_lua_array::<Tile>(&response)?;
         Ok(tiles)
     }
 
     /// Get a specific tile
     pub async fn get_tile(&mut self, position: Position) -> Result<Tile> {
-        let lua = LuaCommand::get_tile(position);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("get_tile", &[json!(position.x), json!(position.y)])
+            .await?;
         let tile: Tile = serde_json::from_str(&response)?;
         Ok(tile)
     }
@@ -360,32 +467,32 @@ impl FactorioClient {
 
     /// Get a recipe by name
     pub async fn get_recipe(&mut self, name: &str) -> Result<Recipe> {
-        let lua = LuaCommand::get_recipe(name);
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("get_recipe", &[json!(name)]).await?;
         let recipe: Recipe = serde_json::from_str(&response)?;
         Ok(recipe)
     }
 
     /// Get all recipes in a category
     pub async fn get_recipes_by_category(&mut self, category: &str) -> Result<Vec<RecipeSummary>> {
-        let lua = LuaCommand::get_recipes_by_category(category);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("get_recipes_by_category", &[json!(category)])
+            .await?;
         let recipes = parse_lua_array::<RecipeSummary>(&response)?;
         Ok(recipes)
     }
 
     /// Get all recipes that produce a specific item
     pub async fn get_recipes_for_item(&mut self, item: &str) -> Result<Vec<Recipe>> {
-        let lua = LuaCommand::get_recipes_for_item(item);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("get_recipes_for_item", &[json!(item)])
+            .await?;
         let recipes = parse_lua_array::<Recipe>(&response)?;
         Ok(recipes)
     }
 
     /// Get an entity prototype by name
     pub async fn get_prototype(&mut self, name: &str) -> Result<Prototype> {
-        let lua = LuaCommand::get_prototype(name);
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("get_prototype", &[json!(name)]).await?;
         let prototype: Prototype = serde_json::from_str(&response)?;
         Ok(prototype)
     }
@@ -398,8 +505,18 @@ impl FactorioClient {
         agent_id: &AgentId,
         area: Area,
     ) -> Result<crate::world::NativeBlueprintExport> {
-        let lua = LuaCommand::create_native_blueprint(agent_id, area);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "create_native_blueprint",
+                &[
+                    json!(agent_id.as_str()),
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                ],
+            )
+            .await?;
         if response.contains("\"error\"") {
             #[derive(serde::Deserialize)]
             struct ErrorResponse {
@@ -419,24 +536,33 @@ impl FactorioClient {
         name: &str,
         area: Area,
     ) -> Result<crate::world::BlueprintSaveResult> {
-        let lua = LuaCommand::save_blueprint(agent_id, name, area);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "save_blueprint",
+                &[
+                    json!(agent_id.as_str()),
+                    json!(name),
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                ],
+            )
+            .await?;
         let result: crate::world::BlueprintSaveResult = serde_json::from_str(&response)?;
         Ok(result)
     }
 
     /// List all saved blueprints
     pub async fn list_blueprints(&mut self) -> Result<Vec<crate::world::StoredBlueprint>> {
-        let lua = LuaCommand::list_blueprints();
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("list_blueprints", &[]).await?;
         let result = parse_lua_array::<crate::world::StoredBlueprint>(&response)?;
         Ok(result)
     }
 
     /// Get a saved blueprint string by name
     pub async fn get_blueprint(&mut self, name: &str) -> Result<crate::world::BlueprintGetResult> {
-        let lua = LuaCommand::get_blueprint(name);
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("get_blueprint", &[json!(name)]).await?;
         let result: crate::world::BlueprintGetResult = serde_json::from_str(&response)?;
         Ok(result)
     }
@@ -449,8 +575,18 @@ impl FactorioClient {
         position: Position,
         direction: u8,
     ) -> Result<crate::world::BlueprintPlaceResult> {
-        let lua = LuaCommand::place_blueprint(agent_id, name, position, direction);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "place_blueprint",
+                &[
+                    json!(agent_id.as_str()),
+                    json!(name),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(direction),
+                ],
+            )
+            .await?;
         let result: crate::world::BlueprintPlaceResult = serde_json::from_str(&response)?;
         Ok(result)
     }
@@ -463,16 +599,25 @@ impl FactorioClient {
         position: Position,
         direction: u8,
     ) -> Result<crate::world::BlueprintPlaceResult> {
-        let lua = LuaCommand::import_blueprint(agent_id, bp_string, position, direction);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "import_blueprint",
+                &[
+                    json!(agent_id.as_str()),
+                    json!(bp_string),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(direction),
+                ],
+            )
+            .await?;
         let result: crate::world::BlueprintPlaceResult = serde_json::from_str(&response)?;
         Ok(result)
     }
 
     /// Delete a saved blueprint
     pub async fn delete_blueprint(&mut self, name: &str) -> Result<bool> {
-        let lua = LuaCommand::delete_blueprint(name);
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("delete_blueprint", &[json!(name)]).await?;
         #[derive(serde::Deserialize)]
         struct DeleteResult {
             success: bool,
@@ -485,40 +630,66 @@ impl FactorioClient {
 
     /// Initialize character entity
     pub async fn init_character(&mut self, x: f64, y: f64) -> Result<Entity> {
-        let lua = LuaCommand::init_character(&self.agent_id, x, y);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "init_character",
+                &[
+                    json!(character_storage_key(&self.agent_id)),
+                    json!(x),
+                    json!(y),
+                ],
+            )
+            .await?;
         let entity: Entity = serde_json::from_str(&response)?;
         Ok(entity)
     }
 
     /// Teleport character to position
     pub async fn teleport_character(&mut self, position: Position) -> Result<()> {
-        let lua = LuaCommand::teleport_character(&self.agent_id, position);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "teleport_character",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(position.x),
+                    json!(position.y),
+                ],
+            )
+            .await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
 
     /// Start walking character to position
     pub async fn walk_character(&mut self, position: Position) -> Result<()> {
-        let lua = LuaCommand::walk_character(&self.agent_id, position);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "set_walk_target",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(position.x),
+                    json!(position.y),
+                ],
+            )
+            .await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
 
     /// Get character status
     pub async fn character_status(&mut self) -> Result<CharacterStatus> {
-        let lua = LuaCommand::character_status(&self.agent_id);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("character_status", &[json!(self.agent_id.as_str())])
+            .await?;
         let status: CharacterStatus = serde_json::from_str(&response)?;
         Ok(status)
     }
 
     /// Get character inventory
     pub async fn character_inventory(&mut self) -> Result<Inventory> {
-        let lua = LuaCommand::character_inventory(&self.agent_id);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("character_inventory", &[json!(self.agent_id.as_str())])
+            .await?;
         let inventory: Inventory = serde_json::from_str(&response)?;
         Ok(inventory)
     }
@@ -529,22 +700,39 @@ impl FactorioClient {
         position: Position,
         radius: u32,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::can_stand_at(&self.agent_id, position, radius);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "can_stand_at",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(radius),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
     /// Diagnose whether the current character position is blocked and suggest clear positions.
     pub async fn is_player_blocked(&mut self, radius: u32) -> Result<serde_json::Value> {
-        let lua = LuaCommand::is_player_blocked(&self.agent_id, radius);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "is_player_blocked",
+                &[json!(self.agent_id.as_str()), json!(radius)],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
     /// Move a physically blocked character to the nearest verified clear standing position.
     pub async fn unstuck(&mut self, radius: u32, dry_run: bool) -> Result<serde_json::Value> {
-        let lua = LuaCommand::unstuck(&self.agent_id, radius, dry_run);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "unstuck",
+                &[json!(self.agent_id.as_str()), json!(radius), json!(dry_run)],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -560,8 +748,18 @@ impl FactorioClient {
             let _ = self.walk_to(position, false).await?;
         }
 
-        let lua = LuaCommand::mine_at(&self.agent_id, position, count);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "mine_at",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(count),
+                    json!(3),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -573,8 +771,16 @@ impl FactorioClient {
         let count_before: u32 = inv_before.items.iter().map(|i| i.count).sum();
 
         for _ in 0..count {
-            let find_lua = LuaCommand::find_nearest_minable(&self.agent_id, entity_type, 100);
-            let response = self.execute_lua(&find_lua).await?;
+            let response = self
+                .call_remote(
+                    "find_nearest_minable",
+                    &[
+                        json!(self.agent_id.as_str()),
+                        json!(entity_type),
+                        json!(100),
+                    ],
+                )
+                .await?;
             let nearest: NearestMinableResponse = serde_json::from_str(&response)?;
             if let Some(error) = nearest.error {
                 anyhow::bail!(error);
@@ -610,16 +816,20 @@ impl FactorioClient {
 
     /// Start crafting a recipe
     pub async fn craft(&mut self, recipe: &str, count: u32) -> Result<CraftResult> {
-        let lua = LuaCommand::craft(&self.agent_id, recipe, count);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "craft",
+                &[json!(self.agent_id.as_str()), json!(recipe), json!(count)],
+            )
+            .await?;
         let result: CraftResult = serde_json::from_str(&response)?;
         Ok(result)
     }
 
     /// Wait for crafting to complete
     pub async fn wait_for_crafting(&mut self) -> Result<()> {
-        let lua = LuaCommand::wait_for_crafting(&self.agent_id);
-        self.execute_lua(&lua).await?;
+        self.call_remote("wait_for_crafting", &[json!(self.agent_id.as_str())])
+            .await?;
         Ok(())
     }
 
@@ -632,8 +842,18 @@ impl FactorioClient {
         position: Position,
         direction: Direction,
     ) -> Result<Entity> {
-        let lua = LuaCommand::place_entity(&self.agent_id, entity_name, position, direction);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "place_entity",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(entity_name),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(direction.to_factorio()),
+                ],
+            )
+            .await?;
         // Check for error response
         if response.contains("\"error\"") {
             #[derive(serde::Deserialize)]
@@ -653,9 +873,18 @@ impl FactorioClient {
         position: Position,
         direction: Direction,
     ) -> Result<serde_json::Value> {
-        let lua =
-            LuaCommand::check_entity_placement(&self.agent_id, entity_name, position, direction);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "check_entity_placement",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(entity_name),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(direction.to_factorio()),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -666,9 +895,19 @@ impl FactorioClient {
         radius: u32,
         limit: u32,
     ) -> Result<serde_json::Value> {
-        let lua =
-            LuaCommand::find_entity_placements(&self.agent_id, entity_name, center, radius, limit);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "find_entity_placements",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(entity_name),
+                    json!(center.x),
+                    json!(center.y),
+                    json!(radius),
+                    json!(limit),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -679,14 +918,19 @@ impl FactorioClient {
         radius: u32,
         limit: u32,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::plan_entity_placement_near(
-            &self.agent_id,
-            entity_name,
-            target,
-            radius,
-            limit,
-        );
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "plan_entity_placement_near",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(entity_name),
+                    json!(target.x),
+                    json!(target.y),
+                    json!(radius),
+                    json!(limit),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -698,15 +942,20 @@ impl FactorioClient {
         drill_name: &str,
         limit: u32,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::build_edge_miner(
-            &self.agent_id,
-            resource_name,
-            center,
-            radius,
-            drill_name,
-            limit,
-        );
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "build_edge_miner",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(resource_name),
+                    json!(center.x),
+                    json!(center.y),
+                    json!(radius),
+                    json!(drill_name),
+                    json!(limit),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -719,16 +968,30 @@ impl FactorioClient {
         belt_name: &str,
         radius: u32,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::build_direct_smelter(
-            &self.agent_id,
-            drill_unit_number,
-            output,
-            furnace_name,
-            inserter_name,
-            belt_name,
-            radius,
-        );
-        let response = self.execute_lua(&lua).await?;
+        let (output_x, output_y, output_direction) = match output {
+            Some((position, direction)) => (
+                json!(position.x),
+                json!(position.y),
+                json!(direction.to_factorio()),
+            ),
+            None => (Value::Null, Value::Null, Value::Null),
+        };
+        let response = self
+            .call_remote(
+                "build_direct_smelter",
+                &[
+                    json!(self.agent_id.as_str()),
+                    drill_unit_number.map_or(Value::Null, |unit| json!(unit)),
+                    output_x,
+                    output_y,
+                    output_direction,
+                    json!(furnace_name),
+                    json!(inserter_name),
+                    json!(belt_name),
+                    json!(radius),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -737,8 +1000,20 @@ impl FactorioClient {
         water_area: Area,
         target: Position,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::plan_steam_power(&self.agent_id, water_area, target);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "plan_steam_power",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(water_area.left_top.x),
+                    json!(water_area.left_top.y),
+                    json!(water_area.right_bottom.x),
+                    json!(water_area.right_bottom.y),
+                    json!(target.x),
+                    json!(target.y),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -749,8 +1024,19 @@ impl FactorioClient {
         radius: u32,
         target: Position,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::repair_steam_power(&self.agent_id, x, y, radius, target);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "repair_steam_power",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(x),
+                    json!(y),
+                    json!(radius),
+                    json!(target.x),
+                    json!(target.y),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -761,8 +1047,19 @@ impl FactorioClient {
         radius: u32,
         target: Position,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::extend_power_to(&self.agent_id, x, y, radius, target);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "extend_power_to",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(x),
+                    json!(y),
+                    json!(radius),
+                    json!(target.x),
+                    json!(target.y),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -773,8 +1070,18 @@ impl FactorioClient {
         position: Position,
         direction: Direction,
     ) -> Result<Entity> {
-        let lua = LuaCommand::place_ghost(&self.agent_id, entity_name, position, direction);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "place_ghost",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(entity_name),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(direction.to_factorio()),
+                ],
+            )
+            .await?;
         if response.contains("\"error\"") {
             #[derive(serde::Deserialize)]
             struct ErrorResponse {
@@ -789,24 +1096,37 @@ impl FactorioClient {
 
     /// Remove entity at position
     pub async fn remove_entity_at(&mut self, position: Position) -> Result<()> {
-        let lua = LuaCommand::remove_entity_at(&self.agent_id, position);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "remove_entity_at",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(position.x),
+                    json!(position.y),
+                ],
+            )
+            .await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
 
     /// Remove entity by unit number
     pub async fn remove_entity(&mut self, unit_number: u32) -> Result<()> {
-        let lua = LuaCommand::remove_entity(&self.agent_id, unit_number);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "remove_entity",
+                &[json!(self.agent_id.as_str()), json!(unit_number)],
+            )
+            .await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
 
     /// Rotate entity to a new direction
     pub async fn rotate_entity(&mut self, unit_number: u32, direction: u8) -> Result<()> {
-        let lua = LuaCommand::rotate_entity(unit_number, direction);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("rotate_entity", &[json!(unit_number), json!(direction)])
+            .await?;
         if response.contains("error") {
             anyhow::bail!("Failed to rotate entity: {}", response);
         }
@@ -821,8 +1141,17 @@ impl FactorioClient {
         count: u32,
         inventory_type: &str,
     ) -> Result<()> {
-        let lua = LuaCommand::insert_items(unit_number, item, count, inventory_type);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "insert_items",
+                &[
+                    json!(unit_number),
+                    json!(item),
+                    json!(count),
+                    json!(inventory_type),
+                ],
+            )
+            .await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
@@ -835,9 +1164,18 @@ impl FactorioClient {
         count: u32,
         inventory_type: &str,
     ) -> Result<u32> {
-        let lua =
-            LuaCommand::extract_items(&self.agent_id, unit_number, item, count, inventory_type);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "extract_items",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    json!(item),
+                    json!(count),
+                    json!(inventory_type),
+                ],
+            )
+            .await?;
 
         #[derive(serde::Deserialize)]
         struct ExtractResult {
@@ -858,8 +1196,9 @@ impl FactorioClient {
 
     /// Set recipe on an assembling machine
     pub async fn set_recipe(&mut self, unit_number: u32, recipe: &str) -> Result<()> {
-        let lua = LuaCommand::set_recipe(unit_number, recipe);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("set_recipe", &[json!(unit_number), json!(recipe)])
+            .await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
@@ -871,21 +1210,26 @@ impl FactorioClient {
         count: u32,
         dry_run: bool,
     ) -> Result<serde_json::Value> {
-        let lua = LuaCommand::feed_lab_from_inventory(
-            &self.agent_id,
-            lab_unit_number,
-            science_pack,
-            count,
-            dry_run,
-        );
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "feed_lab_from_inventory",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(lab_unit_number),
+                    json!(science_pack),
+                    json!(count),
+                    json!(dry_run),
+                ],
+            )
+            .await?;
         Ok(serde_json::from_str(&response)?)
     }
 
     /// Check if a technology has been researched
     pub async fn is_tech_researched(&mut self, tech_name: &str) -> Result<bool> {
-        let lua = LuaCommand::is_tech_researched(tech_name);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("is_tech_researched", &[json!(tech_name)])
+            .await?;
         #[derive(serde::Deserialize)]
         struct TechState {
             researched: bool,
@@ -903,14 +1247,19 @@ impl FactorioClient {
         direction: Direction,
         belt_type: &str, // "input" for entry, "output" for exit
     ) -> Result<Entity> {
-        let lua = LuaCommand::place_underground_belt(
-            &self.agent_id,
-            entity_name,
-            position,
-            direction,
-            belt_type,
-        );
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "place_underground_belt",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(entity_name),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(direction.to_factorio()),
+                    json!(belt_type),
+                ],
+            )
+            .await?;
         // Check for error response
         if response.contains("\"error\"") {
             #[derive(serde::Deserialize)]
@@ -928,24 +1277,21 @@ impl FactorioClient {
 
     /// Pause the game
     pub async fn pause_game(&mut self) -> Result<()> {
-        let lua = LuaCommand::set_tick_paused(true);
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("set_tick_paused", &[json!(true)]).await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
 
     /// Resume the game
     pub async fn resume_game(&mut self) -> Result<()> {
-        let lua = LuaCommand::set_tick_paused(false);
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("set_tick_paused", &[json!(false)]).await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
 
     /// Set game speed
     pub async fn set_game_speed(&mut self, speed: f64) -> Result<()> {
-        let lua = LuaCommand::set_game_speed(speed);
-        let response = self.execute_lua(&lua).await?;
+        let response = self.call_remote("set_game_speed", &[json!(speed)]).await?;
         ensure_lua_success(&response)?;
         Ok(())
     }
@@ -1003,8 +1349,9 @@ impl FactorioClient {
 
     /// Get character's current position (uses first connected player or spawned character)
     pub async fn get_character_position(&mut self) -> Result<Position> {
-        let lua = LuaCommand::get_character_position(&self.agent_id);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote("get_character_pos", &[json!(self.agent_id.as_str())])
+            .await?;
         let parts: Vec<&str> = response.trim().split(',').collect();
         if parts.len() != 2 {
             anyhow::bail!("No character available");
@@ -1103,10 +1450,16 @@ impl FactorioClient {
         let start_pos = self.get_character_position().await?;
         let mut last_pos = start_pos;
 
-        let target_lua = LuaCommand::set_walk_target(&self.agent_id, target);
-        let clear_lua = LuaCommand::clear_walk_target(&self.agent_id);
-        let active_lua = LuaCommand::walk_target_active(&self.agent_id);
-        let target_response = self.execute_lua(&target_lua).await?;
+        let target_response = self
+            .call_remote(
+                "set_walk_target",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(target.x),
+                    json!(target.y),
+                ],
+            )
+            .await?;
         ensure_lua_success(&target_response)?;
 
         for _ in 0..500 {
@@ -1114,7 +1467,8 @@ impl FactorioClient {
             total_distance += pos.distance(&last_pos);
 
             if pos.distance(&target) < 3.0 {
-                self.execute_lua(&clear_lua).await?;
+                self.call_remote("clear_walk_target", &[json!(self.agent_id.as_str())])
+                    .await?;
                 return Ok(WalkResult {
                     arrived: true,
                     final_position: pos,
@@ -1123,7 +1477,9 @@ impl FactorioClient {
                 });
             }
 
-            let target_active = self.execute_lua(&active_lua).await?;
+            let target_active = self
+                .call_remote("has_walk_target", &[json!(self.agent_id.as_str())])
+                .await?;
             if target_active.trim() != "true" {
                 return Ok(WalkResult {
                     arrived: pos.distance(&target) < 3.0,
@@ -1137,7 +1493,8 @@ impl FactorioClient {
             tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
         }
 
-        self.execute_lua(&clear_lua).await?;
+        self.call_remote("clear_walk_target", &[json!(self.agent_id.as_str())])
+            .await?;
         let pos = self.get_character_position().await?;
         Ok(WalkResult {
             arrived: false,
@@ -1158,8 +1515,16 @@ impl FactorioClient {
         let mut gathered = 0u32;
 
         for _ in 0..amount {
-            let find_lua = LuaCommand::find_nearest_minable(&self.agent_id, resource_name, radius);
-            let response = self.execute_lua(&find_lua).await?;
+            let response = self
+                .call_remote(
+                    "find_nearest_minable",
+                    &[
+                        json!(self.agent_id.as_str()),
+                        json!(resource_name),
+                        json!(radius),
+                    ],
+                )
+                .await?;
             let nearest: NearestMinableResponse = serde_json::from_str(&response)?;
             if let Some(error) = nearest.error {
                 anyhow::bail!(error);
@@ -1203,15 +1568,24 @@ impl FactorioClient {
         drill_type: &str,
         direction: &str,
     ) -> Result<BuildResult> {
-        let lua = LuaCommand::build_drill_array(
-            &self.agent_id,
-            count,
-            resource,
-            near,
-            drill_type,
-            direction,
-        );
-        let response = self.execute_lua(&lua).await?;
+        let (near_x, near_y) = match near {
+            Some((x, y)) => (json!(x), json!(y)),
+            None => (Value::Null, Value::Null),
+        };
+        let response = self
+            .call_remote(
+                "build_drill_array",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(count),
+                    json!(resource),
+                    near_x,
+                    near_y,
+                    json!(drill_type),
+                    json!(direction),
+                ],
+            )
+            .await?;
         let result: BuildResult = serde_json::from_str(&response)?;
         Ok(result)
     }
@@ -1225,15 +1599,20 @@ impl FactorioClient {
         line_direction: &str,
         spacing: u32,
     ) -> Result<BuildResult> {
-        let lua = LuaCommand::build_smelter_line(
-            &self.agent_id,
-            count,
-            start,
-            furnace_type,
-            line_direction,
-            spacing,
-        );
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "build_smelter_line",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(count),
+                    json!(start.0),
+                    json!(start.1),
+                    json!(furnace_type),
+                    json!(line_direction),
+                    json!(spacing),
+                ],
+            )
+            .await?;
         let result: BuildResult = serde_json::from_str(&response)?;
         Ok(result)
     }
@@ -1282,16 +1661,34 @@ impl FactorioClient {
 
     /// Get items on transport belts in an area
     pub async fn get_belt_contents(&mut self, area: Area) -> Result<BeltContentsResult> {
-        let lua = LuaCommand::get_belt_contents(area);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "get_belt_contents",
+                &[
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                ],
+            )
+            .await?;
         let result: BeltContentsResult = serde_json::from_str(&response)?;
         Ok(result)
     }
 
     /// Get items on transport belts with lane separation
     pub async fn get_belt_lane_contents(&mut self, area: Area) -> Result<BeltLaneContentsResult> {
-        let lua = LuaCommand::get_belt_lane_contents(area);
-        let response = self.execute_lua(&lua).await?;
+        let response = self
+            .call_remote(
+                "get_belt_lane_contents",
+                &[
+                    json!(area.left_top.x),
+                    json!(area.left_top.y),
+                    json!(area.right_bottom.x),
+                    json!(area.right_bottom.y),
+                ],
+            )
+            .await?;
 
         // Parse the raw belt data
         #[derive(serde::Deserialize)]
@@ -1404,6 +1801,51 @@ fn entity_collision_padding(entity_name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_command_uses_json_envelope_with_explicit_arg_count() {
+        let command = claude_command(
+            "example",
+            &[
+                json!("quote \" and newline\n kept"),
+                Value::Null,
+                json!("unicode \u{2603}"),
+            ],
+        );
+
+        let payload = command
+            .strip_prefix("/claude ")
+            .expect("remote commands should use the /claude console command");
+        let parsed: Value = serde_json::from_str(payload).expect("command payload should be JSON");
+        assert_eq!(parsed["fn"], "example");
+        assert_eq!(parsed["n"], 3);
+        assert_eq!(parsed["args"][0], "quote \" and newline\n kept");
+        assert!(parsed["args"][1].is_null());
+        assert_eq!(parsed["args"][2], "unicode \u{2603}");
+        assert!(
+            !command.contains("remote.call") && !command.contains("/silent-command"),
+            "normal remote requests should not generate Lua"
+        );
+    }
+
+    #[test]
+    fn old_mod_claude_command_skew_returns_structured_sync_error() {
+        let response = old_mod_claude_command_skew_response(
+            "get_tick",
+            "Unknown command \"claude\". Type /help for more help.",
+        )
+        .expect("unknown /claude command should be classified as old mod skew");
+        let parsed: Value = serde_json::from_str(&response).expect("skew response should be JSON");
+        assert_eq!(parsed["success"], false);
+        assert_eq!(parsed["error_kind"], "unknown_function");
+        assert_eq!(parsed["action_needed"], "sync_or_restart_mod");
+        assert!(parsed["error"]
+            .as_str()
+            .expect("error should be a string")
+            .contains("get_tick"));
+
+        assert!(old_mod_claude_command_skew_response("get_tick", "pong").is_none());
+    }
 
     #[test]
     fn mutating_lua_response_errors_are_promoted_to_rust_errors() {

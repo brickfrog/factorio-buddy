@@ -1,7 +1,7 @@
 use factorioctl::client::lua::LuaCommand;
 use factorioctl::client::AgentId;
 use factorioctl::world::{Area, Direction, Position};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 struct LuaCase {
@@ -18,6 +18,37 @@ impl LuaCase {
         assert_no_same_line_trailing_comments(self.name, &self.lua);
         assert_balanced_double_quotes(self.name, &self.lua);
     }
+}
+
+fn remote_request(command: &str) -> Value {
+    let request = command
+        .strip_prefix("/claude ")
+        .unwrap_or_else(|| panic!("expected /claude command envelope, got:\n{command}"));
+    serde_json::from_str(request).expect("remote request envelope should be JSON")
+}
+
+fn remote_args(command: &str) -> Vec<Value> {
+    remote_request(command)["args"]
+        .as_array()
+        .expect("request args should be an array")
+        .clone()
+}
+
+fn assert_remote_request(name: &str, command: &str, method: &str) {
+    let request = remote_request(command);
+    assert_eq!(
+        request["fn"].as_str(),
+        Some(method),
+        "{name} should target remote {method:?}:\n{command}"
+    );
+    let args = request["args"]
+        .as_array()
+        .expect("request args should be an array");
+    assert_eq!(
+        request["n"].as_u64(),
+        Some(args.len() as u64),
+        "{name} should include explicit n matching args length:\n{command}"
+    );
 }
 
 fn pos(x: f64, y: f64) -> Position {
@@ -82,15 +113,18 @@ fn rust_wrapper_remote_names() -> BTreeSet<String> {
 fn control_lua_remote_signatures() -> BTreeMap<String, Vec<String>> {
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
     let mut signatures = BTreeMap::new();
-    let mut in_interface = false;
+    let mut in_api = false;
     for line in control_lua.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with(r#"remote.add_interface("claude_interface""#) {
-            in_interface = true;
+        if trimmed == "local api = {" {
+            in_api = true;
             continue;
         }
-        if !in_interface {
+        if !in_api {
             continue;
+        }
+        if trimmed == "}" {
+            break;
         }
         let Some((name, rest)) = trimmed.split_once(" = function(") else {
             continue;
@@ -107,6 +141,39 @@ fn control_lua_remote_signatures() -> BTreeMap<String, Vec<String>> {
         signatures.insert(name.to_string(), args);
     }
     signatures
+}
+
+fn lifecycle_remote_names() -> BTreeSet<String> {
+    [
+        "clear_chat",
+        "connected_player_count",
+        "connected_player_count_result",
+        "ensure_surface",
+        "ensure_surface_result",
+        "eval_production_snapshot",
+        "get_character",
+        "has_walk_target",
+        "inject_message",
+        "list_characters",
+        "live_state_line",
+        "live_state_result",
+        "ping",
+        "pre_place_character",
+        "pre_place_character_result",
+        "queue_rotate",
+        "receive_response",
+        "register_agent",
+        "register_character",
+        "set_spectator_mode",
+        "set_status",
+        "set_walk",
+        "stop_walk",
+        "tool_status",
+        "unregister_agent",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn all_lua_cases() -> Vec<LuaCase> {
@@ -536,12 +603,17 @@ fn remote_api_manifest_matches_rust_wrappers_and_mod_exports() {
     let manifest = manifest_remotes();
     let manifest_names = manifest.keys().cloned().collect::<BTreeSet<_>>();
     let wrapper_names = rust_wrapper_remote_names();
+    let lifecycle_names = lifecycle_remote_names();
     let control_signatures = control_lua_remote_signatures();
     let control_names = control_signatures.keys().cloned().collect::<BTreeSet<_>>();
 
     assert_eq!(
-        wrapper_names, manifest_names,
-        "Every Rust claude_interface_json_call wrapper should be represented in remote_api.json"
+        wrapper_names
+            .union(&lifecycle_names)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        manifest_names,
+        "remote_api.json should cover Rust wrappers plus bridge lifecycle remotes"
     );
 
     for name in &manifest_names {
@@ -563,7 +635,8 @@ fn mod_json_response_helper_lives_in_domain_module() {
     let json_response_lua = include_str!("../companion/mod/claude-interface/json_response.lua");
 
     assert!(
-        control_lua.contains(r#"require("json_response").remote_call"#),
+        control_lua.contains(r#"local json_response = require("json_response")"#)
+            && control_lua.contains("local json_remote_call = json_response.remote_call"),
         "control.lua should import the shared JSON remote-call helper"
     );
     assert!(
@@ -576,6 +649,38 @@ fn mod_json_response_helper_lives_in_domain_module() {
             && json_response_lua.contains("success = false")
             && json_response_lua.contains("helpers.table_to_json(result_or_error)"),
         "json_response.lua should own the remote JSON wrapper and keep pcall failures typed"
+    );
+}
+
+#[test]
+fn claude_command_dispatcher_uses_shared_api_and_structured_errors() {
+    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let json_response_lua = include_str!("../companion/mod/claude-interface/json_response.lua");
+
+    assert!(
+        control_lua.contains("local api = {")
+            && control_lua.contains(r#"remote.add_interface("claude_interface", api)"#)
+            && control_lua.contains(r#"commands.add_command("claude""#),
+        "control.lua should expose the same api table via remote interface and /claude command"
+    );
+    assert!(
+        control_lua.contains("pcall(helpers.json_to_table, cmd.parameter or \"\")")
+            && control_lua.contains("local handler = api[request.fn]")
+            && control_lua.contains("table.unpack(args, 1, n)"),
+        "/claude dispatcher should parse one JSON envelope and preserve nil holes via explicit n"
+    );
+    assert!(
+        control_lua.contains(r#"json_response.error("bad_request""#)
+            && control_lua.contains(r#"json_response.error("unknown_function""#)
+            && control_lua.contains(r#"json_response.error("lua_error""#)
+            && control_lua.contains("action_needed = \"sync_or_restart_mod\""),
+        "/claude dispatcher should return structured request/skew/lua errors"
+    );
+    assert!(
+        json_response_lua.contains("function M.error(error_kind, message, extra)")
+            && json_response_lua.contains("result.error_kind = error_kind")
+            && json_response_lua.contains("result.success = false"),
+        "json_response.error should produce the structured error_kind envelope"
     );
 }
 
@@ -621,13 +726,7 @@ fn transport_line_readers_document_factorio_2_object_array_shape() {
             "get_belt_lane_contents",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
 
         for forbidden in [
             "get_transport_line",
@@ -673,10 +772,8 @@ fn named_walk_routes_to_mod_target_without_host_driver_state() {
         ("walk_character", walk_character.as_str()),
         ("walk_target", walk_target.as_str()),
     ] {
-        assert!(
-            lua.contains(r#"remote.call("claude_interface", "set_walk_target", "doug", 12, 13)"#),
-            "{name} should route movement through the mod target backend"
-        );
+        assert_remote_request(name, lua, "set_walk_target");
+        assert_eq!(remote_args(lua), vec![json!("doug"), json!(12), json!(13)]);
         for forbidden in [
             "storage.factorioctl_walk_targets",
             "walking_state",
@@ -719,11 +816,8 @@ fn research_readiness_counts_resolved_character_science_in_totals() {
 fn get_entity_inventory_uses_factorio_2_object_array_for_cjf_2() {
     let lua = LuaCommand::get_entity_inventory(42);
 
-    assert!(
-        lua.contains(r#"remote.interfaces["claude_interface"]["get_entity_inventory"]"#)
-            && lua.contains(r#"remote.call("claude_interface", "get_entity_inventory", 42)"#),
-        "get_entity_inventory should be a small guarded mod remote call:\n{lua}"
-    );
+    assert_remote_request("get_entity_inventory", &lua, "get_entity_inventory");
+    assert_eq!(remote_args(&lua), vec![json!(42)]);
     for forbidden in [
         "inv.get_contents()",
         "storage.factorioctl_entities[",
@@ -788,13 +882,7 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
         ("get_tiles", LuaCommand::get_tiles(area()), "get_tiles"),
         ("get_tile", LuaCommand::get_tile(pos(7.0, 8.0)), "get_tile"),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
 
         for forbidden in [
             "game.surfaces",
@@ -810,6 +898,45 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
                 "{name} Rust wrapper should not embed heavy Lua {forbidden:?}:\n{lua}"
             );
         }
+    }
+
+    let client_mod = include_str!("../src/client/mod.rs");
+    for forbidden in [
+        "let lua = LuaCommand::get_surfaces();",
+        "let lua = LuaCommand::find_entities(area, entity_type, name);",
+        "let lua = LuaCommand::get_entity(unit_number);",
+        "let lua = LuaCommand::get_entity_inventory(unit_number);",
+        "let lua = LuaCommand::verify_production(area);",
+        "let lua = LuaCommand::diagnose_factory_blockers(area, limit);",
+        "let lua = LuaCommand::diagnose_fuel_sustainability(area, limit);",
+        "let lua = LuaCommand::find_resources(area, resource_type);",
+        "let lua = LuaCommand::find_nearest_resource(resource_name, from);",
+        "let lua = LuaCommand::get_tiles(area);",
+        "let lua = LuaCommand::get_tile(position);",
+    ] {
+        assert!(
+            !client_mod.contains(forbidden),
+            "FactorioClient observation queries should call /claude directly, not generated Lua {forbidden:?}"
+        );
+    }
+    for required in [
+        r#"self.call_remote("get_surfaces", &[])"#,
+        r#"call_remote("#,
+        r#""find_entities""#,
+        r#""get_entity""#,
+        r#""get_entity_inventory""#,
+        r#""verify_production""#,
+        r#""diagnose_factory_blockers""#,
+        r#""diagnose_fuel_sustainability""#,
+        r#""find_resources""#,
+        r#""find_nearest_resource""#,
+        r#""get_tiles""#,
+        r#""get_tile""#,
+    ] {
+        assert!(
+            client_mod.contains(required),
+            "FactorioClient observation queries should retain direct /claude call marker {required:?}"
+        );
     }
 
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
@@ -901,12 +1028,12 @@ fn entity_lookup_and_drop_position_live_in_the_mod_not_rust_strings() {
     );
 
     let drop_lua = LuaCommand::get_entity_drop_position(42);
-    assert!(
-        drop_lua.contains(r#"remote.interfaces["claude_interface"]["get_entity_drop_position"]"#)
-            && drop_lua
-                .contains(r#"remote.call("claude_interface", "get_entity_drop_position", 42)"#),
-        "get_entity_drop_position should be a small guarded mod remote call:\n{drop_lua}"
+    assert_remote_request(
+        "get_entity_drop_position",
+        &drop_lua,
+        "get_entity_drop_position",
     );
+    assert_eq!(remote_args(&drop_lua), vec![json!(42)]);
     for forbidden in [
         "local dp",
         ".drop_position",
@@ -922,10 +1049,11 @@ fn entity_lookup_and_drop_position_live_in_the_mod_not_rust_strings() {
 
     let mcp_rs = include_str!("../src/bin/mcp.rs");
     assert!(
-        mcp_rs.contains("LuaCommand::get_entity_drop_position(params.unit_number)")
+        mcp_rs.contains(r#"call_remote("#)
+            && mcp_rs.contains(r#""get_entity_drop_position""#)
             && !mcp_rs.contains("fn drill_drop_position_lua")
             && !mcp_rs.contains("LuaCommand::entity_lookup"),
-        "MCP drill belt-position helper should call the mod remote, not build Lua locally"
+        "MCP drill belt-position helper should call /claude directly, not build Lua locally"
     );
 
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
@@ -971,13 +1099,20 @@ fn entity_lookup_and_drop_position_live_in_the_mod_not_rust_strings() {
 fn bridge_bootstrap_gameplay_lives_in_the_mod_not_python_strings() {
     let transport_py = include_str!("../companion/bridge/transport.py");
     for required in [
-        "RconRemoteCall.command",
-        "ensure_surface_result",
-        "pre_place_character_result",
+        "def send_chat_response(",
+        "def ensure_surface(",
+        "def place_character(",
+        "def ping(",
     ] {
         assert!(
             transport_py.contains(required),
-            "bridge transport should call the mod remote through the RconRemoteCall builder {required:?}"
+            "bridge transport should expose Rust MCP lifecycle wrapper {required:?}"
+        );
+    }
+    for forbidden in ["RconRemoteCall", "from rcon", "command_to_tool_call"] {
+        assert!(
+            !transport_py.contains(forbidden),
+            "bridge transport should not render requests or import Python RCON {forbidden:?}"
         );
     }
     for forbidden in [
@@ -1044,20 +1179,49 @@ fn bridge_bootstrap_gameplay_lives_in_the_mod_not_python_strings() {
 }
 
 #[test]
+fn lifecycle_remotes_have_thin_rust_mcp_wrappers() {
+    let mcp_rs = include_str!("../src/bin/mcp.rs");
+    for (tool, remote) in [
+        ("send_chat_response", "receive_response"),
+        ("tool_status", "tool_status"),
+        ("set_status", "set_status"),
+        ("register_agent", "register_agent"),
+        ("unregister_agent", "unregister_agent"),
+        ("ensure_surface", "ensure_surface_result"),
+        ("place_character", "pre_place_character_result"),
+        ("set_spectator_mode", "set_spectator_mode"),
+        ("ping", "ping"),
+        ("live_state", "live_state_result"),
+        ("connected_player_count", "connected_player_count_result"),
+        ("eval_production_snapshot", "eval_production_snapshot"),
+    ] {
+        assert!(
+            mcp_rs.contains(&format!("async fn {tool}"))
+                && mcp_rs.contains(&format!("\"{remote}\"")),
+            "MCP lifecycle tool {tool:?} should call mod remote {remote:?}"
+        );
+    }
+}
+
+#[test]
 fn bridge_live_state_gameplay_lives_in_the_mod_not_python_strings() {
     let pipe_py = include_str!("../companion/bridge/pipe.py");
     assert!(
-        pipe_py.contains("RconRemoteCall.command")
-            && pipe_py.contains("live_state_result")
+        pipe_py.contains(".live_state(")
             && pipe_py.contains("LiveState.from_rcon_response"),
-        "bridge live-state probe should call the typed JSON mod remote through the RconRemoteCall builder"
+        "bridge live-state probe should call the typed JSON mod remote through the Rust MCP lifecycle client"
     );
     assert!(
-        pipe_py.contains("RconRemoteCall.command")
-            && pipe_py.contains("connected_player_count_result")
+        pipe_py.contains(".connected_player_count()")
             && pipe_py.contains("ConnectedPlayerCountResult.from_rcon_response"),
-        "bridge human-connected probe should call the typed JSON mod remote through the RconRemoteCall builder"
+        "bridge human-connected probe should call the typed JSON mod remote through the Rust MCP lifecycle client"
     );
+    for forbidden in ["RconRemoteCall", "from rcon", "ThreadSafeRCON"] {
+        assert!(
+            !pipe_py.contains(forbidden),
+            "bridge live-state probe should not import or render Python RCON requests {forbidden:?}"
+        );
+    }
     for forbidden in [
         "c.surface.find_entities_filtered",
         "#game.connected_players",
@@ -1137,13 +1301,7 @@ fn broadcast_display_gameplay_lives_in_the_mod_not_cli_or_mcp_strings() {
             "broadcast_flying_text",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
         for forbidden in ["game.print", "game.players[1]", "create_local_flying_text"] {
             assert!(
                 !lua.contains(forbidden),
@@ -1154,13 +1312,13 @@ fn broadcast_display_gameplay_lives_in_the_mod_not_cli_or_mcp_strings() {
 
     let say_rs = include_str!("../src/cli/say.rs");
     let mcp_rs = include_str!("../src/bin/mcp.rs");
-    for required in [
-        "LuaCommand::broadcast_console",
-        "LuaCommand::broadcast_flying_text",
-    ] {
+    for required in ["broadcast_console", "broadcast_flying_text"] {
         assert!(
-            say_rs.contains(required) && mcp_rs.contains(required),
-            "CLI and MCP broadcast paths should use wrapper {required:?}"
+            say_rs.contains("call_remote(")
+                && say_rs.contains(required)
+                && mcp_rs.contains("call_remote(")
+                && mcp_rs.contains(required),
+            "CLI and MCP broadcast paths should call /claude directly {required:?}"
         );
     }
     for forbidden in [
@@ -1206,13 +1364,7 @@ fn tick_control_gameplay_lives_in_the_mod_not_rust_strings() {
             "set_game_speed",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
         for forbidden in ["rcon.print(game.tick)", "game.tick_paused", "game.speed"] {
             assert!(
                 !lua.contains(forbidden),
@@ -1233,17 +1385,32 @@ fn tick_control_gameplay_lives_in_the_mod_not_rust_strings() {
             "FactorioClient tick control should not embed direct Lua {forbidden:?}"
         );
     }
+    for forbidden in [
+        "let lua = LuaCommand::get_tick();",
+        "let lua = LuaCommand::set_tick_paused(true);",
+        "let lua = LuaCommand::set_tick_paused(false);",
+        "let lua = LuaCommand::set_game_speed(speed);",
+    ] {
+        assert!(
+            !client_mod.contains(forbidden),
+            "FactorioClient tick control should use the /claude remote primitive, not generated Lua {forbidden:?}"
+        );
+    }
     for required in [
-        "LuaCommand::get_tick()",
-        "LuaCommand::set_tick_paused(true)",
-        "LuaCommand::set_tick_paused(false)",
-        "LuaCommand::set_game_speed(speed)",
+        r#"self.call_remote("get_tick", &[])"#,
+        r#"self.call_remote("set_tick_paused", &[json!(true)])"#,
+        r#"self.call_remote("set_tick_paused", &[json!(false)])"#,
+        r#"self.call_remote("set_game_speed", &[json!(speed)])"#,
     ] {
         assert!(
             client_mod.contains(required),
-            "FactorioClient tick control should use wrapper {required:?}"
+            "FactorioClient tick control should call /claude directly with typed JSON args {required:?}"
         );
     }
+    assert!(
+        client_mod.contains("use serde_json::{json, Value};"),
+        "FactorioClient get_tick should use the /claude remote primitive, not generated Lua"
+    );
 
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
     for required in [
@@ -1260,6 +1427,55 @@ fn tick_control_gameplay_lives_in_the_mod_not_rust_strings() {
         assert!(
             control_lua.contains(required),
             "control.lua tick-control remotes should include {required:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_production_paths_do_not_use_generated_lua_remotes() {
+    for (path, source) in [
+        ("src/client/mod.rs", include_str!("../src/client/mod.rs")),
+        ("src/bin/mcp.rs", include_str!("../src/bin/mcp.rs")),
+        ("src/cli/say.rs", include_str!("../src/cli/say.rs")),
+        (
+            "src/cli/research.rs",
+            include_str!("../src/cli/research.rs"),
+        ),
+        ("src/cli/power.rs", include_str!("../src/cli/power.rs")),
+        ("src/cli/map.rs", include_str!("../src/cli/map.rs")),
+    ] {
+        assert!(
+            !source.contains("LuaCommand::"),
+            "{path} normal remote path should not use generated Lua builders"
+        );
+        assert!(
+            !source.contains("execute_lua(&lua)")
+                && !source.contains("execute_lua(&register_lua)")
+                && !source.contains("execute_lua(&fetch_lua)")
+                && !source.contains("execute_lua(&research_lua)")
+                && !source.contains("execute_lua(&find_lua)")
+                && !source.contains("execute_lua(&target_lua)")
+                && !source.contains("execute_lua(&active_lua)")
+                && !source.contains("execute_lua(&clear_lua)"),
+            "{path} normal remote path should use call_remote, not execute generated Lua"
+        );
+    }
+
+    for (path, source, allowed) in [
+        (
+            "src/cli/exec.rs",
+            include_str!("../src/cli/exec.rs"),
+            "execute_lua(&cmd.lua)",
+        ),
+        (
+            "src/bin/mcp.rs",
+            include_str!("../src/bin/mcp.rs"),
+            "execute_lua(&params.lua)",
+        ),
+    ] {
+        assert!(
+            source.contains(allowed),
+            "{path} should keep only its explicit raw-Lua escape hatch"
         );
     }
 }
@@ -1298,13 +1514,7 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
             "set_recipe",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
 
         for forbidden in [
             "storage.factorioctl_entities[",
@@ -1322,6 +1532,44 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
                 "{name} Rust wrapper should not embed heavy Lua {forbidden:?}:\n{lua}"
             );
         }
+    }
+
+    let client_mod = include_str!("../src/client/mod.rs");
+    for forbidden in [
+        "let lua = LuaCommand::init_character(&self.agent_id, x, y);",
+        "let lua = LuaCommand::teleport_character(&self.agent_id, position);",
+        "let lua = LuaCommand::walk_character(&self.agent_id, position);",
+        "let lua = LuaCommand::character_status(&self.agent_id);",
+        "let lua = LuaCommand::character_inventory(&self.agent_id);",
+        "let lua = LuaCommand::can_stand_at(&self.agent_id, position, radius);",
+        "let lua = LuaCommand::is_player_blocked(&self.agent_id, radius);",
+        "let lua = LuaCommand::unstuck(&self.agent_id, radius, dry_run);",
+        "let lua = LuaCommand::get_character_position(&self.agent_id);",
+        "let lua = LuaCommand::craft(&self.agent_id, recipe, count);",
+        "let lua = LuaCommand::wait_for_crafting(&self.agent_id);",
+    ] {
+        assert!(
+            !client_mod.contains(forbidden),
+            "FactorioClient character/crafting methods should call /claude directly, not generated Lua {forbidden:?}"
+        );
+    }
+    for required in [
+        r#""init_character""#,
+        r#""teleport_character""#,
+        r#""set_walk_target""#,
+        r#""character_status""#,
+        r#""character_inventory""#,
+        r#""can_stand_at""#,
+        r#""is_player_blocked""#,
+        r#""unstuck""#,
+        r#""get_character_pos""#,
+        r#""craft""#,
+        r#""wait_for_crafting""#,
+    ] {
+        assert!(
+            client_mod.contains(required),
+            "FactorioClient character/crafting methods should retain direct /claude marker {required:?}"
+        );
     }
 
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
@@ -1362,9 +1610,10 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
     );
 
     let init_lua = LuaCommand::init_character(&named_agent(), 0.0, 0.0);
-    assert!(
-        init_lua.contains(r#"remote.call("claude_interface", "init_character", "doug", 0, 0)"#),
-        "init_character should be a small guarded mod remote call:\n{init_lua}"
+    assert_remote_request("init_character", &init_lua, "init_character");
+    assert_eq!(
+        remote_args(&init_lua),
+        vec![json!("doug"), json!(0), json!(0)]
     );
     assert!(
         control_lua.contains("local remember_factorioctl_character = characters.remember")
@@ -1432,13 +1681,7 @@ fn blueprint_commands_are_agent_scoped_for_cjf_11() {
             "delete_blueprint",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
 
         for forbidden in [
             "storage.factorioctl_characters",
@@ -1494,9 +1737,9 @@ fn chat_fetch_uses_mod_remote_without_level_storage_fallback() {
     let register_lua = LuaCommand::register_chat_handler();
     let lua = LuaCommand::get_and_clear_chat_messages();
 
-    assert!(register_lua.contains(r#"remote.call("claude_interface", "chat_capture_status")"#));
+    assert_remote_request("chat_capture_status", &register_lua, "chat_capture_status");
     assert!(!register_lua.contains(r#"rcon.print("registered")"#));
-    assert!(lua.contains(r#"remote.call("claude_interface", "get_chat_messages")"#));
+    assert_remote_request("get_chat_messages", &lua, "get_chat_messages");
     assert!(!lua.contains("storage.factorioctl_chat"));
     assert!(!lua.contains("handler_registered"));
 
@@ -1511,14 +1754,13 @@ fn named_walk_poll_loop_exits_when_driver_clears_target() {
     let active_lua = LuaCommand::walk_target_active(&named_agent());
 
     assert!(
-        client_mod.contains("walk_target_active") && client_mod.contains("Walk target cleared"),
+        client_mod.contains(r#"call_remote("has_walk_target""#)
+            && client_mod.contains(r#"call_remote("clear_walk_target""#)
+            && client_mod.contains("Walk target cleared"),
         "named walk_to should poll the shared driver target and exit when it has been cleared"
     );
-    assert!(
-        active_lua.contains(r#"remote.call("claude_interface", "has_walk_target""#)
-            && active_lua.contains(r#"rcon.print("false")"#),
-        "walk_target_active should query the mod target backend and fail closed without it"
-    );
+    assert_remote_request("walk_target_active", &active_lua, "has_walk_target");
+    assert_eq!(remote_args(&active_lua), vec![json!("doug")]);
     assert!(
         !active_lua.contains("storage.factorioctl_walk_targets"),
         "Rust should not keep a fallback walk-target table after the mod backend is required"
@@ -1579,13 +1821,7 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
             "wait_for_crafting",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
 
         for forbidden in [
             "storage.factorioctl_characters",
@@ -1787,13 +2023,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             "place_underground_belt",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
 
         for forbidden in [
             "storage.factorioctl_characters",
@@ -1950,13 +2180,7 @@ fn build_helpers_live_in_the_mod_not_rust_strings() {
             "build_smelter_line",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
 
         for forbidden in [
             "storage.factorioctl_characters",
@@ -2005,17 +2229,8 @@ fn build_helpers_live_in_the_mod_not_rust_strings() {
 fn steam_power_diagnostic_uses_mod_remote_not_inline_lua() {
     let lua = LuaCommand::diagnose_steam_power(-25, 50, 20);
 
-    assert!(
-        lua.contains(r#"remote.interfaces["claude_interface"]["diagnose_steam_power"]"#)
-            && lua.contains(
-                r#"remote.call("claude_interface", "diagnose_steam_power", -25, 50, 20)"#
-            ),
-        "diagnose_steam_power should be a small guarded mod remote call:\n{lua}"
-    );
-    assert!(
-        lua.contains("sync_or_restart_mod"),
-        "diagnose_steam_power should explain an out-of-date mod instead of silently falling back:\n{lua}"
-    );
+    assert_remote_request("diagnose_steam_power", &lua, "diagnose_steam_power");
+    assert_eq!(remote_args(&lua), vec![json!(-25), json!(50), json!(20)]);
     for forbidden in [
         "get_fluid_box_neighbours",
         "get_fluid_box_pipe_connections",
@@ -2037,16 +2252,18 @@ fn steam_power_planner_uses_mod_remote_not_inline_lua() {
         pos(55.0, -2.0),
     );
 
-    assert!(
-        lua.contains(r#"remote.interfaces["claude_interface"]["plan_steam_power"]"#)
-            && lua.contains(
-                r#"remote.call("claude_interface", "plan_steam_power", "doug", -40, 37, -30, 57, 55, -2)"#
-            ),
-        "plan_steam_power should be a small guarded mod remote call:\n{lua}"
-    );
-    assert!(
-        lua.contains("sync_or_restart_mod"),
-        "plan_steam_power should explain an out-of-date mod instead of silently falling back:\n{lua}"
+    assert_remote_request("plan_steam_power", &lua, "plan_steam_power");
+    assert_eq!(
+        remote_args(&lua),
+        vec![
+            json!("doug"),
+            json!(-40),
+            json!(37),
+            json!(-30),
+            json!(57),
+            json!(55),
+            json!(-2),
+        ]
     );
     for forbidden in [
         "surface.can_place_entity",
@@ -2065,16 +2282,17 @@ fn steam_power_planner_uses_mod_remote_not_inline_lua() {
 fn steam_power_repair_uses_mod_remote_not_inline_lua() {
     let lua = LuaCommand::repair_steam_power(&named_agent(), -25, 50, 20, pos(55.0, -2.0));
 
-    assert!(
-        lua.contains(r#"remote.interfaces["claude_interface"]["repair_steam_power"]"#)
-            && lua.contains(
-                r#"remote.call("claude_interface", "repair_steam_power", "doug", -25, 50, 20, 55, -2)"#
-            ),
-        "repair_steam_power should be a small guarded mod remote call:\n{lua}"
-    );
-    assert!(
-        lua.contains("sync_or_restart_mod"),
-        "repair_steam_power should explain an out-of-date mod instead of silently falling back:\n{lua}"
+    assert_remote_request("repair_steam_power", &lua, "repair_steam_power");
+    assert_eq!(
+        remote_args(&lua),
+        vec![
+            json!("doug"),
+            json!(-25),
+            json!(50),
+            json!(20),
+            json!(55),
+            json!(-2)
+        ]
     );
     for forbidden in [
         "surface.find_entities_filtered",
@@ -2093,16 +2311,17 @@ fn steam_power_repair_uses_mod_remote_not_inline_lua() {
 fn power_extension_uses_mod_remote_not_inline_lua() {
     let lua = LuaCommand::extend_power_to(&named_agent(), 0, 0, 20, pos(2.0, 0.0));
 
-    assert!(
-        lua.contains(r#"remote.interfaces["claude_interface"]["extend_power_to"]"#)
-            && lua.contains(
-                r#"remote.call("claude_interface", "extend_power_to", "doug", 0, 0, 20, 2, 0)"#
-            ),
-        "extend_power_to should be a small guarded mod remote call:\n{lua}"
-    );
-    assert!(
-        lua.contains("sync_or_restart_mod"),
-        "extend_power_to should explain an out-of-date mod instead of silently falling back:\n{lua}"
+    assert_remote_request("extend_power_to", &lua, "extend_power_to");
+    assert_eq!(
+        remote_args(&lua),
+        vec![
+            json!("doug"),
+            json!(0),
+            json!(0),
+            json!(20),
+            json!(2),
+            json!(0)
+        ]
     );
     for forbidden in [
         "surface.find_entities_filtered",
@@ -2191,17 +2410,7 @@ fn power_diagnostics_use_mod_remote_not_inline_lua() {
             "get_alerts",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
-        assert!(
-            lua.contains("sync_or_restart_mod"),
-            "{name} should explain an out-of-date mod instead of silently falling back:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
         for forbidden in [
             "surface.find_entities_filtered",
             "electric-pole",
@@ -2341,7 +2550,7 @@ fn power_diagnostics_live_in_mod_remote_interface() {
         "find_power_issues = function(x, y, radius)",
         "get_power_coverage = function(x, y, radius)",
         "get_alerts = function(x, y, radius)",
-        r#"require("json_response").remote_call"#,
+        "json_remote_call",
     ] {
         assert!(
             control_lua.contains(required),
@@ -2419,13 +2628,7 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
             "clear_area",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
 
         for forbidden in [
             "storage.factorioctl_characters",
@@ -2441,6 +2644,23 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
                 "{name} Rust wrapper should not embed heavy Lua {forbidden:?}:\n{lua}"
             );
         }
+    }
+
+    let client_mod = include_str!("../src/client/mod.rs");
+    for forbidden in [
+        "let lua = LuaCommand::mine_at(&self.agent_id, position, count);",
+        "let find_lua = LuaCommand::find_nearest_minable(&self.agent_id, entity_type, 100);",
+    ] {
+        assert!(
+            !client_mod.contains(forbidden),
+            "FactorioClient mining methods should call /claude directly, not generated Lua {forbidden:?}"
+        );
+    }
+    for required in [r#""mine_at""#, r#""find_nearest_minable""#] {
+        assert!(
+            client_mod.contains(required),
+            "FactorioClient mining methods should retain direct /claude marker {required:?}"
+        );
     }
 
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
@@ -2485,8 +2705,8 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
 fn gather_resource_reuses_mining_remotes_not_inline_resource_scans() {
     let client_mod = include_str!("../src/client/mod.rs");
     assert!(
-        client_mod
-            .contains("LuaCommand::find_nearest_minable(&self.agent_id, resource_name, radius)")
+        client_mod.contains(r#"call_remote("#)
+            && client_mod.contains(r#""find_nearest_minable""#)
             && client_mod.contains("let mine_result = self.mine_at(target_pos, 1).await?")
             && client_mod.contains("let inv_result = self.character_inventory().await?"),
         "gather_resource should compose existing remote-backed mining and inventory helpers"
@@ -2531,13 +2751,7 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
             "get_prototype",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
         for forbidden in [
             "prototypes.recipe",
             "prototypes.entity",
@@ -2586,13 +2800,7 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
             "is_tech_researched",
         ),
     ] {
-        assert!(
-            lua.contains(&format!(
-                r#"remote.interfaces["claude_interface"]["{}"]"#,
-                method
-            )) && lua.contains(&format!(r#"remote.call("claude_interface", "{}""#, method)),
-            "{name} should be a small guarded mod remote call:\n{lua}"
-        );
+        assert_remote_request(name, &lua, method);
         for forbidden in [
             "force.technologies",
             "find_entities_filtered",
@@ -2605,6 +2813,30 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
                 "{name} Rust wrapper should not embed heavy Lua {forbidden:?}:\n{lua}"
             );
         }
+    }
+
+    let client_mod = include_str!("../src/client/mod.rs");
+    for forbidden in [
+        "let lua = LuaCommand::get_recipe(name);",
+        "let lua = LuaCommand::get_recipes_by_category(category);",
+        "let lua = LuaCommand::get_recipes_for_item(item);",
+        "let lua = LuaCommand::get_prototype(name);",
+    ] {
+        assert!(
+            !client_mod.contains(forbidden),
+            "FactorioClient recipe/prototype queries should call /claude directly, not generated Lua {forbidden:?}"
+        );
+    }
+    for required in [
+        r#"self.call_remote("get_recipe", &[json!(name)])"#,
+        r#"call_remote("get_recipes_by_category", &[json!(category)])"#,
+        r#"call_remote("get_recipes_for_item", &[json!(item)])"#,
+        r#"self.call_remote("get_prototype", &[json!(name)])"#,
+    ] {
+        assert!(
+            client_mod.contains(required),
+            "FactorioClient recipe/prototype queries should retain direct /claude call marker {required:?}"
+        );
     }
 
     let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
@@ -2732,15 +2964,20 @@ fn research_cli_queries_use_mod_remotes_not_inline_lua() {
     let client_mod = include_str!("../src/client/mod.rs");
 
     for required in [
-        "LuaCommand::get_research_status()",
-        "LuaCommand::get_available_research(client.agent_id())",
-        "LuaCommand::feed_lab_from_inventory",
-        "LuaCommand::start_research(&tech)",
-        "LuaCommand::is_tech_researched(tech_name)",
+        "get_research_status",
+        "get_available_research",
+        "start_research",
     ] {
         assert!(
-            research_rs.contains(required) || client_mod.contains(required),
-            "research path should use wrapper {required:?}"
+            (research_rs.contains("call_remote(") && research_rs.contains(required))
+                || (client_mod.contains("call_remote(") && client_mod.contains(required)),
+            "research path should call /claude directly {required:?}"
+        );
+    }
+    for required in [r#""feed_lab_from_inventory""#, r#""is_tech_researched""#] {
+        assert!(
+            client_mod.contains(required),
+            "FactorioClient research helpers should use /claude directly with remote marker {required:?}"
         );
     }
 
@@ -2764,10 +3001,17 @@ fn eval_harness_production_snapshot_lives_in_mod_remote_not_python_lua() {
     let diagnostics_lua = include_str!("../companion/mod/claude-interface/diagnostics.lua");
 
     assert!(
-        eval_py.contains("RconRemoteCall.command")
-            && eval_py.contains("eval_production_snapshot"),
-        "eval harness should query production stats via a mod remote through the RconRemoteCall builder"
+        eval_py.contains("eval_production_snapshot(surface_name=surface)")
+            && eval_py.contains("McpLifecycleClient")
+            && eval_py.contains("find_factorioctl_mcp"),
+        "eval harness should query production stats via the Rust MCP lifecycle client"
     );
+    for forbidden in ["RconRemoteCall", "from rcon"] {
+        assert!(
+            !eval_py.contains(forbidden),
+            "eval harness should not import or render Python RCON requests {forbidden:?}"
+        );
+    }
     for forbidden in [
         "game.surfaces",
         "game.forces.player",
@@ -2843,21 +3087,18 @@ fn agent_id_accepts_and_rejects_spec_vectors() {
 }
 
 #[test]
-fn generated_lua_escapes_hostile_string_arguments_as_single_literals() {
+fn remote_command_preserves_hostile_string_arguments_as_json_values() {
     let hostile_inputs = [
-        ("a\"b", "a\\\"b"),
-        ("a'b", "a\\'b"),
-        ("a\\b", "a\\\\b"),
-        ("a\nb", "a\\nb"),
-        ("a\rb", "a\\rb"),
-        ("a]b", "a]b"),
-        (
-            "\\\"); game.print(\"pwned",
-            "\\\\\\\"); game.print(\\\"pwned",
-        ),
+        "a\"b",
+        "a'b",
+        "a\\b",
+        "a\nb",
+        "a\rb",
+        "a]b",
+        "\\\"); game.print(\"pwned",
     ];
 
-    for (raw, escaped) in hostile_inputs {
+    for raw in hostile_inputs {
         for (case_name, lua) in [
             (
                 "find_entities_name",
@@ -2944,15 +3185,16 @@ fn generated_lua_escapes_hostile_string_arguments_as_single_literals() {
             ),
             ("start_research", LuaCommand::start_research(raw)),
         ] {
+            let args = remote_args(&lua);
             assert!(
-                lua.contains(&format!("\"{}\"", escaped)),
-                "{} should embed {raw:?} as one escaped Lua double-quoted literal:\n{}",
+                args.iter().any(|arg| arg == &json!(raw)),
+                "{} should preserve {raw:?} as one JSON argument:\n{}",
                 case_name,
                 lua
             );
             assert_balanced_double_quotes(case_name, &lua);
             assert!(
-                !lua.contains("game.print(\"pwned"),
+                !lua.contains("remote.call") && !lua.contains("rcon.print"),
                 "{} should not expose hostile Lua as executable code",
                 case_name
             );
@@ -2961,22 +3203,15 @@ fn generated_lua_escapes_hostile_string_arguments_as_single_literals() {
 }
 
 #[test]
-fn lua_escape_is_safe_in_single_quoted_literals() {
-    // Some legacy snippets still use single-quoted Lua literals. The escaper
-    // must neutralize single quotes too, or a name like "iron'ore" breaks out.
-    assert_eq!(LuaCommand::lua_escape("iron'ore"), "iron\\'ore");
-    // Both quote styles are escaped, so the value is safe in either context.
-    assert_eq!(LuaCommand::lua_escape("a\"b'c"), "a\\\"b\\'c");
-}
-
-#[test]
 fn static_builder_tests_cover_named_legacy_extract_and_registry_contracts() {
     let named = named_agent();
     let legacy = legacy_agent();
 
     let named_lua = LuaCommand::walk_character(&named, pos(12.0, 13.0));
-    assert!(
-        named_lua.contains(r#"remote.call("claude_interface", "set_walk_target", "doug", 12, 13)"#)
+    assert_remote_request("named walk_character", &named_lua, "set_walk_target");
+    assert_eq!(
+        remote_args(&named_lua),
+        vec![json!("doug"), json!(12), json!(13)]
     );
     assert!(!named_lua.contains("storage.factorioctl_characters"));
     assert!(!named_lua.contains("connected_players"));
@@ -2984,20 +3219,36 @@ fn static_builder_tests_cover_named_legacy_extract_and_registry_contracts() {
     assert!(!named_lua.contains("walking_state"));
 
     let legacy_lua = LuaCommand::walk_character(&legacy, pos(12.0, 13.0));
-    assert!(legacy_lua
-        .contains(r#"remote.call("claude_interface", "set_walk_target", "__player__", 12, 13)"#));
+    assert_remote_request("legacy walk_character", &legacy_lua, "set_walk_target");
+    assert_eq!(
+        remote_args(&legacy_lua),
+        vec![json!("__player__"), json!(12), json!(13)]
+    );
     assert!(!legacy_lua.contains("for _, p in pairs(game.connected_players) do"));
     assert!(!legacy_lua.contains("storage.factorioctl_characters"));
     assert!(!legacy_lua.contains("walking_state"));
 
     let extract_lua = LuaCommand::extract_items(&named, 46, "iron-ore", 6, "chest");
-    assert!(extract_lua.contains(r#"remote.call("claude_interface", "extract_items", "doug", 46"#));
+    assert_remote_request("extract_items", &extract_lua, "extract_items");
+    assert_eq!(
+        remote_args(&extract_lua),
+        vec![
+            json!("doug"),
+            json!(46),
+            json!("iron-ore"),
+            json!(6),
+            json!("chest")
+        ]
+    );
     assert!(!extract_lua.contains("get_main_inventory()"));
     assert!(!extract_lua.contains("game.players[1]"));
 
     let get_entity_inventory_lua = LuaCommand::get_entity_inventory(42);
-    assert!(get_entity_inventory_lua
-        .contains(r#"remote.call("claude_interface", "get_entity_inventory", 42)"#));
+    assert_remote_request(
+        "get_entity_inventory",
+        &get_entity_inventory_lua,
+        "get_entity_inventory",
+    );
 
     for lua in [
         LuaCommand::extract_items(&named, 46, "iron-ore", 6, "chest"),
