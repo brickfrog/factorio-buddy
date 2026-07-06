@@ -167,6 +167,7 @@ class ToolResultPayload(BaseModel):
     type: str | None = None
     text: str | None = None
     success: bool | None = None
+    error_kind: str | None = None
     expected_miss: bool | None = None
     mined_count: int | None = None
     error: Any = None
@@ -435,6 +436,7 @@ class GameRejectionPayload(RemotePayloadModel):
 
     raw_text: str = ""
     success: bool | None = None
+    error_kind: Any = None
     entity: Any = None
     recipe: Any = None
     error: Any = None
@@ -596,6 +598,8 @@ class GameRejectionEvidence(BridgeModel):
                 reason="automation verification payload",
             )
         parts: list[str] = []
+        if payload.error_kind:
+            parts.append(f"error_kind={payload.error_kind}")
         if payload.error:
             parts.append(str(payload.error))
         if payload.entity:
@@ -746,6 +750,25 @@ class ToolResultOutcome(BridgeModel):
     message: str = ""
     text_evidence: ToolResultTextEvidence | None = None
 
+    _ERROR_KIND_CLASSIFICATIONS: ClassVar[dict[str, ToolResultClassification]] = {
+        "invalid_request": ToolResultClassification.INVALID_REQUEST,
+        "parameter_invalid": ToolResultClassification.INVALID_REQUEST,
+        "deserialize_error": ToolResultClassification.INVALID_REQUEST,
+        "bad_request": ToolResultClassification.INVALID_REQUEST,
+        "infrastructure_failure": ToolResultClassification.INFRASTRUCTURE_FAILURE,
+        "rcon_error": ToolResultClassification.INFRASTRUCTURE_FAILURE,
+        "connection_error": ToolResultClassification.INFRASTRUCTURE_FAILURE,
+        "route_area_too_large": ToolResultClassification.GAME_REJECTED,
+        "route_failed": ToolResultClassification.GAME_REJECTED,
+        "path_not_found": ToolResultClassification.GAME_REJECTED,
+        "insufficient_materials": ToolResultClassification.GAME_REJECTED,
+        "placement_failed": ToolResultClassification.GAME_REJECTED,
+        "cannot_place": ToolResultClassification.GAME_REJECTED,
+        "missing_items": ToolResultClassification.GAME_REJECTED,
+        "entity_not_found": ToolResultClassification.GAME_REJECTED,
+        "expected_miss": ToolResultClassification.EXPECTED_MISS,
+    }
+
     @classmethod
     def from_text(
         cls,
@@ -819,6 +842,16 @@ class ToolResultOutcome(BridgeModel):
     @classmethod
     def text_indicates_failure(cls, value: Any) -> bool:
         return cls.from_text(str(value or "")).indicates_failure
+
+    @classmethod
+    def _classification_from_error_kind(
+        cls,
+        value: Any,
+    ) -> ToolResultClassification | None:
+        normalized = str(value or "").strip().lower().replace("-", "_")
+        if not normalized:
+            return None
+        return cls._ERROR_KIND_CLASSIFICATIONS.get(normalized)
 
     @property
     def log_level(self) -> str:
@@ -921,6 +954,14 @@ class ToolResultOutcome(BridgeModel):
             return cls(classification=ToolResultClassification.OK, source="success")
 
         success_false = payload.success is False
+
+        error_kind_classification = cls._classification_from_error_kind(payload.error_kind)
+        if error_kind_classification is not None:
+            return cls(
+                classification=error_kind_classification,
+                source="error_kind",
+                message=str(payload.error or payload.message or payload.reason or ""),
+            )
 
         if payload.success is False and payload.expected_miss is True:
             return cls(

@@ -40,6 +40,24 @@ fn production_verification_json(
     )
 }
 
+fn route_belt_failure_json(
+    params: &RouteBeltParams,
+    error_kind: &str,
+    error: impl Into<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "success": false,
+        "dry_run": params.dry_run,
+        "error_kind": error_kind,
+        "error": error.into(),
+        "from": { "x": params.from_x, "y": params.from_y },
+        "to": { "x": params.to_x, "y": params.to_y },
+        "belt_type": params.belt_type,
+        "search_radius": params.search_radius,
+        "materials_sufficient": false,
+    })
+}
+
 fn placed_units_not_dead(
     verification: &serde_json::Value,
     unit_numbers: &[u32],
@@ -256,7 +274,7 @@ mod tests {
         automation_repair_hint, execute_lua_refusal, flow_lookup, flow_scan_area,
         is_machine_output_source, machine_output_build_args, machine_side_layout,
         placed_unit_working, placed_units_not_dead, raw_lua_enabled, ready_fuel_supply_args,
-        route_segment_waypoint,
+        route_belt_failure_json, route_segment_waypoint, RouteBeltParams,
     };
     use factorioctl::analyze::EntityLookup;
     use factorioctl::world::{Area, Entity, GridPos, Position, TilePos};
@@ -494,6 +512,31 @@ mod tests {
 
         let already_close = route_segment_waypoint(0, 0, 12, -3, 40);
         assert_eq!(already_close, GridPos::new(12, -3));
+    }
+
+    #[test]
+    fn route_belt_failure_payload_carries_error_kind() {
+        let params = RouteBeltParams {
+            from_x: 73,
+            from_y: -28,
+            to_x: 51,
+            to_y: -6,
+            belt_type: "transport-belt".to_string(),
+            search_radius: 10,
+            dry_run: false,
+            respect_zones: false,
+            allow_underground: false,
+            extend_existing: true,
+        };
+
+        let payload = route_belt_failure_json(&params, "route_failed", "Route failed: blocked");
+
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["error_kind"], "route_failed");
+        assert_eq!(payload["error"], "Route failed: blocked");
+        assert_eq!(payload["from"]["x"], 73);
+        assert_eq!(payload["to"]["y"], -6);
+        assert_eq!(payload["belt_type"], "transport-belt");
     }
 
     #[test]
@@ -5297,7 +5340,11 @@ impl FactorioMcp {
                         "guidance": "Route is too large for one collision-map request. Call route_belt with next_segment.route_belt_args to extend the belt highway, then retry the original durable controller from next_segment.after_success.retry_from_* toward the final target. Do not call build_fuel_supply for intermediate waypoints because that would place the consumer inserter before fuel reaches it.",
                     }));
                 }
-                return Err(format!("Error building collision map: {}", e));
+                return Ok(route_belt_failure_json(
+                    params,
+                    "infrastructure_failure",
+                    format!("Error building collision map: {}", e),
+                ));
             }
         };
 
@@ -5305,10 +5352,16 @@ impl FactorioMcp {
         if params.extend_existing {
             collision_map.unblock(GridPos::new(params.from_x, params.from_y));
             collision_map.unblock(GridPos::new(params.to_x, params.to_y));
-            let entities = client
-                .find_entities(area, None, None)
-                .await
-                .map_err(|e| format!("Error checking existing route entities: {}", e))?;
+            let entities = match client.find_entities(area, None, None).await {
+                Ok(entities) => entities,
+                Err(e) => {
+                    return Ok(route_belt_failure_json(
+                        params,
+                        "infrastructure_failure",
+                        format!("Error checking existing route entities: {}", e),
+                    ));
+                }
+            };
             for entity in entities {
                 if !is_existing_belt_entity(&entity.name) {
                     continue;
@@ -5371,16 +5424,26 @@ impl FactorioMcp {
         );
 
         if !result.success {
-            return Err(format!(
-                "Route failed: {}",
-                result.error.unwrap_or_else(|| "unknown error".to_string())
+            return Ok(route_belt_failure_json(
+                params,
+                "route_failed",
+                format!(
+                    "Route failed: {}",
+                    result.error.unwrap_or_else(|| "unknown error".to_string())
+                ),
             ));
         }
 
-        let inventory = client
-            .character_inventory()
-            .await
-            .map_err(|e| format!("Error checking inventory: {}", e))?;
+        let inventory = match client.character_inventory().await {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                return Ok(route_belt_failure_json(
+                    params,
+                    "infrastructure_failure",
+                    format!("Error checking inventory: {}", e),
+                ));
+            }
+        };
         let surface_belts_needed = result
             .belts
             .iter()
@@ -5415,15 +5478,23 @@ impl FactorioMcp {
                 underground_belts_needed > 0 && underground_belts_have < underground_belts_needed;
             if underground_short && !params.dry_run {
                 let ug_name = underground_belt_name.unwrap_or("underground-belt");
-                return Err(format!(
-                    "Insufficient materials: need {} {}, have {}. Craft more underground belts first.",
-                    underground_belts_needed, ug_name, underground_belts_have
+                return Ok(route_belt_failure_json(
+                    params,
+                    "insufficient_materials",
+                    format!(
+                        "Insufficient materials: need {} {}, have {}. Craft more underground belts first.",
+                        underground_belts_needed, ug_name, underground_belts_have
+                    ),
                 ));
             }
             if surface_belts_have == 0 && !params.dry_run {
-                return Err(format!(
-                    "Insufficient materials: need {} {}, have 0. Craft more belts first.",
-                    surface_belts_needed, params.belt_type
+                return Ok(route_belt_failure_json(
+                    params,
+                    "insufficient_materials",
+                    format!(
+                        "Insufficient materials: need {} {}, have 0. Craft more belts first.",
+                        surface_belts_needed, params.belt_type
+                    ),
                 ));
             }
             if !underground_short && surface_belts_have > 0 {
@@ -5576,6 +5647,7 @@ impl FactorioMcp {
         Ok(serde_json::json!({
             "success": errors.is_empty(),
             "dry_run": false,
+            "error_kind": if errors.is_empty() { serde_json::Value::Null } else { serde_json::json!("placement_failed") },
             "from": { "x": params.from_x, "y": params.from_y },
             "to": { "x": params.to_x, "y": params.to_y },
             "built_to": build_belts.last().map(|belt| serde_json::json!({
@@ -5618,7 +5690,14 @@ impl FactorioMcp {
                 )
                 .await
             }
-            Err(error) => self.with_player_messages(error).await,
+            Err(error) => {
+                let value = route_belt_failure_json(&params, "infrastructure_failure", error);
+                self.with_player_messages(
+                    serde_json::to_string_pretty(&value)
+                        .unwrap_or_else(|e| format!("Error: {}", e)),
+                )
+                .await
+            }
         }
     }
 
@@ -5656,7 +5735,7 @@ impl FactorioMcp {
 
         let route = match self.route_belt_core(client, &route_params).await {
             Ok(report) => report,
-            Err(e) => return Err(format!("Error: {}", e)),
+            Err(e) => route_belt_failure_json(&route_params, "infrastructure_failure", e),
         };
         let route_success = route
             .get("success")
@@ -5711,6 +5790,9 @@ impl FactorioMcp {
         if !route_success {
             return Ok(serde_json::json!({
                 "success": false,
+                "error_kind": route.get("error_kind")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("route_failed"),
                 "dry_run": false,
                 "consumer": {
                     "unit_number": consumer.unit_number,
@@ -5730,6 +5812,9 @@ impl FactorioMcp {
         if !route_materials_sufficient {
             return Ok(serde_json::json!({
                 "success": false,
+                "error_kind": route.get("error_kind")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("insufficient_materials"),
                 "dry_run": false,
                 "consumer": {
                     "unit_number": consumer.unit_number,
@@ -5842,6 +5927,7 @@ impl FactorioMcp {
             && fuel_inserter_ready;
         Ok(serde_json::json!({
             "success": success,
+            "error_kind": if success { serde_json::Value::Null } else { serde_json::json!("placement_failed") },
             "placement_success": inserter.is_ok(),
             "dry_run": false,
             "consumer": {

@@ -234,6 +234,44 @@ class ModelToolResultTests(unittest.TestCase):
         self.assertEqual(outcome.classification, ToolResultClassification.GAME_REJECTED)
         self.assertEqual(outcome.source, "placement_rejected")
 
+    def test_tool_result_outcome_prefers_structured_error_kind(self):
+        route_outcome = ToolResultOutcome.from_payload({
+            "success": False,
+            "error_kind": "route_failed",
+            "error": "opaque route engine wording changed",
+        })
+        invalid_outcome = ToolResultOutcome.from_payload({
+            "success": False,
+            "error_kind": "parameter_invalid",
+            "error": "opaque schema wording changed",
+        })
+        wrapped_outcome = ToolResultOutcome.from_payload([{
+            "type": "text",
+            "text": (
+                '{"success":false,"error_kind":"insufficient_materials",'
+                '"error":"need belts"}'
+            ),
+        }])
+
+        self.assertIsNotNone(route_outcome)
+        self.assertEqual(
+            route_outcome.classification,
+            ToolResultClassification.GAME_REJECTED,
+        )
+        self.assertEqual(route_outcome.source, "error_kind")
+        self.assertIsNotNone(invalid_outcome)
+        self.assertEqual(
+            invalid_outcome.classification,
+            ToolResultClassification.INVALID_REQUEST,
+        )
+        self.assertEqual(invalid_outcome.source, "error_kind")
+        self.assertIsNotNone(wrapped_outcome)
+        self.assertEqual(
+            wrapped_outcome.classification,
+            ToolResultClassification.GAME_REJECTED,
+        )
+        self.assertEqual(wrapped_outcome.source, "error_kind")
+
     def test_tool_result_outcome_keeps_read_only_placement_diagnostics_ok(self):
         outcome = ToolResultOutcome.from_payload({
             "allowed": False,
