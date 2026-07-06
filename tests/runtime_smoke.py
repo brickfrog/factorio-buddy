@@ -88,7 +88,9 @@ class PlacedEntityPayload:
 
 @dataclass(frozen=True)
 class PlacementFailurePayload:
-    blockers: list[SmokeBlocker] = field(default_factory=list)
+    # Lua serializes empty tables as {} — every list field fed by the mod
+    # must also accept an (always-empty) dict.
+    blockers: list[SmokeBlocker] | dict[str, Any] = field(default_factory=list)
     alternate_belt_placements: Any = None
     candidate_alternate_path: Any = None
     recommended_action: str = ""
@@ -121,15 +123,15 @@ class SteamNoPlantDiagnostic:
 
 @dataclass(frozen=True)
 class SteamNoPlantRepair:
-    blockers: list[SmokeBlocker] = field(default_factory=list)
+    blockers: list[SmokeBlocker] | dict[str, Any] = field(default_factory=list)
     suggested_next_tool: SmokeSuggestedTool | None = None
 
 
 @dataclass(frozen=True)
 class PowerExtensionPlan:
     dry_run: bool = False
-    steps: list[SmokeToolStep] = field(default_factory=list)
-    missing_items: list[Any] = field(default_factory=list)
+    steps: list[SmokeToolStep] | dict[str, Any] = field(default_factory=list)
+    missing_items: list[Any] | dict[str, Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -139,8 +141,8 @@ class LabFeedPlan:
     ready: bool | None = None
     inserted: int = 0
     lab_after: int = 0
-    steps: list[SmokeToolStep] = field(default_factory=list)
-    blockers: list[SmokeBlocker] = field(default_factory=list)
+    steps: list[SmokeToolStep] | dict[str, Any] = field(default_factory=list)
+    blockers: list[SmokeBlocker] | dict[str, Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -153,7 +155,7 @@ class SmokePosition:
 class SteamPlannerResult:
     placement_success: bool = False
     target: SmokePosition | None = None
-    blockers: list[SmokeBlocker] = field(default_factory=list)
+    blockers: list[SmokeBlocker] | dict[str, Any] = field(default_factory=list)
     existing_plant: Any = None
 
 
@@ -168,14 +170,14 @@ class ExistingPlantSummary:
 class ExistingPlantDiagnostic:
     has_existing_plant: bool = False
     summary: ExistingPlantSummary = field(default_factory=ExistingPlantSummary)
-    issues: list[SmokeBlocker] = field(default_factory=list)
+    issues: list[SmokeBlocker] | dict[str, Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class SteamRepairPlan:
     dry_run: bool = False
-    repair_steps: list[SmokeToolStep] = field(default_factory=list)
-    missing_items: list[Any] = field(default_factory=list)
+    repair_steps: list[SmokeToolStep] | dict[str, Any] = field(default_factory=list)
+    missing_items: list[Any] | dict[str, Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,7 @@ class SmokePlacement:
 
 @dataclass(frozen=True)
 class FindPlacementsPayload:
-    placements: list[SmokePlacement] = field(default_factory=list)
+    placements: list[SmokePlacement] | dict[str, Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -210,7 +212,7 @@ class DrillPlacement:
 
 @dataclass(frozen=True)
 class DrillPlacementsPayload:
-    placements: list[DrillPlacement] = field(default_factory=list)
+    placements: list[DrillPlacement] | dict[str, Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -219,8 +221,8 @@ class EdgeMinerPlan:
     success: bool | None = None
     ready: bool | None = None
     selected: DrillPlacement | None = None
-    steps: list[SmokeToolStep] = field(default_factory=list)
-    missing_items: list[Any] = field(default_factory=list)
+    steps: list[SmokeToolStep] | dict[str, Any] = field(default_factory=list)
+    missing_items: list[Any] | dict[str, Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -234,8 +236,8 @@ class DirectSmelterPlan:
     success: bool | None = None
     ready: bool | None = None
     selected: DirectSmelterSelection | None = None
-    steps: list[SmokeToolStep] = field(default_factory=list)
-    missing_items: list[Any] = field(default_factory=list)
+    steps: list[SmokeToolStep] | dict[str, Any] = field(default_factory=list)
+    missing_items: list[Any] | dict[str, Any] = field(default_factory=list)
     verify_step: SmokeToolStep | None = None
 
 
@@ -268,7 +270,7 @@ class SteamPlan:
     offshore_pump: SteamPlannedEntity
     boiler: SteamPlannedEntity
     steam_engine: SteamPlannedEntity
-    pipes: list[SteamPlannedEntity] = field(default_factory=list)
+    pipes: list[SteamPlannedEntity] | dict[str, Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -454,6 +456,8 @@ def classify_failure(text: str, returncode: int = 0) -> str:
             "factorio cannot place",
             "teleport blocked",
             "create_entity returned nil after can_place_entity succeeded",
+            "placement overlaps agent character",
+            "item not in inventory",
         ]
     ):
         return "factorio-game-rejection"
@@ -552,6 +556,11 @@ class CliRunner:
         )
         combined = "\n".join(part for part in [proc.stdout, proc.stderr] if part)
         classification = classify_failure(combined, proc.returncode)
+        if args and args[0] == "exec" and "cannot execute command" in combined.lower():
+            raise SmokeError(
+                _format_failure(name, cmd, "mod-lua", combined),
+                "mod-lua",
+            )
         if proc.returncode != 0 and not (
             allow_factorio_rejection and classification == "factorio-game-rejection"
         ):
@@ -815,6 +824,26 @@ def _position_from_find_result(value: Any) -> tuple[int, int]:
     return int(round(pos.x)), int(round(pos.y))
 
 
+def _prime_raw_lua(cli: CliRunner) -> StepResult:
+    """Absorb Factorio's achievements-confirmation prompt.
+
+    The first Lua console command on a save is swallowed with a
+    "Please repeat the command to proceed" warning that only reaches the
+    server log; RCON sees an empty response and the Lua does not run. Fire a
+    probe (and one repeat) so fixture seeding is never the swallowed command.
+    """
+    probe = 'rcon.print("primed")'
+    result, _ = cli.run("prime raw lua", ["exec", probe], json_output=False)
+    if "primed" not in (result.result or ""):
+        result, _ = cli.run("prime raw lua (repeat)", ["exec", probe], json_output=False)
+        if "primed" not in (result.result or ""):
+            raise SmokeError(
+                f"raw Lua probe did not execute after repeat: {result.result!r}",
+                "rcon",
+            )
+    return result
+
+
 def _seed_inventory(cli: CliRunner) -> StepResult:
     lua = r'''
 local c = remote.call("claude_interface", "get_character", "smoke")
@@ -1020,6 +1049,7 @@ def run_smoke(args: argparse.Namespace) -> list[StepResult]:
     steps.append(result)
     result, _ = cli.run("character init", ["character", "init", "--x", "0", "--y", "0"])
     steps.append(result)
+    steps.append(_prime_raw_lua(cli))
     steps.append(_seed_inventory(cli))
     result, lab_fixture = _seed_lab_fixture(cli)
     steps.append(result)
