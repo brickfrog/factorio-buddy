@@ -118,15 +118,15 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(delta.messages[0].target_agent, "doug")
         self.assertEqual(second.messages, [])
 
-    def test_input_watcher_legacy_poll_returns_dicts(self):
+    def test_input_watcher_poll_model_returns_typed_messages(self):
         with tempfile.TemporaryDirectory() as tmp:
             input_file = Path(tmp) / "input.jsonl"
             watcher = transport.InputWatcher(input_file)
             input_file.write_text(json.dumps({"message": "hi"}) + "\n")
 
-            messages = watcher.poll()
+            messages = watcher.poll_model()
 
-        self.assertEqual(messages, [{
+        self.assertEqual([message.to_dict() for message in messages], [{
             "message": "hi",
             "player_index": 1,
             "player_name": "Player",
@@ -139,9 +139,9 @@ class TransportTests(unittest.TestCase):
             '{"planet":"nauvis","status":"exists"}\n',
         ])
 
-        result = transport.setup_surfaces(rcon, ["vulcanus", "nauvis"])
+        result = transport.setup_surfaces_model(rcon, ["vulcanus", "nauvis"])
 
-        self.assertEqual(result, {"vulcanus": "created", "nauvis": "exists"})
+        self.assertEqual(result.to_dict(), {"vulcanus": "created", "nauvis": "exists"})
         self.assertEqual(len(rcon.commands), 2)
         self.assertIn('remote.call("claude_interface", "ensure_surface_result"', rcon.commands[0])
         for command in rcon.commands:
@@ -252,9 +252,9 @@ class TransportTests(unittest.TestCase):
     def test_pre_place_character_uses_mod_remote(self):
         rcon = FakeRcon(['{"agent_name":"doug-nauvis","planet":"nauvis","status":"created"}\n'])
 
-        result = transport.pre_place_character(rcon, "doug-nauvis", "nauvis", spawn_offset=2)
+        result = transport.pre_place_character_model(rcon, "doug-nauvis", "nauvis", spawn_offset=2)
 
-        self.assertEqual(result, "created")
+        self.assertEqual(result.status, "created")
         self.assertEqual(len(rcon.commands), 1)
         command = rcon.commands[0]
         self.assertIn('remote.call("claude_interface", "pre_place_character_result"', command)

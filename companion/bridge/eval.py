@@ -515,11 +515,6 @@ def evaluate_model(snapshot: EvalProductionSnapshot | dict[str, Any]) -> EvalRes
     )
 
 
-def evaluate(snapshot: EvalProductionSnapshot | dict[str, Any]) -> dict[str, Any]:
-    """Evaluate a production snapshot and return the legacy dict shape."""
-    return evaluate_model(snapshot).to_dict()
-
-
 def query_snapshot_model(rcon: Any, surface: str = "nauvis") -> EvalProductionSnapshot:
     """Read force item production statistics over RCON.
 
@@ -535,11 +530,6 @@ def query_snapshot_model(rcon: Any, surface: str = "nauvis") -> EvalProductionSn
         return EvalProductionSnapshot.from_rcon_text(response)
     except Exception:
         return EvalProductionSnapshot()
-
-
-def query_snapshot(rcon: Any, surface: str = "nauvis") -> dict[str, dict[str, float]]:
-    """Read production stats and return the legacy snapshot dict shape."""
-    return query_snapshot_model(rcon, surface=surface).to_dict()
 
 
 def _format_report(
@@ -603,21 +593,6 @@ def run_model(
     return final_result
 
 
-def run(
-    rcon: Any,
-    duration_s: float,
-    interval_s: float,
-    surface: str = "nauvis",
-) -> dict[str, Any]:
-    """Sample production stats for duration_s and return the legacy dict shape."""
-    return run_model(
-        rcon,
-        duration_s,
-        interval_s,
-        surface=surface,
-    ).to_dict()
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Factorio production eval harness")
     parser.add_argument("--duration", type=float, default=300.0, help="Run duration in seconds")
@@ -630,7 +605,7 @@ def main() -> int:
 
     rcon = RCONClient(args.host, args.port, args.password)
     try:
-        run(rcon, args.duration, args.interval, surface=args.surface)
+        run_model(rcon, args.duration, args.interval, surface=args.surface)
     finally:
         rcon.close()
     return 0

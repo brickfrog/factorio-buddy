@@ -68,11 +68,6 @@ def setup_surfaces_model(rcon, planets: list[str]) -> SurfaceSetupResults:
     return SurfaceSetupResults(results=results)
 
 
-def setup_surfaces(rcon, planets: list[str]) -> dict[str, str]:
-    """Legacy dict wrapper for setup_surfaces_model."""
-    return setup_surfaces_model(rcon, planets).to_dict()
-
-
 def pre_place_character_model(
     rcon,
     agent_name: str,
@@ -100,16 +95,6 @@ def pre_place_character_model(
         agent_name=agent_name,
         planet=planet,
     )
-
-
-def pre_place_character(rcon, agent_name: str, planet: str, spawn_offset: int = 0) -> str:
-    """Legacy status-string wrapper for pre_place_character_model."""
-    return pre_place_character_model(
-        rcon,
-        agent_name,
-        planet,
-        spawn_offset=spawn_offset,
-    ).to_status()
 
 
 def set_spectator_mode(rcon, enabled: bool = True):
@@ -164,6 +149,3 @@ class InputWatcher:
 
     def poll_model(self) -> list[BridgeInputMessage]:
         return self.poll_delta_model().messages
-
-    def poll(self) -> list[dict]:
-        return self.poll_delta_model().to_dicts()

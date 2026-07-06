@@ -155,10 +155,10 @@ class PromptEvalScenarioTest(unittest.TestCase):
         self.assertIn("bootstrap_smelting_once", examples[0]["expected_behavior"])
         self.assertIn("input_text", examples[0])
 
-    def test_legacy_wrappers_return_dict_shapes(self):
+    def test_prompt_scenario_model_accepts_mapping_inputs(self):
         scenario = prompt_eval.DEFAULT_SCENARIOS[0]
 
-        result = prompt_eval.evaluate_prompt_scenario(
+        result = prompt_eval.evaluate_prompt_scenario_model(
             scenario.to_dict(),
             {
                 "tool_calls": ["bootstrap_smelting_once"],
@@ -166,9 +166,9 @@ class PromptEvalScenarioTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["scenario_name"], scenario.name)
-        self.assertTrue(result["passed"])
-        self.assertEqual(result["score"], 1.0)
+        self.assertEqual(result.scenario_name, scenario.name)
+        self.assertTrue(result.passed)
+        self.assertEqual(result.score, 1.0)
 
     def test_load_log_records_accepts_plain_bridge_log_and_time_filters(self):
         with TemporaryDirectory() as tmp:

@@ -181,20 +181,6 @@ def evaluate_prompt_scenario_model(
     )
 
 
-def evaluate_prompt_scenario(
-    scenario: PromptEvalScenario | dict[str, Any],
-    transcript: (
-        PromptEvalTranscript
-        | dict[str, Any]
-        | list[str]
-        | tuple[str, ...]
-        | str
-    ),
-) -> dict[str, Any]:
-    """Legacy dict wrapper for evaluate_prompt_scenario_model."""
-    return evaluate_prompt_scenario_model(scenario, transcript).to_dict()
-
-
 def evaluate_prompt_suite_model(
     scenario_transcripts: dict[str, Any],
     scenarios: tuple[PromptEvalScenario, ...] | list[PromptEvalScenario] | None = None,
@@ -209,14 +195,6 @@ def evaluate_prompt_suite_model(
         for scenario in selected
     ]
     return PromptEvalSuiteResult.from_results(results)
-
-
-def evaluate_prompt_suite(
-    scenario_transcripts: dict[str, Any],
-    scenarios: tuple[PromptEvalScenario, ...] | list[PromptEvalScenario] | None = None,
-) -> dict[str, Any]:
-    """Legacy dict wrapper for evaluate_prompt_suite_model."""
-    return evaluate_prompt_suite_model(scenario_transcripts, scenarios).to_dict()
 
 
 def transcript_from_log_records_model(records: Any) -> PromptEvalTranscript:
@@ -235,11 +213,6 @@ def transcript_from_log_records_model(records: Any) -> PromptEvalTranscript:
             tool_calls.append(match.group(1))
         text_parts.append(message)
     return PromptEvalTranscript(tool_calls=tool_calls, text="\n".join(text_parts))
-
-
-def transcript_from_log_records(records: Any) -> dict[str, Any]:
-    """Legacy dict wrapper for transcript_from_log_records_model."""
-    return transcript_from_log_records_model(records).to_dict()
 
 
 def load_log_records_model(
@@ -429,11 +402,6 @@ def mine_prompt_scenarios_model(records: Any) -> tuple[PromptEvalScenario, ...]:
         ))
 
     return tuple(_dedupe_scenarios(scenarios))
-
-
-def mine_prompt_scenarios(records: Any) -> list[dict[str, Any]]:
-    """Legacy dict wrapper for mine_prompt_scenarios_model."""
-    return [scenario.to_dict() for scenario in mine_prompt_scenarios_model(records)]
 
 
 def load_scenarios_model(path: str | Path) -> tuple[PromptEvalScenario, ...]:

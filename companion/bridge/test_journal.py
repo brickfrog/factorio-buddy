@@ -384,10 +384,10 @@ error_tips:
         self.assertLess(len(rendered), journal.MAX_RENDERED_EVENT_TEXT + 80)
         self.assertIn("...", rendered)
 
-    def test_parse_response_uses_typed_shape_but_keeps_telemetry_dict(self):
+    def test_parse_response_model_uses_typed_shape_and_preserves_dict_projection(self):
         import pipe
 
-        parsed = pipe.parse_response(
+        parsed = pipe.parse_response_model(
             "[color=1,0.6,0.2]CLASSIFICATION:[/color] Done\n\n"
             "Body text.\n\n"
             "[color=0.6,0.8,1]ACTIONS TAKEN:[/color]\n"
@@ -397,11 +397,12 @@ error_tips:
             "[color=0.4,0.6,0.4]FILED:[/color] complete"
         )
 
-        self.assertEqual(parsed["header"]["label"], "CLASSIFICATION")
-        self.assertEqual(parsed["body"], "Body text.")
-        self.assertEqual(parsed["actions"], ["placed belt", "verified furnace"])
-        self.assertEqual(parsed["data"]["ANOMALY"]["text"], "belt blocked")
-        self.assertEqual(parsed["footer"]["text"], "complete")
+        self.assertEqual(parsed.header.label, "CLASSIFICATION")
+        self.assertEqual(parsed.body, "Body text.")
+        self.assertEqual(parsed.actions, ["placed belt", "verified furnace"])
+        self.assertEqual(parsed.data["ANOMALY"].text, "belt blocked")
+        self.assertEqual(parsed.footer.text, "complete")
+        self.assertEqual(parsed.to_dict()["data"]["ANOMALY"]["text"], "belt blocked")
 
     def test_parse_response_model_exposes_anomaly_text_without_dict_spelunking(self):
         import pipe
@@ -416,7 +417,7 @@ error_tips:
     def test_parse_response_preserves_body_shape_for_empty_text(self):
         import pipe
 
-        self.assertEqual(pipe.parse_response(""), {"body": ""})
+        self.assertEqual(pipe.parse_response_model("").to_dict(), {"body": ""})
 
     def test_journal_helpers_are_total_on_bad_input(self):
         # None/non-str/non-dict inputs must never raise (audit round 1).

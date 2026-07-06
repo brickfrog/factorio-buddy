@@ -250,11 +250,6 @@ def parse_response_model(text: str) -> ParsedAgentResponse:
     return ParsedAgentResponse.from_text(text)
 
 
-def parse_response(text: str) -> dict:
-    """Parse a rich-text agent response into the telemetry dict shape."""
-    return parse_response_model(text).to_dict()
-
-
 def sanitize_response(text: str) -> str:
     """Remove markdown artifacts while preserving Factorio rich text tags."""
     return ParsedAgentResponse.sanitize_text(text)

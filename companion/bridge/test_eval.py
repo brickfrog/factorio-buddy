@@ -96,9 +96,6 @@ class EvaluateTest(unittest.TestCase):
         self.assertTrue(result.milestones["iron_plate_16_pm"])
         self.assertEqual(result.milestones_reached, 2)
 
-        legacy = eval_harness.evaluate(snapshot)
-        self.assertEqual(legacy, result.to_dict())
-
     def test_basic_milestones_use_totals(self):
         snapshot = {
             "produced": {
@@ -108,15 +105,15 @@ class EvaluateTest(unittest.TestCase):
             "rate_per_min": {},
         }
 
-        result = eval_harness.evaluate(snapshot)
+        result = eval_harness.evaluate_model(snapshot)
 
-        self.assertTrue(result["milestones"]["burner_mining"])
-        self.assertTrue(result["milestones"]["automated_smelting"])
-        self.assertFalse(result["milestones"]["green_circuits"])
-        self.assertFalse(result["milestones"]["red_science"])
-        self.assertFalse(result["milestones"]["iron_plate_16_pm"])
-        self.assertFalse(result["milestones"]["red_science_16_pm"])
-        self.assertEqual(result["milestones_reached"], 2)
+        self.assertTrue(result.milestones["burner_mining"])
+        self.assertTrue(result.milestones["automated_smelting"])
+        self.assertFalse(result.milestones["green_circuits"])
+        self.assertFalse(result.milestones["red_science"])
+        self.assertFalse(result.milestones["iron_plate_16_pm"])
+        self.assertFalse(result.milestones["red_science_16_pm"])
+        self.assertEqual(result.milestones_reached, 2)
 
     def test_red_science_throughput_uses_rate_boundary(self):
         at_threshold = {
@@ -129,10 +126,10 @@ class EvaluateTest(unittest.TestCase):
         }
 
         self.assertTrue(
-            eval_harness.evaluate(at_threshold)["milestones"]["red_science_16_pm"]
+            eval_harness.evaluate_model(at_threshold).milestones["red_science_16_pm"]
         )
         self.assertFalse(
-            eval_harness.evaluate(below_threshold)["milestones"]["red_science_16_pm"]
+            eval_harness.evaluate_model(below_threshold).milestones["red_science_16_pm"]
         )
 
     def test_individual_milestone_boundaries(self):
@@ -163,20 +160,20 @@ class EvaluateTest(unittest.TestCase):
             "rate_per_min": {"iron-plate": 2},
         }
 
-        result = eval_harness.evaluate(snapshot)
+        result = eval_harness.evaluate_model(snapshot)
 
         self.assertEqual(
-            result["production_score"],
+            result.production_score,
             2 * eval_harness.VALUES["iron-plate"],
         )
 
     def test_missing_keys_never_raise(self):
-        result = eval_harness.evaluate({})
+        result = eval_harness.evaluate_model({})
 
-        self.assertEqual(result["production_score"], 0.0)
-        self.assertEqual(result["milestones_reached"], 0)
+        self.assertEqual(result.production_score, 0.0)
+        self.assertEqual(result.milestones_reached, 0)
         self.assertEqual(
-            result["milestones"],
+            result.milestones,
             {name: False for name, _ in eval_harness.MILESTONES},
         )
 
@@ -333,13 +330,13 @@ class QuerySnapshotTest(unittest.TestCase):
             '{"produced":{"iron-plate":12},"rate_per_min":{"iron-plate":16}}\n'
         )
 
-        snapshot = eval_harness.query_snapshot(
+        snapshot = eval_harness.query_snapshot_model(
             rcon,
             surface='nauvis") game.print("oops ]]',
         )
 
-        self.assertEqual(snapshot["produced"], {"iron-plate": 12.0})
-        self.assertEqual(snapshot["rate_per_min"], {"iron-plate": 16.0})
+        self.assertEqual(snapshot.produced, {"iron-plate": 12.0})
+        self.assertEqual(snapshot.rate_per_min, {"iron-plate": 16.0})
         self.assertEqual(len(rcon.commands), 1)
         command = rcon.commands[0]
         self.assertEqual(
@@ -359,22 +356,22 @@ class QuerySnapshotTest(unittest.TestCase):
     def test_query_snapshot_treats_empty_object_buckets_as_empty_maps(self):
         rcon = FakeRcon('{"produced":{},"rate_per_min":{}}\n')
 
-        snapshot = eval_harness.query_snapshot(rcon)
+        snapshot = eval_harness.query_snapshot_model(rcon)
 
-        self.assertEqual(snapshot, {"produced": {}, "rate_per_min": {}})
+        self.assertEqual(snapshot, EvalProductionSnapshot())
 
     def test_query_snapshot_errors_return_empty_snapshot(self):
         class BrokenRcon:
             def execute(self, command):
                 raise RuntimeError("rcon down")
 
-        snapshot = eval_harness.query_snapshot(BrokenRcon())
+        snapshot = eval_harness.query_snapshot_model(BrokenRcon())
 
-        self.assertEqual(snapshot, {"produced": {}, "rate_per_min": {}})
+        self.assertEqual(snapshot, EvalProductionSnapshot())
 
 
 class RunTest(unittest.TestCase):
-    def test_run_model_returns_typed_result_and_legacy_run_returns_dict(self):
+    def test_run_model_returns_typed_result(self):
         rcon = FakeRcon(
             '{"produced":{"iron-plate":1},"rate_per_min":{"iron-plate":16}}\n'
         )
@@ -384,14 +381,6 @@ class RunTest(unittest.TestCase):
         self.assertIsInstance(typed, EvalResult)
         self.assertTrue(typed.milestones["automated_smelting"])
         self.assertTrue(typed.milestones["iron_plate_16_pm"])
-
-        legacy_rcon = FakeRcon(
-            '{"produced":{"iron-plate":1},"rate_per_min":{"iron-plate":16}}\n'
-        )
-        self.assertEqual(
-            eval_harness.run(legacy_rcon, duration_s=0, interval_s=1),
-            typed.to_dict(),
-        )
 
 
 if __name__ == "__main__":
