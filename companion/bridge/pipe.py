@@ -189,7 +189,7 @@ _PROJECT_ROOT = _BRIDGE_DIR.parent.parent
 _PLAYER_MESSAGES_MARKER = "\n\n--- Player Messages ---\n"
 DEFAULT_MAX_TURNS = 200
 DEFAULT_AUTONOMY_EXEC_MAX_TURNS = 4
-DEFAULT_AUTONOMY_EXEC_TIMEOUT_S = 60.0
+DEFAULT_AUTONOMY_EXEC_TIMEOUT_S = 600.0
 DEFAULT_SDK_SKILLS = "factorio-control"
 SESSIONS_FILE = state_file(".sessions.json")
 
@@ -625,7 +625,6 @@ def _mark_autonomy_step_followup(
 _RUNTIME_SETTINGS = _runtime_settings()
 _PROVIDER_USAGE_LIMIT_SETTINGS = ProviderUsageLimitSettings.from_env(os.environ)
 _TICK_TIMEOUT_S = _RUNTIME_SETTINGS.tick_timeout_s
-_SDK_RATE_LIMIT_RETRY_BACKOFF_S = 60.0
 
 # A long tick is fine if the SDK keeps emitting messages, but a long silent gap
 # after a tool result leaves the game looking dropped. Abort that invocation and
@@ -1037,21 +1036,9 @@ async def _run_agent(
                 system_message = SdkSystemMessage.from_sdk_message(msg)
                 if not _log_sdk_init(system_message, options, log):
                     if system_message.is_rate_limit_retry:
-                        cooldown_until = _set_usage_limit_cooldown_for(
-                            agent_name,
-                            max(
-                                _SDK_RATE_LIMIT_RETRY_BACKOFF_S,
-                                system_message.retry_delay_s,
-                            ),
-                            log=log,
-                        )
-                        usage_limit_seen = True
-                        progress.usage_limit_seen = True
                         log.info(
-                            "provider rate limit retry from SDK; pausing agent attempts until {}",
-                            _format_local_time(cooldown_until),
+                            "provider rate limit retry from SDK; waiting for terminal reset signal"
                         )
-                        break
                     if system_message.should_log:
                         log.debug("system: {}", msg)
             else:
