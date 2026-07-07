@@ -69,6 +69,45 @@ class SdkSystemMessage(BridgeModel):
         return self.subtype not in {"thinking_tokens"}
 
     @property
+    def is_api_retry(self) -> bool:
+        return self.subtype == "api_retry"
+
+    @property
+    def retry_error_status(self) -> int | None:
+        value = self.data.get("error_status")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    @property
+    def retry_error(self) -> str:
+        return str(self.data.get("error") or "").strip().lower()
+
+    @property
+    def retry_delay_s(self) -> float:
+        value = self.data.get("retry_delay_ms")
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            return max(0.0, float(value) / 1000.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @property
+    def is_rate_limit_retry(self) -> bool:
+        return self.is_api_retry and (
+            self.retry_error_status == 429
+            or self.retry_error == "rate_limit"
+        )
+
+    @property
     def cwd(self) -> Any:
         return self.data.get("cwd")
 

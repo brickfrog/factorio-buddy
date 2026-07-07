@@ -143,6 +143,35 @@ def _set_usage_limit_cooldown_from_limit(
     return reset_at
 
 
+def _set_usage_limit_cooldown_for(
+    agent_name: str,
+    seconds: float,
+    log=None,
+    now: datetime | None = None,
+) -> datetime:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.astimezone()
+    delay_s = max(1.0, float(seconds))
+    reset_at = now + timedelta(seconds=delay_s)
+
+    changed = False
+    with _USAGE_LIMIT_COOLDOWNS_LOCK:
+        existing = _USAGE_LIMIT_COOLDOWNS.get(agent_name)
+        if existing is None or reset_at > existing:
+            _USAGE_LIMIT_COOLDOWNS[agent_name] = reset_at
+            changed = True
+        else:
+            reset_at = existing
+    if log and changed:
+        log.info(
+            "provider usage limit active until {}; pausing agent attempts",
+            _format_local_time(reset_at),
+        )
+    return reset_at
+
+
 def _get_usage_limit_cooldown(
     agent_name: str,
     now: datetime | None = None,

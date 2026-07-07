@@ -508,6 +508,14 @@ class ModelToolSchemaSdkTests(unittest.TestCase):
             "thinking_tokens",
             {"estimated_tokens": 12},
         ))
+        rate_limit_retry = SdkSystemMessage.from_sdk_message(Message(
+            "api_retry",
+            {
+                "error_status": 429,
+                "error": "rate_limit",
+                "retry_delay_ms": 602.5,
+            },
+        ))
 
         self.assertTrue(init.is_loggable_init)
         self.assertEqual(init.cwd, "/tmp/factorioctl")
@@ -521,6 +529,10 @@ class ModelToolSchemaSdkTests(unittest.TestCase):
         self.assertFalse(malformed_init.is_loggable_init)
         self.assertEqual(malformed_init.bounded_visible_skills(), [])
         self.assertFalse(thinking.should_log)
+        self.assertTrue(rate_limit_retry.is_rate_limit_retry)
+        self.assertEqual(rate_limit_retry.retry_error_status, 429)
+        self.assertEqual(rate_limit_retry.retry_error, "rate_limit")
+        self.assertAlmostEqual(rate_limit_retry.retry_delay_s, 0.6025)
         self.assertTrue(SdkSystemMessage.from_sdk_message(
             Message("error", {"message": "visible diagnostic"})
         ).should_log)

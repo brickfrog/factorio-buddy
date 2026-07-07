@@ -2433,6 +2433,54 @@ progress: plan confirmed; awaiting execution
         self.assertEqual(transcript.session_id, "s")
         self.assertEqual(transcript.text_parts, [limit_text])
 
+    def test_run_agent_treats_sdk_api_retry_429_as_usage_limit(self):
+        import asyncio
+
+        import pipe
+        from claude_agent_sdk import SystemMessage
+
+        messages = [
+            SystemMessage(
+                subtype="api_retry",
+                data={
+                    "type": "system",
+                    "subtype": "api_retry",
+                    "attempt": 1,
+                    "max_retries": 10,
+                    "retry_delay_ms": 602.0,
+                    "error_status": 429,
+                    "error": "rate_limit",
+                    "session_id": "retry-session",
+                },
+            )
+        ]
+
+        def scripted_query(*, prompt, options):
+            async def gen():
+                for msg in messages:
+                    yield msg
+                await asyncio.sleep(1)
+            return gen()
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        pipe._USAGE_LIMIT_COOLDOWNS.clear()
+        self.addCleanup(pipe._USAGE_LIMIT_COOLDOWNS.clear)
+
+        with mock.patch("pipe.query", scripted_query):
+            transcript = asyncio.run(pipe._run_agent(
+                "go", object(), "doug", None, "doug",
+                StubRCON(), 0, pipe.logger.bind(agent="doug"),
+            ))
+
+        self.assertEqual(journal.load_events_model("doug"), JournalWindow())
+        self.assertIsNotNone(pipe._get_usage_limit_cooldown("doug"))
+        self.assertTrue(transcript.usage_limit_seen)
+        self.assertFalse(transcript.context_window_limit)
+        self.assertEqual(transcript.text_parts, [])
+
     def test_handle_message_exception_uses_typed_invocation_signal(self):
         import pipe
 
