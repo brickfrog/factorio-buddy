@@ -1319,6 +1319,63 @@ progress: plan confirmed; awaiting execution
         self.assertEqual(allowed_furnace, {})
         self.assertEqual(allowed_drill, {})
 
+    def test_manual_automation_drift_gate_allows_bootstrap_craft_during_execute_guard(self):
+        import pipe
+        from models import LedgerState
+
+        bootstrap_plan = LedgerState(
+            objective="Bootstrap Nauvis from empty inventory to first automated iron mining and smelting cell",
+            plan_steps=[
+                "walk_to iron patch and mine_at count=40 for iron-ore",
+                "walk_to coal patch and mine_at count=20 for coal",
+                "walk_to stone patch and mine_at count=30 for stone",
+                "craft count=4 furnaces and count=2 burner drills",
+                "execute_edge_miner targeting iron-ore",
+                "execute_direct_smelter from the placed drill",
+            ],
+        )
+        zero_infrastructure = LiveState(
+            found=True,
+            surface="nauvis",
+            x=20.4,
+            y=-92.7,
+            entity_counts={},
+        )
+        gate = pipe.ManualAutomationDriftGate(
+            pipe.logger.bind(agent="test"),
+            agent_name="doug",
+            ledger_loader=lambda agent_name: bootstrap_plan,
+            live_state_loader=lambda agent_name: zero_infrastructure,
+            block_all_manual_transfers=True,
+        )
+
+        allowed_furnace = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__craft",
+                "tool_input": {
+                    "recipe": "stone-furnace",
+                    "count": 4,
+                },
+            },
+            "tool-1",
+            {},
+        ))
+        blocked_science = asyncio.run(gate.hook(
+            {
+                "tool_name": "mcp__factorioctl__craft",
+                "tool_input": {
+                    "recipe": "automation-science-pack",
+                    "count": 4,
+                },
+            },
+            "tool-2",
+            {},
+        ))
+
+        self.assertEqual(allowed_furnace, {})
+        self.assertEqual(blocked_science["decision"], "block")
+        self.assertIn("stale manual automation tool", blocked_science["reason"])
+
     def test_manual_automation_drift_gate_blocks_bootstrap_manual_flow_after_assembler(self):
         import pipe
         from models import LedgerState
@@ -2952,29 +3009,39 @@ progress: tick timeout progress survived
         with self.assertRaises(pipe.AgentTickWatchdogAbort):
             watchdog.observe_text()
 
-    def test_autonomy_step_completion_ignores_guard_denial_even_when_sdk_labels_ok(self):
+    def test_autonomy_step_completion_fast_fails_guard_denial_even_when_sdk_labels_ok(self):
         import pipe
+
+        skill_required = (
+            "Factorioctl bridge blocked Factorio tool before control "
+            "skill: broadcast_thought. Call Skill(factorio-control) "
+            "before using Factorio MCP tools."
+        )
+        invalid_params = (
+            "Factorioctl bridge blocked invalid Factorio tool parameters: "
+            "failed to deserialize parameters"
+        )
 
         self.assertFalse(
             pipe._autonomy_tool_result_completes_step(
                 tool_name="mcp__factorioctl__broadcast_thought",
                 classification=ToolResultClassification.OK,
-                text=(
-                    "Factorioctl bridge blocked Factorio tool before control "
-                    "skill: broadcast_thought. Call Skill(factorio-control) "
-                    "before using Factorio MCP tools."
-                ),
+                text=skill_required,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             pipe._autonomy_tool_result_completes_step(
                 tool_name="mcp__factorioctl__place_entity",
                 classification=ToolResultClassification.OK,
-                text=(
-                    "Factorioctl bridge blocked invalid Factorio tool parameters: "
-                    "failed to deserialize parameters"
-                ),
+                text=invalid_params,
             )
+        )
+        self.assertEqual(
+            pipe._autonomy_step_result_classification(
+                ToolResultClassification.OK,
+                invalid_params,
+            ),
+            ToolResultClassification.INVALID_REQUEST,
         )
 
     def test_tick_watchdog_coerces_legacy_string_classifications(self):
@@ -3190,15 +3257,15 @@ progress: tick timeout progress survived
         self.assertFalse(handle_message.call_args.kwargs["stop_after_factorio_result"])
         self.assertIsNone(handle_message.call_args.kwargs["tick_timeout_s"])
 
-    def test_autonomy_execute_stops_after_first_factorio_tool_result(self):
+    def test_autonomy_execute_stops_after_first_mutating_factorio_tool_result(self):
         import ledger
         import pipe
         from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
 
-        consumed_after_factorio_result = []
+        consumed_after_mutating_result = []
         ledger.save_ledger_model("doug", {
-            "objective": "Route coal",
-            "plan_steps": ["route_belt from coal to furnace"],
+            "objective": "Mine coal",
+            "plan_steps": ["mine_at x=78 y=-19 count=15"],
             "progress_notes": [],
             "status": "executing",
             "next_required_mode": "execute",
@@ -3237,17 +3304,17 @@ progress: tick timeout progress survived
                         yield AssistantMessage(
                             content=[ToolUseBlock(
                                 id="tool-1",
-                                name="mcp__factorioctl__situation_report",
-                                input={"radius": 10},
+                                name="mcp__factorioctl__mine_at",
+                                input={"x": 78, "y": -19, "count": 15},
                             )],
                             model="test",
                         )
                         yield UserMessage(content=[ToolResultBlock(
                             tool_use_id="tool-1",
-                            content='{"position":{"x":0,"y":0}}',
+                            content='{"success":true,"mined_count":15}',
                             is_error=False,
                         )])
-                        consumed_after_factorio_result.append(True)
+                        consumed_after_mutating_result.append(True)
                         yield AssistantMessage(
                             content=[TextBlock("should not be consumed")],
                             model="test",
@@ -3296,7 +3363,7 @@ progress: tick timeout progress survived
 
         self.assertTrue(result.reset_session)
         clear_session.assert_called_once_with("doug")
-        self.assertEqual(consumed_after_factorio_result, [])
+        self.assertEqual(consumed_after_mutating_result, [])
         self.assertEqual(len(StubClaudeSDKClient.instances), 1)
         self.assertTrue(StubClaudeSDKClient.instances[0].interrupted)
         self.assertTrue(StubClaudeSDKClient.instances[0].disconnected)
@@ -3304,11 +3371,270 @@ progress: tick timeout progress survived
         events = journal.load_events_model("doug")
         self.assertEqual(len(events.events), 1)
         self.assertEqual(events.events[0].kind, "progress")
-        self.assertIn("autonomy_step_complete: situation_report ok", events.events[0].text)
+        self.assertIn("autonomy_step_complete: mine_at ok", events.events[0].text)
+        updated = ledger.load_ledger_model("doug")
+        self.assertEqual(updated.next_required_mode.value, "execute")
+        self.assertEqual(updated.status.value, "executing")
+        self.assertIn("mine_at ok", updated.progress_notes[-1])
+
+    def test_autonomy_execute_does_not_stop_after_read_only_detour(self):
+        import ledger
+        import pipe
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
+
+        consumed_after_mutating_result = []
+        ledger.save_ledger_model("doug", {
+            "objective": "Mine coal",
+            "plan_steps": ["mine_at x=78 y=-19 count=15"],
+            "progress_notes": [],
+            "status": "executing",
+            "next_required_mode": "execute",
+        })
+
+        class StubClaudeSDKClient:
+            instances = []
+
+            def __init__(self, *, options):
+                self.options = options
+                self.prompt = None
+                self.interrupted = False
+                self.disconnected = False
+                self.stream_closed = False
+                self.__class__.instances.append(self)
+
+            async def connect(self, prompt):
+                self.prompt = prompt
+
+            def receive_messages(self):
+                async def gen():
+                    try:
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(
+                                id="skill-1",
+                                name="Skill",
+                                input={"skill": "factorio-control"},
+                            )],
+                            model="test",
+                        )
+                        yield UserMessage(content=[ToolResultBlock(
+                            tool_use_id="skill-1",
+                            content="Launching skill: factorio-control",
+                            is_error=False,
+                        )])
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(
+                                id="scan-1",
+                                name="mcp__factorioctl__get_entities",
+                                input={"x": 55, "y": -20, "radius": 2},
+                            )],
+                            model="test",
+                        )
+                        yield UserMessage(content=[ToolResultBlock(
+                            tool_use_id="scan-1",
+                            content='[{"name":"stone-furnace","unit_number":2}]',
+                            is_error=False,
+                        )])
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(
+                                id="tool-1",
+                                name="mcp__factorioctl__mine_at",
+                                input={"x": 78, "y": -19, "count": 15},
+                            )],
+                            model="test",
+                        )
+                        yield UserMessage(content=[ToolResultBlock(
+                            tool_use_id="tool-1",
+                            content='{"success":true,"mined_count":15}',
+                            is_error=False,
+                        )])
+                        consumed_after_mutating_result.append(True)
+                        yield AssistantMessage(
+                            content=[TextBlock("should not be consumed")],
+                            model="test",
+                        )
+                        yield ResultMessage(
+                            subtype="error",
+                            duration_ms=1,
+                            duration_api_ms=1,
+                            is_error=True,
+                            num_turns=4,
+                            session_id="old-session",
+                            result="Reached maximum number of turns (4)",
+                            total_cost_usd=0.0,
+                        )
+                    finally:
+                        self.stream_closed = True
+                return gen()
+
+            async def interrupt(self):
+                self.interrupted = True
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with (
+            mock.patch("pipe.ClaudeSDKClient", StubClaudeSDKClient),
+            mock.patch("pipe.query", side_effect=AssertionError("query should not be used")),
+            mock.patch("pipe.clear_session") as clear_session,
+        ):
+            result = pipe.handle_message_model(
+                "go",
+                {},
+                "system",
+                "old-session",
+                StubRCON(),
+                0,
+                None,
+                agent_name="doug",
+                sdk_skills=["factorio-control"],
+                stop_after_factorio_result=True,
+            )
+
+        self.assertTrue(result.reset_session)
+        clear_session.assert_called_once_with("doug")
+        self.assertEqual(consumed_after_mutating_result, [])
+        self.assertEqual(len(StubClaudeSDKClient.instances), 1)
+        self.assertTrue(StubClaudeSDKClient.instances[0].interrupted)
+        self.assertTrue(StubClaudeSDKClient.instances[0].disconnected)
+        self.assertTrue(StubClaudeSDKClient.instances[0].stream_closed)
+        events = journal.load_events_model("doug")
+        self.assertEqual(len(events.events), 1)
+        self.assertEqual(events.events[0].kind, "progress")
+        self.assertIn("autonomy_step_complete: mine_at ok", events.events[0].text)
+        self.assertNotIn("get_entities", events.events[0].text)
+        updated = ledger.load_ledger_model("doug")
+        self.assertEqual(updated.next_required_mode.value, "execute")
+        self.assertEqual(updated.status.value, "executing")
+        self.assertIn("mine_at ok", updated.progress_notes[-1])
+
+    def test_autonomy_execute_stops_after_manual_automation_guard_denial(self):
+        import ledger
+        import pipe
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
+
+        consumed_after_guard_denial = []
+        ledger.save_ledger_model("doug", {
+            "objective": "Bootstrap iron smelting",
+            "plan_steps": ["craft recipe=stone-furnace count=3"],
+            "progress_notes": [],
+            "status": "executing",
+            "next_required_mode": "execute",
+        })
+        guard_denial = (
+            "Factorioctl bridge blocked stale manual automation tool: craft. "
+            "The active ledger plan is stale because it relies on manual "
+            "transfer loops."
+        )
+
+        class StubClaudeSDKClient:
+            instances = []
+
+            def __init__(self, *, options):
+                self.options = options
+                self.prompt = None
+                self.interrupted = False
+                self.disconnected = False
+                self.stream_closed = False
+                self.__class__.instances.append(self)
+
+            async def connect(self, prompt):
+                self.prompt = prompt
+
+            def receive_messages(self):
+                async def gen():
+                    try:
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(
+                                id="skill-1",
+                                name="Skill",
+                                input={"skill": "factorio-control"},
+                            )],
+                            model="test",
+                        )
+                        yield UserMessage(content=[ToolResultBlock(
+                            tool_use_id="skill-1",
+                            content="Launching skill: factorio-control",
+                            is_error=False,
+                        )])
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(
+                                id="tool-1",
+                                name="mcp__factorioctl__craft",
+                                input={"recipe": "stone-furnace", "count": 3},
+                            )],
+                            model="test",
+                        )
+                        yield UserMessage(content=[ToolResultBlock(
+                            tool_use_id="tool-1",
+                            content=guard_denial,
+                            is_error=True,
+                        )])
+                        consumed_after_guard_denial.append(True)
+                        yield AssistantMessage(
+                            content=[TextBlock("should not be consumed")],
+                            model="test",
+                        )
+                        yield ResultMessage(
+                            subtype="error",
+                            duration_ms=1,
+                            duration_api_ms=1,
+                            is_error=True,
+                            num_turns=4,
+                            session_id="old-session",
+                            result="Reached maximum number of turns (4)",
+                            total_cost_usd=0.0,
+                        )
+                    finally:
+                        self.stream_closed = True
+                return gen()
+
+            async def interrupt(self):
+                self.interrupted = True
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        class StubRCON:
+            def execute(self, _cmd):
+                return ""
+
+        with (
+            mock.patch("pipe.ClaudeSDKClient", StubClaudeSDKClient),
+            mock.patch("pipe.query", side_effect=AssertionError("query should not be used")),
+            mock.patch("pipe.clear_session") as clear_session,
+        ):
+            result = pipe.handle_message_model(
+                "go",
+                {},
+                "system",
+                "old-session",
+                StubRCON(),
+                0,
+                None,
+                agent_name="doug",
+                sdk_skills=["factorio-control"],
+                stop_after_factorio_result=True,
+            )
+
+        self.assertTrue(result.reset_session)
+        clear_session.assert_called_once_with("doug")
+        self.assertEqual(consumed_after_guard_denial, [])
+        self.assertEqual(len(StubClaudeSDKClient.instances), 1)
+        self.assertTrue(StubClaudeSDKClient.instances[0].interrupted)
+        self.assertTrue(StubClaudeSDKClient.instances[0].disconnected)
+        self.assertTrue(StubClaudeSDKClient.instances[0].stream_closed)
+        events = journal.load_events_model("doug")
+        self.assertEqual(len(events.events), 1)
+        self.assertEqual(events.events[0].kind, "progress")
+        self.assertIn("autonomy_step_complete: craft game_rejected", events.events[0].text)
         updated = ledger.load_ledger_model("doug")
         self.assertEqual(updated.next_required_mode.value, "plan")
         self.assertEqual(updated.status.value, "ready")
-        self.assertIn("situation_report ok", updated.progress_notes[-1])
+        self.assertIn("craft game_rejected", updated.progress_notes[-1])
 
     def test_autonomy_step_complete_continues_after_successful_mutation(self):
         import ledger
@@ -3428,7 +3754,20 @@ progress: tick timeout progress survived
                     )
                     yield UserMessage(content=[ToolResultBlock(
                         tool_use_id="tool-1",
-                        content='{"position":{"x":1,"y":2}}',
+                            content='{"position":{"x":1,"y":2}}',
+                            is_error=False,
+                        )])
+                    yield AssistantMessage(
+                        content=[ToolUseBlock(
+                            id="tool-2",
+                            name="mcp__factorioctl__mine_at",
+                            input={"x": 78, "y": -19, "count": 15},
+                        )],
+                        model="test",
+                    )
+                    yield UserMessage(content=[ToolResultBlock(
+                        tool_use_id="tool-2",
+                        content='{"success":true,"mined_count":15}',
                         is_error=False,
                     )])
                 return gen()
@@ -3465,7 +3804,11 @@ progress: tick timeout progress survived
         clear_session.assert_called_once_with("doug")
         events = journal.load_events_model("doug")
         self.assertTrue(any(
-            "autonomy_step_complete: situation_report ok" in event.text
+            "autonomy_step_complete: mine_at ok" in event.text
+            for event in events.events
+        ))
+        self.assertFalse(any(
+            "autonomy_step_complete: situation_report" in event.text
             for event in events.events
         ))
         self.assertFalse(any(

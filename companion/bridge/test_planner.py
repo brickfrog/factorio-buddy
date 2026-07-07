@@ -894,6 +894,9 @@ class PlannerTests(unittest.TestCase):
 
         self.assertIn("do not re-plan", planner.EXECUTION_PROMPT.lower())
         self.assertIn("committed objective and plan", planner.EXECUTION_PROMPT.lower())
+        self.assertIn("actual target", planner.EXECUTION_PROMPT.lower())
+        self.assertIn("movement tool reports", planner.EXECUTION_PROMPT.lower())
+        self.assertNotIn("25 tiles", planner.EXECUTION_PROMPT.lower())
         self.assertIn("stale", planner.EXECUTION_PROMPT.lower())
         self.assertIn("stop before", planner.EXECUTION_PROMPT.lower())
         self.assertIn("mutating tool call", planner.EXECUTION_PROMPT.lower())

@@ -571,6 +571,14 @@ _EXECUTE_STEP_READ_ONLY_TOOLS = {
 }
 
 
+def _is_execute_step_read_only_tool(tool_name: str) -> bool:
+    return (
+        ToolCallRequest.is_read_only_factorio_tool_name(tool_name)
+        or ToolCallRequest.short_factorio_tool_name(tool_name)
+        in _EXECUTE_STEP_READ_ONLY_TOOLS
+    )
+
+
 def _mark_autonomy_step_followup(
     agent_name: str,
     *,
@@ -581,7 +589,7 @@ def _mark_autonomy_step_followup(
     short_name = ToolCallRequest.short_factorio_tool_name(tool_name)
     continue_executing = (
         classification == ToolResultClassification.OK
-        and short_name not in _EXECUTE_STEP_READ_ONLY_TOOLS
+        and not _is_execute_step_read_only_tool(tool_name)
     )
     next_mode = (
         LedgerNextRequiredMode.EXECUTE
@@ -739,15 +747,38 @@ def _autonomy_tool_result_completes_step(
     short_name = ToolCallRequest.short_factorio_tool_name(tool_name)
     if short_name in {"broadcast_thought", "tool_status"}:
         return False
+    if text.startswith(BRIDGE_SKILL_REQUIRED_GUARD_PREFIX):
+        return False
+    if _autonomy_guard_denial_classification(text) is not None:
+        return True
+    if (
+        classification == ToolResultClassification.OK
+        and _is_execute_step_read_only_tool(tool_name)
+    ):
+        return False
+    return True
+
+
+def _autonomy_guard_denial_classification(
+    text: str,
+) -> ToolResultClassification | None:
+    if text.startswith(BRIDGE_PARAM_SCHEMA_GUARD_PREFIX):
+        return ToolResultClassification.INVALID_REQUEST
     if text.startswith((
         BRIDGE_PARALLEL_MUTATION_GUARD_PREFIX,
         BRIDGE_READ_ONLY_TURN_GUARD_PREFIX,
-        BRIDGE_SKILL_REQUIRED_GUARD_PREFIX,
-        BRIDGE_PARAM_SCHEMA_GUARD_PREFIX,
         BRIDGE_MANUAL_AUTOMATION_GUARD_PREFIX,
     )):
-        return False
-    return True
+        return ToolResultClassification.GAME_REJECTED
+    return None
+
+
+def _autonomy_step_result_classification(
+    classification: ToolResultClassification,
+    text: str,
+) -> ToolResultClassification:
+    guard_classification = _autonomy_guard_denial_classification(text)
+    return guard_classification or classification
 
 
 async def _query_with_idle_timeout(prompt: str, options: ClaudeAgentOptions):
@@ -903,18 +934,22 @@ async def _run_agent(
                         if observation.tool_use_id
                         else ""
                     )
+                    step_classification = _autonomy_step_result_classification(
+                        classification,
+                        observation.text,
+                    )
                     if (
                         stop_after_factorio_result
                         and _autonomy_tool_result_completes_step(
                             tool_name=tool_name,
-                            classification=classification,
+                            classification=step_classification,
                             text=observation.text,
                         )
                         and not autonomy_step_progress
                     ):
                         autonomy_step_progress = AgentAutonomyStepComplete(
                             tool_name=tool_name,
-                            classification=classification,
+                            classification=step_classification,
                             text=observation.text,
                         ).progress_text
                         progress.autonomy_step_progress = autonomy_step_progress

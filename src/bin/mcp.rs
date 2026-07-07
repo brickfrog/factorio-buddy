@@ -4140,7 +4140,7 @@ impl FactorioMcp {
 
     /// Walk character to a position.
     #[tool(
-        description = "Walk character to a position using pathfinding. TIP: Call broadcast_thought in the SAME response to narrate your movement while walking."
+        description = "Walk character to a position using the mod's direct stepped movement target. TIP: Call broadcast_thought in the SAME response to narrate your movement while walking."
     )]
     async fn walk_to(&self, Parameters(params): Parameters<PositionParams>) -> String {
         let mut client = match self.connect().await {

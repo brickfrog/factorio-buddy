@@ -16,6 +16,8 @@
 set -e
 trap 'echo ""; echo "Interrupted."; exit 130' INT TERM
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+SERVER_DATA_DIR="${FACTORIO_SERVER_DATA:-$PROJECT_ROOT/.factorio-server-data}"
+BRIDGE_STATE_DIR="${FACTORIOCTL_BRIDGE_STATE_DIR:-$SERVER_DATA_DIR/bridge-state}"
 
 CMD="${1:-bridge}"
 FRESH=false
@@ -92,7 +94,10 @@ case "$CMD" in
         ;;
     restart)
         stop_server
-        rm -f "$PROJECT_ROOT/bridge/.session-"*.json
+        rm -f "$PROJECT_ROOT/bridge/.session-"*.json \
+              "$PROJECT_ROOT/bridge/.sessions.json" \
+              "$BRIDGE_STATE_DIR/.session-"*.json \
+              "$BRIDGE_STATE_DIR/.sessions.json"
         echo "Cleared agent sessions"
         sleep 2
         sync_mod
@@ -107,10 +112,17 @@ case "$CMD" in
         # agent boots believing it already finished a factory that no longer
         # exists (stale ledger/journal) and just spins re-scanning.
         rm -f "$PROJECT_ROOT/bridge/.session-"*.json \
+              "$PROJECT_ROOT/bridge/.sessions.json" \
               "$PROJECT_ROOT/bridge/.ledger-"*.json \
               "$PROJECT_ROOT/bridge/.journal-"*.jsonl \
               "$PROJECT_ROOT/bridge/.reflection-"*.json \
-              "$PROJECT_ROOT/bridge/.skills.json"
+              "$PROJECT_ROOT/bridge/.skills.json" \
+              "$BRIDGE_STATE_DIR/.session-"*.json \
+              "$BRIDGE_STATE_DIR/.sessions.json" \
+              "$BRIDGE_STATE_DIR/.ledger-"*.json \
+              "$BRIDGE_STATE_DIR/.journal-"*.jsonl \
+              "$BRIDGE_STATE_DIR/.reflection-"*.json \
+              "$BRIDGE_STATE_DIR/.skills.json"
         echo "Cleared agent memory (sessions, ledger, journal, reflection, skills)"
         sleep 2
         sync_mod

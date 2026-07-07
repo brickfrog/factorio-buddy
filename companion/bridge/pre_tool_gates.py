@@ -151,11 +151,6 @@ class ManualAutomationDriftGate:
         if request.short_name not in self.MANUAL_TRANSFER_TOOLS:
             return PreToolUseHookResponse.noop().to_dict()
 
-        if self.block_all_manual_transfers:
-            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
-            self.log.debug(block.debug_message)
-            return PreToolUseHookResponse.block(block).to_dict()
-
         try:
             ledger = self.ledger_loader(self.agent_name)
         except Exception as exc:
@@ -185,14 +180,21 @@ class ManualAutomationDriftGate:
             return PreToolUseHookResponse.noop().to_dict()
         automation_setup_context = self._ledger_has_automation_enabling_setup_context(ledger)
         if (
+            request.is_bootstrap_infrastructure_craft
+            and (
+                automation_setup_context
+                or not has_automation_footprint
+            )
+        ):
+            return PreToolUseHookResponse.noop().to_dict()
+        if self.block_all_manual_transfers:
+            block = PreToolUseGuardBlock.manual_automation(tool_name=request.short_name)
+            self.log.debug(block.debug_message)
+            return PreToolUseHookResponse.block(block).to_dict()
+        if (
             automation_setup_context
             and request.is_manual_material_transfer
             and not has_automation_footprint
-        ):
-            return PreToolUseHookResponse.noop().to_dict()
-        if (
-            request.is_bootstrap_infrastructure_craft
-            and automation_setup_context
         ):
             return PreToolUseHookResponse.noop().to_dict()
         if (
