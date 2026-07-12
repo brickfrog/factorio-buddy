@@ -2504,7 +2504,7 @@ pub struct SetStatusParams {
     pub status: String,
 }
 
-/// Parameters for registering an agent tab in the companion UI.
+/// Parameters for registering an agent tab in the Buddy UI.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RegisterAgentParams {
     /// Agent name.
@@ -2513,7 +2513,7 @@ pub struct RegisterAgentParams {
     pub label: Option<String>,
 }
 
-/// Parameters for unregistering an agent tab in the companion UI.
+/// Parameters for unregistering an agent tab in the Buddy UI.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct UnregisterAgentParams {
     /// Agent name.
@@ -2934,9 +2934,7 @@ impl FactorioMcp {
 #[tool_router]
 impl FactorioMcp {
     /// Send an agent response to the in-game chat UI.
-    #[tool(
-        description = "Bridge lifecycle tool: send an agent response to the Factorio companion UI."
-    )]
+    #[tool(description = "NPC lifecycle tool: send an agent response to the Factorio Buddy UI.")]
     async fn send_chat_response(
         &self,
         Parameters(params): Parameters<SendChatResponseParams>,
@@ -2952,9 +2950,9 @@ impl FactorioMcp {
         .await
     }
 
-    /// Update the visible tool status in the companion UI.
+    /// Update the visible tool status in the Buddy UI.
     #[tool(
-        description = "Bridge lifecycle tool: update the visible tool status in the Factorio companion UI."
+        description = "NPC lifecycle tool: update the visible tool status in the Factorio Buddy UI."
     )]
     async fn tool_status(&self, Parameters(params): Parameters<ToolStatusParams>) -> String {
         self.call_lifecycle_remote(
@@ -2968,10 +2966,8 @@ impl FactorioMcp {
         .await
     }
 
-    /// Set the visible status in the companion UI.
-    #[tool(
-        description = "Bridge lifecycle tool: set the visible status in the Factorio companion UI."
-    )]
+    /// Set the visible status in the Buddy UI.
+    #[tool(description = "NPC lifecycle tool: set the visible status in the Factorio Buddy UI.")]
     async fn set_status(&self, Parameters(params): Parameters<SetStatusParams>) -> String {
         self.call_lifecycle_remote(
             "set_status",
@@ -2983,10 +2979,8 @@ impl FactorioMcp {
         .await
     }
 
-    /// Register an agent tab in the companion UI.
-    #[tool(
-        description = "Bridge lifecycle tool: register an agent tab in the Factorio companion UI."
-    )]
+    /// Register an agent tab in the Buddy UI.
+    #[tool(description = "NPC lifecycle tool: register an agent tab in the Factorio Buddy UI.")]
     async fn register_agent(&self, Parameters(params): Parameters<RegisterAgentParams>) -> String {
         let mut args = vec![serde_json::json!(params.agent_name)];
         if let Some(label) = params.label {
@@ -2995,10 +2989,8 @@ impl FactorioMcp {
         self.call_lifecycle_remote("register_agent", &args).await
     }
 
-    /// Unregister an agent tab from the companion UI.
-    #[tool(
-        description = "Bridge lifecycle tool: unregister an agent tab from the Factorio companion UI."
-    )]
+    /// Unregister an agent tab from the Buddy UI.
+    #[tool(description = "NPC lifecycle tool: unregister an agent tab from the Factorio Buddy UI.")]
     async fn unregister_agent(
         &self,
         Parameters(params): Parameters<UnregisterAgentParams>,
@@ -3009,7 +3001,7 @@ impl FactorioMcp {
 
     /// Ensure a planet surface exists.
     #[tool(
-        description = "Bridge lifecycle tool: ensure a planet surface exists and return its status."
+        description = "NPC lifecycle tool: ensure a planet surface exists and return its status."
     )]
     async fn ensure_surface(&self, Parameters(params): Parameters<EnsureSurfaceParams>) -> String {
         self.call_lifecycle_remote("ensure_surface_result", &[serde_json::json!(params.planet)])
@@ -3018,7 +3010,7 @@ impl FactorioMcp {
 
     /// Pre-place an agent character on a planet surface.
     #[tool(
-        description = "Bridge lifecycle tool: create or teleport an agent character on a planet surface."
+        description = "NPC lifecycle tool: create or teleport an agent character on a planet surface."
     )]
     async fn place_character(
         &self,
@@ -3036,7 +3028,7 @@ impl FactorioMcp {
     }
 
     /// Toggle spectator mode for connecting players.
-    #[tool(description = "Bridge lifecycle tool: toggle spectator mode for connecting players.")]
+    #[tool(description = "NPC lifecycle tool: toggle spectator mode for connecting players.")]
     async fn set_spectator_mode(
         &self,
         Parameters(params): Parameters<SetSpectatorModeParams>,
@@ -3045,21 +3037,21 @@ impl FactorioMcp {
             .await
     }
 
-    /// Ping the companion mod dispatcher.
-    #[tool(description = "Bridge lifecycle tool: ping the companion mod dispatcher.")]
+    /// Ping the Factorio Buddy mod dispatcher.
+    #[tool(description = "NPC lifecycle tool: ping the Factorio Buddy mod dispatcher.")]
     async fn ping(&self) -> String {
         self.call_lifecycle_remote("ping", &[]).await
     }
 
     /// Get compact live state for an agent.
-    #[tool(description = "Bridge lifecycle tool: get compact live state for an agent.")]
+    #[tool(description = "NPC lifecycle tool: get compact live state for an agent.")]
     async fn live_state(&self, Parameters(params): Parameters<LiveStateParams>) -> String {
         self.call_lifecycle_remote("live_state_result", &[serde_json::json!(params.agent_name)])
             .await
     }
 
     /// Count currently connected human players.
-    #[tool(description = "Bridge lifecycle tool: count currently connected human players.")]
+    #[tool(description = "NPC lifecycle tool: count currently connected human players.")]
     async fn connected_player_count(&self) -> String {
         self.call_lifecycle_remote("connected_player_count_result", &[])
             .await
@@ -3452,7 +3444,7 @@ impl FactorioMcp {
 
     /// Capture one read-only visual/collision snapshot for wedged-state debugging.
     #[tool(
-        description = "Read-only save-state debug probe for stuck agents. Returns current position, is_player_blocked collision diagnostics, dry-run unstuck recommendation, optional can_stand_at for the map center, and a local ASCII map with @ marking the character. Use when Doug is standing still, appears under an entity, or screenshots suggest the character is physically wedged."
+        description = "Read-only save-state debug probe for stuck NPCs. Returns current position, is_player_blocked collision diagnostics, dry-run unstuck recommendation, optional can_stand_at for the map center, and a local ASCII map with @ marking the character. Use when the NPC is standing still, appears under an entity, or screenshots suggest the character is physically wedged."
     )]
     async fn debug_wedged_state(
         &self,

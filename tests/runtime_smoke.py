@@ -2,7 +2,7 @@
 """
 Runtime smoke checks for the real factorioctl/claude-interface surface.
 
-This runner is intentionally separate from Doug/the bridge. It is an
+This runner is intentionally separate from the NPC runtime. It is an
 operator-facing disposable-save test harness, so it explicitly opts into raw
 Lua for trusted CLI fixture seeding while keeping raw Lua disabled for MCP
 agents by default.
@@ -24,7 +24,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MOD_SOURCE = REPO_ROOT / "companion" / "mod" / "claude-interface"
+MOD_SOURCE = REPO_ROOT / "mod" / "claude-interface"
 DEFAULT_SYNCED_MOD = Path.home() / ".factorio" / "mods" / "claude-interface"
 DEFAULT_CLI = REPO_ROOT / "target" / "release" / "factorioctl"
 DEFAULT_MCP = REPO_ROOT / "target" / "release" / "mcp"
@@ -285,8 +285,7 @@ def _pydantic_runtime() -> tuple[Any, type[Exception]]:
     except ModuleNotFoundError as exc:
         raise SmokeError(
             "runtime smoke JSON validation requires pydantic; run tests/smoke.sh "
-            "or invoke this script with companion/.venv/bin/python after "
-            "`cd companion && just install`",
+            "with a Python environment that provides pydantic",
             "smoke-runner",
         ) from exc
     return TypeAdapter, ValidationError

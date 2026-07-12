@@ -69,7 +69,7 @@ fn named_agent() -> AgentId {
 
 fn manifest_remotes() -> BTreeMap<String, Vec<String>> {
     let manifest: Value = serde_json::from_str(include_str!(
-        "../companion/mod/claude-interface/remote_api.json"
+        "../mod/claude-interface/remote_api.json"
     ))
     .expect("remote_api.json should be valid JSON");
     let remotes = manifest["remotes"]
@@ -111,7 +111,7 @@ fn rust_wrapper_remote_names() -> BTreeSet<String> {
 }
 
 fn control_lua_remote_signatures() -> BTreeMap<String, Vec<String>> {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
     let mut signatures = BTreeMap::new();
     let mut in_api = false;
     for line in control_lua.lines() {
@@ -631,8 +631,8 @@ fn remote_api_manifest_matches_rust_wrappers_and_mod_exports() {
 
 #[test]
 fn mod_json_response_helper_lives_in_domain_module() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let json_response_lua = include_str!("../companion/mod/claude-interface/json_response.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let json_response_lua = include_str!("../mod/claude-interface/json_response.lua");
 
     assert!(
         control_lua.contains(r#"local json_response = require("json_response")"#)
@@ -654,8 +654,8 @@ fn mod_json_response_helper_lives_in_domain_module() {
 
 #[test]
 fn claude_command_dispatcher_uses_shared_api_and_structured_errors() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let json_response_lua = include_str!("../companion/mod/claude-interface/json_response.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let json_response_lua = include_str!("../mod/claude-interface/json_response.lua");
 
     assert!(
         control_lua.contains("local api = {")
@@ -686,8 +686,8 @@ fn claude_command_dispatcher_uses_shared_api_and_structured_errors() {
 
 #[test]
 fn corrected_inventory_readers_document_factorio_2_get_contents_shape() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let research_lua = include_str!("../companion/mod/claude-interface/research.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let research_lua = include_str!("../mod/claude-interface/research.lua");
     assert_uses_factorio_2_get_contents_shape("research.lua get_available_research", research_lua);
     assert_uses_factorio_2_get_contents_shape("control.lua clear_area_impl", control_lua);
 }
@@ -740,8 +740,8 @@ fn transport_line_readers_document_factorio_2_object_array_shape() {
         }
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let transport_lua = include_str!("../companion/mod/claude-interface/transport.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let transport_lua = include_str!("../mod/claude-interface/transport.lua");
     assert!(
         control_lua.contains("local transport = require(\"transport\")")
             && control_lua.contains("get_belt_contents = function(x1, y1, x2, y2)")
@@ -789,8 +789,8 @@ fn named_walk_routes_to_mod_target_without_host_driver_state() {
 
 #[test]
 fn research_readiness_counts_resolved_character_science_in_totals() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let research_lua = include_str!("../companion/mod/claude-interface/research.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let research_lua = include_str!("../mod/claude-interface/research.lua");
 
     assert!(
         control_lua.contains("local character = find_factorioctl_character(agent_id)")
@@ -829,8 +829,8 @@ fn get_entity_inventory_uses_factorio_2_object_array_for_cjf_2() {
         );
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let inventory_lua = include_str!("../companion/mod/claude-interface/inventory.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let inventory_lua = include_str!("../mod/claude-interface/inventory.lua");
     assert!(
         control_lua.contains("local function get_entity_inventory_impl")
             && control_lua.contains("get_entity_inventory = function(unit_number)")
@@ -939,9 +939,9 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
         );
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let entities_lua = include_str!("../companion/mod/claude-interface/entities.lua");
-    let world_lua = include_str!("../companion/mod/claude-interface/world.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let entities_lua = include_str!("../mod/claude-interface/entities.lua");
+    let world_lua = include_str!("../mod/claude-interface/world.lua");
     for required in [
         "local entities = require(\"entities\")",
         "entities.get_surfaces",
@@ -1056,8 +1056,8 @@ fn entity_lookup_and_drop_position_live_in_the_mod_not_rust_strings() {
         "MCP drill belt-position helper should call /claude directly, not build Lua locally"
     );
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let entities_lua = include_str!("../companion/mod/claude-interface/entities.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let entities_lua = include_str!("../mod/claude-interface/entities.lua");
     for required in [
         "local entities = require(\"entities\")",
         "entities.get_drop_position",
@@ -1096,89 +1096,6 @@ fn entity_lookup_and_drop_position_live_in_the_mod_not_rust_strings() {
 }
 
 #[test]
-fn bridge_bootstrap_gameplay_lives_in_the_mod_not_python_strings() {
-    let transport_py = include_str!("../companion/bridge/transport.py");
-    for required in [
-        "def send_chat_response(",
-        "def ensure_surface(",
-        "def place_character(",
-        "def ping(",
-    ] {
-        assert!(
-            transport_py.contains(required),
-            "bridge transport should expose Rust MCP lifecycle wrapper {required:?}"
-        );
-    }
-    for forbidden in ["RconRemoteCall", "from rcon", "command_to_tool_call"] {
-        assert!(
-            !transport_py.contains(forbidden),
-            "bridge transport should not render requests or import Python RCON {forbidden:?}"
-        );
-    }
-    for forbidden in [
-        "game.planets",
-        "game.surfaces",
-        "create_surface",
-        "request_to_generate_chunks",
-        "force_generate_chunk_requests",
-        "create_entity",
-        "storage.factorioctl_characters",
-        "storage.factorioctl_entities",
-    ] {
-        assert!(
-            !transport_py.contains(forbidden),
-            "bridge transport should not embed gameplay Lua {forbidden:?}"
-        );
-    }
-
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let characters_lua = include_str!("../companion/mod/claude-interface/characters.lua");
-    for required in [
-        "local characters = require(\"characters\")",
-        "characters.ensure_surface",
-        "characters.ensure_surface_result",
-        "characters.pre_place",
-        "characters.pre_place_result",
-        "ensure_surface = function(planet_name)",
-        "ensure_surface_result = function(planet_name)",
-        "pre_place_character = function(agent_id, planet_name, spawn_x)",
-        "pre_place_character_result = function(agent_id, planet_name, spawn_x)",
-    ] {
-        assert!(
-            control_lua.contains(required),
-            "control.lua bridge bootstrap remotes should include {required:?}"
-        );
-    }
-    for moved in [
-        "local function ensure_surface_impl",
-        "local function pre_place_character_impl",
-        "target_surface.request_to_generate_chunks({spawn_x, 0}, 4)",
-        "character = target_surface.create_entity{",
-        "remember_factorioctl_character(agent_id, character)",
-    ] {
-        assert!(
-            !control_lua.contains(moved),
-            "control.lua should not retain bridge bootstrap implementation {moved:?}"
-        );
-    }
-    for required in [
-        "function M.ensure_surface(planet_name)",
-        "function M.ensure_surface_result(planet_name)",
-        "function M.pre_place(agent_id, planet_name, spawn_x)",
-        "function M.pre_place_result(agent_id, planet_name, spawn_x)",
-        "target_surface.request_to_generate_chunks({spawn_x, 0}, 4)",
-        "character = target_surface.create_entity{",
-        "M.remember(agent_id, character)",
-        "helpers.table_to_json",
-    ] {
-        assert!(
-            characters_lua.contains(required),
-            "characters.lua bridge bootstrap helpers should include {required:?}"
-        );
-    }
-}
-
-#[test]
 fn lifecycle_remotes_have_thin_rust_mcp_wrappers() {
     let mcp_rs = include_str!("../src/bin/mcp.rs");
     for (tool, remote) in [
@@ -1199,88 +1116,6 @@ fn lifecycle_remotes_have_thin_rust_mcp_wrappers() {
             mcp_rs.contains(&format!("async fn {tool}"))
                 && mcp_rs.contains(&format!("\"{remote}\"")),
             "MCP lifecycle tool {tool:?} should call mod remote {remote:?}"
-        );
-    }
-}
-
-#[test]
-fn bridge_live_state_gameplay_lives_in_the_mod_not_python_strings() {
-    let pipe_py = include_str!("../companion/bridge/pipe.py");
-    assert!(
-        pipe_py.contains(".live_state(")
-            && pipe_py.contains("LiveState.from_rcon_response"),
-        "bridge live-state probe should call the typed JSON mod remote through the Rust MCP lifecycle client"
-    );
-    assert!(
-        pipe_py.contains(".connected_player_count()")
-            && pipe_py.contains("ConnectedPlayerCountResult.from_rcon_response"),
-        "bridge human-connected probe should call the typed JSON mod remote through the Rust MCP lifecycle client"
-    );
-    for forbidden in ["RconRemoteCall", "from rcon", "ThreadSafeRCON"] {
-        assert!(
-            !pipe_py.contains(forbidden),
-            "bridge live-state probe should not import or render Python RCON requests {forbidden:?}"
-        );
-    }
-    for forbidden in [
-        "c.surface.find_entities_filtered",
-        "#game.connected_players",
-        "local names =",
-        "player entities:",
-        "string.format(\"%.1f,%.1f\"",
-    ] {
-        assert!(
-            !pipe_py.contains(forbidden),
-            "bridge live-state probe should not embed gameplay Lua {forbidden:?}"
-        );
-    }
-
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let characters_lua = include_str!("../companion/mod/claude-interface/characters.lua");
-    for required in [
-        "local characters = require(\"characters\")",
-        "characters.live_state_line",
-        "characters.live_state_result",
-        "characters.connected_player_count",
-        "characters.connected_player_count_result",
-        "live_state_line = function(agent_id)",
-        "live_state_result = function(agent_id)",
-        "connected_player_count = function()",
-        "connected_player_count_result = function()",
-    ] {
-        assert!(
-            control_lua.contains(required),
-            "control.lua live-state remote should include {required:?}"
-        );
-    }
-    for moved in [
-        "local function live_state_line_impl",
-        "character.surface.find_entities_filtered{force = character.force, name = name}",
-        "\"Live state: \"",
-        "\"; player entities: \" .. table.concat(parts, \", \")",
-        "local function connected_player_count_impl",
-        "return #game.connected_players",
-    ] {
-        assert!(
-            !control_lua.contains(moved),
-            "control.lua should not retain live-state implementation {moved:?}"
-        );
-    }
-    for required in [
-        "function M.live_state_line(agent_id)",
-        "function M.live_state_result(agent_id)",
-        "character.surface.find_entities_filtered{force = character.force, name = name}",
-        "\"Live state: \"",
-        "\"; player entities: \" .. table.concat(parts, \", \")",
-        "helpers.table_to_json",
-        "entity_counts = live_state_entity_counts(character)",
-        "function M.connected_player_count()",
-        "function M.connected_player_count_result()",
-        "return #game.connected_players",
-    ] {
-        assert!(
-            characters_lua.contains(required),
-            "characters.lua live-state helper should include {required:?}"
         );
     }
 }
@@ -1332,7 +1167,7 @@ fn broadcast_display_gameplay_lives_in_the_mod_not_cli_or_mcp_strings() {
         );
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
     for required in [
         "local function broadcast_console_impl",
         "game.print(\"[Agent] \" .. tostring(message or \"\"))",
@@ -1412,7 +1247,7 @@ fn tick_control_gameplay_lives_in_the_mod_not_rust_strings() {
         "FactorioClient get_tick should use the /claude remote primitive, not generated Lua"
     );
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
     for required in [
         "local function get_tick_impl",
         "return {tick = game.tick}",
@@ -1572,10 +1407,10 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
         );
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let characters_lua = include_str!("../companion/mod/claude-interface/characters.lua");
-    let json_response_lua = include_str!("../companion/mod/claude-interface/json_response.lua");
-    let inventory_lua = include_str!("../companion/mod/claude-interface/inventory.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let characters_lua = include_str!("../mod/claude-interface/characters.lua");
+    let json_response_lua = include_str!("../mod/claude-interface/json_response.lua");
+    let inventory_lua = include_str!("../mod/claude-interface/inventory.lua");
     for required in [
         "local find_factorioctl_character = characters.find",
         "local function remove_entity_at_impl",
@@ -1627,7 +1462,7 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
 
 #[test]
 fn blueprint_commands_use_scratch_stack_without_name_only_restore() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
     assert!(
         control_lua.contains("local function blueprint_scratch_stack")
             && control_lua.contains("inv.find_empty_stack(\"blueprint\")")
@@ -1699,7 +1534,7 @@ fn blueprint_commands_are_agent_scoped_for_cjf_11() {
         }
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
     for required in [
         "local function create_native_blueprint_impl",
         "local function save_blueprint_impl",
@@ -1743,7 +1578,7 @@ fn chat_fetch_uses_mod_remote_without_level_storage_fallback() {
     assert!(!lua.contains("storage.factorioctl_chat"));
     assert!(!lua.contains("handler_registered"));
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
     assert!(control_lua.contains("chat_capture_status = function()"));
     assert!(control_lua.contains("registered = true"));
 }
@@ -1840,9 +1675,9 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
         }
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let characters_lua = include_str!("../companion/mod/claude-interface/characters.lua");
-    let json_response_lua = include_str!("../companion/mod/claude-interface/json_response.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let characters_lua = include_str!("../mod/claude-interface/characters.lua");
+    let json_response_lua = include_str!("../mod/claude-interface/json_response.lua");
     for required in [
         "local characters = require(\"characters\")",
         "local remember_factorioctl_character = characters.remember",
@@ -1924,7 +1759,7 @@ fn wedged_debug_probe_combines_collision_diagnostics_and_visual_snapshot() {
         "debug_wedged_state should be a one-call save-state visual/collision probe"
     );
     assert!(
-        mcp_rs.contains("Read-only save-state debug probe for stuck agents")
+        mcp_rs.contains("Read-only save-state debug probe for stuck NPCs")
             && mcp_rs.contains("appears under an entity")
             && mcp_rs.contains("@ marking the character"),
         "debug_wedged_state tool description should steer agents toward wedged-state diagnosis"
@@ -2043,8 +1878,8 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         }
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let placement_lua = include_str!("../companion/mod/claude-interface/placement.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let placement_lua = include_str!("../mod/claude-interface/placement.lua");
     for required in [
         "local placement = require(\"placement\")",
         "placement.place_entity",
@@ -2199,7 +2034,7 @@ fn build_helpers_live_in_the_mod_not_rust_strings() {
         }
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
     for required in [
         "local function build_entity_result",
         "local function direction_from_name",
@@ -2338,8 +2173,8 @@ fn power_extension_uses_mod_remote_not_inline_lua() {
 
 #[test]
 fn steam_power_planner_lives_in_power_module() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let power_lua = include_str!("../mod/claude-interface/power.lua");
 
     assert!(
         control_lua.contains(r#"local power = require("power")"#)
@@ -2428,8 +2263,8 @@ fn power_diagnostics_use_mod_remote_not_inline_lua() {
 
 #[test]
 fn steam_power_repair_lives_in_power_module() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let power_lua = include_str!("../mod/claude-interface/power.lua");
 
     assert!(
         control_lua.contains(r#"local power = require("power")"#)
@@ -2461,8 +2296,8 @@ fn steam_power_repair_lives_in_power_module() {
 
 #[test]
 fn power_extension_lives_in_power_module() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let power_lua = include_str!("../mod/claude-interface/power.lua");
 
     assert!(
         control_lua.contains(r#"local power = require("power")"#)
@@ -2491,8 +2326,8 @@ fn power_extension_lives_in_power_module() {
 
 #[test]
 fn steam_power_diagnostic_lives_in_mod_remote_interface() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let power_lua = include_str!("../mod/claude-interface/power.lua");
 
     assert!(
         control_lua.contains(r#"local power = require("power")"#)
@@ -2541,8 +2376,8 @@ fn steam_power_diagnostic_lives_in_mod_remote_interface() {
 
 #[test]
 fn power_diagnostics_live_in_mod_remote_interface() {
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let power_lua = include_str!("../companion/mod/claude-interface/power.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let power_lua = include_str!("../mod/claude-interface/power.lua");
 
     for required in [
         "get_power_status = function(x, y, radius)",
@@ -2663,7 +2498,7 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
         );
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
     for required in [
         "local function inventory_item_total",
         "local function find_minable_at",
@@ -2854,9 +2689,9 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
         );
     }
 
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let recipes_lua = include_str!("../companion/mod/claude-interface/recipes.lua");
-    let research_lua = include_str!("../companion/mod/claude-interface/research.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let recipes_lua = include_str!("../mod/claude-interface/recipes.lua");
+    let research_lua = include_str!("../mod/claude-interface/research.lua");
     for required in [
         "local function recipe_unlocks",
         "local function recipe_ingredients",
@@ -3005,72 +2840,6 @@ fn research_cli_queries_use_mod_remotes_not_inline_lua() {
         assert!(
             !research_rs.contains(forbidden) && !client_mod.contains(forbidden),
             "research CLI/client should not embed inline gameplay Lua {forbidden:?}"
-        );
-    }
-}
-
-#[test]
-fn eval_harness_production_snapshot_lives_in_mod_remote_not_python_lua() {
-    let eval_py = include_str!("../companion/bridge/eval.py");
-    let control_lua = include_str!("../companion/mod/claude-interface/control.lua");
-    let diagnostics_lua = include_str!("../companion/mod/claude-interface/diagnostics.lua");
-
-    assert!(
-        eval_py.contains("eval_production_snapshot(surface_name=surface)")
-            && eval_py.contains("McpLifecycleClient")
-            && eval_py.contains("find_factorioctl_mcp"),
-        "eval harness should query production stats via the Rust MCP lifecycle client"
-    );
-    for forbidden in ["RconRemoteCall", "from rcon"] {
-        assert!(
-            !eval_py.contains(forbidden),
-            "eval harness should not import or render Python RCON requests {forbidden:?}"
-        );
-    }
-    for forbidden in [
-        "game.surfaces",
-        "game.forces.player",
-        "get_item_production_statistics",
-        "get_flow_count",
-        "defines.flow_precision_index",
-    ] {
-        assert!(
-            !eval_py.contains(forbidden),
-            "eval harness should not embed production Lua {forbidden:?}"
-        );
-    }
-
-    for required in [
-        "local diagnostics = require(\"diagnostics\")",
-        "diagnostics.eval_production_snapshot",
-        "eval_production_snapshot = function(surface_name)",
-    ] {
-        assert!(
-            control_lua.contains(required),
-            "control.lua should expose eval production snapshot through diagnostics.lua {required:?}"
-        );
-    }
-    for moved in [
-        "local function eval_production_snapshot_impl",
-        "game.forces.player.get_item_production_statistics(surface)",
-        "defines.flow_precision_index.one_minute",
-        "stats.get_flow_count{",
-    ] {
-        assert!(
-            !control_lua.contains(moved),
-            "control.lua should not retain eval production snapshot implementation {moved:?}"
-        );
-    }
-
-    for required in [
-        "function M.eval_production_snapshot(surface_name)",
-        "game.forces.player.get_item_production_statistics(surface)",
-        "defines.flow_precision_index.one_minute",
-        "stats.get_flow_count{",
-    ] {
-        assert!(
-            diagnostics_lua.contains(required),
-            "diagnostics.lua should own eval production snapshot logic {required:?}"
         );
     }
 }

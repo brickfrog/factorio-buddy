@@ -1,0 +1,9 @@
+{
+    "name": "claude-interface",
+    "version": "1.0.0",
+    "title": "Factorio Buddy",
+    "author": "factorio-buddy",
+    "factorio_version": "2.0",
+    "dependencies": ["base >= 2.0"],
+    "description": "Game-side adapter for one autonomous Factorio NPC controlled by the Rust factorio-buddy runtime."
+}

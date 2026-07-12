@@ -2,8 +2,7 @@
 # Setup an isolated Factorio server for factorioctl runtime tests.
 #
 # This script deliberately uses a test save, test RCON port, and test
-# write-data directory. It must not touch the companion save used by
-# `just play` / `just resume`.
+# write-data directory. It must not touch the normal buddy save.
 
 set -euo pipefail
 
@@ -17,7 +16,7 @@ RCON_PASSWORD="${RCON_PASSWORD:-test_password}"
 GAME_PORT="${GAME_PORT:-34198}"
 SERVER_DATA_DIR="${SERVER_DATA_DIR:-$PROJECT_ROOT/.factorio-test-data}"
 CONFIG_FILE="$SERVER_DATA_DIR/config.ini"
-MOD_SRC="$PROJECT_ROOT/companion/mod/claude-interface"
+MOD_SRC="$PROJECT_ROOT/mod/claude-interface"
 MOD_DST="$SERVER_DATA_DIR/mods/claude-interface"
 
 if [ -n "${1:-}" ]; then

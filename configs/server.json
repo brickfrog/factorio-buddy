@@ -1,0 +1,18 @@
+{
+  "name": "Factorio Buddy",
+  "description": "Local game with one autonomous AI teammate",
+  "tags": ["buddy", "local"],
+  "max_players": 4,
+  "visibility": {
+    "public": false,
+    "lan": true
+  },
+  "require_user_verification": false,
+  "auto_pause": false,
+  "auto_pause_when_players_connect": false,
+  "autosave_interval": 10,
+  "autosave_slots": 3,
+  "afk_autokick_interval": 0,
+  "allow_commands": "true",
+  "only_admins_can_pause_the_game": false
+}

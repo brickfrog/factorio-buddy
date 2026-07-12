@@ -13,12 +13,11 @@ RCON_PASSWORD="${RCON_PASSWORD:-test_password}"
 GAME_PORT="${GAME_PORT:-34198}"
 SYNCED_MOD_DIR="${FACTORIOCTL_SYNCED_MOD_DIR:-$PROJECT_ROOT/.factorio-test-data/mods/claude-interface}"
 SAVE_PATH="${SAVE_PATH:-$PROJECT_ROOT/saves/${SAVE_NAME}.zip}"
-PYTHON_BIN="${PYTHON_BIN:-$PROJECT_ROOT/companion/.venv/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
-    echo "ERROR: runtime smoke checks require the companion Python environment."
-    echo "       Run: cd companion && just install"
-    echo "       Or set PYTHON_BIN=/path/to/python-with-pydantic"
+    echo "ERROR: runtime smoke checks require Python 3 with pydantic."
+    echo "       Set PYTHON_BIN=/path/to/python3 if it is not on PATH."
     exit 1
 fi
 
