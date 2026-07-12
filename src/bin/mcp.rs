@@ -4358,7 +4358,7 @@ impl FactorioMcp {
 
     /// Execute a safe entity placement selected by plan_entity_placement_near.
     #[tool(
-        description = "Place one entity using the selected safe placement from plan_entity_placement_near. Avoids agent-overlap/trapping placements and returns the placed unit number. Prefer this over manual place_entity for assemblers, labs, poles, chests, and crowded builds. Use dry_run=true during planner turns."
+        description = "Place one isolated entity using a nearby safe position selected by plan_entity_placement_near. This may change the requested coordinate, so do not use it to execute exact placement arguments returned by another planner. Use dry_run=true to preview the selected position."
     )]
     async fn execute_entity_placement_near(
         &self,
@@ -5223,7 +5223,8 @@ impl FactorioMcp {
             )
             .await
         {
-            Ok(()) => format!("Inserted {} {} into entity", params.count, params.item),
+            Ok(transfer) => serde_json::to_string_pretty(&transfer)
+                .unwrap_or_else(|e| format!("Error serializing transfer result: {}", e)),
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await

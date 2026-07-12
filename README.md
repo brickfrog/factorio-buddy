@@ -25,21 +25,21 @@ Join `localhost:34197` from Factorio's multiplayer menu. Press `Ctrl+Shift+C`
 to open the Buddy panel.
 
 `just play` builds the Rust binaries, installs the included Lua mod into an
-isolated `.factorio-buddy` write-data directory, creates a save if necessary,
-starts the headless server, waits for RCON, registers one NPC character, and
-starts the model/tool loop. Ctrl+C stops both the NPC and the server.
+isolated `.factorio-buddy` write-data directory, replaces the Buddy save with a
+new game, starts the headless server, waits for RCON, registers one NPC
+character, and starts the model/tool loop. Ctrl+C stops both the NPC and the
+server.
 
-Use `just fresh` to replace the isolated Buddy world with a new save. Use
-`just npc` if Factorio is already running with RCON and the mod installed.
+Use `just resume` to continue the existing isolated Buddy world. Use `just npc`
+if Factorio is already running with RCON and the mod installed.
 
-## Cost controls
+## Autonomy
 
 Autonomy runs only while a human player is connected. The default autonomous
-interval is 30 seconds and each model turn is capped at $0.25. Override these
-when launching if needed:
+interval is 30 seconds. Override the interval when launching if needed:
 
 ```bash
-BUDDY_HEARTBEAT_SECONDS=60 BUDDY_MAX_BUDGET_USD=0.10 just play
+BUDDY_HEARTBEAT_SECONDS=60 just play
 ```
 
 Set `BUDDY_HEARTBEAT_SECONDS=0` or run `just chat` for chat-only operation.

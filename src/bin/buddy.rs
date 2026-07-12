@@ -6,6 +6,7 @@
 //! gameplay implementation remains in Rust/Lua; there is no second planner or
 //! memory system here.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -17,12 +18,13 @@ use clap::Parser;
 use factorioctl::client::{AgentId, FactorioClient};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the autonomous Factorio buddy using the Rust MCP tool server")]
@@ -77,10 +79,6 @@ struct Args {
 
     #[arg(long, default_value_t = true, env = "AUTONOMY_REQUIRES_PLAYER")]
     autonomy_requires_player: bool,
-
-    /// Maximum model spend per turn. Set to 0 to disable the cap explicitly.
-    #[arg(long, default_value_t = 0.25, env = "BUDDY_MAX_BUDGET_USD")]
-    max_budget_usd: f64,
 
     #[arg(long, default_value_t = 600, env = "BUDDY_TURN_TIMEOUT_SECONDS")]
     turn_timeout_seconds: u64,
@@ -229,9 +227,9 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install_mod(write_data: &Path) -> Result<()> {
+fn install_mod_into(mods_dir: &Path) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod/claude-interface");
-    let destination = write_data.join("mods/claude-interface");
+    let destination = mods_dir.join("claude-interface");
     if destination.exists() {
         std::fs::remove_dir_all(&destination)?;
     }
@@ -239,13 +237,35 @@ fn install_mod(write_data: &Path) -> Result<()> {
         .with_context(|| format!("failed to install Factorio mod from {}", source.display()))
 }
 
+fn install_mods(write_data: &Path) -> Result<()> {
+    install_mod_into(&write_data.join("mods"))?;
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let client_mods = home.join(".factorio/mods");
+        if client_mods.is_dir() {
+            install_mod_into(&client_mods)
+                .context("failed to install Buddy mod for the Factorio client")?;
+            info!(path = %client_mods.display(), "installed Factorio client mod");
+        }
+    }
+    Ok(())
+}
+
 async fn start_local_server(args: &Args) -> Result<LocalServer> {
+    if tokio::net::TcpStream::connect((&*args.rcon_host, args.rcon_port))
+        .await
+        .is_ok()
+    {
+        bail!(
+            "RCON port {} is already in use; stop the existing Factorio server before `just play`",
+            args.rcon_port
+        );
+    }
     let factorio = find_factorio(args.factorio_bin.clone())?;
     let write_data = std::fs::canonicalize(&args.write_data).or_else(|_| {
         std::fs::create_dir_all(&args.write_data)?;
         std::fs::canonicalize(&args.write_data)
     })?;
-    install_mod(&write_data)?;
+    install_mods(&write_data)?;
     std::fs::create_dir_all(write_data.join("saves"))?;
     std::fs::create_dir_all(write_data.join("logs"))?;
 
@@ -312,18 +332,22 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         .context("Factorio stdin pipe unavailable")?;
 
     for _ in 0..60 {
+        if let Some(status) = child.try_wait()? {
+            bail!("Factorio server exited during startup: {status}");
+        }
         if FactorioClient::connect(&args.rcon_host, args.rcon_port, &args.rcon_password)
             .await
             .is_ok()
         {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(status) = child.try_wait()? {
+                bail!("Factorio server exited after opening RCON: {status}");
+            }
             info!(save = %save.display(), "Factorio server ready");
             return Ok(LocalServer {
                 child,
                 _stdin: stdin,
             });
-        }
-        if let Some(status) = child.try_wait()? {
-            bail!("Factorio server exited during startup: {status}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -369,11 +393,14 @@ async fn invoke_claude(
     prompt: &str,
     session_id: &mut Option<String>,
 ) -> Result<String> {
+    let started = Instant::now();
+    info!(event = "turn_start", session = session_id.as_deref().unwrap_or("new"), prompt = %prompt, "Claude turn started");
     let mut command = Command::new("claude");
     command
         .arg("--print")
         .arg("--output-format")
-        .arg("json")
+        .arg("stream-json")
+        .arg("--verbose")
         .arg("--strict-mcp-config")
         .arg("--mcp-config")
         .arg(config)
@@ -387,44 +414,138 @@ async fn invoke_claude(
         .arg("--system-prompt")
         .arg(&args.system_prompt)
         .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .kill_on_drop(true);
     if let Some(model) = &args.model {
         command.arg("--model").arg(model);
-    }
-    if args.max_budget_usd > 0.0 {
-        command
-            .arg("--max-budget-usd")
-            .arg(args.max_budget_usd.to_string());
     }
     if let Some(id) = session_id.as_deref() {
         command.arg("--resume").arg(id);
     }
     command.arg(prompt);
 
-    let output = timeout(
-        Duration::from_secs(args.turn_timeout_seconds),
-        command.output(),
-    )
-    .await
-    .context("claude turn exceeded the wall-clock timeout")?
-    .context("failed to start `claude`; install/authenticate Claude Code")?;
-    if !output.status.success() {
-        bail!("claude exited {}", output.status);
+    let mut child = command
+        .spawn()
+        .context("failed to start `claude`; install/authenticate Claude Code")?;
+    let stdout = child.stdout.take().context("claude stdout unavailable")?;
+    let stderr = child.stderr.take().context("claude stderr unavailable")?;
+
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            warn!(event = "model_stderr", message = %line, "Claude stderr");
+        }
+    });
+
+    let stream = async move {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut final_result = None;
+        let mut tool_names: HashMap<String, String> = HashMap::new();
+        while let Some(line) = lines.next_line().await? {
+            let event: Value = match serde_json::from_str(&line) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(event = "model_protocol_error", %error, raw = %line, "Invalid Claude event");
+                    continue;
+                }
+            };
+            match event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+            {
+                "assistant" => {
+                    if let Some(blocks) =
+                        event.pointer("/message/content").and_then(Value::as_array)
+                    {
+                        for block in blocks {
+                            match block
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                            {
+                                "tool_use" => {
+                                    let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                                    let tool = block
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown");
+                                    let arguments =
+                                        block.get("input").cloned().unwrap_or_else(|| json!(null));
+                                    tool_names.insert(id.to_owned(), tool.to_owned());
+                                    info!(event = "tool_call", tool, tool_use_id = id, arguments = %arguments, "Tool call");
+                                }
+                                "text" => {
+                                    info!(event = "model_text", text = %block.get("text").and_then(|value| value.as_str()).unwrap_or(""), "Claude text")
+                                }
+                                "thinking" => {
+                                    info!(event = "model_thinking", thinking = %block.get("thinking").and_then(|value| value.as_str()).unwrap_or(""), "Claude thinking")
+                                }
+                                kind => {
+                                    info!(event = "model_content", content_type = kind, payload = %block, "Claude content")
+                                }
+                            }
+                        }
+                    }
+                }
+                "user" => {
+                    if let Some(blocks) =
+                        event.pointer("/message/content").and_then(Value::as_array)
+                    {
+                        for block in blocks {
+                            if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                                let id = block
+                                    .get("tool_use_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let is_error = block
+                                    .get("is_error")
+                                    .and_then(|value| value.as_bool())
+                                    .unwrap_or(false);
+                                let result =
+                                    block.get("content").cloned().unwrap_or_else(|| json!(null));
+                                info!(event = "tool_result", tool = tool_names.get(id).map(String::as_str).unwrap_or("unknown"), tool_use_id = id, is_error, result = %result, "Tool result");
+                            }
+                        }
+                    }
+                }
+                "result" => {
+                    info!(event = "model_result", payload = %event, "Claude result");
+                    final_result = serde_json::from_value::<ClaudeResult>(event).ok();
+                }
+                kind => {
+                    info!(event = "model_event", event_type = kind, payload = %event, "Claude event")
+                }
+            }
+        }
+        let status = child.wait().await?;
+        Ok::<_, anyhow::Error>((status, final_result))
+    };
+
+    let (status, parsed) = timeout(Duration::from_secs(args.turn_timeout_seconds), stream)
+        .await
+        .context("claude turn exceeded the wall-clock timeout")??;
+    let _ = stderr_task.await;
+    info!(event = "turn_exit", exit_status = %status, duration_ms = started.elapsed().as_millis(), "Claude process exited");
+
+    if let Some(parsed) = parsed {
+        if let Some(id) = parsed.session_id {
+            info!(event = "session", session = %id, "Claude session active");
+            *session_id = Some(id);
+        }
+        if parsed.is_error {
+            bail!("claude returned an error: {}", parsed.result);
+        }
+        if !parsed.result.trim().is_empty() {
+            info!(event = "turn_complete", response = %parsed.result, "Claude turn completed");
+            return Ok(parsed.result);
+        }
     }
-    let parsed: ClaudeResult =
-        serde_json::from_slice(&output.stdout).context("claude returned invalid JSON")?;
-    if let Some(id) = parsed.session_id {
-        *session_id = Some(id);
+    if !status.success() {
+        bail!("claude exited {status} without a valid result");
     }
-    if parsed.is_error {
-        bail!("claude returned an error: {}", parsed.result);
-    }
-    if parsed.result.trim().is_empty() {
-        bail!("claude returned an empty response");
-    }
-    Ok(parsed.result)
+    bail!("claude returned no final result")
 }
 
 async fn handle_turn(

@@ -5,13 +5,13 @@ default:
 build:
     cargo build --release
 
-# Start a local Factorio server and one NPC. Join localhost:34197 in Factorio.
+# Create a new local game, then start the server and one NPC.
 play: build
-    ./target/release/buddy --start-server
-
-# Recreate the local world, then start the server and NPC.
-fresh: build
     ./target/release/buddy --start-server --fresh
+
+# Resume the existing local game, then start the server and NPC.
+resume: build
+    ./target/release/buddy --start-server
 
 # Start only the NPC against an already-running RCON-enabled game.
 npc: build

@@ -68,10 +68,9 @@ fn named_agent() -> AgentId {
 }
 
 fn manifest_remotes() -> BTreeMap<String, Vec<String>> {
-    let manifest: Value = serde_json::from_str(include_str!(
-        "../mod/claude-interface/remote_api.json"
-    ))
-    .expect("remote_api.json should be valid JSON");
+    let manifest: Value =
+        serde_json::from_str(include_str!("../mod/claude-interface/remote_api.json"))
+            .expect("remote_api.json should be valid JSON");
     let remotes = manifest["remotes"]
         .as_object()
         .expect("remote_api.json remotes should be an object");
@@ -375,7 +374,7 @@ fn all_lua_cases() -> Vec<LuaCase> {
         LuaCase::new("rotate_entity", LuaCommand::rotate_entity(44, 4)),
         LuaCase::new(
             "insert_items",
-            LuaCommand::insert_items(45, "coal", 5, "fuel"),
+            LuaCommand::insert_items(&legacy_agent(), 45, "coal", 5, "fuel"),
         ),
         LuaCase::new(
             "extract_items",
@@ -1335,7 +1334,7 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
         ),
         (
             "insert_items",
-            LuaCommand::insert_items(45, "coal", 5, "fuel"),
+            LuaCommand::insert_items(&legacy_agent(), 45, "coal", 5, "fuel"),
             "insert_items",
         ),
         (
@@ -1421,7 +1420,7 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
         "remove_entity_at = function(agent_id, x, y)",
         "remove_entity = function(agent_id, unit_number)",
         "rotate_entity = function(unit_number, direction)",
-        "insert_items = function(unit_number, item, count, inventory_type)",
+        "insert_items = function(agent_id, unit_number, item, count, inventory_type)",
         "extract_items = function(agent_id, unit_number, item, count, inventory_type)",
         "set_recipe = function(unit_number, recipe)",
     ] {
@@ -1443,6 +1442,21 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
             && !control_lua.contains("\"error\": \"No items of that type in inventory\""),
         "control.lua extraction logic should preserve the named-agent/no-items contract"
     );
+
+    for required in [
+        "local function insert_items_impl(agent_id, unit_number, item, count, inventory_type)",
+        "local character_inv = character.get_main_inventory()",
+        "local available = character_inv.get_item_count(item)",
+        "local removed = character_inv.remove{name = item, count = math.min(count, available)}",
+        "local inserted = inv.insert{name = item, count = removed}",
+        "returned = character_inv.insert{name = item, count = remainder}",
+        "if returned ~= remainder then",
+    ] {
+        assert!(
+            control_lua.contains(required),
+            "control.lua insertion must conserve the named agent's real inventory via {required:?}"
+        );
+    }
 
     let init_lua = LuaCommand::init_character(&named_agent(), 0.0, 0.0);
     assert_remote_request("init_character", &init_lua, "init_character");
@@ -2905,7 +2919,7 @@ fn remote_command_preserves_hostile_string_arguments_as_json_values() {
             ),
             (
                 "insert_items",
-                LuaCommand::insert_items(45, raw, 1, "chest"),
+                LuaCommand::insert_items(&legacy_agent(), 45, raw, 1, "chest"),
             ),
             ("set_recipe", LuaCommand::set_recipe(47, raw)),
             ("get_recipe", LuaCommand::get_recipe(raw)),

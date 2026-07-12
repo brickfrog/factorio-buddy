@@ -62,7 +62,7 @@
     "has_walk_target": {"args": ["agent_id"], "returns": "boolean"},
     "import_blueprint": {"args": ["agent_id", "bp_string", "x", "y", "direction"], "returns": "json"},
     "init_character": {"args": ["agent_id", "x", "y"], "returns": "json"},
-    "insert_items": {"args": ["unit_number", "item", "count", "inventory_type"], "returns": "json"},
+    "insert_items": {"args": ["agent_id", "unit_number", "item", "count", "inventory_type"], "returns": "json"},
     "inject_message": {"args": ["from_name", "target_agent", "message"], "returns": "nil"},
     "is_player_blocked": {"args": ["agent_id", "radius"], "returns": "json"},
     "is_tech_researched": {"args": ["tech_name"], "returns": "json"},
@@ -109,4 +109,3 @@
     "wait_for_crafting": {"args": ["agent_id"], "returns": "json"}
   }
 }
-

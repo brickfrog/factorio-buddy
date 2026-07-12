@@ -723,10 +723,17 @@ impl LuaCommand {
     }
 
     /// Insert items into an entity
-    pub fn insert_items(unit_number: u32, item: &str, count: u32, inventory_type: &str) -> String {
+    pub fn insert_items(
+        agent_id: &AgentId,
+        unit_number: u32,
+        item: &str,
+        count: u32,
+        inventory_type: &str,
+    ) -> String {
         Self::claude_interface_json_call(
             "insert_items",
             &[
+                Self::lua_string_arg(agent_id.as_str()),
                 unit_number.to_string(),
                 Self::lua_string_arg(item),
                 count.to_string(),

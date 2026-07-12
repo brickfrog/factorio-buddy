@@ -1564,7 +1564,21 @@ local function remove_entity_impl(agent_id, unit_number)
     return mine_entity_for_agent(agent_id, entity)
 end
 
-local function insert_items_impl(unit_number, item, count, inventory_type)
+local function insert_items_impl(agent_id, unit_number, item, count, inventory_type)
+    local character = find_factorioctl_character(agent_id)
+    if not (character and character.valid) then
+        return {error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
+    end
+
+    local character_inv = character.get_main_inventory()
+    if not character_inv then
+        return {error = "Character has no inventory"}
+    end
+
+    if type(count) ~= "number" or count <= 0 then
+        return {error = "Count must be a positive number"}
+    end
+
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
@@ -1575,12 +1589,56 @@ local function insert_items_impl(unit_number, item, count, inventory_type)
         return {error = "Entity has no such inventory"}
     end
 
-    local inserted = inv.insert{name = item, count = count}
-    if inserted == 0 then
-        return {error = "Inserted 0 items (inventory full or item not accepted)"}
+    local available = character_inv.get_item_count(item)
+    local removed = character_inv.remove{name = item, count = math.min(count, available)}
+    if removed == 0 then
+        return {
+            error = "Character has no items to insert",
+            item = item,
+            requested = count,
+            available = available,
+        }
     end
 
-    return {inserted = inserted}
+    local inserted = inv.insert{name = item, count = removed}
+    local remainder = removed - inserted
+    local returned = 0
+    if remainder > 0 then
+        returned = character_inv.insert{name = item, count = remainder}
+    end
+
+    if returned ~= remainder then
+        return {
+            error = "Item conservation failure while returning unaccepted items",
+            item = item,
+            requested = count,
+            available = available,
+            removed = removed,
+            inserted = inserted,
+            returned = returned,
+        }
+    end
+
+    if inserted == 0 then
+        return {
+            error = "Inserted 0 items (inventory full or item not accepted)",
+            item = item,
+            requested = count,
+            available = available,
+            removed = removed,
+            inserted = inserted,
+            returned = returned,
+        }
+    end
+
+    return {
+        item = item,
+        requested = count,
+        available = available,
+        removed = removed,
+        inserted = inserted,
+        returned = returned,
+    }
 end
 
 local function extract_items_impl(agent_id, unit_number, item, count, inventory_type)
@@ -2143,8 +2201,8 @@ local api = {
         return json_remote_call("rotate_entity", placement.rotate_entity, unit_number, direction)
     end,
 
-    insert_items = function(unit_number, item, count, inventory_type)
-        return json_remote_call("insert_items", insert_items_impl, unit_number, item, count, inventory_type)
+    insert_items = function(agent_id, unit_number, item, count, inventory_type)
+        return json_remote_call("insert_items", insert_items_impl, agent_id, unit_number, item, count, inventory_type)
     end,
 
     extract_items = function(agent_id, unit_number, item, count, inventory_type)
@@ -2423,4 +2481,3 @@ script.on_event(defines.events.on_gui_closed, function(event)
         update_shortcut_state(player)
     end
 end)
-

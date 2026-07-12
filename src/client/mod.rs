@@ -1140,11 +1140,12 @@ impl FactorioClient {
         item: &str,
         count: u32,
         inventory_type: &str,
-    ) -> Result<()> {
+    ) -> Result<serde_json::Value> {
         let response = self
             .call_remote(
                 "insert_items",
                 &[
+                    json!(self.agent_id.as_str()),
                     json!(unit_number),
                     json!(item),
                     json!(count),
@@ -1153,7 +1154,7 @@ impl FactorioClient {
             )
             .await?;
         ensure_lua_success(&response)?;
-        Ok(())
+        Ok(serde_json::from_str(&response)?)
     }
 
     /// Extract items from an entity into player inventory
