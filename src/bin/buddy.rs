@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -37,6 +38,14 @@ struct Args {
 
     #[arg(long, env = "MODEL")]
     model: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "low",
+        env = "BUDDY_EFFORT",
+        value_parser = ["low", "medium", "high", "xhigh", "max"]
+    )]
+    effort: String,
 
     #[arg(long, default_value = "localhost", env = "FACTORIO_RCON_HOST")]
     rcon_host: String,
@@ -77,10 +86,10 @@ struct Args {
     #[arg(long, default_value_t = 30, env = "BUDDY_HEARTBEAT_SECONDS")]
     heartbeat_seconds: u64,
 
-    #[arg(long, default_value_t = true, env = "AUTONOMY_REQUIRES_PLAYER")]
+    #[arg(long, default_value_t = false, env = "AUTONOMY_REQUIRES_PLAYER")]
     autonomy_requires_player: bool,
 
-    #[arg(long, default_value_t = 600, env = "BUDDY_TURN_TIMEOUT_SECONDS")]
+    #[arg(long, default_value_t = 180, env = "BUDDY_TURN_TIMEOUT_SECONDS")]
     turn_timeout_seconds: u64,
 
     #[arg(long, default_value = DEFAULT_SYSTEM_PROMPT)]
@@ -412,6 +421,10 @@ fn connected_player_count(value: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn stream_event_session_id(event: &Value) -> Option<&str> {
+    event.get("session_id").and_then(Value::as_str)
+}
+
 async fn invoke_claude(
     args: &Args,
     config: &str,
@@ -436,6 +449,8 @@ async fn invoke_claude(
         .arg("--tools")
         .arg("")
         .arg("--disable-slash-commands")
+        .arg("--effort")
+        .arg(&args.effort)
         .arg("--system-prompt")
         .arg(&args.system_prompt)
         .stdin(Stdio::null())
@@ -455,6 +470,8 @@ async fn invoke_claude(
         .context("failed to start `claude`; install/authenticate Claude Code")?;
     let stdout = child.stdout.take().context("claude stdout unavailable")?;
     let stderr = child.stderr.take().context("claude stderr unavailable")?;
+    let observed_session_id = Arc::new(Mutex::new(session_id.clone()));
+    let streamed_session_id = Arc::clone(&observed_session_id);
 
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
@@ -475,6 +492,11 @@ async fn invoke_claude(
                     continue;
                 }
             };
+            if let Some(id) = stream_event_session_id(&event) {
+                if let Ok(mut observed) = streamed_session_id.lock() {
+                    *observed = Some(id.to_owned());
+                }
+            }
             match event
                 .get("type")
                 .and_then(Value::as_str)
@@ -548,9 +570,22 @@ async fn invoke_claude(
         Ok::<_, anyhow::Error>((status, final_result))
     };
 
-    let (status, parsed) = timeout(Duration::from_secs(args.turn_timeout_seconds), stream)
-        .await
-        .context("claude turn exceeded the wall-clock timeout")??;
+    let outcome = timeout(Duration::from_secs(args.turn_timeout_seconds), stream).await;
+    if let Ok(observed) = observed_session_id.lock() {
+        if let Some(id) = observed.as_deref() {
+            if session_id.as_deref() != Some(id) {
+                info!(event = "session", session = id, "Claude session observed");
+                *session_id = Some(id.to_owned());
+            }
+        }
+    }
+    let (status, parsed) = match outcome {
+        Ok(result) => result?,
+        Err(error) => {
+            stderr_task.abort();
+            return Err(error).context("claude turn exceeded the wall-clock timeout");
+        }
+    };
     let _ = stderr_task.await;
     info!(event = "turn_exit", exit_status = %status, duration_ms = started.elapsed().as_millis(), "Claude process exited");
 
@@ -755,6 +790,13 @@ mod tests {
         assert_eq!(connected_player_count("2"), 2);
         assert_eq!(connected_player_count(r#"{"count":3}"#), 3);
         assert_eq!(connected_player_count("garbage"), 0);
+    }
+
+    #[test]
+    fn reads_session_id_from_stream_events() {
+        let event = json!({"type": "system", "subtype": "init", "session_id": "abc-123"});
+        assert_eq!(stream_event_session_id(&event), Some("abc-123"));
+        assert_eq!(stream_event_session_id(&json!({"type": "assistant"})), None);
     }
 
     #[test]
