@@ -40,6 +40,30 @@ fn production_verification_json(
     )
 }
 
+fn factory_playbook(topic: &str) -> Option<&'static str> {
+    match topic.trim().to_ascii_lowercase().as_str() {
+        "bootstrap" => Some(include_str!(
+            "../../.claude/skills/factorio-control/references/bootstrap.md"
+        )),
+        "logistics" => Some(include_str!(
+            "../../.claude/skills/factorio-control/references/logistics.md"
+        )),
+        "power" => Some(include_str!(
+            "../../.claude/skills/factorio-control/references/power.md"
+        )),
+        "smelting" => Some(include_str!(
+            "../../.claude/skills/factorio-control/references/smelting.md"
+        )),
+        "science" => Some(include_str!(
+            "../../.claude/skills/factorio-control/references/science.md"
+        )),
+        "recovery" => Some(include_str!(
+            "../../.claude/skills/factorio-control/references/recovery.md"
+        )),
+        _ => None,
+    }
+}
+
 fn route_belt_failure_json(
     params: &RouteBeltParams,
     error_kind: &str,
@@ -285,7 +309,7 @@ struct ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        automation_repair_hint, execute_lua_refusal, flow_lookup, flow_scan_area,
+        automation_repair_hint, execute_lua_refusal, factory_playbook, flow_lookup, flow_scan_area,
         is_machine_output_source, machine_output_build_args, machine_side_layout,
         placed_unit_working, placed_units_not_dead, raw_lua_enabled, ready_fuel_supply_args,
         route_belt_failure_json, route_segment_waypoint, BuildFuelSupplyParams, RouteBeltParams,
@@ -312,6 +336,21 @@ mod tests {
         for (env_value, expected) in cases {
             assert_eq!(raw_lua_enabled(env_value), expected, "{env_value:?}");
         }
+    }
+
+    #[test]
+    fn factory_playbooks_are_embedded_and_selected_on_demand() {
+        for (topic, heading) in [
+            ("bootstrap", "# Bootstrap"),
+            ("logistics", "# Logistics"),
+            ("power", "# Power"),
+            ("smelting", "# Smelting"),
+            ("science", "# Science"),
+            ("recovery", "# Recovery"),
+        ] {
+            assert!(factory_playbook(topic).unwrap().starts_with(heading));
+        }
+        assert!(factory_playbook("unknown").is_none());
     }
 
     #[test]
@@ -2560,6 +2599,34 @@ pub struct EvalProductionSnapshotParams {
     pub surface_name: String,
 }
 
+/// Parameters for loading one strategy reference on demand.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct LoadFactoryPlaybookParams {
+    /// Strategy topic: bootstrap, logistics, power, smelting, science, or recovery.
+    pub topic: String,
+}
+
+/// Parameters for establishing one persistent factory milestone.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SetFactoryMilestoneParams {
+    /// Concrete outcome to finish before selecting another milestone.
+    pub objective: String,
+    /// Item whose production, consumption, or stockpile delta proves progress.
+    pub target_item: String,
+    /// Completion mode: production, consumption, research, or stockpile.
+    pub target_kind: String,
+    /// Optional audit-area center X; defaults to the NPC position.
+    pub center_x: Option<f64>,
+    /// Optional audit-area center Y; defaults to the NPC position.
+    pub center_y: Option<f64>,
+    /// Audit radius in tiles; defaults to 96.
+    pub radius: Option<u32>,
+    /// Required clean observation duration in game ticks; minimum 600, default 3600.
+    pub verify_ticks: Option<u32>,
+    /// Minimum target progress during the clean observation; defaults to 1.
+    pub minimum_delta: Option<u32>,
+}
+
 // === Zone Management Parameters ===
 
 /// Parameters for create_zone tool
@@ -3057,9 +3124,9 @@ impl FactorioMcp {
             .await
     }
 
-    /// Query production statistics snapshot for eval/report scoring.
+    /// Query the force-wide production and consumption statistics shown by Factorio.
     #[tool(
-        description = "Read force item production totals and one-minute rates for eval/report scoring."
+        description = "Read force-wide item production and consumption totals, one-minute rates, and net flow for a surface. Use this for factory throughput and imbalance; use audit_automation for the physical producer-to-consumer path and root cause."
     )]
     async fn eval_production_snapshot(
         &self,
@@ -3068,6 +3135,98 @@ impl FactorioMcp {
         self.call_lifecycle_remote(
             "eval_production_snapshot",
             &[serde_json::json!(params.surface_name)],
+        )
+        .await
+    }
+
+    /// Load one phase-specific factory strategy reference.
+    #[tool(
+        description = "Load one on-demand Factorio strategy playbook. Topics: bootstrap, logistics, power, smelting, science, recovery. This supplies flow strategy and definitions of done without prescribing fixed layouts."
+    )]
+    async fn load_factory_playbook(
+        &self,
+        Parameters(params): Parameters<LoadFactoryPlaybookParams>,
+    ) -> String {
+        match factory_playbook(&params.topic) {
+            Some(playbook) => playbook.to_string(),
+            None => serde_json::json!({
+                "error": "unknown playbook topic",
+                "allowed": ["bootstrap", "logistics", "power", "smelting", "science", "recovery"]
+            })
+            .to_string(),
+        }
+    }
+
+    /// Establish or replace the one persistent factory milestone for this NPC.
+    #[tool(
+        description = "Set one concrete factory milestone persisted in the Factorio save. Keep it until verify_factory_milestone reports complete. The target item and kind define measurable progress; geometry defines the audit area, not a fixed layout."
+    )]
+    async fn set_factory_milestone(
+        &self,
+        Parameters(params): Parameters<SetFactoryMilestoneParams>,
+    ) -> String {
+        let agent_id = match AgentId::new(std::env::var("FACTORIO_AGENT_ID").ok().as_deref()) {
+            Ok(agent_id) => agent_id,
+            Err(error) => return format!("Error: {error}"),
+        };
+        self.call_lifecycle_remote(
+            "set_factory_milestone",
+            &[
+                serde_json::json!(agent_id.as_str()),
+                serde_json::json!(params.objective),
+                serde_json::json!(params.target_item),
+                serde_json::json!(params.target_kind),
+                serde_json::json!(params.center_x),
+                serde_json::json!(params.center_y),
+                serde_json::json!(params.radius),
+                serde_json::json!(params.verify_ticks),
+                serde_json::json!(params.minimum_delta),
+            ],
+        )
+        .await
+    }
+
+    /// Read the persistent factory milestone.
+    #[tool(
+        description = "Read the current persistent factory milestone. Do this before selecting work so autonomous turns continue the same objective instead of creating unrelated production islands."
+    )]
+    async fn get_factory_milestone(&self) -> String {
+        let agent_id = match AgentId::new(std::env::var("FACTORIO_AGENT_ID").ok().as_deref()) {
+            Ok(agent_id) => agent_id,
+            Err(error) => return format!("Error: {error}"),
+        };
+        self.call_lifecycle_remote(
+            "get_factory_milestone",
+            &[serde_json::json!(agent_id.as_str())],
+        )
+        .await
+    }
+
+    /// Audit material flow and character-mediated logistics for the milestone.
+    #[tool(
+        description = "Audit the current milestone using force-wide throughput plus a directed physical item graph derived from live transport lines, inserters, direct mining outputs, recipes, and fuel dependencies. Reports producer-to-consumer paths, disconnected networks, stalled rates, buffers, and character-mediated handoffs as ranked dependencies. Close the first dependency before unrelated expansion."
+    )]
+    async fn audit_automation(&self) -> String {
+        let agent_id = match AgentId::new(std::env::var("FACTORIO_AGENT_ID").ok().as_deref()) {
+            Ok(agent_id) => agent_id,
+            Err(error) => return format!("Error: {error}"),
+        };
+        self.call_lifecycle_remote("audit_automation", &[serde_json::json!(agent_id.as_str())])
+            .await
+    }
+
+    /// Start or complete a sustained no-character-logistics observation.
+    #[tool(
+        description = "Start or finish sustained milestone verification. Completion requires the target to progress across the configured game-tick window with zero manual material events and no chest-only target endpoint. A failed window resets so repairs can be followed by a clean observation."
+    )]
+    async fn verify_factory_milestone(&self) -> String {
+        let agent_id = match AgentId::new(std::env::var("FACTORIO_AGENT_ID").ok().as_deref()) {
+            Ok(agent_id) => agent_id,
+            Err(error) => return format!("Error: {error}"),
+        };
+        self.call_lifecycle_remote(
+            "verify_factory_milestone",
+            &[serde_json::json!(agent_id.as_str())],
         )
         .await
     }

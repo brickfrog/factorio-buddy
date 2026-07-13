@@ -7,7 +7,6 @@
 //! memory system here.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,7 +23,7 @@ use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the factorio-control skill and Factorio MCP tools to observe and play through your own character. Act on player requests immediately. Maintain one persistent factory milestone at a time. Begin from its automation audit: use global production and consumption rates to measure the outcome, then use the directed producer-to-consumer graph to close the first physical dependency. Repair and extend existing flow before placing another isolated machine, and do not switch objectives until sustained verification reports complete. The character may construct and bootstrap the factory but must not remain an edge in steady-state logistics. Treat planner output as an executable contract: execute exact returned mutation arguments rather than substituting approximate placement. After compound mutation, inspect and correct or remove failed partial work. Never claim success without tool evidence. Keep final chat replies concise because they render in a small in-game panel.";
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the autonomous Factorio buddy using the Rust MCP tool server")]
@@ -260,6 +259,14 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
             args.rcon_port
         );
     }
+    let game_socket = std::net::UdpSocket::bind(("0.0.0.0", args.game_port)).with_context(|| {
+        format!(
+            "Factorio game port {} is already in use; stop the process using it or set FACTORIO_GAME_PORT",
+            args.game_port
+        )
+    })?;
+    drop(game_socket);
+
     let factorio = find_factorio(args.factorio_bin.clone())?;
     let write_data = std::fs::canonicalize(&args.write_data).or_else(|_| {
         std::fs::create_dir_all(&args.write_data)?;
@@ -267,7 +274,6 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
     })?;
     install_mods(&write_data)?;
     std::fs::create_dir_all(write_data.join("saves"))?;
-    std::fs::create_dir_all(write_data.join("logs"))?;
 
     let data_root = factorio
         .parent()
@@ -308,7 +314,6 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         }
     }
 
-    let log = File::create(write_data.join("logs/server.log"))?;
     let mut child = Command::new(&factorio)
         .arg("--config")
         .arg(&config)
@@ -323,8 +328,8 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         .arg("--server-settings")
         .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/server.json"))
         .stdin(Stdio::piped())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()?;
     let stdin = child
         .stdin
@@ -387,6 +392,37 @@ fn connected_player_count(value: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn compact_factory_context(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_owned();
+    };
+    let open_dependencies = value
+        .get("open_dependencies")
+        .and_then(Value::as_array)
+        .map(|dependencies| dependencies.iter().take(5).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let target_flow = json!({
+        "producer_count": value.pointer("/material_graph/target_flow/producer_count").cloned().unwrap_or(Value::Null),
+        "consumer_count": value.pointer("/material_graph/target_flow/consumer_count").cloned().unwrap_or(Value::Null),
+        "complete_path_count": value.pointer("/material_graph/target_flow/complete_path_count").cloned().unwrap_or(Value::Null),
+        "target_items_on_belts": value.pointer("/material_graph/target_flow/target_items_on_belts").cloned().unwrap_or(Value::Null),
+        "belt_network_count": value.pointer("/material_graph/topology/belt_network_count").cloned().unwrap_or(Value::Null),
+    });
+    json!({
+        "configured": value.get("configured").cloned().unwrap_or(Value::Bool(false)),
+        "status": value.get("status").cloned().unwrap_or(Value::Null),
+        "milestone": value.get("milestone").cloned().unwrap_or(Value::Null),
+        "manual_event_count": value.pointer("/manual_window/event_count").cloned().unwrap_or(Value::Null),
+        "production_flow": value.get("production_flow").cloned().unwrap_or(Value::Null),
+        "target_flow": target_flow,
+        "structural_dependency_count": value.get("structural_dependency_count").cloned().unwrap_or(Value::Null),
+        "open_dependency_count": value.get("open_dependency_count").cloned().unwrap_or(Value::Null),
+        "open_dependencies": open_dependencies,
+        "guidance": value.get("guidance").cloned().unwrap_or(Value::Null),
+    })
+    .to_string()
+}
+
 async fn invoke_claude(
     args: &Args,
     config: &str,
@@ -407,10 +443,9 @@ async fn invoke_claude(
         .arg("--permission-mode")
         .arg("bypassPermissions")
         .arg("--allowedTools")
-        .arg("mcp__factorio__*")
+        .arg("Skill,mcp__factorio__*")
         .arg("--tools")
-        .arg("")
-        .arg("--disable-slash-commands")
+        .arg("Skill")
         .arg("--system-prompt")
         .arg(&args.system_prompt)
         .stdin(Stdio::null())
@@ -565,6 +600,13 @@ async fn handle_turn(
         ],
     )
     .await;
+    let audit = lifecycle(args, "audit_automation", &[json!(args.agent)])
+        .await
+        .map(|raw| compact_factory_context(&raw))
+        .unwrap_or_else(|error| format!("{{\"audit_error\":{}}}", json!(error.to_string())));
+    let prompt = format!(
+        "Current persistent factory state:\n{audit}\n\nRequest for this turn:\n{prompt}\n\nContinue the current milestone unless the player explicitly changed the objective. Use the factorio-control skill."
+    );
     match invoke_claude(args, config, &prompt, session_id).await {
         Ok(reply) => {
             if let Err(error) = lifecycle(
@@ -694,7 +736,7 @@ async fn main() -> Result<()> {
         handle_turn(
             &args,
             &config,
-            "Autonomy tick: inspect the current game state and take the next useful concrete action toward a functioning automated factory. Use tools; do not merely describe a plan.".to_owned(),
+            "Autonomy tick: continue the persistent factory milestone. If none exists, inspect live state and set one concrete milestone. Audit its material-flow graph, close the first open dependency, then audit or verify again. Do not create an unrelated production island and do not use the character as ongoing logistics. Use tools; do not merely describe a plan.".to_owned(),
             0,
             &args.agent,
             &mut session_id,
@@ -729,5 +771,42 @@ mod tests {
         assert_eq!(connected_player_count("2"), 2);
         assert_eq!(connected_player_count(r#"{"count":3}"#), 3);
         assert_eq!(connected_player_count("garbage"), 0);
+    }
+
+    #[test]
+    fn compact_factory_context_keeps_contract_and_bounds_dependencies() {
+        let dependencies = (0..8)
+            .map(|index| json!({"kind": "manual_material_path", "index": index}))
+            .collect::<Vec<_>>();
+        let raw = json!({
+            "configured": true,
+            "status": "manual_dependency",
+            "milestone": {"objective": "automate science"},
+            "manual_window": {"event_count": 3, "events": [1, 2, 3]},
+            "production_flow": {"produced_per_minute": 12, "consumed_per_minute": 8},
+            "open_dependency_count": 8,
+            "open_dependencies": dependencies,
+            "material_graph": {
+                "target_flow": {
+                    "producer_count": 2,
+                    "consumer_count": 1,
+                    "complete_path_count": 1,
+                    "target_items_on_belts": 7
+                },
+                "topology": {"belt_network_count": 3}
+            },
+            "structural_dependency_count": 2,
+            "guidance": "close the first dependency"
+        })
+        .to_string();
+
+        let compact: Value = serde_json::from_str(&compact_factory_context(&raw)).unwrap();
+        assert_eq!(compact["manual_event_count"], 3);
+        assert_eq!(compact["production_flow"]["produced_per_minute"], 12);
+        assert_eq!(compact["target_flow"]["complete_path_count"], 1);
+        assert_eq!(compact["target_flow"]["belt_network_count"], 3);
+        assert_eq!(compact["structural_dependency_count"], 2);
+        assert_eq!(compact["open_dependencies"].as_array().unwrap().len(), 5);
+        assert!(compact.get("material_graph").is_none());
     }
 }

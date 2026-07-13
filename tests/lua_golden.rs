@@ -145,12 +145,14 @@ fn control_lua_remote_signatures() -> BTreeMap<String, Vec<String>> {
 fn lifecycle_remote_names() -> BTreeSet<String> {
     [
         "clear_chat",
+        "audit_automation",
         "connected_player_count",
         "connected_player_count_result",
         "ensure_surface",
         "ensure_surface_result",
         "eval_production_snapshot",
         "get_character",
+        "get_factory_milestone",
         "has_walk_target",
         "inject_message",
         "list_characters",
@@ -164,11 +166,13 @@ fn lifecycle_remote_names() -> BTreeSet<String> {
         "register_agent",
         "register_character",
         "set_spectator_mode",
+        "set_factory_milestone",
         "set_status",
         "set_walk",
         "stop_walk",
         "tool_status",
         "unregister_agent",
+        "verify_factory_milestone",
     ]
     .into_iter()
     .map(str::to_string)
@@ -1110,6 +1114,10 @@ fn lifecycle_remotes_have_thin_rust_mcp_wrappers() {
         ("live_state", "live_state_result"),
         ("connected_player_count", "connected_player_count_result"),
         ("eval_production_snapshot", "eval_production_snapshot"),
+        ("set_factory_milestone", "set_factory_milestone"),
+        ("get_factory_milestone", "get_factory_milestone"),
+        ("audit_automation", "audit_automation"),
+        ("verify_factory_milestone", "verify_factory_milestone"),
     ] {
         assert!(
             mcp_rs.contains(&format!("async fn {tool}"))
@@ -1117,6 +1125,93 @@ fn lifecycle_remotes_have_thin_rust_mcp_wrappers() {
             "MCP lifecycle tool {tool:?} should call mod remote {remote:?}"
         );
     }
+}
+
+#[test]
+fn automation_contract_tracks_character_edges_and_requires_clean_progress() {
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let automation_lua = include_str!("../mod/claude-interface/automation.lua");
+    let diagnostics_lua = include_str!("../mod/claude-interface/diagnostics.lua");
+    let logistics_lua = include_str!("../mod/claude-interface/logistics.lua");
+    for required in [
+        "local automation = require(\"automation\")",
+        "automation.record_manual(agent_id, \"insert\"",
+        "automation.record_manual(agent_id, \"extract\"",
+        "automation.record_manual(agent_id, \"craft\"",
+        "automation.record_manual(agent_id, \"mine\"",
+        "source = \"cleared terrain\"",
+        "automation.record_manual(agent_id, \"lab_feed\"",
+        "audit_automation = function(agent_id)",
+        "verify_factory_milestone = function(agent_id)",
+    ] {
+        assert!(
+            control_lua.contains(required),
+            "control.lua should route automation evidence through {required:?}"
+        );
+    }
+    for required in [
+        "function M.set_milestone",
+        "function M.audit",
+        "function M.verify",
+        "kind = \"manual_material_path\"",
+        "storage.automation.manual_event_counts",
+        "manual_event_delta == 0",
+        "kind = \"disconnected_target_logistics\"",
+        "local graph = logistics.snapshot",
+        "local throughput = diagnostics.item_flow",
+        "local verified = manual_event_delta == 0",
+        "progress_delta >= milestone.minimum_delta",
+        "(audit.open_dependency_count or 0) == 0",
+        "milestone.status = \"complete\"",
+    ] {
+        assert!(
+            automation_lua.contains(required),
+            "automation.lua should enforce the generic milestone contract via {required:?}"
+        );
+    }
+    for required in [
+        "line.output_lines",
+        "entity.belt_neighbours",
+        "\"belt_connection\"",
+        "entity.neighbours",
+        "\"underground_connection\"",
+        "inserter_target(inserter, \"pickup_target\"",
+        "inserter_target(inserter, \"drop_target\"",
+        "producer_has_supply",
+        "item_supply_dependencies",
+        "fuel_supply_connected",
+        "complete_path_count",
+    ] {
+        assert!(
+            logistics_lua.contains(required),
+            "logistics.lua should derive the directed physical graph via {required:?}"
+        );
+    }
+    for required in [
+        "consumed_total",
+        "produced_per_minute",
+        "consumed_per_minute",
+        "net_per_minute",
+        "defines.flow_precision_index.five_seconds",
+        "recent_produced_per_minute",
+        "recent_consumed_per_minute",
+        "recent_net_per_minute",
+        "category = category",
+    ] {
+        assert!(
+            diagnostics_lua.contains(required),
+            "diagnostics.lua should expose production and consumption via {required:?}"
+        );
+    }
+}
+
+#[test]
+fn buddy_enables_native_skill_loading_without_general_filesystem_tools() {
+    let buddy_rs = include_str!("../src/bin/buddy.rs");
+    assert!(buddy_rs.contains(".arg(\"Skill,mcp__factorio__*\")"));
+    assert!(buddy_rs.contains(".arg(\"Skill\")"));
+    assert!(!buddy_rs.contains(".arg(\"--disable-slash-commands\")"));
+    assert!(!buddy_rs.contains(".arg(\"Read\")") && !buddy_rs.contains(".arg(\"Bash\")"));
 }
 
 #[test]
@@ -1447,6 +1542,7 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
         "local function insert_items_impl(agent_id, unit_number, item, count, inventory_type)",
         "local character_inv = character.get_main_inventory()",
         "local available = character_inv.get_item_count(item)",
+        "if available == 0 then",
         "local removed = character_inv.remove{name = item, count = math.min(count, available)}",
         "local inserted = inv.insert{name = item, count = removed}",
         "returned = character_inv.insert{name = item, count = remainder}",
@@ -2754,7 +2850,8 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
         "local character = find_factorioctl_character(agent_id)",
         "json_remote_call(\"get_available_research\", research.get_available_research, character)",
         "feed_lab_from_inventory = function(agent_id, lab_unit_number, science_pack, count, dry_run)",
-        "json_remote_call(\"feed_lab_from_inventory\", research.feed_lab_from_inventory, character, lab_unit_number, science_pack, count, dry_run)",
+        "local function feed_lab_from_inventory_impl(agent_id, lab_unit_number, science_pack, count, dry_run)",
+        "json_remote_call(\"feed_lab_from_inventory\", feed_lab_from_inventory_impl, agent_id, lab_unit_number, science_pack, count, dry_run)",
         "start_research = function(tech_name)",
         "json_remote_call(\"start_research\", research.start_research, tech_name)",
         "is_tech_researched = function(tech_name)",
