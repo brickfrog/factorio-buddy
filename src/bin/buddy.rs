@@ -7,7 +7,6 @@
 //! memory system here.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -18,8 +17,9 @@ use clap::Parser;
 use factorioctl::client::{AgentId, FactorioClient};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -123,12 +123,33 @@ struct LocalServer {
     // Factorio exits when stdin reaches EOF, so retain the pipe for the life of
     // the server even though the buddy never writes console commands to it.
     _stdin: tokio::process::ChildStdin,
+    output_task: JoinHandle<()>,
 }
 
 impl LocalServer {
     async fn stop(mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+        let _ = self.output_task.await;
+    }
+}
+
+fn should_forward_factorio_output(line: &str) -> bool {
+    !line.contains("New RCON connection")
+}
+
+async fn forward_factorio_output(reader: impl AsyncRead + Unpin) {
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) if should_forward_factorio_output(&line) => println!("{line}"),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) => {
+                warn!(%error, "failed to read Factorio server output");
+                break;
+            }
+        }
     }
 }
 
@@ -267,7 +288,6 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
     })?;
     install_mods(&write_data)?;
     std::fs::create_dir_all(write_data.join("saves"))?;
-    std::fs::create_dir_all(write_data.join("logs"))?;
 
     let data_root = factorio
         .parent()
@@ -308,7 +328,6 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         }
     }
 
-    let log = File::create(write_data.join("logs/server.log"))?;
     let mut child = Command::new(&factorio)
         .arg("--config")
         .arg(&config)
@@ -323,13 +342,18 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         .arg("--server-settings")
         .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/server.json"))
         .stdin(Stdio::piped())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()?;
     let stdin = child
         .stdin
         .take()
         .context("Factorio stdin pipe unavailable")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Factorio stdout pipe unavailable")?;
+    let output_task = tokio::spawn(forward_factorio_output(stdout));
 
     for _ in 0..60 {
         if let Some(status) = child.try_wait()? {
@@ -347,6 +371,7 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
             return Ok(LocalServer {
                 child,
                 _stdin: stdin,
+                output_task,
             });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -688,6 +713,7 @@ async fn main() -> Result<()> {
                 .map(|value| connected_player_count(&value))
                 .unwrap_or(0);
             if count == 0 {
+                next_autonomy = Instant::now() + Duration::from_secs(args.heartbeat_seconds.max(1));
                 continue;
             }
         }
@@ -729,5 +755,16 @@ mod tests {
         assert_eq!(connected_player_count("2"), 2);
         assert_eq!(connected_player_count(r#"{"count":3}"#), 3);
         assert_eq!(connected_player_count("garbage"), 0);
+    }
+
+    #[test]
+    fn hides_only_routine_rcon_connection_lines() {
+        assert!(!should_forward_factorio_output(
+            "Info RemoteCommandProcessor.cpp:245: New RCON connection from 127.0.0.1"
+        ));
+        assert!(should_forward_factorio_output(
+            "Error RemoteCommandProcessor.cpp: RCON authentication failed"
+        ));
+        assert!(should_forward_factorio_output("Joining game"));
     }
 }
