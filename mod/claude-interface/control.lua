@@ -5,7 +5,6 @@ local GUI_FRAME = "claude_interface_frame"
 local MAX_MESSAGES = 100
 local INPUT_FILE = "claude-chat/input.jsonl"
 local characters = require("characters")
-local automation = require("automation")
 local diagnostics = require("diagnostics")
 local entities = require("entities")
 local json_response = require("json_response")
@@ -1018,13 +1017,6 @@ local function craft_impl(agent_id, recipe_name, count)
     }
     if crafted <= 0 then
         result.error = "Crafting did not start; check ingredients, recipe category, or character craftability"
-    else
-        automation.record_manual(agent_id, "craft", {
-            recipe = recipe_name,
-            count = crafted,
-            source = "character:" .. tostring(agent_id),
-            target = "character:" .. tostring(agent_id),
-        })
     end
     return result
 end
@@ -1101,12 +1093,6 @@ local function start_mining_impl(agent_id, x, y)
     end
 
     character.mining_state = {mining = true, position = target.position}
-    automation.record_manual(agent_id, "mine", {
-        item = target.name,
-        count = 1,
-        source = "world:" .. tostring(target.name),
-        target = "character:" .. tostring(agent_id),
-    })
     return {
         success = true,
         target = target.name,
@@ -1203,12 +1189,6 @@ local function mine_at_impl(agent_id, x, y, count, radius)
     }
     if not success then
         result.error = "No minable entity at position"
-    else
-        automation.record_manual(agent_id, "mine", {
-            count = math.max(items_gained, picked_up),
-            source = "world",
-            target = "character:" .. tostring(agent_id),
-        })
     end
     return result
 end
@@ -1277,13 +1257,6 @@ local function mine_nearest_impl(agent_id, entity_name, count)
     }
     if mined == 0 then
         result.error = "No minable entity found"
-    else
-        automation.record_manual(agent_id, "mine", {
-            item = entity_name,
-            count = mined,
-            source = "world:" .. tostring(entity_name),
-            target = "character:" .. tostring(agent_id),
-        })
     end
     return result
 end
@@ -1357,12 +1330,6 @@ local function clear_area_impl(agent_id, x1, y1, x2, y2, clear_trees, clear_rock
             local gained = item.count - (before[item.name] or 0)
             if gained > 0 then
                 table.insert(result.items_gained, {name = item.name, count = gained})
-                automation.record_manual(agent_id, "mine", {
-                    item = item.name,
-                    count = gained,
-                    source = "cleared terrain",
-                    target = "character:" .. tostring(agent_id),
-                })
             end
         end
     end
@@ -1623,18 +1590,10 @@ local function insert_items_impl(agent_id, unit_number, item, count, inventory_t
     end
 
     local available = character_inv.get_item_count(item)
-    if available == 0 then
-        return {
-            error = "Character has no items to insert",
-            item = item,
-            requested = count,
-            available = available,
-        }
-    end
     local removed = character_inv.remove{name = item, count = math.min(count, available)}
     if removed == 0 then
         return {
-            error = "Could not remove items from character inventory",
+            error = "Character has no items to insert",
             item = item,
             requested = count,
             available = available,
@@ -1671,14 +1630,6 @@ local function insert_items_impl(agent_id, unit_number, item, count, inventory_t
             returned = returned,
         }
     end
-
-    automation.record_manual(agent_id, "insert", {
-        item = item,
-        count = inserted,
-        source = "character:" .. tostring(agent_id),
-        target = "entity:" .. tostring(unit_number),
-        unit_number = unit_number,
-    })
 
     return {
         item = item,
@@ -1723,32 +1674,7 @@ local function extract_items_impl(agent_id, unit_number, item, count, inventory_
         inv.insert{name = item, count = removed - inserted}
     end
 
-    if inserted > 0 then
-        automation.record_manual(agent_id, "extract", {
-            item = item,
-            count = inserted,
-            source = "entity:" .. tostring(unit_number),
-            target = "character:" .. tostring(agent_id),
-            unit_number = unit_number,
-        })
-    end
-
     return {extracted = inserted, available = available}
-end
-
-local function feed_lab_from_inventory_impl(agent_id, lab_unit_number, science_pack, count, dry_run)
-    local character = find_factorioctl_character(agent_id)
-    local result = research.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)
-    if dry_run == false and result and (result.inserted or 0) > 0 then
-        automation.record_manual(agent_id, "lab_feed", {
-            item = science_pack,
-            count = result.inserted,
-            source = "character:" .. tostring(agent_id),
-            target = "entity:" .. tostring(lab_unit_number),
-            unit_number = lab_unit_number,
-        })
-    end
-    return result
 end
 
 local function set_recipe_impl(unit_number, recipe)
@@ -2107,22 +2033,6 @@ local api = {
         return json_remote_call("diagnose_fuel_sustainability", entities.diagnose_fuel_sustainability, x1, y1, x2, y2, limit)
     end,
 
-    set_factory_milestone = function(agent_id, objective, target_item, target_kind, center_x, center_y, radius, verify_ticks, minimum_delta)
-        return json_remote_call("set_factory_milestone", automation.set_milestone, agent_id, objective, target_item, target_kind, center_x, center_y, radius, verify_ticks, minimum_delta)
-    end,
-
-    get_factory_milestone = function(agent_id)
-        return json_remote_call("get_factory_milestone", automation.get_milestone, agent_id)
-    end,
-
-    audit_automation = function(agent_id)
-        return json_remote_call("audit_automation", automation.audit, agent_id)
-    end,
-
-    verify_factory_milestone = function(agent_id)
-        return json_remote_call("verify_factory_milestone", automation.verify, agent_id)
-    end,
-
     get_entity = function(unit_number)
         return json_remote_call("get_entity", entities.get_entity, unit_number)
     end,
@@ -2333,7 +2243,8 @@ local api = {
     end,
 
     feed_lab_from_inventory = function(agent_id, lab_unit_number, science_pack, count, dry_run)
-        return json_remote_call("feed_lab_from_inventory", feed_lab_from_inventory_impl, agent_id, lab_unit_number, science_pack, count, dry_run)
+        local character = find_factorioctl_character(agent_id)
+        return json_remote_call("feed_lab_from_inventory", research.feed_lab_from_inventory, character, lab_unit_number, science_pack, count, dry_run)
     end,
 
     start_research = function(tech_name)

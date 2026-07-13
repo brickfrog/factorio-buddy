@@ -1,7 +1,6 @@
 {
   "schema_version": 1,
   "remotes": {
-    "audit_automation": {"args": ["agent_id"], "returns": "json"},
     "broadcast_console": {"args": ["message"], "returns": "json"},
     "broadcast_flying_text": {"args": ["message"], "returns": "json"},
     "build_direct_smelter": {"args": ["agent_id", "drill_unit_number", "output_x", "output_y", "output_direction", "furnace_name", "inserter_name", "belt_name", "radius"], "returns": "json"},
@@ -44,7 +43,6 @@
     "get_entity": {"args": ["unit_number"], "returns": "json"},
     "get_entity_drop_position": {"args": ["unit_number"], "returns": "json"},
     "get_entity_inventory": {"args": ["unit_number"], "returns": "json"},
-    "get_factory_milestone": {"args": ["agent_id"], "returns": "json"},
     "get_mining_status": {"args": ["agent_id"], "returns": "json"},
     "get_power_coverage": {"args": ["x", "y", "radius"], "returns": "json"},
     "get_power_networks": {"args": ["x", "y", "radius"], "returns": "json"},
@@ -93,7 +91,6 @@
     "register_agent": {"args": ["agent_name", "label"], "returns": "nil"},
     "register_character": {"args": ["agent_id", "entity"], "returns": "entity"},
     "set_game_speed": {"args": ["speed"], "returns": "json"},
-    "set_factory_milestone": {"args": ["agent_id", "objective", "target_item", "target_kind", "center_x", "center_y", "radius", "verify_ticks", "minimum_delta"], "returns": "json"},
     "set_recipe": {"args": ["unit_number", "recipe"], "returns": "json"},
     "set_spectator_mode": {"args": ["enabled"], "returns": "nil"},
     "set_status": {"args": ["player_index", "status_text"], "returns": "nil"},
@@ -109,7 +106,6 @@
     "unregister_agent": {"args": ["agent_name"], "returns": "nil"},
     "unstuck": {"args": ["agent_id", "radius", "dry_run"], "returns": "json"},
     "verify_production": {"args": ["x1", "y1", "x2", "y2"], "returns": "json"},
-    "verify_factory_milestone": {"args": ["agent_id"], "returns": "json"},
     "wait_for_crafting": {"args": ["agent_id"], "returns": "json"}
   }
 }

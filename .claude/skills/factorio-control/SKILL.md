@@ -1,65 +1,97 @@
 ---
 name: factorio-control
-description: Control an autonomous Factorio teammate through the Factorio MCP. Use for every gameplay turn to maintain one persistent factory milestone, eliminate character-mediated logistics, close material-flow dependencies, and prove sustained automation from live game evidence.
+description: Use when controlling Factorio through factorioctl MCP tools; gives live-state, placement, recipe, and verification discipline without hard-coded layouts.
 ---
 
-# Factorio Factory Control
+# Factorio Control
 
-Treat the factory as a material-flow graph. The character may construct the
-graph, but must not remain an edge in its steady-state operation.
+Use the game tools as the source of truth. Do not rely on memorized recipe names,
+fixed entity orientations, or hard-coded build coordinates when a factorioctl
+tool can inspect the current game state.
 
-## Operating loop
+## Operating Rules
 
-1. Read `get_factory_milestone`. If none exists, set one concrete milestone
-   with a target item and observable completion condition.
-2. Call `audit_automation`. Read `production_flow` as the outcome and
-   `material_graph.target_flow` as the causal producer-to-consumer path.
-3. Close the first reported dependency. Work backward through its item/fuel
-   supply evidence and reuse the named producers, consumers, buffers, and belt
-   networks before placing anything new.
-4. Make one coherent graph change, then audit again. If throughput remains
-   zero, diagnose the existing statuses and path before adding capacity.
-5. Call `verify_factory_milestone` to start or finish a sustained observation
-   window. Select a new milestone only after verification reports `complete`.
+1. Inspect before mutating.
+   Use `situation_report`, `render_map`, `get_inventory`, recipe/prototype
+   lookups, `check_placement`, or `find_entity_placements` to choose the next
+   action from live state. If the current position is far from the objective
+   site, local absence is not global absence; inspect the target/resource/build
+   area with read-only tools before deciding infrastructure is missing.
 
-## Automation contract
+2. Mutate one dependent step at a time.
+   Wait for the result of a world- or inventory-changing tool before issuing the
+   next dependent mutating command. Use `count` parameters for repeated mining,
+   crafting, or extraction instead of many tiny repeated calls.
 
-- A completed chain continuously gathers, transports, processes, and delivers
-  its required resources without character inventory transfers.
-- Manual mining, crafting, insertion, extraction, and lab feeding are bounded
-  bootstrap or recovery actions. Replace their material dependency before
-  claiming completion.
-- A chest is a buffer. It is a valid endpoint only for an explicit stockpile
-  milestone; otherwise it needs an automated outbound path to the consumer.
-- Working once is not proof. Require positive progress across the verification
-  window with zero manual material events.
-- A placed machine is not progress by itself. Count it only when upstream
-  producers reach its inputs and its output reaches the milestone endpoint.
-- Global rates answer whether the factory works; the directed material graph
-  answers where it fails. Use both, never one as a substitute for the other.
-- Derive geometry from live state. These rules constrain flow and evidence,
-  not layouts or coordinates.
+3. Prefer derived placement.
+   For drills, assemblers, power, fluids, belts, and inserters, use the helper
+   tools to derive input, output, and valid placement positions. Do not assume a
+   fixed orientation or copied coordinate layout.
 
-## Mutation discipline
+4. Reuse existing infrastructure before building duplicates.
+   For power and fluid work, audit existing `offshore-pump`, `boiler`,
+   `steam-engine`, `pipe`, and electric pole entities before crafting or
+   placing new ones. Search near the base, near known water, and near any
+   partially built power plant. If relevant entities exist, inspect and repair
+   their connections first; only place a duplicate after verifying the existing
+   entity cannot be reused.
 
-- Do not place a speculative duplicate while the audit identifies an existing
-  producer, consumer, or nearest disconnected pair.
-- Use `analyze_item_flow` on the reported producer/consumer pair when a path is
-  disconnected, then repair its first break.
-- Treat composite builders and placement planners as execution primitives, not
-  strategy. The milestone graph decides what needs to be connected.
-- Expand capacity only after one complete path has positive production and
-  consumption flow. Connectivity comes before scale.
+5. Verify what changed.
+   After placing or changing production, call `verify_production` or the
+   relevant status tool. If verification reports a problem, fix that concrete
+   problem before expanding the build.
 
-## Strategy references
+6. Build durable automation instead of repeating manual cycles.
+   Manual `insert_items`, `extract_items`, `craft`, `hand_feed_furnace`, and
+   `feed_lab_from_inventory` are bootstrap or recovery actions, not finished
+   factory work. If the same ingredient, fuel, plate, or science-pack transfer
+   will be needed again, spend the next actionable turn building the durable
+   route:
+   - use `execute_direct_smelter` for drill-to-furnace cells
+   - use `execute_edge_miner` for patch-edge drill plus output-belt cells
+   - use `execute_entity_placement_near` for safe assembler, lab, pole, chest,
+     or crowded-build placement
+   - use `diagnose_fuel_sustainability` then `build_fuel_supply` for boilers,
+     furnaces, and burner drills; when diagnostics return
+     `build_fuel_supply_args`, pass those directly to `build_fuel_supply`
+   - use `plan_automation_science` to derive a complete red-science cell, then
+     pass its `ready_to_call.execute_args` to `build_automation_science`
+   - use `plan_recipe_assembler_cell` then `build_recipe_assembler_cell` to
+     create component belts such as `iron-gear-wheel` from an `iron-plate` belt
+   - use `build_assembler_feed` for assembler input belts
+   - use `build_assembler_output` for assembler product belts
+   - use `build_lab_feed` for science belts into labs
+   A plan that only hand-crafts and hand-delivers more science packs is stale
+   once assemblers, inserters, belts, and power exist.
+   A plan that only inserts coal or ore into an existing furnace, boiler, or
+   burner drill is stale once belts, inserters, power poles, drills, labs, or
+   assemblers exist. In that state, diagnose the consumer and build the coal
+   delivery path with `build_fuel_supply` instead of refilling it by hand.
 
-Load only the relevant topic with `load_factory_playbook`:
+7. Automate science production as a complete cell.
+   For `automation-science-pack`, do not stop at crafting packs in inventory.
+   Place missing assemblers or labs with `execute_entity_placement_near`
+   first, then use the returned `placed_unit_number`. Prefer
+   `plan_recipe_assembler_cell` before `plan_automation_science` when no
+   `iron-gear-wheel` belt exists: place a small gear assembler, plan the
+   `iron-gear-wheel` cell from an `iron-plate` belt, execute
+   `build_recipe_assembler_cell`, and use that output belt as the gear source.
+   Then prefer
+   `plan_automation_science` during planning. It takes the assembler, lab, gear
+   source belt tile, and copper source belt tile, then returns exact
+   `build_automation_science` arguments plus dry-run route checks. If
+   `plan_automation_science.success` is true, call `build_automation_science`
+   with `ready_to_call.execute_args`. Use `build_automation_science` with
+   hand-written coordinates only when repairing a known custom layout. Use
+   `build_assembler_feed`, `build_assembler_output`, and `build_lab_feed` only
+   for repair or custom layouts that the composite planner cannot cover. Verify
+   the assembler and lab before starting another research objective.
 
-- `bootstrap`: escape initial hand work without making it permanent.
-- `logistics`: connect producers, buffers, and consumers into continuous flow.
-- `power`: make generation, fuel, distribution, and demand sustainable.
-- `smelting`: turn raw extraction into expandable plate flow.
-- `science`: automate intermediates through lab consumption.
-- `recovery`: repair a stalled or malformed chain without building duplicates.
+8. Treat research and recipes as runtime data.
+   If a craft fails or a recipe seems unavailable, query the recipe/technology
+   state and follow the reported blockers. Avoid guessing alternate recipe
+   names.
 
-Keep in-game replies operational and concise.
+9. Keep replies short.
+   The player sees in-game text. Report the operational result and any real
+   blocker, not an internal chain of thought.

@@ -59,17 +59,3 @@ NPC character in Factorio
 The Lua mod is required because Factorio exposes its runtime world and entity
 APIs to mods. All model hosting, tool serving, RCON communication, NPC
 lifecycle, server startup, and autonomy are owned by Rust.
-
-Factory control uses two independent observations. Force-wide production and
-consumption statistics measure whether the milestone is making sustained
-progress. A directed item graph derived from live belts, underground belts,
-splitters, inserters, direct mining outputs, recipes, and burner fuel paths
-identifies the first broken producer-to-consumer dependency. The NPC receives a
-compact audit every turn and can inspect the full graph through MCP; placement
-helpers execute repairs but do not choose strategy or fixed layouts.
-
-TODO: Extend the directed material graph beyond item transport. Pipe and fluid
-networks, train and station routing, and logistic-robot provider/requester
-networks are not yet modeled as causal graph edges. Until those adapters exist,
-the automation audit can observe their effects through force-wide production
-and consumption rates, but it cannot prove or diagnose their physical paths.
