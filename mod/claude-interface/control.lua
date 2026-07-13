@@ -2255,8 +2255,8 @@ local api = {
         return json_remote_call("is_tech_researched", research.is_tech_researched, tech_name)
     end,
 
-    eval_production_snapshot = function(surface_name)
-        return json_remote_call("eval_production_snapshot", diagnostics.eval_production_snapshot, surface_name)
+    production_statistics = function(surface_name)
+        return json_remote_call("production_statistics", diagnostics.production_statistics, surface_name)
     end,
 
     -- Get character position (read-only, safe from any context)

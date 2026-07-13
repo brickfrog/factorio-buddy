@@ -149,7 +149,7 @@ fn lifecycle_remote_names() -> BTreeSet<String> {
         "connected_player_count_result",
         "ensure_surface",
         "ensure_surface_result",
-        "eval_production_snapshot",
+        "production_statistics",
         "get_character",
         "has_walk_target",
         "inject_message",
@@ -1109,7 +1109,7 @@ fn lifecycle_remotes_have_thin_rust_mcp_wrappers() {
         ("ping", "ping"),
         ("live_state", "live_state_result"),
         ("connected_player_count", "connected_player_count_result"),
-        ("eval_production_snapshot", "eval_production_snapshot"),
+        ("production_statistics", "production_statistics"),
     ] {
         assert!(
             mcp_rs.contains(&format!("async fn {tool}"))

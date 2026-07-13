@@ -58,7 +58,7 @@
     "get_tiles": {"args": ["x1", "y1", "x2", "y2"], "returns": "json"},
     "ensure_surface": {"args": ["planet_name"], "returns": "string"},
     "ensure_surface_result": {"args": ["planet_name"], "returns": "json"},
-    "eval_production_snapshot": {"args": ["surface_name"], "returns": "json"},
+    "production_statistics": {"args": ["surface_name"], "returns": "json"},
     "has_walk_target": {"args": ["agent_id"], "returns": "boolean"},
     "import_blueprint": {"args": ["agent_id", "bp_string", "x", "y", "direction"], "returns": "json"},
     "init_character": {"args": ["agent_id", "x", "y"], "returns": "json"},

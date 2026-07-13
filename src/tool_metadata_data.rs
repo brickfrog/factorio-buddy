@@ -32,7 +32,7 @@ pub const FACTORIO_MCP_TOOLS: &[FactorioToolMetadata] = &[
     tool("ping", false, true, false),
     tool("live_state", false, true, false),
     tool("connected_player_count", false, true, false),
-    tool("eval_production_snapshot", false, true, false),
+    tool("production_statistics", false, true, false),
     tool("get_entities", false, true, false),
     tool("get_machine_belt_positions", false, true, false),
     tool("render_map", false, true, false),

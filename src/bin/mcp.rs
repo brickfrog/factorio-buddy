@@ -2552,9 +2552,9 @@ pub struct LiveStateParams {
     pub agent_name: String,
 }
 
-/// Parameters for querying force production statistics for eval/report tools.
+/// Parameters for querying force-wide item production and consumption statistics.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct EvalProductionSnapshotParams {
+pub struct ProductionStatisticsParams {
     /// Surface name to inspect.
     #[serde(default = "default_surface_name")]
     pub surface_name: String,
@@ -3057,16 +3057,16 @@ impl FactorioMcp {
             .await
     }
 
-    /// Query production statistics snapshot for eval/report scoring.
+    /// Query force-wide item production and consumption statistics.
     #[tool(
-        description = "Read force item production totals and one-minute rates for eval/report scoring."
+        description = "Read force-wide item production and consumption totals plus one-minute produced, consumed, and net rates. Use this to see what the factory is actually making and using."
     )]
-    async fn eval_production_snapshot(
+    async fn production_statistics(
         &self,
-        Parameters(params): Parameters<EvalProductionSnapshotParams>,
+        Parameters(params): Parameters<ProductionStatisticsParams>,
     ) -> String {
         self.call_lifecycle_remote(
-            "eval_production_snapshot",
+            "production_statistics",
             &[serde_json::json!(params.surface_name)],
         )
         .await
