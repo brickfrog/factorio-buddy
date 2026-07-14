@@ -1049,6 +1049,7 @@ local function find_minable_at(surface, character, x, y, radius)
     local entities = surface.find_entities_filtered{
         position = {x, y},
         radius = radius,
+        type = {"tree", "simple-entity", "fish"},
     }
     for _, entity in pairs(entities) do
         if entity.minable and entity ~= character then
@@ -1145,7 +1146,9 @@ local function mine_at_impl(agent_id, x, y, count, radius)
     local mined = 0
     local picked_up = 0
     local surface = game.surfaces[1]
-    local search_radius = radius or 3
+    -- mine_at is deliberately point-targeted. Never let a caller turn it into
+    -- an area deconstruction primitive that can catch nearby infrastructure.
+    local search_radius = math.min(math.max(radius or 0.5, 0), 0.5)
 
     for _ = 1, count do
         local iteration_before_count = inventory_item_total(inv)
@@ -1188,7 +1191,7 @@ local function mine_at_impl(agent_id, x, y, count, radius)
         inventory = items,
     }
     if not success then
-        result.error = "No minable entity at position"
+        result.error = "No loose item or natural minable entity at exact position; use remove_entity with a unit number for placed infrastructure"
     end
     return result
 end

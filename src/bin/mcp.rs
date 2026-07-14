@@ -1185,14 +1185,14 @@ fn default_direct_smelter_radius() -> u32 {
     6
 }
 
-/// Parameters for mine_at tool
+/// Parameters for mine_at tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MineAtParams {
-    /// X coordinate to mine at
+    /// Exact X coordinate of a natural resource or loose item
     pub x: f64,
-    /// Y coordinate to mine at
+    /// Exact Y coordinate of a natural resource or loose item
     pub y: f64,
-    /// Number of entities to mine
+    /// Number of mining or pickup attempts
     #[serde(default = "default_count")]
     pub count: u32,
 }
@@ -5105,8 +5105,10 @@ impl FactorioMcp {
         self.with_player_messages(msg).await
     }
 
-    /// Mine entities at a position.
-    #[tool(description = "Mine entities at a position. Character will walk there first if needed.")]
+    /// Mine natural entities or pick up loose items at an exact position.
+    #[tool(
+        description = "Mine natural resources, trees, or rocks, or pick up loose items at an exact position. This never removes placed infrastructure; use remove_entity with a unit number for that. Character will walk there first if needed."
+    )]
     async fn mine_at(&self, Parameters(params): Parameters<MineAtParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,

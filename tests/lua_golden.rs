@@ -2511,6 +2511,15 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
             "FactorioClient mining methods should retain direct /claude marker {required:?}"
         );
     }
+    let mine_at_client = client_mod
+        .split("pub async fn mine_at")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn mine_nearest").next())
+        .expect("mine_at should exist before mine_nearest");
+    assert!(
+        mine_at_client.contains("json!(0.5)") && !mine_at_client.contains("json!(3)"),
+        "FactorioClient::mine_at must point-target rather than search nearby infrastructure"
+    );
 
     let control_lua = include_str!("../mod/claude-interface/control.lua");
     for required in [
@@ -2551,6 +2560,16 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
             && control_lua.contains("find_entities_filtered{"),
         "control.lua should own mining scans and measure mining progress from state changes"
     );
+    let find_minable_at = control_lua
+        .split("local function find_minable_at")
+        .nth(1)
+        .and_then(|tail| tail.split("local function mining_failure").next())
+        .expect("find_minable_at should exist before mining_failure");
+    assert!(
+        find_minable_at.contains("type = \"resource\"")
+            && find_minable_at.contains("type = {\"tree\", \"simple-entity\", \"fish\"}"),
+        "find_minable_at must exclude placed infrastructure entity types"
+    );
     let mine_at_impl = control_lua
         .split("local function mine_at_impl")
         .nth(1)
@@ -2560,8 +2579,10 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
         })
         .expect("mine_at_impl should exist before find_nearest_minable_impl");
     assert!(
-        !mine_at_impl.contains("if character.mine_entity(target, true) then"),
-        "mine_at_impl must not trust LuaControl.mine_entity's boolean for resource mining progress"
+        !mine_at_impl.contains("if character.mine_entity(target, true) then")
+            && mine_at_impl
+                .contains("local search_radius = math.min(math.max(radius or 0.5, 0), 0.5)"),
+        "mine_at_impl must point-target and measure actual mining progress"
     );
 }
 

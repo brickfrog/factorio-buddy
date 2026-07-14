@@ -738,8 +738,8 @@ impl FactorioClient {
 
     // --- Mining ---
 
-    /// Mine entity at position
-    /// Walks to the entity if needed, then mines with mine_entity
+    /// Mine a natural entity or pick up loose items at an exact position.
+    /// Walks to the target first if needed.
     pub async fn mine_at(&mut self, position: Position, count: u32) -> Result<MineResult> {
         // Walk to the target first
         let char_pos = self.get_character_position().await?;
@@ -756,7 +756,7 @@ impl FactorioClient {
                     json!(position.x),
                     json!(position.y),
                     json!(count),
-                    json!(3),
+                    json!(0.5),
                 ],
             )
             .await?;
