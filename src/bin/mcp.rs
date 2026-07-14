@@ -21,8 +21,8 @@ use factorioctl::client::{AgentId, FactorioClient};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
 use factorioctl::world::{
     build_production_report, build_situation_report, entity_size, find_belt_route_with_options,
-    Area, BeltKind, Direction, Entity, EntityProduction, GridPos, Position, RoutingOptions,
-    TilePos, UndergroundConfig,
+    Area, BeltKind, BeltRouteTopology, Direction, Entity, EntityProduction, GridPos, Position,
+    RoutingOptions, TilePos, UndergroundConfig,
 };
 
 fn production_verification_json(
@@ -56,6 +56,49 @@ fn route_belt_failure_json(
         "search_radius": params.search_radius,
         "materials_sufficient": false,
     })
+}
+
+fn route_material_shortfall(
+    surface_name: &str,
+    surface_needed: u32,
+    surface_available: u32,
+    underground_name: Option<&str>,
+    underground_needed: u32,
+    underground_available: u32,
+) -> Option<String> {
+    let mut missing = Vec::new();
+    if surface_available < surface_needed {
+        missing.push(format!(
+            "need {surface_needed} {surface_name}, have {surface_available}"
+        ));
+    }
+    if underground_available < underground_needed {
+        missing.push(format!(
+            "need {underground_needed} {}, have {underground_available}",
+            underground_name.unwrap_or("underground-belt")
+        ));
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Insufficient materials for complete route: {}. No belts were placed.",
+            missing.join("; ")
+        ))
+    }
+}
+
+fn compact_belt_topology(topology: Option<&BeltRouteTopology>) -> serde_json::Value {
+    match topology {
+        Some(topology) => serde_json::json!({
+            "connected": topology.connected,
+            "start_tile": topology.start_tile,
+            "goal_tile": topology.goal_tile,
+            "step_count": topology.steps.len(),
+            "errors": topology.errors,
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 fn deserialize_tile_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
@@ -288,7 +331,8 @@ mod tests {
         automation_repair_hint, execute_lua_refusal, flow_lookup, flow_scan_area,
         is_machine_output_source, machine_output_build_args, machine_side_layout,
         placed_unit_working, placed_units_not_dead, raw_lua_enabled, ready_fuel_supply_args,
-        route_belt_failure_json, route_segment_waypoint, BuildFuelSupplyParams, RouteBeltParams,
+        route_belt_failure_json, route_material_shortfall, route_segment_waypoint,
+        BuildFuelSupplyParams, RouteBeltParams,
     };
     use factorioctl::analyze::EntityLookup;
     use factorioctl::world::{Area, Entity, GridPos, Position, TilePos};
@@ -551,6 +595,63 @@ mod tests {
         assert_eq!(payload["from"]["x"], 73);
         assert_eq!(payload["to"]["y"], -6);
         assert_eq!(payload["belt_type"], "transport-belt");
+    }
+
+    #[test]
+    fn route_materials_are_all_or_nothing() {
+        assert_eq!(
+            route_material_shortfall("transport-belt", 12, 12, Some("underground-belt"), 2, 2,),
+            None
+        );
+        assert_eq!(
+            route_material_shortfall(
+                "transport-belt",
+                12,
+                4,
+                Some("underground-belt"),
+                2,
+                0,
+            )
+            .as_deref(),
+            Some(
+                "Insufficient materials for complete route: need 12 transport-belt, have 4; need 2 underground-belt, have 0. No belts were placed."
+            )
+        );
+    }
+
+    #[test]
+    fn route_belt_core_has_no_partial_prefix_path() {
+        let source = include_str!("mcp.rs");
+        let route_core = source
+            .rsplit("    async fn route_belt_core(")
+            .next()
+            .and_then(|tail| tail.split("\n    async fn route_belt(").next())
+            .expect("route_belt_core should exist before route_belt");
+
+        for forbidden in [
+            "partial_route",
+            "partial_reason",
+            "partial_route_available",
+            "buildable prefix",
+            "places the buildable prefix",
+        ] {
+            assert!(
+                !route_core.contains(forbidden),
+                "route_belt_core must not retain partial mutation path {forbidden:?}"
+            );
+        }
+        for required in [
+            "check_entity_placement",
+            "Complete route preflight failed; no belts were placed.",
+            "client.remove_entity(unit_number).await",
+            "\"complete_route\": true",
+            "\"ready_to_call\"",
+        ] {
+            assert!(
+                route_core.contains(required),
+                "route_belt_core should retain atomic-route invariant {required:?}"
+            );
+        }
     }
 
     #[test]
@@ -4150,7 +4251,7 @@ impl FactorioMcp {
 
     /// Place an entity from character inventory.
     #[tool(
-        description = "Place an entity from character inventory at a position. On failure, returns structured diagnostics including can_place, inventory_count, direction, and position."
+        description = "Place one non-belt entity from character inventory at an exact position, or execute a single-belt placement returned verbatim by an automation planner/flow repair. Do not improvise transport routes one belt at a time; use route_belt or a higher-level automation controller. On failure, returns structured diagnostics including can_place, inventory_count, direction, and position."
     )]
     async fn place_entity(&self, Parameters(params): Parameters<PlaceEntityParams>) -> String {
         let mut client = match self.connect().await {
@@ -5860,12 +5961,18 @@ impl FactorioMcp {
         let surface_belts_needed = result
             .belts
             .iter()
-            .filter(|b| b.kind == BeltKind::Surface)
+            .filter(|belt| {
+                belt.kind == BeltKind::Surface
+                    && !existing_belt_tiles.contains(&GridPos::from_position(&belt.position))
+            })
             .count() as u32;
         let underground_belts_needed = result
             .belts
             .iter()
-            .filter(|b| b.kind != BeltKind::Surface)
+            .filter(|belt| {
+                belt.kind != BeltKind::Surface
+                    && !existing_belt_tiles.contains(&GridPos::from_position(&belt.position))
+            })
             .count() as u32;
         let surface_belts_have = inventory
             .items
@@ -5879,80 +5986,17 @@ impl FactorioMcp {
             .map(|i| i.count)
             .unwrap_or(0);
 
-        let full_route_belts = result.belts.clone();
-        let mut build_belts = full_route_belts.clone();
-        let mut partial_route = false;
-        let mut partial_reason: Option<String> = None;
+        let build_belts = result.belts.clone();
         let materials_sufficient = surface_belts_have >= surface_belts_needed
             && underground_belts_have >= underground_belts_needed;
-
-        if !materials_sufficient {
-            let underground_short =
-                underground_belts_needed > 0 && underground_belts_have < underground_belts_needed;
-            if underground_short && !params.dry_run {
-                let ug_name = underground_belt_name.unwrap_or("underground-belt");
-                return Ok(route_belt_failure_json(
-                    params,
-                    "insufficient_materials",
-                    format!(
-                        "Insufficient materials: need {} {}, have {}. Craft more underground belts first.",
-                        underground_belts_needed, ug_name, underground_belts_have
-                    ),
-                ));
-            }
-            if surface_belts_have == 0 && !params.dry_run {
-                return Ok(route_belt_failure_json(
-                    params,
-                    "insufficient_materials",
-                    format!(
-                        "Insufficient materials: need {} {}, have 0. Craft more belts first.",
-                        surface_belts_needed, params.belt_type
-                    ),
-                ));
-            }
-            if !underground_short && surface_belts_have > 0 {
-                let buildable_count = surface_belts_have.min(surface_belts_needed) as usize;
-                build_belts = full_route_belts.into_iter().take(buildable_count).collect();
-                partial_route = !params.dry_run;
-                partial_reason = Some(format!(
-                    "Only {} of {} required {} available; {} buildable prefix.",
-                    surface_belts_have,
-                    surface_belts_needed,
-                    params.belt_type,
-                    if params.dry_run {
-                        "previewing"
-                    } else {
-                        "placing"
-                    }
-                ));
-            }
-        }
-
-        let steps: Vec<serde_json::Value> = build_belts
-            .iter()
-            .map(|belt| {
-                let entity_name = match belt.kind {
-                    BeltKind::Surface => params.belt_type.as_str(),
-                    BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
-                        underground_belt_name.unwrap_or(params.belt_type.as_str())
-                    }
-                };
-                serde_json::json!({
-                    "tool": "place_entity",
-                    "tool_args": {
-                        "entity_name": entity_name,
-                        "x": belt.position.x,
-                        "y": belt.position.y,
-                        "direction": belt.direction.to_factorio()
-                    },
-                    "kind": belt.kind,
-                    "description": format!(
-                        "Place {} at ({:.1},{:.1}) facing {:?}",
-                        entity_name, belt.position.x, belt.position.y, belt.direction
-                    )
-                })
-            })
-            .collect();
+        let material_shortfall = route_material_shortfall(
+            &params.belt_type,
+            surface_belts_needed,
+            surface_belts_have,
+            underground_belt_name,
+            underground_belts_needed,
+            underground_belts_have,
+        );
 
         let materials = serde_json::json!({
             "surface": {
@@ -5970,62 +6014,127 @@ impl FactorioMcp {
         });
 
         if params.dry_run {
-            let mut response = serde_json::json!({
+            let mut execute_args =
+                serde_json::to_value(params).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(object) = execute_args.as_object_mut() {
+                object.insert("dry_run".to_string(), serde_json::json!(false));
+            }
+            return Ok(serde_json::json!({
                 "success": true,
                 "dry_run": true,
                 "from": { "x": params.from_x, "y": params.from_y },
                 "to": { "x": params.to_x, "y": params.to_y },
                 "belt_type": params.belt_type,
                 "belt_count": result.belt_count,
-                "buildable_belt_count": build_belts.len(),
+                "new_belt_count": surface_belts_needed + underground_belts_needed,
                 "turn_count": result.turn_count,
                 "underground_count": result.underground_count,
                 "materials": materials,
                 "materials_sufficient": materials_sufficient,
-                "partial_route_available": !materials_sufficient
-                    && underground_belts_needed == 0
-                    && surface_belts_have > 0,
-                "partial_reason": partial_reason,
-                "topology": result.topology,
-            });
-            if let Some(object) = response.as_object_mut() {
-                if build_belts.len() <= 80 {
-                    object.insert("steps".to_string(), serde_json::json!(steps));
-                    object.insert("belts".to_string(), serde_json::json!(build_belts));
+                "ready_to_execute": materials_sufficient,
+                "material_shortfall": material_shortfall,
+                "topology": compact_belt_topology(result.topology.as_ref()),
+                "ready_to_call": {
+                    "tool": "route_belt",
+                    "execute_args": execute_args,
+                },
+                "guidance": if materials_sufficient {
+                    "Call route_belt with ready_to_call.execute_args to place the complete route atomically. Do not place its belts one tile at a time."
                 } else {
-                    let first_belts: Vec<_> = build_belts.iter().take(8).collect();
-                    let mut last_belts: Vec<_> = build_belts.iter().rev().take(8).collect();
-                    last_belts.reverse();
-                    object.insert("steps_truncated".to_string(), serde_json::json!(true));
-                    object.insert("belts_truncated".to_string(), serde_json::json!(true));
-                    object.insert(
-                        "preview".to_string(),
-                        serde_json::json!({
-                            "first_belts": first_belts,
-                            "last_belts": last_belts,
-                            "omitted_belts": build_belts.len().saturating_sub(16),
-                        }),
-                    );
-                    object.insert(
-                        "guidance".to_string(),
-                        serde_json::json!(
-                            "Route is long; response omits full step list. If materials are insufficient or placement reliability matters, build it in shorter route_belt segments, then use build_fuel_supply only for the final consumer feed."
-                        ),
-                    );
-                }
-            }
-            return Ok(response);
+                    "Craft the missing belts, then rerun route_belt. No partial route will be placed."
+                },
+            }));
         }
 
-        let mut placed = 0;
-        let mut skipped_existing = 0;
-        let mut errors = Vec::new();
+        if let Some(shortfall) = material_shortfall {
+            let mut failure = route_belt_failure_json(params, "insufficient_materials", shortfall);
+            if let Some(object) = failure.as_object_mut() {
+                object.insert("materials".to_string(), materials);
+                object.insert("placed".to_string(), serde_json::json!(0));
+                object.insert(
+                    "topology".to_string(),
+                    compact_belt_topology(result.topology.as_ref()),
+                );
+                object.insert(
+                    "guidance".to_string(),
+                    serde_json::json!(
+                        "Craft the missing belts and retry the same complete route. Do not place a shorter prefix."
+                    ),
+                );
+            }
+            return Ok(failure);
+        }
+
         let underground_entity = underground_config.as_ref().map(|c| c.entity_name.as_str());
+        let skipped_existing = build_belts
+            .iter()
+            .filter(|belt| existing_belt_tiles.contains(&GridPos::from_position(&belt.position)))
+            .count();
+        let mut preflight_errors = Vec::new();
+
+        for belt in &build_belts {
+            if existing_belt_tiles.contains(&GridPos::from_position(&belt.position)) {
+                continue;
+            }
+            let entity_name = match belt.kind {
+                BeltKind::Surface => &params.belt_type,
+                BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
+                    underground_entity.unwrap_or(&params.belt_type)
+                }
+            };
+            match client
+                .check_entity_placement(entity_name, belt.position, belt.direction)
+                .await
+            {
+                Ok(report)
+                    if report
+                        .get("factorio_allowed")
+                        .and_then(|value| value.as_bool())
+                        == Some(true) => {}
+                Ok(report) => preflight_errors.push(serde_json::json!({
+                    "position": belt.position,
+                    "entity": entity_name,
+                    "direction": belt.direction,
+                    "error": report.get("error"),
+                    "occupied_by": report.get("occupied_by"),
+                })),
+                Err(error) => preflight_errors.push(serde_json::json!({
+                    "position": belt.position,
+                    "entity": entity_name,
+                    "direction": belt.direction,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+
+        if !preflight_errors.is_empty() {
+            return Ok(serde_json::json!({
+                "success": false,
+                "complete_route": false,
+                "dry_run": false,
+                "error_kind": "placement_preflight_failed",
+                "error": "Complete route preflight failed; no belts were placed.",
+                "from": { "x": params.from_x, "y": params.from_y },
+                "to": { "x": params.to_x, "y": params.to_y },
+                "belt_type": params.belt_type,
+                "belt_count": result.belt_count,
+                "new_belt_count": surface_belts_needed + underground_belts_needed,
+                "placed": 0,
+                "skipped_existing": skipped_existing,
+                "materials": materials,
+                "materials_sufficient": true,
+                "topology": compact_belt_topology(result.topology.as_ref()),
+                "preflight_errors": preflight_errors,
+                "guidance": "Fix the reported blocker or choose different endpoints, then retry the complete route. Do not place around the failure one tile at a time.",
+            }));
+        }
+
+        let mut placed_entities = Vec::new();
+        let mut placement_error: Option<String> = None;
 
         for belt in &build_belts {
             let belt_tile = GridPos::from_position(&belt.position);
             if existing_belt_tiles.contains(&belt_tile) {
-                skipped_existing += 1;
                 continue;
             }
             let entity_name = match belt.kind {
@@ -6052,15 +6161,67 @@ impl FactorioMcp {
             };
 
             match place_result {
-                Ok(_) => placed += 1,
-                Err(e) => errors.push(format!("({}, {}): {}", belt.position.x, belt.position.y, e)),
+                Ok(entity) => placed_entities.push(entity),
+                Err(error) => {
+                    placement_error = Some(format!(
+                        "({}, {}): {}",
+                        belt.position.x, belt.position.y, error
+                    ));
+                    break;
+                }
             }
         }
 
+        if let Some(error) = placement_error {
+            let attempted_placements = placed_entities.len();
+            let mut rolled_back = 0;
+            let mut rollback_errors = Vec::new();
+            for entity in placed_entities.iter().rev() {
+                let rollback = match entity.unit_number {
+                    Some(unit_number) => client.remove_entity(unit_number).await,
+                    None => client.remove_entity_at(entity.position).await,
+                };
+                match rollback {
+                    Ok(()) => rolled_back += 1,
+                    Err(rollback_error) => rollback_errors.push(serde_json::json!({
+                        "unit_number": entity.unit_number,
+                        "position": entity.position,
+                        "error": rollback_error.to_string(),
+                    })),
+                }
+            }
+            return Ok(serde_json::json!({
+                "success": false,
+                "complete_route": false,
+                "dry_run": false,
+                "error_kind": "placement_failed",
+                "error": error,
+                "from": { "x": params.from_x, "y": params.from_y },
+                "to": { "x": params.to_x, "y": params.to_y },
+                "belt_type": params.belt_type,
+                "belt_count": result.belt_count,
+                "new_belt_count": surface_belts_needed + underground_belts_needed,
+                "placement_attempted": attempted_placements,
+                "rolled_back": rolled_back,
+                "placed": attempted_placements.saturating_sub(rolled_back),
+                "skipped_existing": skipped_existing,
+                "materials": materials,
+                "materials_sufficient": true,
+                "topology": compact_belt_topology(result.topology.as_ref()),
+                "rollback_errors": rollback_errors,
+                "guidance": if rollback_errors.is_empty() {
+                    "The failed route was rolled back. Inspect the reported tile and retry the complete route."
+                } else {
+                    "Rollback was incomplete. Remove only the exact units listed in rollback_errors before retrying."
+                },
+            }));
+        }
+
         Ok(serde_json::json!({
-            "success": errors.is_empty(),
+            "success": true,
+            "complete_route": true,
             "dry_run": false,
-            "error_kind": if errors.is_empty() { serde_json::Value::Null } else { serde_json::json!("placement_failed") },
+            "error_kind": serde_json::Value::Null,
             "from": { "x": params.from_x, "y": params.from_y },
             "to": { "x": params.to_x, "y": params.to_y },
             "built_to": build_belts.last().map(|belt| serde_json::json!({
@@ -6069,25 +6230,23 @@ impl FactorioMcp {
             })),
             "belt_type": params.belt_type,
             "belt_count": result.belt_count,
-            "buildable_belt_count": build_belts.len(),
-            "placed": placed,
+            "new_belt_count": surface_belts_needed + underground_belts_needed,
+            "placed": placed_entities.len(),
             "skipped_existing": skipped_existing,
-            "partial_route": partial_route,
-            "partial_reason": partial_reason,
             "turn_count": result.turn_count,
             "underground_count": result.underground_count,
             "materials": materials,
             "materials_sufficient": materials_sufficient,
-            "topology": result.topology,
-            "errors": errors,
+            "topology": compact_belt_topology(result.topology.as_ref()),
+            "errors": [],
         }))
     }
 
     /// Route belts from point A to point B using A* pathfinding.
     #[tool(
         description = "Route belts from one position to another using A* pathfinding to avoid obstacles. \
-        This is the recommended way to create belt connections. Use dry_run=true to preview the path before placing. \
-        If the full surface-belt route is longer than available belts, this places the buildable prefix and reports built_to."
+        This is the recommended way to create belt connections. Use dry_run=true to preview the route and receive one ready_to_call execution payload. \
+        Execution is all-or-nothing: insufficient materials or failed preflight place no belts, and an unexpected mid-route failure rolls back newly placed belts. Never execute a dry-run route one belt at a time."
     )]
     async fn route_belt(&self, Parameters(params): Parameters<RouteBeltParams>) -> String {
         let mut client = match self.connect().await {

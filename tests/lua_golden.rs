@@ -1947,10 +1947,8 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("local function inspect_placement_blockers")
             && placement_lua.contains("occupied_by = blockers[1]")
             && placement_lua.contains("bounding_box = bounding_box_table(entity)")
-            && placement_lua.contains("local function belt_alternate_candidates")
-            && placement_lua.contains("alternate_belt_placements")
-            && placement_lua.contains("candidate_alternate_path")
-            && placement_lua.contains("route_belt_around_blocker")
+            && placement_lua.contains("details.recommended_action = \"route_belt\"")
+            && placement_lua.contains("do not place an unrelated nearby belt")
             && placement_lua.contains("local function character_placement_blocker")
             && placement_lua.contains("character_overlap = true")
             && placement_lua.contains("walk_to_clear_placement")
@@ -1998,6 +1996,12 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("table.sort(placements")
             && !control_lua.contains("and nil or"),
         "placement.lua should own placement diagnostics, scans, and create_entity contracts"
+    );
+    assert!(
+        !placement_lua.contains("belt_alternate_candidates")
+            && !placement_lua.contains("alternate_belt_placements")
+            && !placement_lua.contains("candidate_alternate_path"),
+        "blocked belt diagnostics must not suggest disconnected one-tile detours"
     );
 }
 

@@ -25,7 +25,7 @@ use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Build belts as complete source-to-destination routes with route_belt or a higher-level automation controller; do not improvise disconnected one-tile belt fragments. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the autonomous Factorio buddy using the Rust MCP tool server")]
@@ -808,5 +808,14 @@ mod tests {
             "Error RemoteCommandProcessor.cpp: RCON authentication failed"
         ));
         assert!(should_forward_factorio_output("Joining game"));
+    }
+
+    #[test]
+    fn default_prompt_requires_complete_belt_routes() {
+        assert!(DEFAULT_SYSTEM_PROMPT
+            .contains("Build belts as complete source-to-destination routes with route_belt"));
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("do not improvise disconnected one-tile belt fragments")
+        );
     }
 }

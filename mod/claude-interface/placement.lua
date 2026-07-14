@@ -246,65 +246,6 @@ local function inspect_placement_blockers(surface, entity_name, position, direct
     return details
 end
 
-local function belt_alternate_candidates(surface, force, position, direction, radius, limit)
-    local candidates = {}
-    radius = radius or 3
-    limit = limit or 5
-    for dx = -radius, radius do
-        for dy = -radius, radius do
-            if not (dx == 0 and dy == 0) then
-                local candidate = {position[1] + dx, position[2] + dy}
-                local ok, can_place = pcall(function()
-                    return surface.can_place_entity{
-                        name = "transport-belt",
-                        position = candidate,
-                        direction = direction,
-                        force = force,
-                        build_check_type = defines.build_check_type.manual,
-                    }
-                end)
-                if ok and can_place == true then
-                    local distance = math.sqrt(dx * dx + dy * dy)
-                    local resources = resources_on_tile(surface, candidate[1], candidate[2])
-                    table.insert(candidates, {
-                        position = {x = candidate[1], y = candidate[2]},
-                        direction = direction,
-                        distance = distance,
-                        clear = #resources == 0,
-                        overlapping_resources = resources,
-                        description = "Place transport-belt at tile ("
-                            .. tostring(candidate[1])
-                            .. ", "
-                            .. tostring(candidate[2])
-                            .. ") facing "
-                            .. direction_name(direction)
-                            .. " to route around the blocker.",
-                    })
-                end
-            end
-        end
-    end
-
-    table.sort(candidates, function(a, b)
-        if a.clear ~= b.clear then
-            return a.clear == true
-        end
-        if a.distance == b.distance then
-            if a.position.x == b.position.x then
-                return a.position.y < b.position.y
-            end
-            return a.position.x < b.position.x
-        end
-        return a.distance < b.distance
-    end)
-
-    local returned = {}
-    for i = 1, math.min(#candidates, limit) do
-        table.insert(returned, candidates[i])
-    end
-    return returned
-end
-
 local function placement_diagnostics(surface, force, entity_name, position, direction, character)
     local details = inspect_placement_blockers(surface, entity_name, position, direction) or {}
     local character_blocker = character_placement_blocker(character, entity_name, position)
@@ -316,22 +257,9 @@ local function placement_diagnostics(surface, force, entity_name, position, dire
         details.recommended_action = "walk_to_clear_placement"
         details.guidance = "Move the agent outside the proposed build footprint before placing this entity."
     end
-    if entity_name == "transport-belt" then
-        local alternatives = belt_alternate_candidates(surface, force, position, direction, 3, 5)
-        if #alternatives > 0 then
-            details.alternate_belt_placements = alternatives
-            details.candidate_alternate_path = {
-                blocked = {
-                    position = {x = position[1], y = position[2]},
-                    direction = direction,
-                },
-                next_belt = alternatives[1],
-                description = "Requested belt tile is blocked; route to the suggested next_belt tile or call route_belt around the blocker.",
-            }
-            if not details.recommended_action then
-                details.recommended_action = "route_belt_around_blocker"
-            end
-        end
+    if entity_name == "transport-belt" and not details.recommended_action then
+        details.recommended_action = "route_belt"
+        details.guidance = "The requested belt tile is blocked. Route the complete source-to-destination connection with route_belt; do not place an unrelated nearby belt."
     end
 
     for _, _ in pairs(details) do
@@ -1811,4 +1739,3 @@ function M.rotate_entity(unit_number, direction)
 end
 
 return M
-
