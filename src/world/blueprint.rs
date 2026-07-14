@@ -198,7 +198,7 @@ impl Blueprint {
                 x: self.origin[0],
                 y: self.origin[1],
             };
-            return (origin.clone(), origin);
+            return (origin, origin);
         }
 
         let mut min_x = f64::MAX;

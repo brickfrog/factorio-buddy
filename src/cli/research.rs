@@ -98,6 +98,7 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
                 current_research: Option<CurrentResearch>,
                 research_progress: f64,
                 labs: Labs,
+                #[serde(default, deserialize_with = "empty_object_as_vec")]
                 science_packs_in_labs: Vec<SciencePack>,
                 message: Option<String>,
             }

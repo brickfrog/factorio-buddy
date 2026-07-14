@@ -138,7 +138,7 @@ pub async fn execute_copy(cmd: CopyCommand, conn: &ResolvedConnectionArgs) -> Re
     };
 
     // Get entities in area
-    let entities = client.find_entities(area.clone(), None, None).await?;
+    let entities = client.find_entities(area, None, None).await?;
     let entities: Vec<_> = entities
         .into_iter()
         .filter(|e| {

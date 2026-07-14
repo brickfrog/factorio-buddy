@@ -1,3 +1,5 @@
+local inventory = require("inventory")
+
 local M = {}
 
 local function pos_table(pos)
@@ -5,8 +7,12 @@ local function pos_table(pos)
     return {x = pos.x, y = pos.y}
 end
 
-function M.get_belt_contents(x1, y1, x2, y2)
-    local surface = game.surfaces[1]
+local function item_key(item)
+    return item.name .. "\0" .. tostring(inventory.quality_name(item) or "normal")
+end
+
+function M.get_belt_contents(surface, x1, y1, x2, y2)
+    if not surface then return {error = "agent surface not found"} end
     local belts = surface.find_entities_filtered{
         area = {{x1, y1}, {x2, y2}},
         type = "transport-belt",
@@ -25,8 +31,16 @@ function M.get_belt_contents(x1, y1, x2, y2)
             local line = belt.get_transport_line(i)
             if line then
                 for _, item in pairs(line.get_contents()) do
-                    table.insert(belt_data.items, {name = item.name, count = item.count})
-                    item_totals[item.name] = (item_totals[item.name] or 0) + item.count
+                    table.insert(belt_data.items, inventory.item_record(item))
+                    local key = item_key(item)
+                    if not item_totals[key] then
+                        item_totals[key] = {
+                            name = item.name,
+                            count = 0,
+                            quality = inventory.quality_name(item),
+                        }
+                    end
+                    item_totals[key].count = item_totals[key].count + item.count
                     total_items = total_items + item.count
                 end
             end
@@ -37,9 +51,13 @@ function M.get_belt_contents(x1, y1, x2, y2)
     end
 
     local summary = {}
-    for item_name, count in pairs(item_totals) do
-        table.insert(summary, {name = item_name, count = count})
+    for _, item in pairs(item_totals) do
+        table.insert(summary, item)
     end
+    table.sort(summary, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        return tostring(a.quality or "normal") < tostring(b.quality or "normal")
+    end)
 
     return {
         belt_count = #belts,
@@ -49,8 +67,8 @@ function M.get_belt_contents(x1, y1, x2, y2)
     }
 end
 
-function M.get_belt_lane_contents(x1, y1, x2, y2)
-    local surface = game.surfaces[1]
+function M.get_belt_lane_contents(surface, x1, y1, x2, y2)
+    if not surface then return {error = "agent surface not found"} end
     local belts = surface.find_entities_filtered{
         area = {{x1, y1}, {x2, y2}},
         type = "transport-belt",
@@ -66,7 +84,7 @@ function M.get_belt_lane_contents(x1, y1, x2, y2)
         local line1 = belt.get_transport_line(1)
         if line1 then
             for _, item in pairs(line1.get_contents()) do
-                table.insert(left_items, {name = item.name, count = item.count})
+                table.insert(left_items, inventory.item_record(item))
                 left_count = left_count + item.count
             end
         end
@@ -74,7 +92,7 @@ function M.get_belt_lane_contents(x1, y1, x2, y2)
         local line2 = belt.get_transport_line(2)
         if line2 then
             for _, item in pairs(line2.get_contents()) do
-                table.insert(right_items, {name = item.name, count = item.count})
+                table.insert(right_items, inventory.item_record(item))
                 right_count = right_count + item.count
             end
         end
@@ -98,4 +116,3 @@ function M.get_belt_lane_contents(x1, y1, x2, y2)
 end
 
 return M
-

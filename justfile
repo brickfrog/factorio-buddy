@@ -22,8 +22,33 @@ chat: build
     ./target/release/buddy --heartbeat-seconds 0
 
 test:
-    cargo test
+    cargo test --all-targets --locked
     find mod/claude-interface -name '*.lua' -print0 | xargs -0 luac -p
+
+# Run every static/unit gate used in CI.
+check:
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --locked -- -D warnings
+    cargo test --all-targets --locked
+    find mod/claude-interface -name '*.lua' -print0 | xargs -0 luac -p
+    cargo build --release --all-targets --locked
+
+# Start one disposable Factorio server and exercise the real Rust/Lua/RCON path.
+test-live: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    save="$(mktemp --suffix=.factorio-buddy-test.zip)"
+    cleanup() {
+        ./tests/cleanup.sh >/dev/null 2>&1 || true
+        rm -f "$save"
+    }
+    trap cleanup EXIT
+    ./tests/setup.sh "$save"
+    ./tests/run_tests.sh
+    FACTORIOCTL_BIN="$PWD/target/release/factorioctl" \
+        FACTORIO_RCON_PORT=27016 \
+        FACTORIO_RCON_PASSWORD=test_password \
+        ./scripts/smoke_agent_binding.sh
 
 doctor:
     @command -v claude >/dev/null && echo "ok  claude  $(claude --version)" || echo "!!  claude CLI missing"

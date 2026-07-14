@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run factorioctl tests against a running server
 #
 # Prerequisites:
@@ -6,16 +6,16 @@
 #
 # Usage: ./tests/run_tests.sh
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
 # Configuration
-RCON_PORT=27016
-RCON_PASSWORD="test_password"
-CLI="./target/release/factorioctl --port $RCON_PORT --password $RCON_PASSWORD"
+RCON_PORT="${RCON_PORT:-27016}"
+RCON_PASSWORD="${RCON_PASSWORD:-test_password}"
+CLI=(./target/release/factorioctl --port "$RCON_PORT" --password "$RCON_PASSWORD")
 
 # Colors
 GREEN='\033[0;32m'
@@ -29,18 +29,18 @@ SKIPPED=0
 
 pass() {
     echo -e "  ${GREEN}PASS${NC}: $1"
-    ((PASSED++))
+    PASSED=$((PASSED + 1))
 }
 
 fail() {
     echo -e "  ${RED}FAIL${NC}: $1"
     echo "       Output: $2"
-    ((FAILED++))
+    FAILED=$((FAILED + 1))
 }
 
 skip() {
     echo -e "  ${YELLOW}SKIP${NC}: $1"
-    ((SKIPPED++))
+    SKIPPED=$((SKIPPED + 1))
 }
 
 echo "=== factorioctl Test Suite ==="
@@ -48,7 +48,7 @@ echo ""
 
 # Check if server is running
 echo "Checking server connection..."
-if ! $CLI get tick > /dev/null 2>&1; then
+if ! "${CLI[@]}" get tick > /dev/null 2>&1; then
     echo "ERROR: Cannot connect to server. Run ./tests/setup.sh first."
     exit 1
 fi
@@ -56,14 +56,14 @@ echo ""
 
 # Test 1: Basic connectivity
 echo "1. Basic Connectivity"
-OUTPUT=$($CLI get tick 2>&1)
+OUTPUT=$("${CLI[@]}" get tick 2>&1 || true)
 if echo "$OUTPUT" | grep -q "Tick:"; then
     pass "get tick"
 else
     fail "get tick" "$OUTPUT"
 fi
 
-OUTPUT=$($CLI get surfaces 2>&1)
+OUTPUT=$("${CLI[@]}" get surfaces 2>&1 || true)
 if echo "$OUTPUT" | grep -q "nauvis"; then
     pass "get surfaces"
 else
@@ -73,14 +73,14 @@ echo ""
 
 # Test 2: Character initialization
 echo "2. Character Management"
-OUTPUT=$($CLI character init 2>&1)
+OUTPUT=$("${CLI[@]}" character init 2>&1 || true)
 if echo "$OUTPUT" | grep -q "character" || echo "$OUTPUT" | grep -q "unit_number"; then
     pass "character init"
 else
     fail "character init" "$OUTPUT"
 fi
 
-OUTPUT=$($CLI character status 2>&1)
+OUTPUT=$("${CLI[@]}" character status 2>&1 || true)
 if echo "$OUTPUT" | grep -q "valid" || echo "$OUTPUT" | grep -q "Position"; then
     pass "character status"
 else
@@ -90,7 +90,7 @@ echo ""
 
 # Test 3: World queries
 echo "3. World Queries"
-OUTPUT=$($CLI get resources --area -100,-100,100,100 2>&1)
+OUTPUT=$("${CLI[@]}" get resources --area -100,-100,100,100 2>&1 || true)
 if echo "$OUTPUT" | grep -qE "(iron-ore|copper-ore|coal|stone|resource)"; then
     pass "get resources"
 else
@@ -102,7 +102,7 @@ else
     fi
 fi
 
-OUTPUT=$($CLI get tile 0,0 2>&1)
+OUTPUT=$("${CLI[@]}" get tile 0,0 2>&1 || true)
 if echo "$OUTPUT" | grep -q "Tile:"; then
     pass "get tile"
 else
@@ -112,7 +112,7 @@ echo ""
 
 # Test 4: Teleportation
 echo "4. Character Movement"
-OUTPUT=$($CLI character teleport 15,15 2>&1)
+OUTPUT=$("${CLI[@]}" character teleport 15,15 2>&1 || true)
 if echo "$OUTPUT" | grep -q "Teleported"; then
     pass "character teleport"
 else
@@ -122,14 +122,14 @@ echo ""
 
 # Test 5: JSON output
 echo "5. JSON Output"
-OUTPUT=$($CLI --output json get tick 2>&1)
+OUTPUT=$("${CLI[@]}" --output json get tick 2>&1 || true)
 if echo "$OUTPUT" | grep -q '"tick"'; then
     pass "JSON get tick"
 else
     fail "JSON get tick" "$OUTPUT"
 fi
 
-OUTPUT=$($CLI --output json character status 2>&1)
+OUTPUT=$("${CLI[@]}" --output json character status 2>&1 || true)
 if echo "$OUTPUT" | grep -q '"valid"'; then
     pass "JSON character status"
 else
@@ -139,14 +139,14 @@ echo ""
 
 # Test 6: Tick control
 echo "6. Tick Control"
-OUTPUT=$($CLI tick pause 2>&1)
+OUTPUT=$("${CLI[@]}" tick pause 2>&1 || true)
 if echo "$OUTPUT" | grep -q "paused"; then
     pass "tick pause"
 else
     fail "tick pause" "$OUTPUT"
 fi
 
-OUTPUT=$($CLI tick resume 2>&1)
+OUTPUT=$("${CLI[@]}" tick resume 2>&1 || true)
 if echo "$OUTPUT" | grep -q "resumed"; then
     pass "tick resume"
 else
@@ -161,6 +161,6 @@ echo -e "  ${RED}Failed${NC}: $FAILED"
 echo -e "  ${YELLOW}Skipped${NC}: $SKIPPED"
 echo ""
 
-if [ $FAILED -gt 0 ]; then
+if (( FAILED > 0 )); then
     exit 1
 fi

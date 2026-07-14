@@ -1,4 +1,5 @@
 local entities = require("entities")
+local characters = require("characters")
 
 local M = {}
 
@@ -20,6 +21,28 @@ local function research_needs_science(tech)
         return true
     end
     return false
+end
+
+local function trigger_value(trigger, field)
+    local ok, value = pcall(function() return trigger[field] end)
+    if not ok or value == nil then return nil end
+    if type(value) == "string" or type(value) == "number" or type(value) == "boolean" then
+        return value
+    end
+    local name_ok, name = pcall(function() return value.name end)
+    if name_ok and name then return name end
+    return tostring(value)
+end
+
+local function research_trigger(tech)
+    local ok, trigger = pcall(function() return tech.prototype.research_trigger end)
+    if not ok or not trigger then return nil end
+    local result = {}
+    for _, field in ipairs({"type", "item", "entity", "fluid", "count", "amount", "quality"}) do
+        local value = trigger_value(trigger, field)
+        if value ~= nil then result[field] = value end
+    end
+    return result
 end
 
 local function research_effects(tech)
@@ -151,6 +174,19 @@ function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, cou
         return expected_miss(result, "choose_valid_lab")
     end
 
+    local reach_error = characters.require_entity_reach(character, lab)
+    if reach_error then
+        result.error = reach_error.error
+        result.error_kind = reach_error.error_kind
+        result.action_needed = reach_error.action_needed
+        result.character_position = reach_error.character_position
+        result.target_position = reach_error.target_position
+        result.distance = reach_error.distance
+        result.max_distance = reach_error.max_distance
+        add_blocker(result, "out_of_reach", "Walk to the lab before transferring science packs.")
+        return result
+    end
+
     local lab_inv = lab.get_inventory(defines.inventory.lab_input)
     if not lab_inv then
         add_blocker(result, "no_lab_inventory", "Lab has no lab_input inventory.")
@@ -197,22 +233,12 @@ function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, cou
     }
 
     if do_dry_run then
-        result.steps = {
-            {
-                tool = "feed_lab_from_inventory",
-                tool_args = {
-                    lab_unit_number = tonumber(lab_unit_number),
-                    science_pack = science_pack,
-                    count = count,
-                    dry_run = false,
-                },
-                description = "Transfer science packs from the agent inventory into the target lab.",
-            },
-        }
+        result.steps = {}
         result.success = true
-        result.ready = true
-        result.next_action = "execute_feed_lab_from_inventory"
-        result.guidance = "Call feed_lab_from_inventory again with dry_run=false, then run verify_step."
+        result.ready = false
+        result.manual_bootstrap_available = true
+        result.next_action = "automate_science_delivery"
+        result.guidance = "This transfer is in reach but is only a manual bootstrap action. Prefer belts and inserters that keep labs supplied without the character."
         return result
     end
 
@@ -238,13 +264,16 @@ function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, cou
 
     result.success = true
     result.next_action = "get_research_status"
-    result.guidance = "Science packs transferred from character inventory into the lab."
+    result.guidance = "Science packs transferred once. Build automated lab delivery before treating research logistics as complete."
     return result
 end
 
-function M.get_research_status()
-    local force = game.forces.player
-    local surface = game.surfaces[1]
+function M.get_research_status(character)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local force = character.force
+    local surface = character.surface
     local result = {
         researched_count = 0,
         total_count = 0,
@@ -273,6 +302,7 @@ function M.get_research_status()
             level = tech.level,
             research_unit_count = tech.research_unit_count,
             ingredients = research_ingredients(tech),
+            trigger = research_trigger(tech),
         }
         result.research_progress = force.research_progress
     end
@@ -314,8 +344,11 @@ function M.get_research_status()
 end
 
 function M.get_available_research(character)
-    local force = game.forces.player
-    local surface = game.surfaces[1]
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first", technologies = {}}
+    end
+    local force = character.force
+    local surface = character.surface
     local result = {
         technologies = {},
         lab_status = {
@@ -354,6 +387,7 @@ function M.get_available_research(character)
             if can_research then
                 local ingredients = {}
                 local needs_science = research_needs_science(tech)
+                local trigger = research_trigger(tech)
                 local has_all_packs = not needs_science or result.lab_status.powered > 0
                 for _, ing in pairs(tech.research_unit_ingredients or {}) do
                     local have = science_totals[ing.name] or 0
@@ -367,18 +401,15 @@ function M.get_available_research(character)
                     })
                 end
 
-                local ready = "ready"
+                local ready = trigger and "trigger_required" or "queueable"
                 local blockers = {}
                 if needs_science then
                     if result.lab_status.count == 0 then
-                        ready = "blocked"
                         table.insert(blockers, "no labs - build a lab first")
                     elseif result.lab_status.powered == 0 then
-                        ready = "blocked"
                         table.insert(blockers, "labs have no power")
                     end
                     if not has_all_packs then
-                        ready = "blocked"
                         table.insert(blockers, "missing science packs in labs")
                     end
                 end
@@ -390,6 +421,8 @@ function M.get_available_research(character)
                     ingredients = ingredients,
                     effects = research_effects(tech),
                     requires_lab = needs_science,
+                    trigger = trigger,
+                    queueable = needs_science,
                     ready = ready,
                     blockers = blockers,
                 })
@@ -397,16 +430,16 @@ function M.get_available_research(character)
         end
     end
 
-    local has_ready_free_tech = false
+    local has_trigger_tech = false
     for _, tech in pairs(result.technologies) do
-        if tech.ready == "ready" and tech.requires_lab == false then
-            has_ready_free_tech = true
+        if tech.trigger then
+            has_trigger_tech = true
             break
         end
     end
 
-    if has_ready_free_tech then
-        result.guidance = "Free bootstrap technologies need no lab or science packs. Call start_research on a ready technology before building labs."
+    if has_trigger_tech then
+        result.guidance = "Trigger technologies are completed only by their listed in-game trigger. Build or craft what the trigger requires; start_research will not unlock them."
     elseif result.lab_status.count == 0 then
         result.guidance = "To research: 1) Craft a lab (requires iron-gear-wheel, electronic-circuit, transport-belt), 2) Place it with power, 3) Craft science packs, 4) Insert science packs into lab"
     elseif result.lab_status.powered == 0 then
@@ -418,8 +451,11 @@ function M.get_available_research(character)
     return result
 end
 
-function M.start_research(tech_name)
-    local force = game.forces.player
+function M.start_research(character, tech_name)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local force = character.force
     local tech = force.technologies[tech_name]
 
     if not tech then
@@ -442,64 +478,41 @@ function M.start_research(tech_name)
 
     local ingredients = research_ingredients(tech)
     local needs_science = research_needs_science(tech)
-    if not needs_science then
-        local ok, err = pcall(function()
-            tech.researched = true
-        end)
-        if ok and tech.researched then
-            return {
-                success = true,
-                name = tech.name,
-                research_unit_count = tech.research_unit_count,
-                ingredients = ingredients,
-                requires_lab = false,
-                message = "Research completed. This technology requires no labs or science packs.",
-            }
-        end
-        return {success = false, error = "Failed to complete free research: " .. tostring(err)}
-    end
-
-    local surface = game.surfaces[1]
-    local labs = surface.find_entities_filtered{type = "lab", force = force}
-    if #labs == 0 then
+    local trigger = research_trigger(tech)
+    if trigger then
         return {
             success = false,
-            error = "No labs found! Build a lab first (requires: 10 iron-gear-wheel, 10 electronic-circuit, 4 transport-belt)",
-            action_needed = "build_lab",
+            error = "Technology requires an in-game research trigger and cannot be queued or force-completed",
+            error_kind = "research_trigger_required",
+            action_needed = "complete_research_trigger",
+            name = tech.name,
+            trigger = trigger,
+            requires_lab = false,
+        }
+    end
+    if not needs_science then
+        return {
+            success = false,
+            error = "Technology has no science units or supported research trigger; refusing to force-complete it",
+            error_kind = "unsupported_research_definition",
         }
     end
 
+    local surface = character.surface
+    local labs = surface.find_entities_filtered{type = "lab", force = force}
     local powered_labs = 0
     for _, lab in pairs(labs) do
         if lab_has_power(lab) then
             powered_labs = powered_labs + 1
         end
     end
-    if powered_labs == 0 then
-        return {
-            success = false,
-            error = "Labs have no power! Connect labs to power grid.",
-            action_needed = "power_labs",
-        }
-    end
-
-    local missing_packs = {}
     local science_in_labs = science_totals_from_labs(labs)
+    local missing_packs = {}
     for _, ing in pairs(tech.research_unit_ingredients or {}) do
         local have = science_in_labs[ing.name] or 0
         if have < ing.amount then
             table.insert(missing_packs, ing.name .. " (need " .. ing.amount .. ", have " .. have .. " in labs)")
         end
-    end
-
-    if #missing_packs > 0 then
-        return {
-            success = false,
-            error = "Missing science packs in labs: " .. table.concat(missing_packs, ", "),
-            action_needed = "insert_science_packs",
-            required_packs = ingredients,
-            hint = "Craft the required science packs and insert them into your labs",
-        }
     end
 
     local added = force.add_research(tech)
@@ -509,15 +522,23 @@ function M.start_research(tech_name)
             name = tech.name,
             research_unit_count = tech.research_unit_count,
             ingredients = ingredients,
-            message = "Research queued! Labs will now consume science packs to progress.",
+            lab_status = {
+                count = #labs,
+                powered = powered_labs,
+                missing_packs = missing_packs,
+            },
+            message = "Research queued. Build and automate any missing lab power or science delivery while it waits.",
         }
     end
 
     return {success = false, error = "Failed to queue research - check if another research is in progress"}
 end
 
-function M.is_tech_researched(tech_name)
-    local tech = game.forces.player.technologies[tech_name]
+function M.is_tech_researched(character, tech_name)
+    if not (character and character.valid) then
+        return {researched = false, error = "no character; spawn first"}
+    end
+    local tech = character.force.technologies[tech_name]
     if not tech then
         return {researched = false, error = "Technology not found"}
     end
@@ -525,4 +546,3 @@ function M.is_tech_researched(tech_name)
 end
 
 return M
-

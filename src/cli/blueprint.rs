@@ -482,7 +482,7 @@ async fn export_blueprint(
     origin: &Position,
     name: &str,
 ) -> Result<Blueprint> {
-    let entities = client.find_entities(area.clone(), None, None).await?;
+    let entities = client.find_entities(*area, None, None).await?;
 
     // Filter to player-built entities only (excluding character)
     let entities: Vec<_> = entities

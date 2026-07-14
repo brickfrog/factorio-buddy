@@ -190,9 +190,12 @@ end
 
 local function live_state_entity_counts(character)
     local counts = {}
-    for _, name in ipairs(LIVE_STATE_ENTITY_NAMES) do
-        local count = #character.surface.find_entities_filtered{force = character.force, name = name}
-        if count > 0 then counts[name] = count end
+    local found = character.surface.find_entities_filtered{
+        force = character.force,
+        name = LIVE_STATE_ENTITY_NAMES,
+    }
+    for _, entity in pairs(found) do
+        counts[entity.name] = (counts[entity.name] or 0) + 1
     end
     return counts
 end
@@ -206,44 +209,126 @@ local function live_state_entity_parts(counts)
     return parts
 end
 
+local function is_player_character(character)
+    if not (character and character.valid) then return false end
+    for _, player in pairs(game.players) do
+        if player.character == character then return true end
+    end
+    return false
+end
+
 function M.find(agent_id)
-    if storage.characters then
-        local character = storage.characters[agent_id]
-        if character and character.valid then return character end
-        if agent_id == "default" then
-            character = storage.characters["__player__"]
-            if character and character.valid then return character end
-        elseif agent_id == "__player__" then
-            character = storage.characters["default"]
-            if character and character.valid then return character end
-        end
+    if not storage.characters then return nil end
+    local character = storage.characters[agent_id]
+    if character and character.valid and not is_player_character(character) then
+        return character
     end
-
-    if agent_id == "default" or agent_id == "__player__" then
-        for _, player in pairs(game.connected_players) do
-            if player.character and player.character.valid then
-                return player.character
-            end
-        end
-    end
-
+    storage.characters[agent_id] = nil
     return nil
 end
 
 function M.remember(agent_id, character)
     storage.characters = storage.characters or {}
     storage.factorioctl_entities = storage.factorioctl_entities or {}
+    if not (character and character.valid) or is_player_character(character) then
+        storage.characters[agent_id] = nil
+        return false
+    end
     storage.characters[agent_id] = character
-    if agent_id == "__player__" then storage.characters["default"] = character end
-    if agent_id == "default" then storage.characters["__player__"] = character end
-    if character and character.valid and character.unit_number then
+    if character.unit_number then
         storage.factorioctl_entities[character.unit_number] = character
     end
+    return true
 end
 
 function M.register(agent_id, character)
-    storage.characters = storage.characters or {}
-    storage.characters[agent_id] = character
+    return M.remember(agent_id, character)
+end
+
+local function position_distance(character, x, y)
+    local dx = x - character.position.x
+    local dy = y - character.position.y
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+local function reach_limit(character, reach_kind)
+    if reach_kind == "build" then
+        return character.build_distance or character.reach_distance or 0
+    end
+    if reach_kind == "resource" then
+        return character.resource_reach_distance or character.reach_distance or 0
+    end
+    return character.reach_distance or 0
+end
+
+local function out_of_reach(character, target, distance, max_distance, unit_number)
+    return {
+        success = false,
+        error = "target is out of character reach",
+        error_kind = "out_of_reach",
+        action_needed = "walk_to",
+        surface = character.surface.name,
+        character_position = pos_table(character.position),
+        target_position = pos_table(target),
+        distance = distance,
+        max_distance = max_distance,
+        unit_number = unit_number,
+    }
+end
+
+function M.require_position_reach(character, x, y, reach_kind)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error = "no valid character",
+            error_kind = "no_character",
+            action_needed = "spawn_character",
+        }
+    end
+    local distance = position_distance(character, x, y)
+    local max_distance = reach_limit(character, reach_kind)
+    if distance <= max_distance then return nil end
+    return out_of_reach(character, {x = x, y = y}, distance, max_distance, nil)
+end
+
+function M.require_entity_reach(character, entity)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error = "no valid character",
+            error_kind = "no_character",
+            action_needed = "spawn_character",
+        }
+    end
+    if not (entity and entity.valid) then
+        return {
+            success = false,
+            error = "entity not found",
+            error_kind = "entity_not_found",
+        }
+    end
+    if entity.surface ~= character.surface then
+        return {
+            success = false,
+            error = "entity is on a different surface",
+            error_kind = "wrong_surface",
+            action_needed = "travel_to_surface",
+            surface = character.surface.name,
+            entity_surface = entity.surface.name,
+            unit_number = entity.unit_number,
+            target_position = pos_table(entity.position),
+        }
+    end
+    local ok, reachable = pcall(function() return character.can_reach_entity(entity) end)
+    if ok and reachable == true then return nil end
+    local distance = position_distance(character, entity.position.x, entity.position.y)
+    return out_of_reach(
+        character,
+        entity.position,
+        distance,
+        character.reach_distance or 0,
+        entity.unit_number
+    )
 end
 
 function M.ensure_surface(planet_name)
@@ -262,6 +347,14 @@ function M.ensure_surface_result(planet_name)
 end
 
 function M.pre_place(agent_id, planet_name, spawn_x)
+    local character = M.find(agent_id)
+    if character and character.valid then
+        -- Buddy startup is idempotent. Never move an established NPC back to
+        -- the configured spawn surface; explicit game travel is a separate act.
+        M.remember(agent_id, character)
+        return "already_placed"
+    end
+
     local target_surface = game.surfaces[planet_name]
     if not target_surface then return "surface_not_found" end
 
@@ -269,25 +362,14 @@ function M.pre_place(agent_id, planet_name, spawn_x)
     target_surface.force_generate_chunk_requests()
 
     local status = nil
-    local character = M.find(agent_id)
-    if character and character.valid then
-        if character.surface.name == planet_name then
-            status = "already_placed"
-        else
-            character.teleport({spawn_x, 0}, target_surface)
-            status = "teleported"
-        end
-    else
-        character = target_surface.create_entity{
-            name = "character",
-            position = {spawn_x, 0},
-            force = game.forces.player,
-        }
-        if character then status = "created" end
-    end
+    character = target_surface.create_entity{
+        name = "character",
+        position = {spawn_x, 0},
+        force = game.forces.player,
+    }
+    if character then status = "created" end
 
-    if character and character.valid then
-        M.remember(agent_id, character)
+    if character and character.valid and M.remember(agent_id, character) then
         return status
     end
 
@@ -295,10 +377,13 @@ function M.pre_place(agent_id, planet_name, spawn_x)
 end
 
 function M.pre_place_result(agent_id, planet_name, spawn_x)
+    local status = M.pre_place(agent_id, planet_name, spawn_x)
+    local character = M.find(agent_id)
     return helpers.table_to_json({
         agent_name = agent_id,
-        planet = planet_name,
-        status = M.pre_place(agent_id, planet_name, spawn_x),
+        requested_planet = planet_name,
+        planet = character and character.valid and character.surface.name or nil,
+        status = status,
     })
 end
 
@@ -574,4 +659,3 @@ function M.inventory(agent_id)
 end
 
 return M
-

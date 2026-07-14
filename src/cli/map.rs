@@ -308,8 +308,8 @@ pub fn render_ascii_map(
 
     // First pass: render power coverage as background (if provided)
     if let Some(coverage) = power_coverage {
-        for gy in 0..height {
-            for gx in 0..width {
+        for (gy, row) in grid.iter_mut().enumerate() {
+            for (gx, cell) in row.iter_mut().enumerate() {
                 let world_x = x_min + gx as i32;
                 let world_y = y_min + gy as i32;
                 if let Some(&network_id) = coverage.get(&(world_x, world_y)) {
@@ -319,7 +319,7 @@ pub fn render_ascii_map(
                     } else {
                         '+'
                     };
-                    grid[gy][gx] = ch;
+                    *cell = ch;
                 }
             }
         }

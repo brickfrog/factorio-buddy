@@ -34,6 +34,7 @@ local function init_storage()
     storage.active_agent = storage.active_agent or {}
     storage._rcon_queue = storage._rcon_queue or {}
     storage.spectator_mode = storage.spectator_mode or false
+    storage.spectator_previous = storage.spectator_previous or {}
     -- Agent character entities and walk targets (for deterministic on_tick processing)
     storage.characters = storage.characters or {}
     storage.walk_state = storage.walk_state or {}
@@ -329,6 +330,10 @@ end
 local function add_chat_message(player, agent_name, role, text)
     save_message(player.index, agent_name, role, text)
 
+    if role == "claude" then
+        player.print("[" .. get_agent_label(agent_name) .. "] " .. text)
+    end
+
     local frame = player.gui.screen[GUI_FRAME]
     if not frame or not frame.valid then return end
 
@@ -368,18 +373,27 @@ local function set_status(player, status_text)
     frame["ci_status"].caption = status_text
 end
 
-local function send_to_bridge(player, message)
+local function write_bridge_message(player_index, player_name, target_agent, message, tick)
     storage.msg_counter = storage.msg_counter + 1
-    local target = get_active_agent(player.index)
     local payload = {
         id = storage.msg_counter,
-        player_index = player.index,
-        player_name = player.name,
+        player_index = player_index,
+        player_name = player_name,
         message = message,
-        target_agent = target,
-        tick = game.tick,
+        target_agent = target_agent,
+        tick = tick or game.tick,
     }
     helpers.write_file(INPUT_FILE, helpers.table_to_json(payload) .. "\n", true, 0)
+end
+
+local function send_to_bridge(player, message)
+    write_bridge_message(
+        player.index,
+        player.name,
+        get_active_agent(player.index),
+        message,
+        game.tick
+    )
 end
 
 local function handle_send(player)
@@ -564,15 +578,10 @@ local function process_entity_queue()
     for _, item in ipairs(queue) do
         if item.action == "rotate" then
             local surface = game.surfaces[item.surface_name]
-            if surface then
-                for _, e in pairs(surface.find_entities_filtered{area = {{-500, -500}, {500, 500}}}) do
-                    if e.unit_number == item.unit_number then
-                        if e.supports_direction then
-                            e.direction = item.direction
-                        end
-                        break
-                    end
-                end
+            local unit_number = tonumber(item.unit_number)
+            local entity = unit_number and game.get_entity_by_unit_number(unit_number) or nil
+            if surface and entity and entity.valid and entity.surface == surface and entity.supports_direction then
+                entity.direction = item.direction
             end
         end
     end
@@ -615,6 +624,40 @@ end
 -- Process queued RCON commands deterministically in on_tick.
 -- This prevents desync in multiplayer: RCON pushes to queue,
 -- on_tick processes it identically on server and all clients.
+local function enable_spectator(player)
+    storage.spectator_previous = storage.spectator_previous or {}
+    if player.controller_type == defines.controllers.spectator then return true end
+    storage.spectator_previous[player.index] = {
+        controller_type = player.controller_type,
+        character = player.character,
+    }
+    local ok = pcall(function()
+        player.set_controller{type = defines.controllers.spectator}
+    end)
+    return ok
+end
+
+local function restore_spectator(player)
+    storage.spectator_previous = storage.spectator_previous or {}
+    local previous = storage.spectator_previous[player.index]
+    if not previous then return false end
+    local ok = pcall(function()
+        if previous.controller_type == defines.controllers.character
+            and previous.character
+            and previous.character.valid
+        then
+            player.set_controller{
+                type = defines.controllers.character,
+                character = previous.character,
+            }
+        else
+            player.set_controller{type = previous.controller_type}
+        end
+    end)
+    if ok then storage.spectator_previous[player.index] = nil end
+    return ok
+end
+
 local function process_rcon_queue()
     if not storage._rcon_queue or #storage._rcon_queue == 0 then return end
     local queue = storage._rcon_queue
@@ -683,12 +726,16 @@ local function process_rcon_queue()
                 end
             end
         elseif item.type == "spectator" then
-            storage.spectator_mode = item.enabled
-            if item.enabled then
+            storage.spectator_mode = item.enabled == true
+            if storage.spectator_mode then
                 for _, player in pairs(game.players) do
                     if player.connected and player.controller_type ~= defines.controllers.spectator then
-                        player.set_controller{type = defines.controllers.spectator}
+                        enable_spectator(player)
                     end
+                end
+            else
+                for _, player in pairs(game.players) do
+                    restore_spectator(player)
                 end
             end
         end
@@ -705,6 +752,10 @@ end
 local function pos_table(pos)
     if not pos then return nil end
     return {x = pos.x, y = pos.y}
+end
+
+local function scoped_character(agent_id)
+    return find_factorioctl_character(agent_id or "default")
 end
 
 local function plan_steam_power_impl(agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
@@ -898,6 +949,8 @@ local function place_blueprint_impl(agent_id, name, x, y, direction)
     if not (character and character.valid) then
         return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
+    local reach_error = characters.require_position_reach(character, x, y, "build")
+    if reach_error then return reach_error end
 
     storage.blueprints = storage.blueprints or {}
     local data = storage.blueprints[name]
@@ -936,6 +989,8 @@ local function import_blueprint_impl(agent_id, bp_string, x, y, direction)
     if not (character and character.valid) then
         return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
+    local reach_error = characters.require_position_reach(character, x, y, "build")
+    if reach_error then return reach_error end
 
     local inv = character.get_main_inventory()
     if not inv then return {success = false, error = "No inventory"} end
@@ -1085,22 +1140,13 @@ local function start_mining_impl(agent_id, x, y)
         return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
 
-    local target = find_minable_at(game.surfaces[1], character, x, y, 1)
+    local target = find_minable_at(character.surface, character, x, y, 1)
     if not target then
         return {success = false, error = "No minable entity at position"}
     end
 
-    local dx = target.position.x - character.position.x
-    local dy = target.position.y - character.position.y
-    local dist = math.sqrt(dx * dx + dy * dy)
-    if dist > character.resource_reach_distance + 0.5 then
-        return {
-            success = false,
-            error = "Too far",
-            distance = dist,
-            reach = character.resource_reach_distance,
-        }
-    end
+    local reach_error = characters.require_entity_reach(character, target)
+    if reach_error then return reach_error end
 
     character.mining_state = {mining = true, position = target.position}
     return {
@@ -1154,7 +1200,7 @@ local function mine_at_impl(agent_id, x, y, count, radius)
     local before_count = inventory_item_total(inv)
     local mined = 0
     local picked_up = 0
-    local surface = game.surfaces[1]
+    local surface = character.surface
     -- mine_at is deliberately point-targeted. Never let a caller turn it into
     -- an area deconstruction primitive that can catch nearby infrastructure.
     local search_radius = math.min(math.max(radius or 0.5, 0), 0.5)
@@ -1168,10 +1214,14 @@ local function mine_at_impl(agent_id, x, y, count, radius)
         }
 
         if #items_on_ground > 0 then
+            local reach_error = characters.require_entity_reach(character, items_on_ground[1])
+            if reach_error then return reach_error end
             picked_up = picked_up + pick_up_item_entity(character, inv, items_on_ground[1])
         else
             local target = find_minable_at(surface, character, x, y, search_radius)
             if not target then break end
+            local reach_error = characters.require_entity_reach(character, target)
+            if reach_error then return reach_error end
             local target_amount_before = nil
             if target.type == "resource" then
                 target_amount_before = target.amount
@@ -1211,7 +1261,7 @@ local function find_nearest_minable_impl(agent_id, entity_name, radius)
         return {found = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
 
-    local entities = game.surfaces[1].find_entities_filtered{
+    local entities = character.surface.find_entities_filtered{
         name = entity_name,
         position = character.position,
         radius = radius or 100,
@@ -1252,8 +1302,10 @@ local function mine_nearest_impl(agent_id, entity_name, count)
     for _ = 1, count do
         local nearest = find_nearest_minable_impl(agent_id, entity_name, 100)
         if not nearest.found then break end
-        local target = find_minable_at(game.surfaces[1], character, nearest.position.x, nearest.position.y, 0.5)
+        local target = find_minable_at(character.surface, character, nearest.position.x, nearest.position.y, 0.5)
         if not target then break end
+        local reach_error = characters.require_entity_reach(character, target)
+        if reach_error then return reach_error end
         if character.mine_entity(target, true) then
             mined = mined + 1
         else
@@ -1279,9 +1331,8 @@ local function clear_area_impl(agent_id, x1, y1, x2, y2, clear_trees, clear_rock
         return {error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
 
-    local surface = game.surfaces[1]
+    local surface = character.surface
     local area = {{x1, y1}, {x2, y2}}
-    local max_distance = 30
     local result = {
         trees_found = 0,
         rocks_found = 0,
@@ -1292,19 +1343,6 @@ local function clear_area_impl(agent_id, x1, y1, x2, y2, clear_trees, clear_rock
         items_gained = {},
     }
 
-    local area_center_x = (area[1][1] + area[2][1]) / 2
-    local area_center_y = (area[1][2] + area[2][2]) / 2
-    local dx = character.position.x - area_center_x
-    local dy = character.position.y - area_center_y
-    local dist = math.sqrt(dx * dx + dy * dy)
-
-    if dist > max_distance and not dry_run then
-        result.too_far = true
-        result.distance = dist
-        result.max_distance = max_distance
-        return result
-    end
-
     local inv = character.get_main_inventory()
     local before = {}
     if inv then
@@ -1313,26 +1351,33 @@ local function clear_area_impl(agent_id, x1, y1, x2, y2, clear_trees, clear_rock
         end
     end
 
-    if clear_trees then
-        local trees = surface.find_entities_filtered{type = "tree", area = area}
-        result.trees_found = #trees
-        if not dry_run then
-            for _, tree in pairs(trees) do
-                if character.mine_entity(tree, true) then
-                    result.trees_mined = result.trees_mined + 1
-                end
-            end
+    local trees = clear_trees and surface.find_entities_filtered{type = "tree", area = area} or {}
+    local rocks = {}
+    if clear_rocks then
+        for _, entity in pairs(surface.find_entities_filtered{type = "simple-entity", area = area}) do
+            if entity.name:find("rock") then table.insert(rocks, entity) end
         end
     end
+    result.trees_found = #trees
+    result.rocks_found = #rocks
 
-    if clear_rocks then
-        local entities = surface.find_entities_filtered{type = "simple-entity", area = area}
-        for _, entity in pairs(entities) do
-            if entity.name:find("rock") then
-                result.rocks_found = result.rocks_found + 1
-                if not dry_run and character.mine_entity(entity, true) then
-                    result.rocks_mined = result.rocks_mined + 1
-                end
+    if not dry_run then
+        for _, entity in ipairs(trees) do
+            local reach_error = characters.require_entity_reach(character, entity)
+            if reach_error then return reach_error end
+        end
+        for _, entity in ipairs(rocks) do
+            local reach_error = characters.require_entity_reach(character, entity)
+            if reach_error then return reach_error end
+        end
+        for _, tree in ipairs(trees) do
+            if character.mine_entity(tree, true) then
+                result.trees_mined = result.trees_mined + 1
+            end
+        end
+        for _, rock in ipairs(rocks) do
+            if character.mine_entity(rock, true) then
+                result.rocks_mined = result.rocks_mined + 1
             end
         end
     end
@@ -1436,7 +1481,10 @@ local function build_drill_array_impl(agent_id, count, resource, near_x, near_y,
                 force = character.force,
             }
 
-            if can_place then
+            local reach_error = characters.require_position_reach(character, px, py, "build")
+            if reach_error then
+                table.insert(errors, "Out of reach at " .. px .. "," .. py)
+            elseif can_place then
                 local entity = surface.create_entity{
                     name = drill_type,
                     position = {px, py},
@@ -1493,7 +1541,10 @@ local function build_smelter_line_impl(agent_id, count, start_x, start_y, furnac
             force = character.force,
         }
 
-        if can_place then
+        local reach_error = characters.require_position_reach(character, px, py, "build")
+        if reach_error then
+            table.insert(errors, "Out of reach at " .. px .. "," .. py)
+        elseif can_place then
             local entity = surface.create_entity{
                 name = furnace_type,
                 position = {px, py},
@@ -1524,6 +1575,9 @@ local function mine_entity_for_agent(agent_id, entity)
         return {success = false, error = "Entity not found"}
     end
 
+    local reach_error = characters.require_entity_reach(character, entity)
+    if reach_error then return reach_error end
+
     local inv = character.get_main_inventory()
     local before_count = inventory_item_total(inv)
     local name = entity.name
@@ -1551,19 +1605,41 @@ local function mine_entity_for_agent(agent_id, entity)
 end
 
 local function remove_entity_at_impl(agent_id, x, y)
+    local character = find_factorioctl_character(agent_id)
+    if not (character and character.valid) then
+        return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
+    end
     storage.factorioctl_entities = storage.factorioctl_entities or {}
-    local entities = game.surfaces[1].find_entities_filtered{
+    local found = character.surface.find_entities_filtered{
         position = {x, y},
         radius = 0.5,
     }
 
-    for _, entity in pairs(entities) do
+    local candidates = {}
+    for _, entity in pairs(found) do
         if entity.type ~= "character" and entity.type ~= "resource" then
-            return mine_entity_for_agent(agent_id, entity)
+            table.insert(candidates, entity)
         end
     end
 
-    return {error = "No entity found"}
+    table.sort(candidates, function(a, b)
+        return (a.unit_number or math.huge) < (b.unit_number or math.huge)
+    end)
+    if #candidates == 0 then return {success = false, error = "No entity found"} end
+    if #candidates > 1 then
+        local summaries = {}
+        for _, entity in ipairs(candidates) do
+            table.insert(summaries, entities.summary(entity, false))
+        end
+        return {
+            success = false,
+            error = "Multiple entities overlap this position; use remove_entity with an exact unit_number",
+            error_kind = "ambiguous_entity",
+            action_needed = "remove_entity_by_unit_number",
+            candidates = summaries,
+        }
+    end
+    return mine_entity_for_agent(agent_id, candidates[1])
 end
 
 local function remove_entity_impl(agent_id, unit_number)
@@ -1595,6 +1671,9 @@ local function insert_items_impl(agent_id, unit_number, item, count, inventory_t
     if not entity then
         return {error = "Entity not found"}
     end
+
+    local reach_error = characters.require_entity_reach(character, entity)
+    if reach_error then return reach_error end
 
     local inv = entity.get_inventory(inventory_define_for(inventory_type, "fuel"))
     if not inv then
@@ -1664,6 +1743,9 @@ local function extract_items_impl(agent_id, unit_number, item, count, inventory_
         return {error = "Entity not found"}
     end
 
+    local reach_error = characters.require_entity_reach(character, entity)
+    if reach_error then return reach_error end
+
     local inv = entity.get_inventory(inventory_define_for(inventory_type, "chest"))
     if not inv then
         return {error = "Entity has no such inventory"}
@@ -1689,11 +1771,19 @@ local function extract_items_impl(agent_id, unit_number, item, count, inventory_
     return {extracted = inserted, available = available}
 end
 
-local function set_recipe_impl(unit_number, recipe)
+local function set_recipe_impl(agent_id, unit_number, recipe)
+    local character = find_factorioctl_character(agent_id)
+    if not (character and character.valid) then
+        return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
+    end
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
     end
+
+
+    local reach_error = characters.require_entity_reach(character, entity)
+    if reach_error then return reach_error end
 
     if not entity.set_recipe then
         return {error = "Entity cannot have recipes"}
@@ -1977,8 +2067,8 @@ local api = {
     end,
 
     -- Diagnose steam-power fluid and electric connectivity near a position.
-    diagnose_steam_power = function(x, y, radius)
-        return json_remote_call("diagnose_steam_power", power.diagnose_steam_power, x, y, radius)
+    diagnose_steam_power = function(x, y, radius, agent_id)
+        return json_remote_call("diagnose_steam_power", power.diagnose_steam_power, scoped_character(agent_id), x, y, radius)
     end,
 
     -- Plan a checked starter steam-power layout before mutating the world.
@@ -1997,52 +2087,58 @@ local api = {
     end,
 
     -- Power diagnostics live in the mod so Rust only emits small remote calls.
-    get_power_status = function(x, y, radius)
-        return json_remote_call("get_power_status", power.get_power_status, x, y, radius)
+    get_power_status = function(x, y, radius, agent_id)
+        return json_remote_call("get_power_status", power.get_power_status, scoped_character(agent_id), x, y, radius)
     end,
 
-    get_power_networks = function(x, y, radius)
-        return json_remote_call("get_power_networks", power.get_power_networks, x, y, radius)
+    get_power_networks = function(x, y, radius, agent_id)
+        return json_remote_call("get_power_networks", power.get_power_networks, scoped_character(agent_id), x, y, radius)
     end,
 
-    find_power_issues = function(x, y, radius)
-        return json_remote_call("find_power_issues", power.find_power_issues, x, y, radius)
+    find_power_issues = function(x, y, radius, agent_id)
+        return json_remote_call("find_power_issues", power.find_power_issues, scoped_character(agent_id), x, y, radius)
     end,
 
-    get_power_coverage = function(x, y, radius)
-        return json_remote_call("get_power_coverage", power.get_power_coverage, x, y, radius)
+    get_power_coverage = function(x, y, radius, agent_id)
+        return json_remote_call("get_power_coverage", power.get_power_coverage, scoped_character(agent_id), x, y, radius)
     end,
 
-    get_alerts = function(x, y, radius)
-        return json_remote_call("get_alerts", power.get_alerts, x, y, radius)
+    get_alerts = function(x, y, radius, agent_id)
+        return json_remote_call("get_alerts", power.get_alerts, scoped_character(agent_id), x, y, radius)
     end,
 
-    get_belt_contents = function(x1, y1, x2, y2)
-        return json_remote_call("get_belt_contents", transport.get_belt_contents, x1, y1, x2, y2)
+    get_belt_contents = function(x1, y1, x2, y2, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("get_belt_contents", transport.get_belt_contents, character and character.surface or nil, x1, y1, x2, y2)
     end,
 
-    get_belt_lane_contents = function(x1, y1, x2, y2)
-        return json_remote_call("get_belt_lane_contents", transport.get_belt_lane_contents, x1, y1, x2, y2)
+    get_belt_lane_contents = function(x1, y1, x2, y2, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("get_belt_lane_contents", transport.get_belt_lane_contents, character and character.surface or nil, x1, y1, x2, y2)
     end,
 
     get_surfaces = function()
         return json_remote_call("get_surfaces", entities.get_surfaces)
     end,
 
-    find_entities = function(x1, y1, x2, y2, entity_type, name)
-        return json_remote_call("find_entities", entities.find_entities, x1, y1, x2, y2, entity_type, name)
+    find_entities = function(x1, y1, x2, y2, entity_type, name, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("find_entities", entities.find_entities, character and character.surface or nil, x1, y1, x2, y2, entity_type, name)
     end,
 
-    verify_production = function(x1, y1, x2, y2)
-        return json_remote_call("verify_production", entities.verify_production, x1, y1, x2, y2)
+    verify_production = function(x1, y1, x2, y2, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("verify_production", entities.verify_production, character and character.surface or nil, character and character.force or nil, x1, y1, x2, y2)
     end,
 
-    diagnose_factory_blockers = function(x1, y1, x2, y2, limit)
-        return json_remote_call("diagnose_factory_blockers", entities.diagnose_factory_blockers, x1, y1, x2, y2, limit)
+    diagnose_factory_blockers = function(x1, y1, x2, y2, limit, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("diagnose_factory_blockers", entities.diagnose_factory_blockers, character and character.surface or nil, character and character.force or nil, x1, y1, x2, y2, limit)
     end,
 
-    diagnose_fuel_sustainability = function(x1, y1, x2, y2, limit)
-        return json_remote_call("diagnose_fuel_sustainability", entities.diagnose_fuel_sustainability, x1, y1, x2, y2, limit)
+    diagnose_fuel_sustainability = function(x1, y1, x2, y2, limit, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("diagnose_fuel_sustainability", entities.diagnose_fuel_sustainability, character and character.surface or nil, character and character.force or nil, x1, y1, x2, y2, limit)
     end,
 
     get_entity = function(unit_number)
@@ -2053,20 +2149,24 @@ local api = {
         return json_remote_call("get_entity_drop_position", entities.get_drop_position, unit_number)
     end,
 
-    find_resources = function(x1, y1, x2, y2, resource_type)
-        return json_remote_call("find_resources", world.find_resources, x1, y1, x2, y2, resource_type)
+    find_resources = function(x1, y1, x2, y2, resource_type, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("find_resources", world.find_resources, character and character.surface or nil, x1, y1, x2, y2, resource_type)
     end,
 
-    find_nearest_resource = function(resource_name, from_x, from_y)
-        return json_remote_call("find_nearest_resource", world.find_nearest_resource, resource_name, from_x, from_y)
+    find_nearest_resource = function(resource_name, from_x, from_y, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("find_nearest_resource", world.find_nearest_resource, character and character.surface or nil, resource_name, from_x, from_y)
     end,
 
-    get_tiles = function(x1, y1, x2, y2)
-        return json_remote_call("get_tiles", world.get_tiles, x1, y1, x2, y2)
+    get_tiles = function(x1, y1, x2, y2, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("get_tiles", world.get_tiles, character and character.surface or nil, x1, y1, x2, y2)
     end,
 
-    get_tile = function(x, y)
-        return json_remote_call("get_tile", world.get_tile, x, y)
+    get_tile = function(x, y, agent_id)
+        local character = scoped_character(agent_id)
+        return json_remote_call("get_tile", world.get_tile, character and character.surface or nil, x, y)
     end,
 
     init_character = function(agent_id, x, y)
@@ -2209,8 +2309,8 @@ local api = {
         return json_remote_call("remove_entity", remove_entity_impl, agent_id, unit_number)
     end,
 
-    rotate_entity = function(unit_number, direction)
-        return json_remote_call("rotate_entity", placement.rotate_entity, unit_number, direction)
+    rotate_entity = function(agent_id, unit_number, direction)
+        return json_remote_call("rotate_entity", placement.rotate_entity, agent_id, unit_number, direction)
     end,
 
     insert_items = function(agent_id, unit_number, item, count, inventory_type)
@@ -2221,8 +2321,8 @@ local api = {
         return json_remote_call("extract_items", extract_items_impl, agent_id, unit_number, item, count, inventory_type)
     end,
 
-    set_recipe = function(unit_number, recipe)
-        return json_remote_call("set_recipe", set_recipe_impl, unit_number, recipe)
+    set_recipe = function(agent_id, unit_number, recipe)
+        return json_remote_call("set_recipe", set_recipe_impl, agent_id, unit_number, recipe)
     end,
 
     get_entity_inventory = function(unit_number)
@@ -2245,8 +2345,8 @@ local api = {
         return json_remote_call("get_prototype", get_prototype_impl, name)
     end,
 
-    get_research_status = function()
-        return json_remote_call("get_research_status", research.get_research_status)
+    get_research_status = function(agent_id)
+        return json_remote_call("get_research_status", research.get_research_status, scoped_character(agent_id))
     end,
 
     get_available_research = function(agent_id)
@@ -2259,16 +2359,18 @@ local api = {
         return json_remote_call("feed_lab_from_inventory", research.feed_lab_from_inventory, character, lab_unit_number, science_pack, count, dry_run)
     end,
 
-    start_research = function(tech_name)
-        return json_remote_call("start_research", research.start_research, tech_name)
+    start_research = function(tech_name, agent_id)
+        return json_remote_call("start_research", research.start_research, scoped_character(agent_id), tech_name)
     end,
 
-    is_tech_researched = function(tech_name)
-        return json_remote_call("is_tech_researched", research.is_tech_researched, tech_name)
+    is_tech_researched = function(tech_name, agent_id)
+        return json_remote_call("is_tech_researched", research.is_tech_researched, scoped_character(agent_id), tech_name)
     end,
 
-    production_statistics = function(surface_name)
-        return json_remote_call("production_statistics", diagnostics.production_statistics, surface_name)
+    production_statistics = function(surface_name, agent_id)
+        local character = scoped_character(agent_id)
+        local scoped_surface = surface_name or (character and character.surface.name or nil)
+        return json_remote_call("production_statistics", diagnostics.production_statistics, scoped_surface, character and character.force or nil)
     end,
 
     autonomy_snapshot = function(agent_id)
@@ -2322,6 +2424,13 @@ local api = {
 remote.add_interface("claude_interface", api)
 
 commands.add_command("claude", "claude-interface dispatch", function(cmd)
+    if cmd.player_index ~= nil then
+        local player = game.get_player(cmd.player_index)
+        if player then
+            player.print("The /claude bridge command is restricted to the server RCON console.")
+        end
+        return
+    end
     local ok, request = pcall(helpers.json_to_table, cmd.parameter or "")
     if not ok or type(request) ~= "table" or type(request.fn) ~= "string" then
         rcon.print(json_response.error("bad_request", "expected {fn, args, n}"))
@@ -2409,7 +2518,7 @@ script.on_event(defines.events.on_player_joined_game, function(event)
     if storage.spectator_mode then
         local player = game.get_player(event.player_index)
         if player and player.controller_type ~= defines.controllers.spectator then
-            player.set_controller{type = defines.controllers.spectator}
+            enable_spectator(player)
         end
     end
 end)
@@ -2431,6 +2540,14 @@ script.on_event(defines.events.on_console_chat, function(event)
     while #storage.chat_messages > MAX_MESSAGES do
         table.remove(storage.chat_messages, 1)
     end
+    local target_agent = event.player_index and get_active_agent(event.player_index) or "all"
+    write_bridge_message(
+        event.player_index or 0,
+        player_name,
+        target_agent,
+        event.message,
+        event.tick
+    )
 end)
 
 -- Hotkey toggle

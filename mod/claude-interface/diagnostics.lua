@@ -21,7 +21,7 @@ local function flow_for(stats, target_name, category, precision)
     return 0
 end
 
-function M.production_statistics(surface_name)
+function M.production_statistics(surface_name, force)
     local surface = game.surfaces[surface_name or "nauvis"]
     if not surface then
         return {
@@ -36,7 +36,8 @@ function M.production_statistics(surface_name)
         }
     end
 
-    local stats = game.forces.player.get_item_production_statistics(surface)
+    force = force or game.forces.player
+    local stats = force.get_item_production_statistics(surface)
     local precision = defines.flow_precision_index.one_minute
     local produced = {}
     local consumed = {}
@@ -87,7 +88,7 @@ function M.production_statistics(surface_name)
 
     return {
         surface = surface.name,
-        force = game.forces.player.name,
+        force = force.name,
         tick = game.tick,
         window = "one_minute",
         produced = produced,

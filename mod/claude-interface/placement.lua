@@ -530,39 +530,6 @@ local function placement_candidate(surface, force, entity_name, position, direct
     return diagnostic
 end
 
-local function clear_ground_items_for_placement(character, surface, entity_name, position)
-    local proto = prototypes.entity[entity_name]
-    if not (proto and proto.collision_box) then return end
-
-    local cb = proto.collision_box
-    local clear_area = {
-        {position[1] + cb.left_top.x - 0.1, position[2] + cb.left_top.y - 0.1},
-        {position[1] + cb.right_bottom.x + 0.1, position[2] + cb.right_bottom.y + 0.1},
-    }
-    local items_on_ground = surface.find_entities_filtered{
-        area = clear_area,
-        type = "item-entity",
-    }
-    for _, item in pairs(items_on_ground) do
-        local stack = item.stack
-        if stack and stack.valid_for_read then
-            local before_count = stack.count
-            local inserted = character.insert(stack)
-            if inserted > 0 then
-                if inserted >= before_count then
-                    item.destroy()
-                else
-                    stack.count = before_count - inserted
-                end
-            else
-                item.destroy()
-            end
-        else
-            item.destroy()
-        end
-    end
-end
-
 function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius, drill_name, limit)
     local character = characters.find(agent_id)
     radius = math.max(1, math.min(40, math.floor(radius or 25)))
@@ -1126,37 +1093,21 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
     })
     result.steps = steps
 
-    local coal_required = 0
-    if furnace_name ~= "electric-furnace" then coal_required = coal_required + 1 end
-    if string.find(inserter_name, "burner", 1, true) then coal_required = coal_required + 1 end
     add_missing_item(result, belt_name, belt_count, existing_belt and 0 or 1)
     add_missing_item(result, furnace_name, furnace_count, 1)
     add_missing_item(result, inserter_name, inserter_count, 1)
-    if coal_required > 0 then add_missing_item(result, "coal", coal_count, coal_required) end
-
-    if furnace_name ~= "electric-furnace" then
-        table.insert(result.after_place_steps, {
-            tool = "insert_items",
+    if furnace_name ~= "electric-furnace" or string.find(inserter_name, "burner", 1, true) then
+        result.fuel_automation_required = true
+        result.after_place_steps = {{
+            tool = "diagnose_fuel_sustainability",
             tool_args = {
-                unit_number = "<placed furnace unit_number>",
-                item = "coal",
-                count = 5,
-                inventory_type = "fuel",
+                x1 = belt_tile.x - 12,
+                y1 = belt_tile.y - 12,
+                x2 = belt_tile.x + 12,
+                y2 = belt_tile.y + 12,
             },
-            description = "Fuel the placed furnace after placement.",
-        })
-    end
-    if string.find(inserter_name, "burner", 1, true) then
-        table.insert(result.after_place_steps, {
-            tool = "insert_items",
-            tool_args = {
-                unit_number = "<placed inserter unit_number>",
-                item = "coal",
-                count = 1,
-                inventory_type = "fuel",
-            },
-            description = "Fuel the burner inserter after placement.",
-        })
+            description = "Plan and build a durable coal belt/inserter feed. Do not use repeated inventory inserts as the operating fuel path.",
+        }}
     end
 
     result.verify_step = {
@@ -1178,7 +1129,7 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
     result.success = true
     result.ready = true
     result.next_action = "execute_direct_smelter_steps"
-    result.guidance = "Execute steps in order, fuel returned furnace/inserter unit numbers, then run verify_step."
+    result.guidance = "Execute placement steps in order, automate any burner fuel input through belts/inserters, then run verify_step."
     return result
 end
 
@@ -1201,6 +1152,12 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
     end
 
     local surface = character.surface
+    local reach_error = characters.require_position_reach(character, x, y, "build")
+    if reach_error then
+        reach_error.entity = entity_name
+        reach_error.direction = direction
+        return reach_error
+    end
     local character_blocker = character_placement_blocker(character, entity_name, position)
     if character_blocker then
         return placement_failure(
@@ -1213,8 +1170,6 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
             placement_diagnostics(surface, character.force, entity_name, position, direction, character)
         )
     end
-    clear_ground_items_for_placement(character, surface, entity_name, position)
-
     local can_place_ok, can_place_or_error = pcall(function()
         return surface.can_place_entity{
             name = entity_name,
@@ -1297,6 +1252,12 @@ function M.place_underground_belt(agent_id, entity_name, x, y, direction, belt_t
 
     local position = {x, y}
     local surface = character.surface
+    local reach_error = characters.require_position_reach(character, x, y, "build")
+    if reach_error then
+        reach_error.entity = entity_name
+        reach_error.direction = direction
+        return reach_error
+    end
     local character_blocker = character_placement_blocker(character, entity_name, position)
     if character_blocker then
         return {
@@ -1673,6 +1634,13 @@ function M.place_ghost(agent_id, entity_name, x, y, direction)
         return {error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
 
+    local reach_error = characters.require_position_reach(character, x, y, "build")
+    if reach_error then
+        reach_error.entity = entity_name
+        reach_error.direction = direction
+        return reach_error
+    end
+
     local entity = character.surface.create_entity{
         name = "entity-ghost",
         inner_name = entity_name,
@@ -1695,7 +1663,15 @@ function M.place_ghost(agent_id, entity_name, x, y, direction)
     return result
 end
 
-function M.rotate_entity(unit_number, direction)
+function M.rotate_entity(agent_id, unit_number, direction)
+    local character = characters.find(agent_id)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+            error_kind = "no_character",
+        }
+    end
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {
@@ -1705,6 +1681,10 @@ function M.rotate_entity(unit_number, direction)
             direction = direction,
         }
     end
+
+
+    local reach_error = characters.require_entity_reach(character, entity)
+    if reach_error then return reach_error end
 
     if not entity.supports_direction then
         return {

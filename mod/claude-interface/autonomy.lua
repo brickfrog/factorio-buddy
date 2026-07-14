@@ -59,8 +59,8 @@ local function sorted_counts(counts)
     return result
 end
 
-local function compact_production(surface_name)
-    local statistics = diagnostics.production_statistics(surface_name)
+local function compact_production(surface_name, force)
+    local statistics = diagnostics.production_statistics(surface_name, force)
     local active_items = {}
     local active_item_count = 0
     for _, item in ipairs(statistics.items or {}) do
@@ -88,8 +88,11 @@ local function character_snapshot(character)
 end
 
 function M.snapshot(character)
-    local surface = character and character.valid and character.surface or game.surfaces[1]
-    local force = game.forces.player
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local surface = character.surface
+    local force = character.force
     local found = surface.find_entities_filtered{force = force}
     local counts_by_name = {}
     local counts_by_type = {}
@@ -168,6 +171,8 @@ function M.snapshot(character)
 
     local margin = 8
     local blockers = entities.diagnose_factory_blockers(
+        surface,
+        force,
         min_x - margin,
         min_y - margin,
         max_x + margin,
@@ -179,8 +184,8 @@ function M.snapshot(character)
         tick = game.tick,
         surface = surface.name,
         character = character_snapshot(character),
-        research = research.get_research_status(),
-        production = compact_production(surface.name),
+        research = research.get_research_status(character),
+        production = compact_production(surface.name, force),
         factory = {
             bounds = {
                 left_top = {x = min_x, y = min_y},

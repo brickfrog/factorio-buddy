@@ -839,11 +839,8 @@ impl Outputable for crate::analyze::BeltSourceTraceResult {
             ));
             for src in &self.left_lane_sources {
                 lines.push(format!(
-                    "    {} {} at ({}, {})",
-                    format!("{:?}", src.source_type),
-                    src.entity_name,
-                    src.position.x,
-                    src.position.y
+                    "    {:?} {} at ({}, {})",
+                    src.source_type, src.entity_name, src.position.x, src.position.y
                 ));
             }
         }
@@ -855,11 +852,8 @@ impl Outputable for crate::analyze::BeltSourceTraceResult {
             ));
             for src in &self.right_lane_sources {
                 lines.push(format!(
-                    "    {} {} at ({}, {})",
-                    format!("{:?}", src.source_type),
-                    src.entity_name,
-                    src.position.x,
-                    src.position.y
+                    "    {:?} {} at ({}, {})",
+                    src.source_type, src.entity_name, src.position.x, src.position.y
                 ));
             }
         }
@@ -871,11 +865,8 @@ impl Outputable for crate::analyze::BeltSourceTraceResult {
             ));
             for src in &self.both_lane_sources {
                 lines.push(format!(
-                    "    {} {} at ({}, {})",
-                    format!("{:?}", src.source_type),
-                    src.entity_name,
-                    src.position.x,
-                    src.position.y
+                    "    {:?} {} at ({}, {})",
+                    src.source_type, src.entity_name, src.position.x, src.position.y
                 ));
             }
         }

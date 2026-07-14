@@ -408,7 +408,8 @@ local function build_plan(surface, force, pump, layout, target)
         fuel_target = {
             entity_name = "boiler",
             position = boiler.position,
-            inventory_type = "fuel",
+            automation_required = true,
+            guidance = "Route coal to this boiler with a belt and inserter; do not hand-feed it.",
         },
         blockers = blockers,
         build_steps = build_steps,
@@ -733,8 +734,12 @@ local function append_place_pole_step(result, pole, description)
     })
 end
 
-function M.diagnose_steam_power(x, y, radius)
-    local surface = game.surfaces[1]
+function M.diagnose_steam_power(character, x, y, radius)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local surface = character.surface
+    local force = character.force
     local r = radius or 50
     local area = {{x - r, y - r}, {x + r, y + r}}
     local result = {
@@ -755,12 +760,12 @@ function M.diagnose_steam_power(x, y, radius)
         suggested_actions = {},
     }
 
-    local poles = surface.find_entities_filtered{type = "electric-pole", area = area, force = "player"}
+    local poles = surface.find_entities_filtered{type = "electric-pole", area = area, force = force}
     result.summary.electric_poles = #poles
 
     local steam_entities = surface.find_entities_filtered{
         area = area,
-        force = "player",
+        force = force,
         name = {"offshore-pump", "boiler", "steam-engine", "pipe", "pipe-to-ground"},
     }
 
@@ -813,7 +818,7 @@ function M.diagnose_steam_power(x, y, radius)
 
         if entity.name == "boiler" then
             if item.fuel and item.fuel.total == 0 then
-                append_steam_issue(result, "boiler_no_fuel", "critical", entity, "Boiler has no fuel.", "Insert coal or another fuel into boiler unit " .. tostring(entity.unit_number) .. ".")
+                append_steam_issue(result, "boiler_no_fuel", "critical", entity, "Boiler has no fuel.", "Build or repair a durable coal belt and inserter feed to boiler unit " .. tostring(entity.unit_number) .. ".")
             end
             if item.status == "no_input_fluid" then
                 local connected_to_water = fluidbox_has_neighbour(item, {["offshore-pump"] = true, ["pipe"] = true, ["pipe-to-ground"] = true})
@@ -852,7 +857,7 @@ function M.diagnose_steam_power(x, y, radius)
                     append_steam_issue(result, "steam_engine_no_steam", "critical", entity, "Steam engine is missing steam input.", "Connect a boiler steam output to steam engine unit " .. tostring(entity.unit_number) .. ".")
                 end
             end
-            local nearby_poles = surface.find_entities_filtered{type = "electric-pole", position = entity.position, radius = 8, force = "player", limit = 1}
+            local nearby_poles = surface.find_entities_filtered{type = "electric-pole", position = entity.position, radius = 8, force = force, limit = 1}
             if #nearby_poles == 0 then
                 local nearest_pole = nearest_entity_record(poles, entity.position)
                 if nearest_pole then
@@ -993,7 +998,7 @@ function M.repair_steam_power(character, x, y, radius, target_x, target_y)
     local force = character.force
     local r = radius or 50
     local area = {{x - r, y - r}, {x + r, y + r}}
-    local diagnostic = M.diagnose_steam_power(x, y, r)
+    local diagnostic = M.diagnose_steam_power(character, x, y, r)
     local result = {
         success = false,
         dry_run = true,
@@ -1040,10 +1045,7 @@ function M.repair_steam_power(character, x, y, radius, target_x, target_y)
     }
     local by_unit = index_entities_by_unit(entities)
     local poles = surface.find_entities_filtered{type = "electric-pole", area = area, force = force}
-    local needed = {
-        ["coal"] = 0,
-        ["small-electric-pole"] = 0,
-    }
+    local needed = { ["small-electric-pole"] = 0 }
 
     local issue_types = {}
     for _, issue in ipairs(diagnostic.issues or {}) do
@@ -1053,21 +1055,16 @@ function M.repair_steam_power(character, x, y, radius, target_x, target_y)
     for _, issue in ipairs(diagnostic.issues or {}) do
         local entity = issue.entity and by_unit[tostring(issue.entity.unit_number)] or nil
         if issue.type == "boiler_no_fuel" and entity then
-            local count = 5
-            needed["coal"] = needed["coal"] + count
-            append_repair_step(
-                result,
-                "fuel_boiler",
-                "Insert fuel into boiler unit " .. tostring(entity.unit_number) .. ".",
-                "insert_items",
-                {
+            table.insert(result.blockers, {
+                type = "durable_boiler_fuel_required",
+                message = "Boiler unit " .. tostring(entity.unit_number) .. " needs automated coal delivery, not a manual inventory insert.",
+                action = "Run diagnose_fuel_sustainability and build its belt/inserter supply path.",
+                entity = {
                     unit_number = entity.unit_number,
-                    item = "coal",
-                    count = count,
-                    inventory_type = "fuel",
+                    name = entity.name,
+                    position = pos_table(entity.position),
                 },
-                entity
-            )
+            })
         elseif (issue.type == "steam_engine_pole_route_incomplete" or issue.type == "steam_engine_not_on_grid") and entity then
             local nearest = nearest_entity_record(poles, entity.position)
             local pole_plan
@@ -1114,7 +1111,6 @@ function M.repair_steam_power(character, x, y, radius, target_x, target_y)
         end
     end
 
-    add_missing_item(result, character, "coal", needed["coal"])
     add_missing_item(result, character, "small-electric-pole", needed["small-electric-pole"])
 
     result.ready = #result.repair_steps > 0 and #result.missing_items == 0 and #result.blockers == 0
@@ -1177,11 +1173,11 @@ local function entity_position_record(entity)
     }
 end
 
-local function build_power_coverage(surface, area, x, y, radius, display_ids)
+local function build_power_coverage(surface, force, area, x, y, radius, display_ids)
     local poles = surface.find_entities_filtered{
         type = "electric-pole",
         area = area,
-        force = "player",
+        force = force,
     }
     local coverage = {}
     local network_map = {}
@@ -1198,7 +1194,7 @@ local function build_power_coverage(surface, area, x, y, radius, display_ids)
             if next_display_id > 9 then next_display_id = 9 end
         end
 
-        local supply_dist = POLE_SUPPLY_AREAS[pole.name] or 2.5
+        local supply_dist = pole.prototype.supply_area_distance or POLE_SUPPLY_AREAS[pole.name] or 2.5
         local coverage_id = display_ids and (network_map[network_id] or 0) or network_id
         if display_ids then
             table.insert(pole_records, {
@@ -1215,11 +1211,9 @@ local function build_power_coverage(surface, area, x, y, radius, display_ids)
         local sd = math.ceil(supply_dist)
         for dx = -sd, sd do
             for dy = -sd, sd do
-                if dx * dx + dy * dy <= supply_dist * supply_dist then
-                    local tx, ty = px + dx, py + dy
-                    if not display_ids or (tx >= x - radius and tx <= x + radius and ty >= y - radius and ty <= y + radius) then
-                        coverage[tx .. "," .. ty] = coverage_id
-                    end
+                local tx, ty = px + dx, py + dy
+                if not display_ids or (tx >= x - radius and tx <= x + radius and ty >= y - radius and ty <= y + radius) then
+                    coverage[tx .. "," .. ty] = coverage_id
                 end
             end
         end
@@ -1228,13 +1222,17 @@ local function build_power_coverage(surface, area, x, y, radius, display_ids)
     return coverage, poles, pole_records, networks
 end
 
-function M.get_power_status(x, y, radius)
-    local surface = game.surfaces[1]
+function M.get_power_status(character, x, y, radius)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local surface = character.surface
+    local force = character.force
     local r, area = area_around(x, y, radius)
     local poles = surface.find_entities_filtered{
         type = "electric-pole",
         area = area,
-        force = "player",
+        force = force,
     }
 
     if #poles == 0 then
@@ -1263,7 +1261,7 @@ function M.get_power_status(x, y, radius)
     local generators = surface.find_entities_filtered{
         area = area,
         type = {"generator", "solar-panel", "accumulator"},
-        force = "player",
+        force = force,
     }
 
     for _, gen in pairs(generators) do
@@ -1271,7 +1269,7 @@ function M.get_power_status(x, y, radius)
             type = "electric-pole",
             position = gen.position,
             radius = 10,
-            force = "player",
+            force = force,
             limit = 1,
         }[1]
         if connected_pole and connected_pole.electric_network_id == network_id then
@@ -1294,7 +1292,7 @@ function M.get_power_status(x, y, radius)
         local entities = surface.find_entities_filtered{
             area = area,
             type = entity_type,
-            force = "player",
+            force = force,
         }
         for _, ent in pairs(entities) do
             if entity_uses_electricity(ent) then
@@ -1381,13 +1379,17 @@ function M.get_power_status(x, y, radius)
     return result
 end
 
-function M.get_power_networks(x, y, radius)
-    local surface = game.surfaces[1]
+function M.get_power_networks(character, x, y, radius)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local surface = character.surface
+    local force = character.force
     local _, area = area_around(x, y, radius)
     local poles = surface.find_entities_filtered{
         type = "electric-pole",
         area = area,
-        force = "player",
+        force = force,
     }
     local networks = {}
     for _, pole in pairs(poles) do
@@ -1417,10 +1419,14 @@ function M.get_power_networks(x, y, radius)
     return result
 end
 
-function M.find_power_issues(x, y, radius)
-    local surface = game.surfaces[1]
+function M.find_power_issues(character, x, y, radius)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local surface = character.surface
+    local force = character.force
     local r, area = area_around(x, y, radius)
-    local coverage, poles = build_power_coverage(surface, area, x, y, r, false)
+    local coverage, poles = build_power_coverage(surface, force, area, x, y, r, false)
     local result = {
         unpowered_entities = {},
         low_power_entities = {},
@@ -1431,7 +1437,7 @@ function M.find_power_issues(x, y, radius)
         local entities = surface.find_entities_filtered{
             area = area,
             type = entity_type,
-            force = "player",
+            force = force,
         }
         for _, ent in pairs(entities) do
             if entity_uses_electricity(ent) then
@@ -1481,10 +1487,14 @@ function M.find_power_issues(x, y, radius)
     return result
 end
 
-function M.get_power_coverage(x, y, radius)
-    local surface = game.surfaces[1]
+function M.get_power_coverage(character, x, y, radius)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local surface = character.surface
+    local force = character.force
     local r, area = area_around(x, y, radius)
-    local coverage, _, poles, networks = build_power_coverage(surface, area, x, y, r, true)
+    local coverage, _, poles, networks = build_power_coverage(surface, force, area, x, y, r, true)
     return {
         poles = poles,
         coverage = coverage,
@@ -1492,8 +1502,12 @@ function M.get_power_coverage(x, y, radius)
     }
 end
 
-function M.get_alerts(x, y, radius)
-    local surface = game.surfaces[1]
+function M.get_alerts(character, x, y, radius)
+    if not (character and character.valid) then
+        return {success = false, error = "no character; spawn first"}
+    end
+    local surface = character.surface
+    local force = character.force
     local _, area = area_around(x, y, radius)
     local alerts = {}
 
@@ -1501,7 +1515,7 @@ function M.get_alerts(x, y, radius)
         local entities = surface.find_entities_filtered{
             area = area,
             type = entity_type,
-            force = "player",
+            force = force,
         }
         for _, ent in pairs(entities) do
             if entity_uses_electricity(ent) then
@@ -1525,7 +1539,7 @@ function M.get_alerts(x, y, radius)
         end
     end
 
-    local drills = surface.find_entities_filtered{type = "mining-drill", area = area, force = "player"}
+    local drills = surface.find_entities_filtered{type = "mining-drill", area = area, force = force}
     for _, drill in pairs(drills) do
         if drill.mining_target == nil and raw_entity_status(drill) == defines.entity_status.no_minable_resources then
             table.insert(alerts, {
@@ -1539,7 +1553,7 @@ function M.get_alerts(x, y, radius)
 
     local fuel_entities = surface.find_entities_filtered{
         area = area,
-        force = "player",
+        force = force,
         type = {"furnace", "boiler"},
     }
     for _, entity in pairs(fuel_entities) do
@@ -1556,7 +1570,7 @@ function M.get_alerts(x, y, radius)
         end
     end
 
-    local assemblers = surface.find_entities_filtered{type = "assembling-machine", area = area, force = "player"}
+    local assemblers = surface.find_entities_filtered{type = "assembling-machine", area = area, force = force}
     for _, assembler in pairs(assemblers) do
         local status = raw_entity_status(assembler)
         if status == defines.entity_status.no_ingredients then
@@ -1609,6 +1623,7 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
         math.ceil(math.sqrt(distance_sq(diagnostic_center, target))) + 16
     )
     local existing_diagnostic = M.diagnose_steam_power(
+        character,
         diagnostic_center.x,
         diagnostic_center.y,
         diagnostic_radius
@@ -1693,7 +1708,7 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
         missing_items = missing,
         plan = selected_plan,
         blockers = {},
-        guidance = "Place components using plan.*.place_args, insert fuel into fuel_target, then call diagnose_steam_power and get_power_status.",
+        guidance = "Place components using plan.*.place_args, build a durable coal belt/inserter feed to plan.fuel_target, then call diagnose_steam_power and get_power_status.",
     }
 
     if not best_plan then
@@ -1711,4 +1726,3 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
 end
 
 return M
-

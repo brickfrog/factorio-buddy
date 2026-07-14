@@ -51,7 +51,7 @@ impl BeltGraph {
 
         // First pass: collect all belt nodes
         for entity in entities {
-            if !entity.name.contains("belt") {
+            if !is_surface_transport_belt(entity) {
                 continue;
             }
 
@@ -123,6 +123,16 @@ impl BeltGraph {
         self.upstream.get(pos).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Whether a belt at `target` can receive an item from `source`.
+    pub fn can_receive_from(&self, target: &TilePos, source: &TilePos) -> bool {
+        self.nodes.get(target).is_some_and(|target| {
+            let [side_left, side_right] = target.side_input_tiles();
+            *source == target.primary_input_tile()
+                || *source == side_left
+                || *source == side_right
+        })
+    }
+
     /// Get all belt positions in the graph
     pub fn all_positions(&self) -> impl Iterator<Item = &TilePos> {
         self.nodes.keys()
@@ -142,6 +152,20 @@ impl BeltGraph {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+}
+
+/// Whether an entity can be modeled exactly by the one-tile belt graph.
+///
+/// Splitters and underground belts require additional runtime state (lanes,
+/// input/output mode, and underground pairing) which `Entity` does not carry.
+/// Excluding them prevents the static analyzer from claiming connectivity it
+/// cannot prove.
+pub fn is_surface_transport_belt(entity: &Entity) -> bool {
+    entity.entity_type.as_deref() == Some("transport-belt")
+        && matches!(
+            entity.name.as_str(),
+            "transport-belt" | "fast-transport-belt" | "express-transport-belt"
+        )
 }
 
 #[cfg(test)]
@@ -206,5 +230,24 @@ mod tests {
         // Side belt should connect to main belt
         assert_eq!(graph.downstream_of(&side), &[main]);
         assert_eq!(graph.upstream_of(&main), &[side]);
+    }
+
+    #[test]
+    fn unsupported_belt_kinds_are_not_certified_as_surface_connections() {
+        let mut underground = make_belt(1, 0, Direction::East);
+        underground.name = "underground-belt".to_string();
+        underground.entity_type = Some("underground-belt".to_string());
+        let mut splitter = make_belt(2, 0, Direction::East);
+        splitter.name = "splitter".to_string();
+        splitter.entity_type = Some("splitter".to_string());
+
+        let graph = BeltGraph::from_entities(&[
+            make_belt(0, 0, Direction::East),
+            underground,
+            splitter,
+        ]);
+
+        assert_eq!(graph.len(), 1);
+        assert!(graph.downstream_of(&TilePos::new(0, 0)).is_empty());
     }
 }

@@ -26,6 +26,11 @@ if [[ ! -x "$BIN" ]]; then
     (cd "$ROOT" && cargo build)
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required for the live smoke test" >&2
+    exit 1
+fi
+
 ctl() {
     "$BIN" \
         --host "$HOST" \
@@ -36,16 +41,7 @@ ctl() {
 }
 
 json_field() {
-    python3 - "$1" "$2" <<'PY'
-import json
-import sys
-
-data = json.loads(sys.argv[1])
-value = data
-for part in sys.argv[2].split("."):
-    value = value[part]
-print(value)
-PY
+    jq -r --arg path "$2" 'getpath($path | split("."))' <<<"$1"
 }
 
 position_json() {
@@ -83,16 +79,16 @@ fi
 
 a_x="$(json_field "$a_status" position.x)"
 b_x="$(json_field "$b_status" position.x)"
-python3 - "$a_x" "$b_x" <<'PY'
-import sys
-
-a_x = float(sys.argv[1])
-b_x = float(sys.argv[2])
-if not a_x > 5.0:
-    raise SystemExit("FAIL: agent a did not move east from x=5")
-if not b_x > 30.0:
-    raise SystemExit("FAIL: agent b did not move east from x=30")
-PY
+awk -v a_x="$a_x" -v b_x="$b_x" 'BEGIN {
+    if (!(a_x > 5.0)) {
+        print "FAIL: agent a did not move east from x=5" > "/dev/stderr"
+        exit 1
+    }
+    if (!(b_x > 30.0)) {
+        print "FAIL: agent b did not move east from x=30" > "/dev/stderr"
+        exit 1
+    }
+}'
 
 human_before="$(FACTORIO_AGENT_ID=__player__ ctl character status || true)"
 human_valid="$(json_field "$human_before" valid 2>/dev/null || echo false)"

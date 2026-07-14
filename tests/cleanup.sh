@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Cleanup the isolated Factorio test server.
 
 set -euo pipefail
@@ -25,7 +25,7 @@ if [ -f "$PID_FILE" ]; then
     fi
     rm -f "$PID_FILE"
 else
-    PIDS="$(pgrep -f "factorio.*--rcon-port $RCON_PORT" || true)"
+    PIDS="$(pgrep -f "factorio.*--rcon-(port|bind)[^ ]*.*$RCON_PORT" || true)"
     if [ -n "$PIDS" ]; then
         echo "Found isolated test server(s): $PIDS"
         kill $PIDS 2>/dev/null || true

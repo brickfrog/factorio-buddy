@@ -17,7 +17,7 @@ pub struct PlaceCommand {
     #[arg(long, allow_hyphen_values = true)]
     pub at: String,
 
-    /// Direction (n, e, s, w, or 0-7)
+    /// Direction (n, e, s, w, or Factorio values 0/4/8/12)
     #[arg(long, default_value = "n")]
     pub direction: String,
 }

@@ -2,7 +2,7 @@
 //!
 //! Exposes Factorio control as MCP tools for LLM agents.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -21,23 +21,42 @@ use factorioctl::client::{AgentId, FactorioClient};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
 use factorioctl::world::{
     build_production_report, build_situation_report, entity_size, find_belt_route_with_options,
-    Area, BeltKind, BeltRouteTopology, Direction, Entity, EntityProduction, GridPos, Position,
-    RoutingOptions, TilePos, UndergroundConfig,
+    Area, BeltKind, BeltPlacement, BeltRouteTopology, Direction, Entity, EntityProduction,
+    GridPos, Position, RoutingOptions, TilePos, UndergroundConfig,
 };
 
 fn production_verification_json(
     entities: Vec<EntityProduction>,
 ) -> (serde_json::Value, bool, bool) {
+    let has_working_producer = entities
+        .iter()
+        .any(|entity| is_production_entity_name(&entity.name) && entity.working);
     let report = build_production_report(entities);
-    let has_working_entity = report.working_count > 0;
     (
         serde_json::json!({
             "success": true,
             "report": report,
         }),
         true,
-        has_working_entity,
+        has_working_producer,
     )
+}
+
+fn is_production_entity_name(name: &str) -> bool {
+    name.starts_with("assembling-machine")
+        || name.contains("furnace")
+        || name.contains("mining-drill")
+        || matches!(
+            name,
+            "lab"
+                | "chemical-plant"
+                | "oil-refinery"
+                | "centrifuge"
+                | "rocket-silo"
+                | "boiler"
+                | "steam-engine"
+                | "steam-turbine"
+        )
 }
 
 fn route_belt_failure_json(
@@ -86,6 +105,149 @@ fn route_material_shortfall(
             missing.join("; ")
         ))
     }
+}
+
+fn compound_route_preflight(
+    routes: &[(&str, &serde_json::Value)],
+    available_items: &BTreeMap<String, u32>,
+    additional_items: &BTreeMap<String, u32>,
+    surface_belt_name: &str,
+    allowed_shared_tiles: &HashSet<GridPos>,
+) -> serde_json::Value {
+    let underground_name = UndergroundConfig::from_belt_type(surface_belt_name)
+        .map(|config| config.entity_name)
+        .unwrap_or_else(|| "underground-belt".to_string());
+    let mut errors = Vec::new();
+    let mut occupied: HashMap<GridPos, (String, BeltPlacement)> = HashMap::new();
+    let mut new_placements: HashMap<GridPos, BeltPlacement> = HashMap::new();
+
+    for (label, report) in routes {
+        if report.get("success").and_then(|value| value.as_bool()) != Some(true) {
+            errors.push(serde_json::json!({
+                "kind": "route_not_ready",
+                "route": label,
+                "error": report.get("error"),
+            }));
+            continue;
+        }
+
+        let planned = report
+            .get("planned_belts")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<BeltPlacement>>(value).ok());
+        let Some(planned) = planned else {
+            errors.push(serde_json::json!({
+                "kind": "missing_route_plan",
+                "route": label,
+            }));
+            continue;
+        };
+        for belt in planned {
+            let tile = GridPos::from_position(&belt.position);
+            if let Some((owner, existing)) = occupied.get(&tile) {
+                let same_segment = existing.kind == belt.kind
+                    && existing.direction == belt.direction;
+                if owner != label && (!allowed_shared_tiles.contains(&tile) || !same_segment) {
+                    errors.push(serde_json::json!({
+                        "kind": "route_overlap",
+                        "tile": tile,
+                        "routes": [owner, label],
+                        "first": existing,
+                        "second": belt,
+                        "error": "Compound routes overlap outside an explicitly shared, direction-compatible handoff tile.",
+                    }));
+                }
+            } else {
+                occupied.insert(tile, ((*label).to_string(), belt));
+            }
+        }
+
+        let planned_new = report
+            .get("planned_new_belts")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<BeltPlacement>>(value).ok())
+            .unwrap_or_default();
+        for belt in planned_new {
+            let tile = GridPos::from_position(&belt.position);
+            new_placements.entry(tile).or_insert(belt);
+        }
+    }
+
+    let mut required = additional_items.clone();
+    for belt in new_placements.values() {
+        let item = match belt.kind {
+            BeltKind::Surface => surface_belt_name,
+            BeltKind::UndergroundEntry | BeltKind::UndergroundExit => &underground_name,
+        };
+        *required.entry(item.to_string()).or_default() += 1;
+    }
+
+    let mut materials = BTreeMap::new();
+    for (item, needed) in &required {
+        let available = available_items.get(item).copied().unwrap_or(0);
+        let sufficient = available >= *needed;
+        if !sufficient {
+            errors.push(serde_json::json!({
+                "kind": "insufficient_materials",
+                "item": item,
+                "needed": needed,
+                "available": available,
+            }));
+        }
+        materials.insert(
+            item.clone(),
+            serde_json::json!({
+                "needed": needed,
+                "available": available,
+                "sufficient": sufficient,
+            }),
+        );
+    }
+
+    serde_json::json!({
+        "ready": errors.is_empty(),
+        "materials": materials,
+        "reserved_tiles": occupied.len(),
+        "new_belt_tiles": new_placements.len(),
+        "errors": errors,
+    })
+}
+
+fn route_report_placed_units(report: &serde_json::Value) -> Vec<u32> {
+    report
+        .get("placed_entities")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entity| entity.get("unit_number").and_then(|value| value.as_u64()))
+        .filter_map(|unit| u32::try_from(unit).ok())
+        .collect()
+}
+
+fn report_success(report: &serde_json::Value) -> bool {
+    report.get("success").and_then(|value| value.as_bool()) == Some(true)
+}
+
+async fn rollback_exact_units(
+    client: &mut FactorioClient,
+    unit_numbers: &[u32],
+) -> serde_json::Value {
+    let mut removed = Vec::new();
+    let mut errors = Vec::new();
+    for unit_number in unit_numbers.iter().rev().copied() {
+        match client.remove_entity(unit_number).await {
+            Ok(()) => removed.push(unit_number),
+            Err(error) => errors.push(serde_json::json!({
+                "unit_number": unit_number,
+                "error": error.to_string(),
+            })),
+        }
+    }
+    serde_json::json!({
+        "success": errors.is_empty(),
+        "removed_units": removed,
+        "errors": errors,
+    })
 }
 
 fn compact_belt_topology(topology: Option<&BeltRouteTopology>) -> serde_json::Value {
@@ -141,14 +303,24 @@ fn placed_units_not_dead(
                     .get("status")
                     .and_then(|value| value.as_str())
                     .unwrap_or("unknown");
-                let dead = matches!(status, "no_power" | "no_fuel" | "disabled");
-                ok &= !dead;
+                let working = entity
+                    .get("working")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let name = entity.get("name").and_then(|value| value.as_str()).unwrap_or("");
+                let operational = if name.contains("inserter") {
+                    (status == "working" && working)
+                        || status == "waiting_for_space_in_destination"
+                } else {
+                    status == "working" && working
+                };
+                ok &= operational;
                 statuses.push(serde_json::json!({
                     "unit_number": unit_number,
                     "name": entity.get("name").cloned().unwrap_or(serde_json::Value::Null),
                     "status": status,
                     "working": entity.get("working").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                    "ok": !dead,
+                    "ok": operational,
                 }));
             }
             None => {
@@ -329,13 +501,16 @@ struct ConnectionConfig {
 mod tests {
     use super::{
         automation_repair_hint, execute_lua_refusal, flow_lookup, flow_scan_area,
-        is_machine_output_source, machine_output_build_args, machine_side_layout,
+        existing_belt_compatibility, is_machine_output_source, machine_output_build_args,
+        machine_side_layout, production_verification_json,
         placed_unit_working, placed_units_not_dead, raw_lua_enabled, ready_fuel_supply_args,
         route_belt_failure_json, route_material_shortfall, route_segment_waypoint,
         BuildFuelSupplyParams, RouteBeltParams,
     };
     use factorioctl::analyze::EntityLookup;
-    use factorioctl::world::{Area, Entity, GridPos, Position, TilePos};
+    use factorioctl::world::{
+        Area, BeltKind, BeltPlacement, Direction, Entity, GridPos, Position, TilePos,
+    };
 
     #[test]
     fn raw_lua_enabled_only_accepts_explicit_truthy_values() {
@@ -393,6 +568,60 @@ mod tests {
         assert_eq!(statuses[1]["status"], "no_power");
         assert_eq!(statuses[2]["ok"], false);
         assert_eq!(statuses[2]["status"], "missing_from_verification_area");
+    }
+
+    #[test]
+    fn production_verification_does_not_count_transport_as_production() {
+        let entities = vec![
+            factorioctl::world::EntityProduction {
+                name: "transport-belt".to_string(),
+                unit_number: Some(1),
+                position: Position::new(0.5, 0.5),
+                status: "working".to_string(),
+                products_finished: None,
+                working: true,
+            },
+            factorioctl::world::EntityProduction {
+                name: "inserter".to_string(),
+                unit_number: Some(2),
+                position: Position::new(1.5, 0.5),
+                status: "working".to_string(),
+                products_finished: None,
+                working: true,
+            },
+            factorioctl::world::EntityProduction {
+                name: "stone-furnace".to_string(),
+                unit_number: Some(3),
+                position: Position::new(2.0, 0.0),
+                status: "no_ingredients".to_string(),
+                products_finished: Some(0),
+                working: false,
+            },
+        ];
+
+        let (_, call_ok, has_working_producer) = production_verification_json(entities);
+        assert!(call_ok);
+        assert!(!has_working_producer);
+    }
+
+    #[test]
+    fn idle_placed_units_are_not_verified_as_operational() {
+        let verification = serde_json::json!({
+            "success": true,
+            "report": {
+                "entities": [{
+                    "name": "inserter",
+                    "unit_number": 11,
+                    "status": "waiting_for_source_items",
+                    "working": false
+                }]
+            }
+        });
+
+        let (ok, statuses) = placed_units_not_dead(&verification, &[11]);
+        assert!(!ok);
+        assert_eq!(statuses[0]["ok"], false);
+        assert_eq!(statuses[0]["status"], "waiting_for_source_items");
     }
 
     #[test]
@@ -625,6 +854,42 @@ mod tests {
                 "Insufficient materials for complete route: need 12 transport-belt, have 4; need 2 underground-belt, have 0. No belts were placed."
             )
         );
+    }
+
+    #[test]
+    fn existing_route_belts_require_exact_type_kind_and_direction() {
+        let entity = Entity {
+            unit_number: Some(41),
+            name: "transport-belt".to_string(),
+            entity_type: Some("transport-belt".to_string()),
+            position: Position::new(2.5, 3.5),
+            direction: Direction::East.to_factorio(),
+            health: Some(150.0),
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+        let east_surface = BeltPlacement {
+            position: entity.position,
+            direction: Direction::East,
+            kind: BeltKind::Surface,
+        };
+        assert!(existing_belt_compatibility(&entity, &east_surface, "transport-belt").is_ok());
+
+        let wrong_direction = BeltPlacement {
+            direction: Direction::North,
+            ..east_surface.clone()
+        };
+        assert!(existing_belt_compatibility(&entity, &wrong_direction, "transport-belt")
+            .unwrap_err()
+            .contains("faces east"));
+
+        let underground = BeltPlacement {
+            kind: BeltKind::UndergroundEntry,
+            ..east_surface
+        };
+        assert!(existing_belt_compatibility(&entity, &underground, "transport-belt").is_err());
+        assert!(existing_belt_compatibility(&entity, &underground, "fast-transport-belt")
+            .is_err());
     }
 
     #[test]
@@ -1561,6 +1826,36 @@ fn is_existing_belt_entity(name: &str) -> bool {
             | "fast-underground-belt"
             | "express-underground-belt"
     )
+}
+
+fn existing_belt_compatibility(
+    entity: &Entity,
+    planned: &BeltPlacement,
+    surface_belt_name: &str,
+) -> Result<(), String> {
+    if planned.kind != BeltKind::Surface {
+        return Err("an existing endpoint cannot replace a planned underground-belt endpoint"
+            .to_string());
+    }
+    if entity.name != surface_belt_name
+        || entity.entity_type.as_deref() != Some("transport-belt")
+    {
+        return Err(format!(
+            "expected {surface_belt_name} surface belt, found {} ({})",
+            entity.name,
+            entity.entity_type.as_deref().unwrap_or("unknown type")
+        ));
+    }
+    let actual_direction = Direction::from_factorio(entity.direction);
+    if actual_direction != planned.direction {
+        return Err(format!(
+            "existing {} faces {}, but the route requires {}",
+            entity.name,
+            actual_direction.to_name(),
+            planned.direction.to_name()
+        ));
+    }
+    Ok(())
 }
 
 /// Parameters for build_fuel_supply tool.
@@ -2872,7 +3167,6 @@ fn default_clear_rocks() -> bool {
 #[derive(Clone)]
 pub struct FactorioMcp {
     config: ConnectionConfig,
-    #[allow(dead_code)]
     client: Arc<Mutex<Option<FactorioClient>>>,
     tool_router: ToolRouter<Self>,
 }
@@ -2888,20 +3182,39 @@ struct ChatMessage {
 
 impl FactorioMcp {
     fn new() -> Self {
+        let mut tool_router = Self::tool_router();
+        if !raw_lua_enabled(std::env::var("FACTORIOCTL_ALLOW_RAW_LUA").ok().as_deref()) {
+            tool_router.remove_route("execute_lua");
+        }
         Self {
             config: ConnectionConfig::from_env(),
             client: Arc::new(Mutex::new(None)),
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
     async fn connect(&self) -> Result<FactorioClient, String> {
         let agent_id = AgentId::new(std::env::var("FACTORIO_AGENT_ID").ok().as_deref())
             .map_err(|e| format!("Invalid FACTORIO_AGENT_ID: {}", e))?;
-        FactorioClient::connect(&self.config.host, self.config.port, &self.config.password)
-            .await
-            .map(|client| client.with_agent_id(agent_id))
-            .map_err(|e| format!("Failed to connect: {}", e))
+        let mut cached = self.client.lock().await;
+        if let Some(client) = cached.as_ref() {
+            let mut candidate = client.clone().with_agent_id(agent_id.clone());
+            if candidate.call_remote("ping", &[]).await.is_ok() {
+                return Ok(candidate);
+            }
+            *cached = None;
+        }
+
+        let client = FactorioClient::connect(
+            &self.config.host,
+            self.config.port,
+            &self.config.password,
+        )
+        .await
+        .map(|client| client.with_agent_id(agent_id))
+        .map_err(|e| format!("Failed to connect: {}", e))?;
+        *cached = Some(client.clone());
+        Ok(client)
     }
 
     /// Fetch pending player messages and clear them from the queue.
@@ -5872,10 +6185,8 @@ impl FactorioMcp {
             }
         };
 
-        let mut existing_belt_tiles: HashSet<GridPos> = HashSet::new();
+        let mut existing_surface_belts: HashMap<GridPos, Entity> = HashMap::new();
         if params.extend_existing {
-            collision_map.unblock(GridPos::new(params.from_x, params.from_y));
-            collision_map.unblock(GridPos::new(params.to_x, params.to_y));
             let entities = match client.find_entities(area, None, None).await {
                 Ok(entities) => entities,
                 Err(e) => {
@@ -5887,26 +6198,14 @@ impl FactorioMcp {
                 }
             };
             for entity in entities {
-                if !is_existing_belt_entity(&entity.name) {
+                if !is_existing_belt_entity(&entity.name)
+                    || entity.entity_type.as_deref() != Some("transport-belt")
+                {
                     continue;
                 }
-                if let Some(bb) = &entity.bounding_box {
-                    let min_x = bb.left_top.x.floor() as i32;
-                    let max_x = bb.right_bottom.x.ceil() as i32;
-                    let min_y = bb.left_top.y.floor() as i32;
-                    let max_y = bb.right_bottom.y.ceil() as i32;
-                    for x in min_x..max_x {
-                        for y in min_y..max_y {
-                            let tile = GridPos::new(x, y);
-                            existing_belt_tiles.insert(tile);
-                            collision_map.unblock(tile);
-                        }
-                    }
-                } else {
-                    let tile = GridPos::from_position(&entity.position);
-                    existing_belt_tiles.insert(tile);
-                    collision_map.unblock(tile);
-                }
+                let tile = GridPos::from_position(&entity.position);
+                collision_map.unblock(tile);
+                existing_surface_belts.insert(tile, entity);
             }
         }
 
@@ -5940,23 +6239,104 @@ impl FactorioMcp {
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
         };
-        let result = find_belt_route_with_options(
-            GridPos::new(params.from_x, params.from_y),
-            GridPos::new(params.to_x, params.to_y),
-            &collision_map,
-            &routing_options,
-        );
+        let start = GridPos::new(params.from_x, params.from_y);
+        let goal = GridPos::new(params.to_x, params.to_y);
+        let mut rejected_existing = Vec::new();
+        let result = loop {
+            let candidate =
+                find_belt_route_with_options(start, goal, &collision_map, &routing_options);
+            if !candidate.success {
+                if !rejected_existing.is_empty() {
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "complete_route": false,
+                        "dry_run": params.dry_run,
+                        "error_kind": "incompatible_existing_belt",
+                        "error": "No complete route can reuse the encountered existing belts without violating their type or flow direction. No belts were placed.",
+                        "from": { "x": params.from_x, "y": params.from_y },
+                        "to": { "x": params.to_x, "y": params.to_y },
+                        "belt_type": params.belt_type,
+                        "incompatible_existing": rejected_existing,
+                        "materials_sufficient": false,
+                        "guidance": "Use a correctly aligned belt highway, or explicitly rotate/rebuild the exact incompatible units before retrying. The router will not silently skip wrong-facing belts.",
+                    }));
+                }
+                return Ok(route_belt_failure_json(
+                    params,
+                    "route_failed",
+                    format!(
+                        "Route failed: {}",
+                        candidate
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
+                    ),
+                ));
+            }
 
-        if !result.success {
-            return Ok(route_belt_failure_json(
-                params,
-                "route_failed",
-                format!(
-                    "Route failed: {}",
-                    result.error.unwrap_or_else(|| "unknown error".to_string())
-                ),
-            ));
-        }
+            let mut incompatible = Vec::new();
+            for planned in &candidate.belts {
+                let tile = GridPos::from_position(&planned.position);
+                let Some(existing) = existing_surface_belts.get(&tile) else {
+                    continue;
+                };
+                if let Err(error) =
+                    existing_belt_compatibility(existing, planned, &params.belt_type)
+                {
+                    incompatible.push((
+                        tile,
+                        serde_json::json!({
+                            "position": planned.position,
+                            "unit_number": existing.unit_number,
+                            "name": existing.name,
+                            "actual_direction": Direction::from_factorio(existing.direction),
+                            "required_direction": planned.direction,
+                            "error": error,
+                        }),
+                    ));
+                }
+            }
+            if incompatible.is_empty() {
+                break candidate;
+            }
+
+            let endpoint_incompatible = incompatible
+                .iter()
+                .any(|(tile, _)| *tile == start || *tile == goal);
+            for (tile, error) in incompatible {
+                collision_map.block(tile);
+                rejected_existing.push(error);
+            }
+            if endpoint_incompatible {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "complete_route": false,
+                    "dry_run": params.dry_run,
+                    "error_kind": "incompatible_existing_belt",
+                    "error": "An existing endpoint belt is not directionally compatible with the planned route. No belts were placed.",
+                    "from": { "x": params.from_x, "y": params.from_y },
+                    "to": { "x": params.to_x, "y": params.to_y },
+                    "belt_type": params.belt_type,
+                    "incompatible_existing": rejected_existing,
+                    "materials_sufficient": false,
+                    "topology": compact_belt_topology(candidate.topology.as_ref()),
+                    "guidance": "Choose an endpoint whose existing belt already flows in the required direction, or explicitly rotate/rebuild that exact belt before routing.",
+                }));
+            }
+        };
+
+        let existing_belt_tiles: HashSet<GridPos> = result
+            .belts
+            .iter()
+            .filter_map(|planned| {
+                let tile = GridPos::from_position(&planned.position);
+                existing_surface_belts
+                    .get(&tile)
+                    .and_then(|existing| {
+                        existing_belt_compatibility(existing, planned, &params.belt_type).ok()
+                    })
+                    .map(|()| tile)
+            })
+            .collect();
 
         let inventory = match client.character_inventory().await {
             Ok(inventory) => inventory,
@@ -6024,6 +6404,12 @@ impl FactorioMcp {
         });
 
         if params.dry_run {
+            let planned_new_belts: Vec<&BeltPlacement> = build_belts
+                .iter()
+                .filter(|belt| {
+                    !existing_belt_tiles.contains(&GridPos::from_position(&belt.position))
+                })
+                .collect();
             let mut execute_args =
                 serde_json::to_value(params).unwrap_or_else(|_| serde_json::json!({}));
             if let Some(object) = execute_args.as_object_mut() {
@@ -6044,6 +6430,8 @@ impl FactorioMcp {
                 "ready_to_execute": materials_sufficient,
                 "material_shortfall": material_shortfall,
                 "topology": compact_belt_topology(result.topology.as_ref()),
+                "planned_belts": build_belts,
+                "planned_new_belts": planned_new_belts,
                 "ready_to_call": {
                     "tool": "route_belt",
                     "execute_args": execute_args,
@@ -6242,6 +6630,11 @@ impl FactorioMcp {
             "belt_count": result.belt_count,
             "new_belt_count": surface_belts_needed + underground_belts_needed,
             "placed": placed_entities.len(),
+            "placed_entities": placed_entities.iter().map(|entity| serde_json::json!({
+                "unit_number": entity.unit_number,
+                "name": entity.name,
+                "position": entity.position,
+            })).collect::<Vec<_>>(),
             "skipped_existing": skipped_existing,
             "turn_count": result.turn_count,
             "underground_count": result.underground_count,
@@ -6309,7 +6702,7 @@ impl FactorioMcp {
             to_y: params.pickup_y,
             belt_type: params.belt_type.clone(),
             search_radius: params.search_radius,
-            dry_run: params.dry_run,
+            dry_run: true,
             respect_zones: params.respect_zones,
             allow_underground: params.allow_underground,
             extend_existing: params.extend_existing,
@@ -6687,7 +7080,7 @@ impl FactorioMcp {
             to_y: params.pickup_y,
             belt_type: params.belt_type.clone(),
             search_radius: params.search_radius,
-            dry_run: params.dry_run,
+            dry_run: true,
             respect_zones: params.respect_zones,
             allow_underground: params.allow_underground,
             extend_existing: params.extend_existing,
@@ -7403,35 +7796,64 @@ impl FactorioMcp {
             extend_existing: params.extend_existing,
         };
 
-        let input_route = self.route_belt_core(&mut client, &input_route_params).await;
-        let output_route = self
+        let input_route = match self.route_belt_core(&mut client, &input_route_params).await {
+            Ok(report) => report,
+            Err(error) => serde_json::json!({"success": false, "error": error}),
+        };
+        let output_route = match self
             .route_belt_core(&mut client, &output_route_params)
-            .await;
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => serde_json::json!({"success": false, "error": error}),
+        };
         let routes = serde_json::json!({
-            "input": match input_route {
-                Ok(report) => report,
-                Err(error) => serde_json::json!({"success": false, "error": error}),
-            },
-            "output": match output_route {
-                Ok(report) => report,
-                Err(error) => serde_json::json!({"success": false, "error": error}),
-            },
+            "input": input_route,
+            "output": output_route,
         });
-        let route_ready = routes
-            .as_object()
-            .map(|object| {
-                object.values().all(|value| {
-                    value
-                        .get("success")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false)
-                        && value
-                            .get("materials_sufficient")
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false)
-                })
+        let inventory = client.character_inventory().await.ok();
+        let available_items: BTreeMap<String, u32> = inventory
+            .as_ref()
+            .map(|inventory| {
+                inventory
+                    .items
+                    .iter()
+                    .map(|item| (item.name.clone(), item.count))
+                    .collect()
             })
-            .unwrap_or(false);
+            .unwrap_or_default();
+        let additional_items = BTreeMap::from([("inserter".to_string(), 2)]);
+        let route_reports = [
+            ("input", &routes["input"]),
+            ("output", &routes["output"]),
+        ];
+        let compound_preflight = compound_route_preflight(
+            &route_reports,
+            &available_items,
+            &additional_items,
+            &params.belt_type,
+            &HashSet::new(),
+        );
+        let placement_preflight = serde_json::json!({
+            "input_inserter": client.check_entity_placement(
+                "inserter",
+                Position::new(input.inserter_x, input.inserter_y),
+                Direction::parse(input.input_direction).unwrap_or(Direction::North),
+            ).await.ok(),
+            "output_inserter": client.check_entity_placement(
+                "inserter",
+                Position::new(output.inserter_x, output.inserter_y),
+                Direction::parse(output.output_direction).unwrap_or(Direction::North),
+            ).await.ok(),
+        });
+        let placements_ready = placement_preflight
+            .as_object()
+            .is_some_and(|checks| checks.values().all(|check| {
+                check.get("factorio_allowed").and_then(|value| value.as_bool()) == Some(true)
+            }));
+        let route_ready = compound_preflight["ready"].as_bool() == Some(true)
+            && placements_ready
+            && inventory.is_some();
 
         let mut execute_args =
             serde_json::to_value(&build_args).unwrap_or_else(|_| serde_json::json!({}));
@@ -7455,6 +7877,8 @@ impl FactorioMcp {
                 "output": output,
             },
             "routes": routes,
+            "compound_preflight": compound_preflight,
+            "placement_preflight": placement_preflight,
             "ready_to_call": {
                 "tool": "build_recipe_assembler_cell",
                 "dry_run_args": build_args,
@@ -7521,7 +7945,7 @@ impl FactorioMcp {
             to_y: params.input_pickup_y,
             belt_type: params.belt_type.clone(),
             search_radius: params.search_radius,
-            dry_run: params.dry_run,
+            dry_run: true,
             respect_zones: params.respect_zones,
             allow_underground: params.allow_underground,
             extend_existing: params.extend_existing,
@@ -7533,7 +7957,7 @@ impl FactorioMcp {
             to_y: params.output_to_y,
             belt_type: params.belt_type.clone(),
             search_radius: params.search_radius,
-            dry_run: params.dry_run,
+            dry_run: true,
             respect_zones: params.respect_zones,
             allow_underground: params.allow_underground,
             extend_existing: params.extend_existing,
@@ -7549,6 +7973,56 @@ impl FactorioMcp {
             Ok(report) => report,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
+
+        let inventory = match client.character_inventory().await {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                return self
+                    .with_player_messages(format!("Error: checking compound materials: {error}"))
+                    .await
+            }
+        };
+        let available_items: BTreeMap<String, u32> = inventory
+            .items
+            .iter()
+            .map(|item| (item.name.clone(), item.count))
+            .collect();
+        let additional_items = BTreeMap::from([("inserter".to_string(), 2)]);
+        let compound_preflight = compound_route_preflight(
+            &[("input", &input_route), ("output", &output_route)],
+            &available_items,
+            &additional_items,
+            &params.belt_type,
+            &HashSet::new(),
+        );
+        let input_placement = client
+            .check_entity_placement(
+                "inserter",
+                Position::new(params.input_inserter_x, params.input_inserter_y),
+                input_direction,
+            )
+            .await;
+        let output_placement = client
+            .check_entity_placement(
+                "inserter",
+                Position::new(params.output_inserter_x, params.output_inserter_y),
+                output_direction,
+            )
+            .await;
+        let placement_allowed = |check: &anyhow::Result<serde_json::Value>| {
+            check.as_ref().ok().and_then(|value| {
+                value
+                    .get("factorio_allowed")
+                    .and_then(|allowed| allowed.as_bool())
+            }) == Some(true)
+        };
+        let placement_preflight = serde_json::json!({
+            "input_inserter": input_placement.as_ref().map_err(|error| error.to_string()),
+            "output_inserter": output_placement.as_ref().map_err(|error| error.to_string()),
+        });
+        let preflight_ready = compound_preflight["ready"].as_bool() == Some(true)
+            && placement_allowed(&input_placement)
+            && placement_allowed(&output_placement);
 
         let recipe_args = serde_json::json!({
             "unit_number": params.assembler_unit_number,
@@ -7569,7 +8043,7 @@ impl FactorioMcp {
 
         if params.dry_run {
             let result = serde_json::json!({
-                "success": true,
+                "success": preflight_ready,
                 "dry_run": true,
                 "recipe": params.recipe,
                 "input_item_name": params.input_item_name,
@@ -7583,6 +8057,8 @@ impl FactorioMcp {
                     "input": input_route,
                     "output": output_route,
                 },
+                "compound_preflight": compound_preflight,
+                "placement_preflight": placement_preflight,
                 "steps": [{
                     "tool": "set_recipe",
                     "args": recipe_args,
@@ -7617,15 +8093,70 @@ impl FactorioMcp {
             return self.with_player_messages(msg).await;
         }
 
-        let set_recipe = client
-            .set_recipe(params.assembler_unit_number, params.recipe.trim())
-            .await;
-        let recipe_report = serde_json::json!({
-            "tool": "set_recipe",
-            "args": recipe_args,
-            "success": set_recipe.is_ok(),
-            "error": set_recipe.as_ref().err().map(|e| e.to_string()),
-        });
+        if !preflight_ready {
+            let result = serde_json::json!({
+                "success": false,
+                "dry_run": false,
+                "error_kind": "compound_preflight_failed",
+                "error": "The complete assembler cell failed shared material, route, or inserter preflight. Nothing was placed.",
+                "routes": { "input": input_route, "output": output_route },
+                "compound_preflight": compound_preflight,
+                "placement_preflight": placement_preflight,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
+
+        let mut input_execute = input_route_params.clone();
+        input_execute.dry_run = false;
+        let mut output_execute = output_route_params.clone();
+        output_execute.dry_run = false;
+        let input_route = match self.route_belt_core(&mut client, &input_execute).await {
+            Ok(report) if report_success(&report) => report,
+            Ok(report) => {
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "input_route_execution_failed",
+                    "route": report,
+                    "rollback": { "success": true, "removed_units": [], "errors": [] },
+                });
+                return self.with_player_messages(serde_json::to_string_pretty(&result).unwrap()).await;
+            }
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let output_route = match self.route_belt_core(&mut client, &output_execute).await {
+            Ok(report) if report_success(&report) => report,
+            Ok(report) => {
+                let rollback = rollback_exact_units(
+                    &mut client,
+                    &route_report_placed_units(&input_route),
+                ).await;
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "output_route_execution_failed",
+                    "route": report,
+                    "rollback": rollback,
+                });
+                return self.with_player_messages(serde_json::to_string_pretty(&result).unwrap()).await;
+            }
+            Err(error) => {
+                let rollback = rollback_exact_units(
+                    &mut client,
+                    &route_report_placed_units(&input_route),
+                ).await;
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "output_route_execution_failed",
+                    "error": error,
+                    "rollback": rollback,
+                });
+                return self.with_player_messages(serde_json::to_string_pretty(&result).unwrap()).await;
+            }
+        };
+
+        let mut transaction_units = route_report_placed_units(&input_route);
+        transaction_units.extend(route_report_placed_units(&output_route));
         let input_inserter = client
             .place_entity(
                 "inserter",
@@ -7633,6 +8164,19 @@ impl FactorioMcp {
                 input_direction,
             )
             .await;
+        if let Err(error) = &input_inserter {
+            let rollback = rollback_exact_units(&mut client, &transaction_units).await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "input_inserter_placement_failed",
+                "error": error.to_string(),
+                "rollback": rollback,
+            });
+            return self.with_player_messages(serde_json::to_string_pretty(&result).unwrap()).await;
+        }
+        if let Some(unit) = input_inserter.as_ref().ok().and_then(|entity| entity.unit_number) {
+            transaction_units.push(unit);
+        }
         let output_inserter = client
             .place_entity(
                 "inserter",
@@ -7640,6 +8184,16 @@ impl FactorioMcp {
                 output_direction,
             )
             .await;
+        if let Err(error) = &output_inserter {
+            let rollback = rollback_exact_units(&mut client, &transaction_units).await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "output_inserter_placement_failed",
+                "error": error.to_string(),
+                "rollback": rollback,
+            });
+            return self.with_player_messages(serde_json::to_string_pretty(&result).unwrap()).await;
+        }
         let input_inserter_unit = input_inserter
             .as_ref()
             .ok()
@@ -7648,6 +8202,28 @@ impl FactorioMcp {
             .as_ref()
             .ok()
             .and_then(|entity| entity.unit_number);
+        if let Some(unit) = output_inserter_unit {
+            transaction_units.push(unit);
+        }
+        let set_recipe = client
+            .set_recipe(params.assembler_unit_number, params.recipe.trim())
+            .await;
+        if let Err(error) = &set_recipe {
+            let rollback = rollback_exact_units(&mut client, &transaction_units).await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "set_recipe_failed",
+                "error": error.to_string(),
+                "rollback": rollback,
+            });
+            return self.with_player_messages(serde_json::to_string_pretty(&result).unwrap()).await;
+        }
+        let recipe_report = serde_json::json!({
+            "tool": "set_recipe",
+            "args": recipe_args,
+            "success": true,
+            "error": serde_json::Value::Null,
+        });
 
         let verify_radius = params.verify_radius.clamp(1, 50) as f64;
         let verify_area = Area::new(

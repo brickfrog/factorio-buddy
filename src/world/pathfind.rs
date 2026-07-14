@@ -317,7 +317,6 @@ pub struct WalkPathResult {
 #[derive(Clone)]
 struct PathNode {
     pos: GridPos,
-    direction: Direction,
     g_cost: f64,
     f_cost: f64,
 }
@@ -341,6 +340,42 @@ impl Ord for PathNode {
 }
 
 impl PartialOrd for PathNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+struct BeltRouteState {
+    pos: GridPos,
+    arrival: Option<Direction>,
+}
+
+#[derive(Clone)]
+struct BeltPathNode {
+    state: BeltRouteState,
+    g_cost: f64,
+    f_cost: f64,
+}
+
+impl PartialEq for BeltPathNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.state == other.state
+    }
+}
+
+impl Eq for BeltPathNode {}
+
+impl Ord for BeltPathNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .f_cost
+            .partial_cmp(&self.f_cost)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for BeltPathNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -384,23 +419,27 @@ pub fn find_belt_route_with_options(
 
     // A* data structures
     let mut open_set = BinaryHeap::new();
-    let mut came_from: HashMap<GridPos, (GridPos, MoveType)> = HashMap::new();
-    let mut g_score: HashMap<GridPos, f64> = HashMap::new();
-    let mut closed_set: HashSet<GridPos> = HashSet::new();
+    let mut came_from: HashMap<BeltRouteState, (BeltRouteState, MoveType)> = HashMap::new();
+    let mut g_score: HashMap<BeltRouteState, f64> = HashMap::new();
+    let mut closed_set: HashSet<BeltRouteState> = HashSet::new();
 
     // Initialize with start node
-    g_score.insert(start, 0.0);
-    open_set.push(PathNode {
+    let start_state = BeltRouteState {
         pos: start,
-        direction: Direction::North, // Placeholder, will be determined by movement
+        arrival: None,
+    };
+    g_score.insert(start_state, 0.0);
+    open_set.push(BeltPathNode {
+        state: start_state,
         g_cost: 0.0,
         f_cost: start.manhattan_distance(&goal) as f64,
     });
 
     while let Some(current) = open_set.pop() {
-        if current.pos == goal {
+        if current.state.pos == goal {
             // Reconstruct path with move types
-            let path_with_moves = reconstruct_path_with_moves(&came_from, goal, start);
+            let path_with_moves =
+                reconstruct_path_with_moves(&came_from, current.state, start_state);
             let belts = path_to_belt_placements_with_moves(&path_with_moves);
             let turn_count = count_turns(&belts);
             let underground_count = belts
@@ -421,42 +460,43 @@ pub fn find_belt_route_with_options(
         }
 
         // Skip if already processed
-        if closed_set.contains(&current.pos) {
+        if closed_set.contains(&current.state) {
             continue;
         }
-        closed_set.insert(current.pos);
-
-        // Get the direction we arrived from (for turn cost calculation)
-        let arrival_direction = came_from
-            .get(&current.pos)
-            .map(|(_, mt)| match mt {
-                MoveType::Surface(d) => *d,
-                MoveType::Underground { direction, .. } => *direction,
-            })
-            .unwrap_or(Direction::North);
+        closed_set.insert(current.state);
 
         // Explore surface neighbors
-        for (neighbor, move_direction) in current.pos.cardinal_neighbors() {
-            if !collision_map.is_walkable(&neighbor) || closed_set.contains(&neighbor) {
+        for (neighbor, move_direction) in current.state.pos.cardinal_neighbors() {
+            let neighbor_state = BeltRouteState {
+                pos: neighbor,
+                arrival: Some(move_direction),
+            };
+            if !collision_map.is_walkable(&neighbor) || closed_set.contains(&neighbor_state) {
                 continue;
             }
 
-            // Calculate movement cost (with turn penalty and tile cost)
-            let is_turn = current.pos != start && arrival_direction != move_direction;
-            let turn_cost = if is_turn { 0.1 } else { 0.0 };
+            let turn_cost = match current.state.arrival {
+                Some(arrival) if arrival != move_direction => 0.1,
+                _ => 0.0,
+            };
             let tile_cost = collision_map.tile_cost(&neighbor);
             let tentative_g = current.g_cost + tile_cost + turn_cost;
 
-            let current_g = g_score.get(&neighbor).copied().unwrap_or(f64::INFINITY);
+            let current_g = g_score
+                .get(&neighbor_state)
+                .copied()
+                .unwrap_or(f64::INFINITY);
             if tentative_g < current_g {
                 // This path is better
-                came_from.insert(neighbor, (current.pos, MoveType::Surface(move_direction)));
-                g_score.insert(neighbor, tentative_g);
+                came_from.insert(
+                    neighbor_state,
+                    (current.state, MoveType::Surface(move_direction)),
+                );
+                g_score.insert(neighbor_state, tentative_g);
 
                 let h = neighbor.manhattan_distance(&goal) as f64;
-                open_set.push(PathNode {
-                    pos: neighbor,
-                    direction: move_direction,
+                open_set.push(BeltPathNode {
+                    state: neighbor_state,
                     g_cost: tentative_g,
                     f_cost: tentative_g + h,
                 });
@@ -474,7 +514,11 @@ pub fn find_belt_route_with_options(
                 ] {
                     // Try underground jumps of length 2 to max_distance
                     for distance in 2..=ug_config.max_distance {
-                        let exit_pos = current.pos.offset(direction, distance as i32);
+                        let exit_pos = current.state.pos.offset(direction, distance as i32);
+                        let exit_state = BeltRouteState {
+                            pos: exit_pos,
+                            arrival: Some(direction),
+                        };
 
                         // Check exit is walkable (entry is current pos, already validated)
                         if !collision_map.is_walkable(&exit_pos) {
@@ -482,7 +526,7 @@ pub fn find_belt_route_with_options(
                         }
 
                         // Skip if already in closed set
-                        if closed_set.contains(&exit_pos) {
+                        if closed_set.contains(&exit_state) {
                             continue;
                         }
 
@@ -492,30 +536,33 @@ pub fn find_belt_route_with_options(
                         let ug_cost = options.underground_penalty * 2.0
                             + (skipped as f64 * options.underground_skip_cost);
 
-                        // Add turn cost if changing direction
-                        let is_turn = current.pos != start && arrival_direction != direction;
-                        let turn_cost = if is_turn { 0.1 } else { 0.0 };
+                        let turn_cost = match current.state.arrival {
+                            Some(arrival) if arrival != direction => 0.1,
+                            _ => 0.0,
+                        };
                         let tentative_g = current.g_cost + ug_cost + turn_cost;
 
-                        let current_g = g_score.get(&exit_pos).copied().unwrap_or(f64::INFINITY);
+                        let current_g = g_score
+                            .get(&exit_state)
+                            .copied()
+                            .unwrap_or(f64::INFINITY);
                         if tentative_g < current_g {
                             // This underground path is better
                             came_from.insert(
-                                exit_pos,
+                                exit_state,
                                 (
-                                    current.pos,
+                                    current.state,
                                     MoveType::Underground {
                                         direction,
                                         distance,
                                     },
                                 ),
                             );
-                            g_score.insert(exit_pos, tentative_g);
+                            g_score.insert(exit_state, tentative_g);
 
                             let h = exit_pos.manhattan_distance(&goal) as f64;
-                            open_set.push(PathNode {
-                                pos: exit_pos,
-                                direction,
+                            open_set.push(BeltPathNode {
+                                state: exit_state,
                                 g_cost: tentative_g,
                                 f_cost: tentative_g + h,
                             });
@@ -648,16 +695,16 @@ fn reconstruct_path(
 
 /// Reconstruct path from came_from map with move types (for underground support)
 fn reconstruct_path_with_moves(
-    came_from: &HashMap<GridPos, (GridPos, MoveType)>,
-    goal: GridPos,
-    start: GridPos,
+    came_from: &HashMap<BeltRouteState, (BeltRouteState, MoveType)>,
+    goal: BeltRouteState,
+    start: BeltRouteState,
 ) -> Vec<(GridPos, Option<MoveType>)> {
-    let mut path = vec![(goal, None)];
+    let mut path = vec![(goal.pos, None)];
     let mut current = goal;
 
     while current != start {
         if let Some((parent, move_type)) = came_from.get(&current) {
-            path.push((*parent, Some(*move_type)));
+            path.push((parent.pos, Some(*move_type)));
             current = *parent;
         } else {
             break;
@@ -834,7 +881,6 @@ pub fn find_walk_path(
     g_score.insert(start, 0.0);
     open_set.push(PathNode {
         pos: start,
-        direction: Direction::North,
         g_cost: 0.0,
         f_cost: start.manhattan_distance(&goal) as f64,
     });
@@ -857,20 +903,13 @@ pub fn find_walk_path(
         }
         closed_set.insert(current.pos);
 
-        let arrival_direction = came_from
-            .get(&current.pos)
-            .map(|(_, d)| *d)
-            .unwrap_or(Direction::North);
-
         // Explore neighbors (including diagonals for walking)
         for (neighbor, move_direction) in current.pos.cardinal_neighbors() {
             if !collision_map.is_walkable(&neighbor) || closed_set.contains(&neighbor) {
                 continue;
             }
 
-            let is_turn = current.pos != start && arrival_direction != move_direction;
-            let turn_cost = if is_turn { 0.05 } else { 0.0 };
-            let tentative_g = current.g_cost + 1.0 + turn_cost;
+            let tentative_g = current.g_cost + 1.0;
 
             let current_g = g_score.get(&neighbor).copied().unwrap_or(f64::INFINITY);
             if tentative_g < current_g {
@@ -880,7 +919,6 @@ pub fn find_walk_path(
                 let h = neighbor.manhattan_distance(&goal) as f64;
                 open_set.push(PathNode {
                     pos: neighbor,
-                    direction: move_direction,
                     g_cost: tentative_g,
                     f_cost: tentative_g + h,
                 });

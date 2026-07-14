@@ -93,11 +93,11 @@ pub fn parse_area(s: &str) -> Result<Area> {
     Ok(Area::new(x1, y1, x2, y2))
 }
 
-/// Parse direction from CLI input (name like "n"/"north" or number 0-7)
+/// Parse direction from CLI input (name or Factorio value 0/2/4/.../14).
 pub fn parse_direction(s: &str) -> Result<Direction> {
     Direction::parse(s).ok_or_else(|| {
         anyhow::anyhow!(
-            "Invalid direction '{}'. Use: n/e/s/w, north/east/south/west, or 0-7",
+            "Invalid direction '{}'. Use a name such as north/east/south/west or a Factorio value 0/2/4/.../14",
             s
         )
     })
@@ -126,7 +126,10 @@ mod tests {
     fn test_parse_direction() {
         assert_eq!(parse_direction("n").unwrap(), Direction::North);
         assert_eq!(parse_direction("east").unwrap(), Direction::East);
-        assert_eq!(parse_direction("2").unwrap(), Direction::East);
+        assert_eq!(parse_direction("2").unwrap(), Direction::NorthEast);
+        assert_eq!(parse_direction("4").unwrap(), Direction::East);
+        assert_eq!(parse_direction("8").unwrap(), Direction::South);
+        assert_eq!(parse_direction("12").unwrap(), Direction::West);
         assert!(parse_direction("invalid").is_err());
     }
 

@@ -6,6 +6,8 @@ pub mod server;
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::world::{
     Area, BeltContentsResult, BeltLaneContentsResult, BeltLaneSummary, BuildResult,
@@ -38,8 +40,9 @@ fn parse_lua_array<T: serde::de::DeserializeOwned>(response: &str) -> Result<Vec
 }
 
 /// High-level client for interacting with Factorio
+#[derive(Clone)]
 pub struct FactorioClient {
-    rcon: RconClient,
+    rcon: Arc<Mutex<RconClient>>,
     /// Use /c instead of /silent-command (shows commands in console)
     debug_commands: bool,
     agent_id: AgentId,
@@ -157,7 +160,7 @@ impl FactorioClient {
             .unwrap_or(false);
 
         Ok(Self {
-            rcon,
+            rcon: Arc::new(Mutex::new(rcon)),
             debug_commands,
             agent_id: AgentId::new(None)?,
         })
@@ -174,7 +177,7 @@ impl FactorioClient {
 
     /// Close the connection
     pub async fn close(&mut self) -> Result<()> {
-        self.rcon.close().await
+        self.rcon.lock().await.close().await
     }
 
     /// Execute a Lua command (silent by default, verbose if debug_commands is enabled)
@@ -192,6 +195,8 @@ impl FactorioClient {
             "/silent-command"
         };
         self.rcon
+            .lock()
+            .await
             .execute(&format!("{} {}", prefix, single_line))
             .await
     }
@@ -206,13 +211,15 @@ impl FactorioClient {
             .join(" ");
         let prefix = if visible { "/c" } else { "/silent-command" };
         self.rcon
+            .lock()
+            .await
             .execute(&format!("{} {}", prefix, single_line))
             .await
     }
 
     pub async fn call_remote(&mut self, fn_name: &str, args: &[Value]) -> Result<String> {
         let command = claude_command(fn_name, args);
-        let response = self.rcon.execute(&command).await?;
+        let response = self.rcon.lock().await.execute(&command).await?;
         if let Some(skew_response) = old_mod_claude_command_skew_response(fn_name, &response) {
             return Ok(skew_response);
         }
@@ -842,6 +849,8 @@ impl FactorioClient {
         position: Position,
         direction: Direction,
     ) -> Result<Entity> {
+        self.approach_position(position, PROXIMITY_RANGE_PLACE)
+            .await?;
         let response = self
             .call_remote(
                 "place_entity",
@@ -1070,6 +1079,8 @@ impl FactorioClient {
         position: Position,
         direction: Direction,
     ) -> Result<Entity> {
+        self.approach_position(position, PROXIMITY_RANGE_PLACE)
+            .await?;
         let response = self
             .call_remote(
                 "place_ghost",
@@ -1096,6 +1107,8 @@ impl FactorioClient {
 
     /// Remove entity at position
     pub async fn remove_entity_at(&mut self, position: Position) -> Result<()> {
+        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
+            .await?;
         let response = self
             .call_remote(
                 "remove_entity_at",
@@ -1112,6 +1125,9 @@ impl FactorioClient {
 
     /// Remove entity by unit number
     pub async fn remove_entity(&mut self, unit_number: u32) -> Result<()> {
+        let position = self.get_entity(unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
+            .await?;
         let response = self
             .call_remote(
                 "remove_entity",
@@ -1124,8 +1140,18 @@ impl FactorioClient {
 
     /// Rotate entity to a new direction
     pub async fn rotate_entity(&mut self, unit_number: u32, direction: u8) -> Result<()> {
+        let position = self.get_entity(unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
+            .await?;
         let response = self
-            .call_remote("rotate_entity", &[json!(unit_number), json!(direction)])
+            .call_remote(
+                "rotate_entity",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    json!(direction),
+                ],
+            )
             .await?;
         if response.contains("error") {
             anyhow::bail!("Failed to rotate entity: {}", response);
@@ -1141,6 +1167,9 @@ impl FactorioClient {
         count: u32,
         inventory_type: &str,
     ) -> Result<serde_json::Value> {
+        let position = self.get_entity(unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INSERT)
+            .await?;
         let response = self
             .call_remote(
                 "insert_items",
@@ -1165,6 +1194,9 @@ impl FactorioClient {
         count: u32,
         inventory_type: &str,
     ) -> Result<u32> {
+        let position = self.get_entity(unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INSERT)
+            .await?;
         let response = self
             .call_remote(
                 "extract_items",
@@ -1197,8 +1229,18 @@ impl FactorioClient {
 
     /// Set recipe on an assembling machine
     pub async fn set_recipe(&mut self, unit_number: u32, recipe: &str) -> Result<()> {
+        let position = self.get_entity(unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
+            .await?;
         let response = self
-            .call_remote("set_recipe", &[json!(unit_number), json!(recipe)])
+            .call_remote(
+                "set_recipe",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    json!(recipe),
+                ],
+            )
             .await?;
         ensure_lua_success(&response)?;
         Ok(())
@@ -1248,6 +1290,8 @@ impl FactorioClient {
         direction: Direction,
         belt_type: &str, // "input" for entry, "output" for exit
     ) -> Result<Entity> {
+        self.approach_position(position, PROXIMITY_RANGE_PLACE)
+            .await?;
         let response = self
             .call_remote(
                 "place_underground_belt",
@@ -1314,6 +1358,22 @@ impl FactorioClient {
     }
 
     // --- Proximity Checks ---
+
+    async fn approach_position(&mut self, target: Position, max_distance: f64) -> Result<()> {
+        let current = self.get_character_position().await?;
+        if current.distance(&target) > max_distance {
+            let result = self.walk_to(target, false).await?;
+            if result.final_position.distance(&target) > max_distance {
+                anyhow::bail!(
+                    "Could not move within interaction range of ({:.1}, {:.1}): {}",
+                    target.x,
+                    target.y,
+                    result.reason.as_deref().unwrap_or("walk stopped early")
+                );
+            }
+        }
+        self.ensure_proximity_to_position(target, max_distance).await
+    }
 
     /// Check if player is within range of a position, return error if not
     pub async fn ensure_proximity_to_position(

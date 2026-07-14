@@ -1,7 +1,7 @@
 //! Inserter pickup/dropoff analysis
 
 use super::{EntityRef, InserterAnalysis};
-use crate::world::{Direction, Entity, TilePos};
+use crate::world::{entity_size, Direction, Entity, TilePos};
 use std::collections::HashMap;
 
 /// Analyze all inserters in the entity list
@@ -18,15 +18,41 @@ pub fn analyze_inserters(entities: &[Entity]) -> Vec<InserterAnalysis> {
 fn build_entity_lookup(entities: &[Entity]) -> HashMap<TilePos, &Entity> {
     let mut entity_at: HashMap<TilePos, &Entity> = HashMap::new();
     for entity in entities {
-        let tile = entity.position.to_tile();
-        match entity_at.get(&tile) {
-            Some(existing) if entity_priority(existing) >= entity_priority(entity) => {}
-            _ => {
-                entity_at.insert(tile, entity);
+        for tile in occupied_tiles(entity) {
+            match entity_at.get(&tile) {
+                Some(existing) if entity_priority(existing) >= entity_priority(entity) => {}
+                _ => {
+                    entity_at.insert(tile, entity);
+                }
             }
         }
     }
     entity_at
+}
+
+fn occupied_tiles(entity: &Entity) -> Vec<TilePos> {
+    let (left, top, right, bottom) = match entity.bounding_box {
+        Some(bounds) => (
+            bounds.left_top.x.floor() as i32,
+            bounds.left_top.y.floor() as i32,
+            bounds.right_bottom.x.ceil() as i32,
+            bounds.right_bottom.y.ceil() as i32,
+        ),
+        None => {
+            let (width, height) = entity_size(&entity.name);
+            let half_width = width as f64 / 2.0;
+            let half_height = height as f64 / 2.0;
+            (
+                (entity.position.x - half_width).floor() as i32,
+                (entity.position.y - half_height).floor() as i32,
+                (entity.position.x + half_width).ceil() as i32,
+                (entity.position.y + half_height).ceil() as i32,
+            )
+        }
+    };
+    (left..right)
+        .flat_map(|x| (top..bottom).map(move |y| TilePos::new(x, y)))
+        .collect()
 }
 
 fn entity_priority(entity: &Entity) -> u8 {
@@ -174,6 +200,30 @@ mod tests {
         assert!(analysis.dropoff_target.is_some());
         assert_eq!(analysis.dropoff_target.as_ref().unwrap().name, "iron-chest");
         // Drops to west (opposite)
+    }
+
+    #[test]
+    fn inserter_resolves_edge_tile_of_multitile_machine() {
+        let mut assembler = make_typed_entity(
+            3,
+            0,
+            "assembling-machine-1",
+            "assembling-machine",
+        );
+        assembler.position = Position::new(3.5, 0.5);
+        assembler.bounding_box = Some(crate::world::Area::new(2.0, -1.0, 5.0, 2.0));
+        let entities = vec![
+            make_entity(0, 0, "transport-belt"),
+            make_inserter(1, 0, Direction::West, "inserter"),
+            assembler,
+        ];
+
+        let result = analyze_inserters(&entities);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].dropoff_target.as_ref().map(|target| target.name.as_str()),
+            Some("assembling-machine-1")
+        );
     }
 
     #[test]

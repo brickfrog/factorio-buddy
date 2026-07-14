@@ -1,11 +1,31 @@
 local M = {}
 
+function M.quality_name(item)
+    if not item or item.quality == nil then return nil end
+    if type(item.quality) == "string" then return item.quality end
+    local ok, name = pcall(function() return item.quality.name end)
+    if ok then return name end
+    return tostring(item.quality)
+end
+
+function M.item_record(item)
+    return {
+        name = item.name,
+        count = item.count,
+        quality = M.quality_name(item),
+    }
+end
+
 function M.contents(inv)
     local result = {}
     if not inv then return result end
     for _, item in pairs(inv.get_contents()) do
-        table.insert(result, {name = item.name, count = item.count})
+        table.insert(result, M.item_record(item))
     end
+    table.sort(result, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        return tostring(a.quality or "normal") < tostring(b.quality or "normal")
+    end)
     return result
 end
 
@@ -23,4 +43,3 @@ function M.define_for(inventory_type, default_type)
 end
 
 return M
-

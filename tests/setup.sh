@@ -87,7 +87,7 @@ EOF
 rm -rf "$MOD_DST"
 cp -R "$MOD_SRC" "$MOD_DST"
 
-if pgrep -f "factorio.*--rcon-port $RCON_PORT" >/dev/null; then
+if pgrep -f "factorio.*--rcon-(port|bind)[^ ]*.*$RCON_PORT" >/dev/null; then
     echo "ERROR: test server already running on RCON port $RCON_PORT"
     echo "       Stop it with: ./tests/cleanup.sh"
     exit 1
@@ -114,7 +114,7 @@ echo "$STDIN_KEEPER_PID" > "$STDIN_KEEPER_PID_FILE"
 setsid "$FACTORIO_BIN" \
     --config "$CONFIG_FILE" \
     --start-server "$SAVE_PATH" \
-    --rcon-port "$RCON_PORT" \
+    --rcon-bind "127.0.0.1:$RCON_PORT" \
     --rcon-password "$RCON_PASSWORD" \
     --port "$GAME_PORT" \
     --server-settings "$PROJECT_ROOT/configs/test-server.json" \

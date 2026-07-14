@@ -20,6 +20,8 @@ pub struct ItemFlowRepair {
     pub tool: String,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unit_number: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_name: Option<String>,
@@ -112,6 +114,7 @@ pub fn analyze_item_flow(
         let repair = ItemFlowRepair {
             tool: "route_belt".to_string(),
             reason: "no_source_belt".to_string(),
+            args: None,
             unit_number: report.source.unit_number,
             entity_name: Some("transport-belt".to_string()),
             x: None,
@@ -133,6 +136,7 @@ pub fn analyze_item_flow(
         let repair = ItemFlowRepair {
             tool: "route_belt".to_string(),
             reason: "no_target_belt_or_inserter_pickup".to_string(),
+            args: None,
             unit_number: report.target.unit_number,
             entity_name: Some("transport-belt".to_string()),
             x: None,
@@ -375,6 +379,7 @@ fn first_reachable_break(
                     entity.unit_number.map(|unit| ItemFlowRepair {
                         tool: "rotate_entity".to_string(),
                         reason: reason.to_string(),
+                        args: None,
                         unit_number: Some(unit),
                         entity_name: None,
                         x: None,
@@ -391,6 +396,14 @@ fn first_reachable_break(
                 "blocked" => Some(ItemFlowRepair {
                     tool: "route_belt".to_string(),
                     reason: reason.to_string(),
+                    args: Some(serde_json::json!({
+                        "from_x": from.x,
+                        "from_y": from.y,
+                        "to_x": target.x,
+                        "to_y": target.y,
+                        "belt_type": node.belt_type,
+                        "extend_existing": true,
+                    })),
                     unit_number: None,
                     entity_name: Some("transport-belt".to_string()),
                     x: Some(to.x),
@@ -400,19 +413,49 @@ fn first_reachable_break(
                         "Route around the blocking entity or remove it before extending the belt."
                             .to_string(),
                 }),
-                _ => Some(ItemFlowRepair {
+                _ if graph.can_receive_from(
+                    &to.offset_in_direction(node.direction),
+                    &to,
+                ) => Some(ItemFlowRepair {
                     tool: "place_entity".to_string(),
-                    reason: reason.to_string(),
+                    reason: "verified_one_tile_gap".to_string(),
+                    args: Some(serde_json::json!({
+                        "entity_name": node.belt_type,
+                        "x": to.x,
+                        "y": to.y,
+                        "direction": node.direction.to_name(),
+                    })),
                     unit_number: None,
-                    entity_name: Some("transport-belt".to_string()),
+                    entity_name: Some(node.belt_type.clone()),
                     x: Some(to.x),
                     y: Some(to.y),
                     direction: Some(node.direction.to_name().to_string()),
                     description: format!(
-                        "Place transport-belt at ({}, {}) facing {}.",
+                        "Fill the verified one-tile gap at ({}, {}) facing {}.",
                         to.x,
                         to.y,
                         node.direction.to_name()
+                    ),
+                }),
+                _ => Some(ItemFlowRepair {
+                    tool: "route_belt".to_string(),
+                    reason: "incomplete_route".to_string(),
+                    args: Some(serde_json::json!({
+                        "from_x": from.x,
+                        "from_y": from.y,
+                        "to_x": target.x,
+                        "to_y": target.y,
+                        "belt_type": node.belt_type,
+                        "extend_existing": true,
+                    })),
+                    unit_number: None,
+                    entity_name: Some(node.belt_type.clone()),
+                    x: Some(target.x),
+                    y: Some(target.y),
+                    direction: None,
+                    description: format!(
+                        "Route one complete belt from ({}, {}) to ({}, {}); do not extend it one tile per turn.",
+                        from.x, from.y, target.x, target.y
                     ),
                 }),
             };
@@ -488,6 +531,26 @@ mod tests {
         assert_eq!(repair.x, Some(1));
         assert_eq!(repair.y, Some(0));
         assert_eq!(repair.direction.as_deref(), Some("east"));
+        assert_eq!(repair.reason, "verified_one_tile_gap");
+    }
+
+    #[test]
+    fn incomplete_distance_returns_one_complete_route_not_single_belt() {
+        let entities = vec![belt(0, 0, Direction::East), belt(4, 0, Direction::East)];
+
+        let report = analyze_item_flow(
+            &entities,
+            &[],
+            EntityLookup::Tile(TilePos::new(0, 0)),
+            EntityLookup::Tile(TilePos::new(4, 0)),
+        );
+
+        let repair = report.repair.expect("incomplete route should have repair");
+        assert_eq!(repair.tool, "route_belt");
+        assert_eq!(repair.reason, "incomplete_route");
+        assert_eq!(repair.args.as_ref().unwrap()["from_x"], 0);
+        assert_eq!(repair.args.as_ref().unwrap()["to_x"], 4);
+        assert_eq!(repair.args.as_ref().unwrap()["extend_existing"], true);
     }
 
     #[test]

@@ -46,29 +46,11 @@ Note: Type 2 is used for both AUTH_RESPONSE and EXECCOMMAND.
 1. Client sends SERVERDATA_EXECCOMMAND with command as body
 2. Server responds with SERVERDATA_RESPONSE_VALUE containing output
 
-## Python Implementation
+## Rust implementation
 
-See `scripts/rcon_client.py` for a working implementation.
-
-### Encoding a Packet
-
-```python
-import struct
-
-def encode_packet(request_id: int, packet_type: int, body: str) -> bytes:
-    body_bytes = body.encode("utf-8") + b"\x00"
-    size = 4 + 4 + len(body_bytes) + 1
-    return struct.pack("<iii", size, request_id, packet_type) + body_bytes + b"\x00"
-```
-
-### Decoding a Packet
-
-```python
-def decode_packet(data: bytes) -> tuple[int, int, str]:
-    size, request_id, packet_type = struct.unpack("<iii", data[:12])
-    body = data[12:-2].decode("utf-8")
-    return request_id, packet_type, body
-```
+The supported implementation is [`src/client/rcon.rs`](../src/client/rcon.rs).
+The normal CLI, MCP server, and Buddy runtime all use that client; there is no
+separate Python RCON path.
 
 ## Factorio-Specific Notes
 
@@ -97,10 +79,7 @@ Use `rcon.print()` to send data back to the RCON client:
 
 The first command after connection may not produce output. Send a dummy command:
 
-```python
-client.execute("/c")  # Warmup
-response = client.execute("/c rcon.print('test')")  # Now works
-```
+The Rust client performs its own connection warmup before sending requests.
 
 ### Response Handling
 
@@ -111,14 +90,9 @@ response = client.execute("/c rcon.print('test')")  # Now works
 ## Testing RCON
 
 ```bash
-# Using the Python client
-python scripts/rcon_client.py --port 27015 --password test
-
-# Interactive mode
-> /c rcon.print('hello')
-hello
-> /c rcon.print(game.tick)
-1234
+# Through the supported Rust CLI and mod dispatcher
+./target/release/factorioctl --port 27015 --password test get tick
+./target/release/factorioctl --port 27015 --password test get surfaces
 ```
 
 ## References

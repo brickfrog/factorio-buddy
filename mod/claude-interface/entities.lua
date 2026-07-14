@@ -32,19 +32,17 @@ local function raw_entity_status(entity)
 end
 
 function M.find_by_unit_number(unit_number)
+    unit_number = tonumber(unit_number)
+    if not unit_number then return nil end
     storage.factorioctl_entities = storage.factorioctl_entities or {}
     local registered = storage.factorioctl_entities[unit_number]
     if registered and registered.valid then return registered end
     storage.factorioctl_entities[unit_number] = nil
 
-    for _, surface in pairs(game.surfaces) do
-        local found = surface.find_entities_filtered{area = {{-500, -500}, {500, 500}}}
-        for _, entity in pairs(found) do
-            if entity.unit_number == unit_number then
-                storage.factorioctl_entities[unit_number] = entity
-                return entity
-            end
-        end
+    local entity = game.get_entity_by_unit_number(unit_number)
+    if entity and entity.valid then
+        storage.factorioctl_entities[unit_number] = entity
+        return entity
     end
     return nil
 end
@@ -58,6 +56,7 @@ function M.summary(entity, include_bounding_box)
         direction = entity.direction,
         health = entity.health,
         force = entity.force and entity.force.name or nil,
+        surface = entity.surface and entity.surface.name or nil,
     }
 
     if include_bounding_box then
@@ -80,23 +79,25 @@ function M.get_surfaces()
     return result
 end
 
-function M.find_entities(x1, y1, x2, y2, entity_type, name)
+function M.find_entities(surface, x1, y1, x2, y2, entity_type, name)
+    if not surface then return {error = "agent surface not found"} end
     local filters = {area = area_table(x1, y1, x2, y2)}
     if entity_type then filters.type = entity_type end
     if name then filters.name = name end
 
     local result = {}
-    for _, entity in pairs(game.surfaces[1].find_entities_filtered(filters)) do
+    for _, entity in pairs(surface.find_entities_filtered(filters)) do
         table.insert(result, M.summary(entity, true))
     end
     return result
 end
 
-function M.verify_production(x1, y1, x2, y2)
+function M.verify_production(surface, force, x1, y1, x2, y2)
+    if not (surface and force) then return {error = "agent surface or force not found"} end
     local result = {}
-    local found = game.surfaces[1].find_entities_filtered{
+    local found = surface.find_entities_filtered{
         area = area_table(x1, y1, x2, y2),
-        force = game.forces.player,
+        force = force,
     }
 
     for _, entity in pairs(found) do
@@ -169,19 +170,6 @@ local function distance_sq(a, b)
     return dx * dx + dy * dy
 end
 
-local function nearest_position(origin, candidates)
-    local best = nil
-    local best_distance = nil
-    for _, candidate in ipairs(candidates) do
-        local d = distance_sq(origin, candidate.position)
-        if d and (best_distance == nil or d < best_distance) then
-            best = candidate
-            best_distance = d
-        end
-    end
-    return best
-end
-
 local function belt_line_item_count(belt, item)
     local total = 0
     local ok = pcall(function()
@@ -219,6 +207,117 @@ local function route_source_tile(entity)
     local source = route_source_position(entity)
     if not source then return nil end
     return {x = tile_coord(source.x), y = tile_coord(source.y)}
+end
+
+local function point_in_bounding_box(point, box)
+    return point and box
+        and point.x >= box.left_top.x
+        and point.x <= box.right_bottom.x
+        and point.y >= box.left_top.y
+        and point.y <= box.right_bottom.y
+end
+
+local function coal_source_record(entity)
+    if entity.type == "transport-belt"
+        or entity.type == "underground-belt"
+        or entity.type == "splitter"
+    then
+        local count = belt_line_item_count(entity, "coal") or 0
+        return {
+            kind = "coal_belt",
+            unit_number = entity.unit_number,
+            name = entity.name,
+            position = pos_table(entity.position),
+            coal_count = count,
+            operational = count > 0,
+        }
+    end
+    if entity.type == "container" or entity.type == "logistic-container" then
+        local count = inventory_item_count(first_inventory(entity, {defines.inventory.chest}), "coal") or 0
+        return {
+            kind = "coal_chest",
+            unit_number = entity.unit_number,
+            name = entity.name,
+            position = pos_table(entity.position),
+            coal_count = count,
+            operational = count > 0,
+        }
+    end
+    if entity.type == "mining-drill" and entity.mining_target and entity.mining_target.name == "coal" then
+        local status = entity_status_string(entity)
+        return {
+            kind = "coal_drill",
+            unit_number = entity.unit_number,
+            name = entity.name,
+            position = pos_table(entity.position),
+            route_position = pos_table(route_source_position(entity)),
+            route_tile = route_source_tile(entity),
+            status = status,
+            operational = status == "working" or status == "waiting_for_space_in_destination",
+        }
+    end
+    return nil
+end
+
+local function proven_fuel_connections(surface, force, consumer)
+    local box = consumer.bounding_box
+    if not box then return {} end
+    local search_area = {
+        {box.left_top.x - 2.5, box.left_top.y - 2.5},
+        {box.right_bottom.x + 2.5, box.right_bottom.y + 2.5},
+    }
+    local result = {}
+    for _, inserter in pairs(surface.find_entities_filtered{type = "inserter", area = search_area, force = force}) do
+        if point_in_bounding_box(inserter.drop_position, box) then
+            local pickup = inserter.pickup_position
+            local pickup_area = {{pickup.x - 0.25, pickup.y - 0.25}, {pickup.x + 0.25, pickup.y + 0.25}}
+            for _, source in pairs(surface.find_entities_filtered{area = pickup_area, force = force}) do
+                if source ~= inserter and point_in_bounding_box(pickup, source.bounding_box) then
+                    local source_record = coal_source_record(source)
+                    if source_record and source_record.operational then
+                        table.insert(result, {
+                            inserter_unit_number = inserter.unit_number,
+                            inserter_name = inserter.name,
+                            inserter_status = entity_status_string(inserter),
+                            pickup_position = pos_table(pickup),
+                            drop_position = pos_table(inserter.drop_position),
+                            source = source_record,
+                        })
+                    end
+                end
+            end
+        end
+    end
+    table.sort(result, function(a, b)
+        return tostring(a.inserter_unit_number or "") < tostring(b.inserter_unit_number or "")
+    end)
+    return result
+end
+
+local function ranked_coal_sources(origin, drills, belts, chests)
+    local result = {}
+    local function append(kind, source)
+        local copy = {}
+        for key, value in pairs(source) do copy[key] = value end
+        copy.kind = kind
+        copy.distance_sq = distance_sq(origin, source.position) or math.huge
+        if copy.operational == nil then
+            copy.operational = (copy.coal_count or 0) > 0
+                or copy.status == "working"
+                or copy.status == "waiting_for_space_in_destination"
+        end
+        table.insert(result, copy)
+    end
+    for _, source in ipairs(drills) do append("coal_drill", source) end
+    for _, source in ipairs(belts) do append("coal_belt", source) end
+    for _, source in ipairs(chests) do append("coal_chest", source) end
+    table.sort(result, function(a, b)
+        if a.operational ~= b.operational then return a.operational == true end
+        if a.distance_sq ~= b.distance_sq then return a.distance_sq < b.distance_sq end
+        if a.kind ~= b.kind then return a.kind < b.kind end
+        return tostring(a.unit_number or "") < tostring(b.unit_number or "")
+    end)
+    return result
 end
 
 local function inserter_fuel_candidates(surface, force, entity)
@@ -316,36 +415,15 @@ end
 local function enrich_actions(blocker, entity, status)
     if status == "no_fuel" then
         add_action(blocker, {
-            type = "temporary_insert_fuel",
-            tool = "insert_items",
-            unit_number = entity.unit_number,
-            inventory_type = "fuel",
-            item = "coal",
-            count = 25,
-            temporary = true,
-            description = "Temporarily buffer fuel in unit " .. tostring(entity.unit_number) .. "; then build a durable coal belt/inserter/chest feed instead of repeating hand inserts.",
-        })
-        add_action(blocker, {
             type = "build_durable_fuel_supply",
-            description = "Locate coal production/storage and route coal to this consumer with belts/inserters or a nearby chest.",
+            tool = "diagnose_fuel_sustainability",
+            description = "Locate coal production/storage and route coal to this consumer with belts and inserters. Do not hand-feed it.",
         })
     elseif status == "no_ingredients" then
-        if entity.type == "furnace" then
-            add_action(blocker, {
-                type = "insert_furnace_source",
-                tool = "insert_items",
-                unit_number = entity.unit_number,
-                inventory_type = "furnace_source",
-                item = "iron-ore",
-                count = 10,
-                description = "Insert ore into the furnace source inventory, or connect an input belt/inserter.",
-            })
-        else
-            add_action(blocker, {
-                type = "provide_ingredients",
-                description = "Inspect recipe/input inventory and provide missing ingredients.",
-            })
-        end
+        add_action(blocker, {
+            type = "build_durable_ingredient_supply",
+            description = "Inspect the recipe and connect its inputs with belts and inserters. Do not repeatedly transfer ingredients by hand.",
+        })
     elseif status == "waiting_for_space_in_destination" then
         add_action(blocker, {
             type = "clear_output",
@@ -404,17 +482,9 @@ local function summarize_power_cause(blockers, boilers)
             message = "One or more boilers in the scan area have no fuel; fix this before debugging downstream no_power entities.",
             primary_unit_number = empty_boilers[1].unit_number,
             actions = {{
-                type = "temporary_insert_fuel",
-                tool = "insert_items",
-                unit_number = empty_boilers[1].unit_number,
-                inventory_type = "fuel",
-                item = "coal",
-                count = 25,
-                temporary = true,
-                description = "Temporarily buffer boiler fuel in unit " .. tostring(empty_boilers[1].unit_number) .. ", rerun diagnostics, then build durable coal delivery.",
-            }, {
                 type = "build_durable_boiler_fuel_supply",
-                description = "Route coal from mining/storage to the boiler with a belt and inserter, or stage a coal chest beside the boiler.",
+                tool = "diagnose_fuel_sustainability",
+                description = "Route coal from mining/storage to the boiler with a belt and inserter before treating power as repaired.",
             }},
         }
     end
@@ -431,12 +501,13 @@ local function summarize_power_cause(blockers, boilers)
     }
 end
 
-function M.diagnose_factory_blockers(x1, y1, x2, y2, limit)
+function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
+    if not (surface and force) then return {error = "agent surface or force not found"} end
     limit = limit or 10
     local area = area_table(x1, y1, x2, y2)
-    local found = game.surfaces[1].find_entities_filtered{
+    local found = surface.find_entities_filtered{
         area = area,
-        force = game.forces.player,
+        force = force,
     }
     local blockers = {}
     local boilers = {}
@@ -510,13 +581,13 @@ function M.diagnose_factory_blockers(x1, y1, x2, y2, limit)
     }
 end
 
-function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
+function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
+    if not (surface and force) then return {error = "agent surface or force not found"} end
     limit = limit or 20
-    local surface = game.surfaces[1]
     local area = area_table(x1, y1, x2, y2)
     local found = surface.find_entities_filtered{
         area = area,
-        force = game.forces.player,
+        force = force,
     }
     local consumers = {}
     local coal_drills = {}
@@ -544,10 +615,9 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
                     name = entity.name,
                     type = entity.type,
                     position = pos_table(entity.position),
+                    bounding_box = bounding_box_table(entity.bounding_box),
                     status = status,
                     fuel_count = fuel_count,
-                    automated = false,
-                    issue = fuel_count == 0 and "empty_fuel" or (fuel_count < 5 and "low_fuel" or "manual_or_unknown_fuel_supply"),
                     fuel_inserter_candidates = inserter_fuel_candidates(surface, entity.force, entity),
                     durable_actions = {{
                         type = "route_coal_supply",
@@ -565,28 +635,18 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
                     route_position = pos_table(route_source_position(entity)),
                     route_tile = source_tile,
                     status = entity_status_string(entity),
+                    operational = entity_status_string(entity) == "working"
+                        or entity_status_string(entity) == "waiting_for_space_in_destination",
                 })
-            elseif entity.type == "transport-belt" then
-                local coal_count = belt_line_item_count(entity, "coal")
-                if coal_count and coal_count > 0 then
-                    table.insert(coal_belts, {
-                        unit_number = entity.unit_number,
-                        name = entity.name,
-                        position = pos_table(entity.position),
-                        coal_count = coal_count,
-                    })
-                end
+            elseif entity.type == "transport-belt"
+                or entity.type == "underground-belt"
+                or entity.type == "splitter"
+            then
+                local source = coal_source_record(entity)
+                if source and source.coal_count > 0 then table.insert(coal_belts, source) end
             elseif entity.type == "container" or entity.type == "logistic-container" then
-                local inv = first_inventory(entity, {defines.inventory.chest})
-                local coal_count = inventory_item_count(inv, "coal")
-                if coal_count and coal_count > 0 then
-                    table.insert(coal_chests, {
-                        unit_number = entity.unit_number,
-                        name = entity.name,
-                        position = pos_table(entity.position),
-                        coal_count = coal_count,
-                    })
-                end
+                local source = coal_source_record(entity)
+                if source and source.coal_count > 0 then table.insert(coal_chests, source) end
             end
         end
     end
@@ -603,29 +663,35 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
     end
 
     for _, consumer in ipairs(consumers) do
-        local nearest_drill = nearest_position(consumer.position, coal_drills)
-        local nearest_belt = nearest_position(consumer.position, coal_belts)
-        local nearest_chest = nearest_position(consumer.position, coal_chests)
-        consumer.nearest_coal_drill = nearest_drill and {
-            unit_number = nearest_drill.unit_number,
-            position = nearest_drill.position,
-            route_position = nearest_drill.route_position,
-            route_tile = nearest_drill.route_tile,
-            status = nearest_drill.status,
-        } or nil
-        consumer.nearest_coal_belt = nearest_belt and {
-            unit_number = nearest_belt.unit_number,
-            position = nearest_belt.position,
-            coal_count = nearest_belt.coal_count,
-        } or nil
-        consumer.nearest_coal_chest = nearest_chest and {
-            unit_number = nearest_chest.unit_number,
-            position = nearest_chest.position,
-            coal_count = nearest_chest.coal_count,
-        } or nil
-        local source = nearest_belt or nearest_drill or nearest_chest
-        local source_kind = nearest_belt and "coal_belt" or (nearest_drill and "coal_drill" or (nearest_chest and "coal_chest" or nil))
-        if source and consumer.fuel_inserter_candidates then
+        consumer.proven_fuel_connections = proven_fuel_connections(surface, force, consumer)
+        consumer.automated = #consumer.proven_fuel_connections > 0
+        if consumer.automated then
+            consumer.issue = consumer.fuel_count == 0 and "automated_supply_starved" or nil
+        else
+            consumer.issue = consumer.fuel_count == 0 and "empty_fuel"
+                or (consumer.fuel_count < 5 and "low_fuel" or "manual_or_unknown_fuel_supply")
+        end
+
+        local ranked_sources = ranked_coal_sources(consumer.position, coal_drills, coal_belts, coal_chests)
+        consumer.candidate_sources = {}
+        for i = 1, math.min(#ranked_sources, 8) do
+            local source = ranked_sources[i]
+            table.insert(consumer.candidate_sources, {
+                kind = source.kind,
+                unit_number = source.unit_number,
+                name = source.name,
+                position = source.position,
+                route_position = source.route_position,
+                route_tile = source.route_tile,
+                coal_count = source.coal_count,
+                status = source.status,
+                operational = source.operational,
+                distance = math.sqrt(source.distance_sq),
+            })
+        end
+
+        local source = ranked_sources[1]
+        if source and source.operational and not consumer.automated and consumer.fuel_inserter_candidates then
             for _, candidate in ipairs(consumer.fuel_inserter_candidates) do
                 if candidate.can_place_inserter then
                     local source_position = source.route_position or source.position
@@ -659,7 +725,8 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
                     consumer.ready_to_call = {
                         tool = "build_fuel_supply",
                         args = candidate.build_fuel_supply_args,
-                        source_kind = source_kind,
+                        source_kind = source.kind,
+                        source_is_proposed = true,
                         follow_up = {
                             tool = "verify_production",
                             args = {x = consumer.position.x, y = consumer.position.y, radius = 8},
@@ -674,7 +741,20 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
     local suggested_actions = {}
     if #consumers > 0 then
         local target = consumers[1]
-        if target.ready_to_call then
+        if target.automated and not target.issue then
+            table.insert(suggested_actions, {
+                type = "fuel_supply_verified",
+                target_unit_number = target.unit_number,
+                description = "An adjacent inserter with an operational coal source is feeding this consumer; no manual fuel action is needed.",
+            })
+        elseif target.automated then
+            table.insert(suggested_actions, {
+                type = "repair_upstream_coal_flow",
+                target_unit_number = target.unit_number,
+                connections = target.proven_fuel_connections,
+                description = "The fuel inserter topology exists, but the consumer is starved. Repair coal flow upstream instead of hand-feeding it.",
+            })
+        elseif target.ready_to_call then
             table.insert(suggested_actions, {
                 type = "build_fuel_supply",
                 target_unit_number = target.unit_number,
@@ -682,28 +762,7 @@ function M.diagnose_fuel_sustainability(x1, y1, x2, y2, limit)
                 args = target.ready_to_call.args,
                 follow_up = target.ready_to_call.follow_up,
                 source_kind = target.ready_to_call.source_kind,
-                description = "Call build_fuel_supply with args to route durable coal delivery to " .. tostring(target.name) .. " unit " .. tostring(target.unit_number) .. ".",
-            })
-        elseif target.nearest_coal_belt then
-            table.insert(suggested_actions, {
-                type = "connect_nearest_coal_belt",
-                target_unit_number = target.unit_number,
-                source_position = target.nearest_coal_belt.position,
-                description = "Route or extend the nearest coal belt to fuel " .. tostring(target.name) .. " unit " .. tostring(target.unit_number) .. ".",
-            })
-        elseif target.nearest_coal_drill then
-            table.insert(suggested_actions, {
-                type = "route_from_coal_drill",
-                target_unit_number = target.unit_number,
-                source_unit_number = target.nearest_coal_drill.unit_number,
-                description = "Route coal from the nearest coal drill to fuel " .. tostring(target.name) .. " unit " .. tostring(target.unit_number) .. ".",
-            })
-        elseif target.nearest_coal_chest then
-            table.insert(suggested_actions, {
-                type = "place_fuel_inserter_from_chest",
-                target_unit_number = target.unit_number,
-                source_unit_number = target.nearest_coal_chest.unit_number,
-                description = "Place an inserter from the nearest coal chest into " .. tostring(target.name) .. " unit " .. tostring(target.unit_number) .. ".",
+                description = "Build the proposed route from the nearest operational source, then verify the actual adjacent inserter and coal flow. The source is not considered durable until proven_fuel_connections reports it.",
             })
         elseif #coal_resources > 0 then
             table.insert(suggested_actions, {

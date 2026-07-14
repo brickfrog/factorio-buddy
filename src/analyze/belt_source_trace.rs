@@ -142,8 +142,8 @@ pub fn trace_belt_sources(
     // For looped belts, all sources can potentially reach any position
     if is_loop {
         // Move all lane-specific sources to "both" since items circulate
-        both_lane_sources.extend(left_lane_sources.drain(..));
-        both_lane_sources.extend(right_lane_sources.drain(..));
+        both_lane_sources.append(&mut left_lane_sources);
+        both_lane_sources.append(&mut right_lane_sources);
     }
 
     Some(BeltSourceTraceResult {
@@ -251,7 +251,7 @@ fn find_sources_for_belt(
                 if entity.name.contains("inserter") {
                     // Check if this inserter drops onto our belt
                     let inserter_dir = Direction::from_factorio(entity.direction);
-                    let drop_pos = search_pos.offset_in_direction(inserter_dir);
+                    let drop_pos = search_pos.offset_in_direction(inserter_dir.opposite());
 
                     if drop_pos == belt_pos {
                         let lane = determine_inserter_lane(search_pos, belt_pos, belt_direction);

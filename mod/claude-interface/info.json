@@ -1,6 +1,6 @@
 {
     "name": "claude-interface",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "title": "Factorio Buddy",
     "author": "factorio-buddy",
     "factorio_version": "2.0",

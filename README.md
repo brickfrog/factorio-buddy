@@ -44,6 +44,15 @@ BUDDY_HEARTBEAT_SECONDS=60 just play
 
 Set `BUDDY_HEARTBEAT_SECONDS=0` or run `just chat` for chat-only operation.
 
+## Current limitations
+
+- TODO: implement end-to-end fluid logistics. Pipe entities can be observed and
+  placed, but the NPC does not yet have a trustworthy pipe-routing, fluid-flow,
+  pump, or fluid-production verifier. It must not claim oil or chemical
+  production is automated until those checks exist.
+- Train routing and logistic-robot network planning are not yet supported as
+  complete, verified automation controllers.
+
 ## Architecture
 
 ```text

@@ -42,8 +42,13 @@ pub fn find_belt_gaps(graph: &BeltGraph, all_entities: &[Entity]) -> BeltGapResu
                     gap_type: GapType::Blocked,
                     blocker: Some(blocker.name.clone()),
                 });
-            } else {
-                // Nothing there at all - missing belt
+            } else if graph.can_receive_from(
+                &output_pos.offset_in_direction(node.direction),
+                &output_pos,
+            ) {
+                // Only call an empty tile a gap when a compatible belt resumes
+                // immediately after it. An empty terminal is a legitimate belt
+                // endpoint, not evidence of a broken line.
                 gaps.push(BeltGap {
                     from: *pos,
                     to: output_pos,
@@ -103,10 +108,7 @@ mod tests {
         let graph = BeltGraph::from_entities(&entities);
         let result = find_belt_gaps(&graph, &entities);
 
-        // Only the last belt has a "gap" (endpoint)
-        assert_eq!(result.gap_count, 1);
-        assert_eq!(result.gaps[0].gap_type, GapType::Missing);
-        assert_eq!(result.gaps[0].from, TilePos::new(2, 0));
+        assert_eq!(result.gap_count, 0);
     }
 
     #[test]
@@ -120,8 +122,7 @@ mod tests {
         let graph = BeltGraph::from_entities(&entities);
         let result = find_belt_gaps(&graph, &entities);
 
-        // Belt at (0,0) has gap, belt at (2,0) has endpoint gap
-        assert_eq!(result.gap_count, 2);
+        assert_eq!(result.gap_count, 1);
 
         let gap_0 = result
             .gaps

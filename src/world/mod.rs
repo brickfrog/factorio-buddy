@@ -250,13 +250,14 @@ pub fn entity_size(name: &str) -> (u32, u32) {
 
         // 2x2 entities
         "stone-furnace" | "steel-furnace" => (2, 2),
-        "burner-mining-drill" | "electric-mining-drill" => (2, 2),
+        "burner-mining-drill" => (2, 2),
         "boiler" => (3, 2),
         "steam-engine" => (3, 5),
         "pumpjack" => (3, 3),
 
         // 3x3 entities
         n if n.starts_with("assembling-machine") => (3, 3),
+        "electric-mining-drill" => (3, 3),
         "chemical-plant" => (3, 3),
         "electric-furnace" => (3, 3),
         "lab" => (3, 3),
@@ -274,7 +275,7 @@ pub fn entity_size(name: &str) -> (u32, u32) {
 
 /// Direction enum matching Factorio 2.0's defines.direction
 /// In Factorio 2.0, direction values are multiples of 4 for cardinal directions
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     #[default]
@@ -338,23 +339,20 @@ impl Direction {
         }
     }
 
-    /// Parse from CLI input: name (n/north), number (0-7), or factorio value (0,2,4...)
+    /// Parse a direction name or Factorio's numeric direction value.
+    ///
+    /// Numeric input is never interpreted as an ordinal index: `4` is east,
+    /// `8` is south, and `12` is west, matching `defines.direction`.
     pub fn parse(s: &str) -> Option<Self> {
-        // Try as name first
         if let Some(dir) = Self::from_name(s) {
             return Some(dir);
         }
-        // Try as simple index (0-7)
-        if let Ok(n) = s.parse::<u8>() {
-            if n <= 7 {
-                return Some(Self::from_factorio(n * 2));
-            }
-            // Try as factorio value (0,2,4,6,8,10,12,14)
-            if n <= 14 && n % 2 == 0 {
-                return Some(Self::from_factorio(n));
-            }
+        let n = s.parse::<u8>().ok()?;
+        if n <= 14 && n % 2 == 0 {
+            Some(Self::from_factorio(n))
+        } else {
+            None
         }
-        None
     }
 
     /// Get the opposite direction (180 degrees)
