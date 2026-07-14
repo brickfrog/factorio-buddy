@@ -13,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -180,10 +180,18 @@ struct ControllerLease {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct SaveIdentity {
+    size: u64,
+    digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct SaveOwner {
     version: u32,
     primary_save: String,
-    run_started_unix_ms: u64,
+    primary_identity: SaveIdentity,
+    run_id: String,
+    run_directory: String,
     clean_shutdown: bool,
 }
 
@@ -710,10 +718,7 @@ fn install_mods(write_data: &Path) -> Result<()> {
     Ok(())
 }
 
-fn newest_autosave(save: &Path) -> Result<Option<(PathBuf, SystemTime)>> {
-    let Some(directory) = save.parent() else {
-        return Ok(None);
-    };
+fn newest_autosave(directory: &Path) -> Result<Option<(PathBuf, SystemTime)>> {
     let mut newest: Option<(PathBuf, SystemTime)> = None;
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Ok(None);
@@ -763,23 +768,64 @@ fn normalized_path(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(absolute.file_name().context("path has no file name")?))
 }
 
-fn unix_millis(time: SystemTime) -> Result<u64> {
-    Ok(time
-        .duration_since(UNIX_EPOCH)
-        .context("system clock predates Unix epoch")?
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX))
+fn save_identity(path: &Path) -> Result<SaveIdentity> {
+    // A stable content identity is sufficient here: it prevents an ownership
+    // sidecar left beside one save from authorizing recovery over replacement
+    // content at the same path. Run isolation below is the stronger ownership
+    // boundary for autosaves themselves.
+    const FNV_OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const FNV_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open save identity source {}", path.display()))?;
+    let mut digest = FNV_OFFSET_BASIS;
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .context("save is too large to identify")?;
+        for byte in &buffer[..read] {
+            digest ^= u128::from(*byte);
+            digest = digest.wrapping_mul(FNV_PRIME);
+        }
+    }
+    Ok(SaveIdentity {
+        size,
+        digest: format!("fnv1a128:{digest:032x}"),
+    })
 }
 
-fn promote_owned_autosave(save: &Path, owner_path: &Path) -> Result<Option<PathBuf>> {
+fn save_owner_path(save: &Path) -> Result<PathBuf> {
+    let parent = save.parent().context("save path has no parent directory")?;
+    let mut name = save
+        .file_name()
+        .context("save path has no file name")?
+        .to_os_string();
+    name.push(".buddy-owner.json");
+    Ok(parent.join(name))
+}
+
+fn valid_run_id(run_id: &str) -> bool {
+    run_id.len() == 64 && run_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn promote_owned_autosave(
+    save: &Path,
+    owner_path: &Path,
+    managed_runs_root: &Path,
+) -> Result<Option<PathBuf>> {
     let owner: SaveOwner = match std::fs::read(owner_path) {
         Ok(encoded) => serde_json::from_slice(&encoded)
             .with_context(|| format!("invalid save ownership file {}", owner_path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if owner.version != 1 || owner.clean_shutdown {
+    if owner.version != 2 || owner.clean_shutdown {
         return Ok(None);
     }
     let requested = normalized_path(save)?;
@@ -792,12 +838,38 @@ fn promote_owned_autosave(save: &Path, owner_path: &Path) -> Result<Option<PathB
         return Ok(None);
     }
 
-    let Some((autosave, autosave_modified)) = newest_autosave(save)? else {
-        return Ok(None);
-    };
-    if unix_millis(autosave_modified)? < owner.run_started_unix_ms {
+    if save.exists() {
+        let current_identity = save_identity(save)?;
+        if current_identity.size != owner.primary_identity.size
+            || current_identity.digest != owner.primary_identity.digest
+        {
+            warn!(
+                save = %save.display(),
+                "refusing to promote an autosave over primary save content that changed outside the owned run"
+            );
+            return Ok(None);
+        }
+    }
+
+    if !valid_run_id(&owner.run_id) {
+        warn!(run_id = %owner.run_id, "refusing invalid autosave run identity");
         return Ok(None);
     }
+    let expected_run_directory = normalized_path(&managed_runs_root.join(&owner.run_id))?;
+    if Path::new(&owner.run_directory) != expected_run_directory {
+        warn!(
+            expected = %expected_run_directory.display(),
+            owner = %owner.run_directory,
+            "refusing autosaves outside the owned run directory"
+        );
+        return Ok(None);
+    }
+
+    let Some((autosave, autosave_modified)) =
+        newest_autosave(&expected_run_directory.join("saves"))?
+    else {
+        return Ok(None);
+    };
     if save.exists() {
         let save_modified = std::fs::metadata(save)?.modified()?;
         if save_modified >= autosave_modified {
@@ -850,7 +922,7 @@ fn promote_owned_autosave(save: &Path, owner_path: &Path) -> Result<Option<PathB
     Ok(Some(autosave))
 }
 
-async fn start_local_server(args: &Args) -> Result<LocalServer> {
+async fn start_local_server(args: &mut Args) -> Result<LocalServer> {
     if tokio::net::TcpStream::connect((&*args.rcon_host, args.rcon_port))
         .await
         .is_ok()
@@ -873,18 +945,6 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         .and_then(Path::parent)
         .and_then(Path::parent)
         .context("cannot derive Factorio data directory from binary path")?;
-    let config = write_data.join("config.ini");
-    atomic_write(
-        &config,
-        format!(
-            "[path]\nread-data={}\nwrite-data={}\n\n[other]\ncheck-updates=false\n",
-            data_root.join("data").display(),
-            write_data.display()
-        )
-        .as_bytes(),
-        true,
-    )?;
-
     let save = args
         .save
         .clone()
@@ -892,19 +952,40 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
     if let Some(parent) = save.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let save_owner_path = write_data.join("save-owner.json");
+    let save = normalized_path(&save)?;
+    let save_owner_path = save_owner_path(&save)?;
+    let managed_runs_root = write_data.join("managed-runs");
+    std::fs::create_dir_all(&managed_runs_root)?;
     if args.fresh && save.exists() {
         std::fs::remove_file(&save)
             .with_context(|| format!("failed to remove old save: {}", save.display()))?;
     }
     if !args.fresh {
-        promote_owned_autosave(&save, &save_owner_path)?;
+        promote_owned_autosave(&save, &save_owner_path, &managed_runs_root)?;
     }
+
+    let run_id = generate_password()?;
+    let run_directory = managed_runs_root.join(&run_id);
+    std::fs::create_dir_all(run_directory.join("saves"))?;
+    let run_directory = normalized_path(&run_directory)?;
+    let config = run_directory.join("config.ini");
+    atomic_write(
+        &config,
+        format!(
+            "[path]\nread-data={}\nwrite-data={}\n\n[other]\ncheck-updates=false\n",
+            data_root.join("data").display(),
+            run_directory.display()
+        )
+        .as_bytes(),
+        true,
+    )?;
     if !save.exists() {
         info!(save = %save.display(), "creating Factorio save");
         let status = Command::new(&factorio)
             .arg("--config")
             .arg(&config)
+            .arg("--mod-directory")
+            .arg(write_data.join("mods"))
             .arg("--create")
             .arg(&save)
             .arg("--map-gen-settings")
@@ -920,17 +1001,22 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
     }
 
     let save_owner = SaveOwner {
-        version: 1,
+        version: 2,
         primary_save: normalized_path(&save)?.to_string_lossy().into_owned(),
-        run_started_unix_ms: unix_millis(SystemTime::now())?,
+        primary_identity: save_identity(&save)?,
+        run_id,
+        run_directory: run_directory.to_string_lossy().into_owned(),
         clean_shutdown: false,
     };
     write_json_atomic(&save_owner_path, &save_owner, false)?;
+    args.script_output = Some(run_directory.join("script-output"));
 
     let mut server_command = Command::new(&factorio);
     server_command
         .arg("--config")
         .arg(&config)
+        .arg("--mod-directory")
+        .arg(write_data.join("mods"))
         .arg("--start-server")
         .arg(&save)
         .arg("--rcon-bind")
@@ -1733,7 +1819,7 @@ async fn main() -> Result<()> {
     };
     configure_rcon_password(&mut args)?;
     let mut local_server = if args.start_server {
-        Some(start_local_server(&args).await?)
+        Some(start_local_server(&mut args).await?)
     } else {
         None
     };
@@ -1749,17 +1835,34 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn write_owner(path: &Path, save: &Path, clean_shutdown: bool) {
+    const RUN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RUN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn write_owner(
+        path: &Path,
+        save: &Path,
+        managed_runs_root: &Path,
+        run_id: &str,
+        clean_shutdown: bool,
+    ) -> PathBuf {
+        let run_directory = managed_runs_root.join(run_id);
+        std::fs::create_dir_all(run_directory.join("saves")).unwrap();
         let owner = SaveOwner {
-            version: 1,
+            version: 2,
             primary_save: normalized_path(save)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            run_started_unix_ms: 0,
+            primary_identity: save_identity(save).unwrap(),
+            run_id: run_id.to_owned(),
+            run_directory: normalized_path(&run_directory)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             clean_shutdown,
         };
         write_json_atomic(path, &owner, false).unwrap();
+        run_directory
     }
 
     fn append(path: &Path, contents: &[u8]) {
@@ -2091,16 +2194,17 @@ mod tests {
     fn resume_promotes_only_owned_newer_autosave_and_preserves_stale_primary() {
         let directory = tempfile::tempdir().expect("tempdir");
         let save = directory.path().join("buddy.zip");
-        let autosave = directory.path().join("_autosave2.zip");
-        let owner = directory.path().join("save-owner.json");
+        let managed_runs = directory.path().join("managed-runs");
+        let owner = save_owner_path(&save).unwrap();
         std::fs::write(&save, b"stale").expect("write primary");
+        let run = write_owner(&owner, &save, &managed_runs, RUN_A, false);
+        let autosave = run.join("saves/_autosave2.zip");
         std::thread::sleep(Duration::from_millis(10));
         std::fs::write(&autosave, b"newer").expect("write autosave");
-        write_owner(&owner, &save, false);
 
         assert_eq!(
-            promote_owned_autosave(&save, &owner).unwrap(),
-            Some(autosave)
+            promote_owned_autosave(&save, &owner, &managed_runs).unwrap(),
+            Some(autosave.clone())
         );
         assert_eq!(std::fs::read(&save).unwrap(), b"newer");
         assert_eq!(
@@ -2114,41 +2218,78 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let save = directory.path().join("buddy.zip");
         let other = directory.path().join("other.zip");
-        let autosave = directory.path().join("_autosave1.zip");
-        let owner = directory.path().join("save-owner.json");
+        let managed_runs = directory.path().join("managed-runs");
+        let owner = save_owner_path(&save).unwrap();
         std::fs::write(&save, b"current").unwrap();
         std::fs::write(&other, b"other").unwrap();
+
+        let run = write_owner(&owner, &save, &managed_runs, RUN_A, true);
+        let autosave = run.join("saves/_autosave1.zip");
         std::thread::sleep(Duration::from_millis(10));
         std::fs::write(&autosave, b"new autosave").unwrap();
 
-        write_owner(&owner, &save, true);
-        assert_eq!(promote_owned_autosave(&save, &owner).unwrap(), None);
-        write_owner(&owner, &other, false);
-        assert_eq!(promote_owned_autosave(&save, &owner).unwrap(), None);
+        assert_eq!(
+            promote_owned_autosave(&save, &owner, &managed_runs).unwrap(),
+            None
+        );
+        write_owner(&owner, &other, &managed_runs, RUN_B, false);
+        assert_eq!(
+            promote_owned_autosave(&save, &owner, &managed_runs).unwrap(),
+            None
+        );
         assert_eq!(std::fs::read(&save).unwrap(), b"current");
         assert!(!directory.path().join("buddy.previous.zip").exists());
     }
 
     #[test]
-    fn resume_refuses_autosaves_that_predate_the_owned_run() {
+    fn resume_refuses_recovery_over_replaced_primary_content() {
         let directory = tempfile::tempdir().unwrap();
         let save = directory.path().join("buddy.zip");
-        let autosave = directory.path().join("_autosave1.zip");
-        let owner_path = directory.path().join("save-owner.json");
+        let managed_runs = directory.path().join("managed-runs");
+        let owner_path = save_owner_path(&save).unwrap();
         std::fs::write(&save, b"current").unwrap();
-        std::fs::write(&autosave, b"unrelated older run").unwrap();
-        let owner = SaveOwner {
-            version: 1,
-            primary_save: normalized_path(&save)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            run_started_unix_ms: u64::MAX,
-            clean_shutdown: false,
-        };
-        write_json_atomic(&owner_path, &owner, false).unwrap();
+        let run = write_owner(&owner_path, &save, &managed_runs, RUN_A, false);
+        std::fs::write(&save, b"replacement save").unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(run.join("saves/_autosave1.zip"), b"owned autosave").unwrap();
 
-        assert_eq!(promote_owned_autosave(&save, &owner_path).unwrap(), None);
-        assert_eq!(std::fs::read(&save).unwrap(), b"current");
+        assert_eq!(
+            promote_owned_autosave(&save, &owner_path, &managed_runs).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read(&save).unwrap(), b"replacement save");
+    }
+
+    #[test]
+    fn per_primary_sidecars_and_run_namespaces_prevent_competing_save_contamination() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed_runs = directory.path().join("managed-runs");
+        let save_a = directory.path().join("alpha.zip");
+        let save_b = directory.path().join("beta.zip");
+        std::fs::write(&save_a, b"alpha primary").unwrap();
+        std::fs::write(&save_b, b"beta primary").unwrap();
+        let owner_a = save_owner_path(&save_a).unwrap();
+        let owner_b = save_owner_path(&save_b).unwrap();
+        assert_ne!(owner_a, owner_b);
+
+        let run_a = write_owner(&owner_a, &save_a, &managed_runs, RUN_A, false);
+        let run_b = write_owner(&owner_b, &save_b, &managed_runs, RUN_B, false);
+        std::thread::sleep(Duration::from_millis(10));
+        let autosave_a = run_a.join("saves/_autosave1.zip");
+        std::fs::write(&autosave_a, b"alpha autosave").unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(run_b.join("saves/_autosave3.zip"), b"newer beta autosave").unwrap();
+        std::fs::write(
+            directory.path().join("_autosave9.zip"),
+            b"shared contamination",
+        )
+        .unwrap();
+
+        assert_eq!(
+            promote_owned_autosave(&save_a, &owner_a, &managed_runs).unwrap(),
+            Some(autosave_a)
+        );
+        assert_eq!(std::fs::read(&save_a).unwrap(), b"alpha autosave");
+        assert_eq!(std::fs::read(&save_b).unwrap(), b"beta primary");
     }
 }

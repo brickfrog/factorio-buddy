@@ -507,20 +507,45 @@ local function process_walk_states()
     end
 end
 
--- Step queued walk targets for agent characters each tick.
--- Processed in on_tick for deterministic multiplayer behavior.
+local WALK_DIRECTION_THRESHOLD = 0.41421356237 -- tan(22.5 degrees)
+
+local function walk_direction_toward(dx, dy)
+    local abs_dx = math.abs(dx)
+    local abs_dy = math.abs(dy)
+
+    if abs_dy <= abs_dx * WALK_DIRECTION_THRESHOLD then
+        return dx >= 0 and defines.direction.east or defines.direction.west
+    end
+    if abs_dx <= abs_dy * WALK_DIRECTION_THRESHOLD then
+        return dy >= 0 and defines.direction.south or defines.direction.north
+    end
+    if dx >= 0 then
+        return dy >= 0 and defines.direction.southeast or defines.direction.northeast
+    end
+    return dy >= 0 and defines.direction.southwest or defines.direction.northwest
+end
+
+local function stop_target_walk(agent_id, character)
+    storage.walk_targets[agent_id] = nil
+    if storage.walk_state then storage.walk_state[agent_id] = nil end
+    if character and character.valid then
+        character.walking_state = {walking = false}
+    end
+end
+
+-- Drive queued targets through the character's ordinary Factorio walking state.
+-- Factorio applies movement and collision; this tick handler only chooses a
+-- direction, detects arrival/stalls, and reliably stops cancelled/expired walks.
 local function process_walk_targets()
     if not storage.walk_targets then return end
     for agent_id, tgt in pairs(storage.walk_targets) do
         local c = find_factorioctl_character(agent_id)
         if not (c and c.valid) then
-            storage.walk_targets[agent_id] = nil
-            if storage.walk_state then storage.walk_state[agent_id] = nil end
+            stop_target_walk(agent_id, nil)
             goto continue
         end
         if tgt.expires_tick and game.tick >= tgt.expires_tick then
-            storage.walk_targets[agent_id] = nil
-            c.walking_state = {walking = false}
+            stop_target_walk(agent_id, c)
             goto continue
         end
 
@@ -528,29 +553,17 @@ local function process_walk_targets()
         local dy = tgt.y - c.position.y
         local dist = math.sqrt(dx * dx + dy * dy)
         local sp = c.character_running_speed or 0.15
+        local arrival_distance = math.max(0.2, sp * 1.5)
 
-        if dist <= sp then
-            c.teleport({tgt.x, tgt.y})
-            storage.walk_targets[agent_id] = nil
-            c.walking_state = {walking = false}
+        if dist <= arrival_distance then
+            stop_target_walk(agent_id, c)
         else
             local last_x = tgt.last_x or c.position.x
             local last_y = tgt.last_y or c.position.y
-            local nx = c.position.x + (dx / dist) * sp
-            local ny = c.position.y + (dy / dist) * sp
-            if not c.teleport({nx, ny}) then
-                if not c.teleport({nx, c.position.y}) then
-                    c.teleport({c.position.x, ny})
-                end
-            end
-
-            -- Teleport is the ONLY mover. Never set walking_state.walking = true:
-            -- the engine then physically walks the orphan character cardinally on
-            -- top of the teleport, and on expiry/stuck clears it keeps walking for
-            -- hundreds of tiles (the "positional discontinuity" runaway).
-            c.walking_state = {walking = false}
-
-            local moved = math.sqrt((c.position.x - last_x) * (c.position.x - last_x) + (c.position.y - last_y) * (c.position.y - last_y))
+            local moved = math.sqrt(
+                (c.position.x - last_x) * (c.position.x - last_x)
+                    + (c.position.y - last_y) * (c.position.y - last_y)
+            )
             if moved < 0.001 then
                 tgt.stuck_ticks = (tgt.stuck_ticks or 0) + 1
             else
@@ -559,8 +572,12 @@ local function process_walk_targets()
             tgt.last_x = c.position.x
             tgt.last_y = c.position.y
             if tgt.stuck_ticks >= 120 then
-                storage.walk_targets[agent_id] = nil
-                c.walking_state = {walking = false}
+                stop_target_walk(agent_id, c)
+            else
+                c.walking_state = {
+                    walking = true,
+                    direction = walk_direction_toward(dx, dy),
+                }
             end
         end
 
@@ -1836,6 +1853,24 @@ local function set_recipe_impl(agent_id, unit_number, recipe)
     return {success = true}
 end
 
+local function get_entity_recipe_impl(unit_number)
+    local entity = entities.find_by_unit_number(unit_number)
+    if not entity then
+        return {success = false, error = "Entity not found"}
+    end
+    local ok, recipe = pcall(function()
+        if not entity.get_recipe then return nil end
+        return entity.get_recipe()
+    end)
+    if not ok then
+        return {success = false, error = tostring(recipe)}
+    end
+    return {
+        success = true,
+        recipe = recipe and recipe.name or nil,
+    }
+end
+
 local function get_entity_inventory_impl(unit_number)
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
@@ -2052,7 +2087,7 @@ local api = {
         storage.walk_state[agent_id] = {walking = false}
     end,
 
-    -- Set target position for deterministic agent step-walking (processed in on_tick)
+    -- Set a target for ordinary character walking (processed in on_tick)
     set_walk_target = function(agent_id, x, y)
         return json_remote_call("set_walk_target", characters.set_walk_target, agent_id, x, y)
     end,
@@ -2360,6 +2395,10 @@ local api = {
 
     set_recipe = function(agent_id, unit_number, recipe)
         return json_remote_call("set_recipe", set_recipe_impl, agent_id, unit_number, recipe)
+    end,
+
+    get_entity_recipe = function(unit_number)
+        return json_remote_call("get_entity_recipe", get_entity_recipe_impl, unit_number)
     end,
 
     get_entity_inventory = function(unit_number)

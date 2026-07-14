@@ -33,6 +33,9 @@ pub fn find_belt_gaps(graph: &BeltGraph, all_entities: &[Entity]) -> BeltGapResu
                         target_belt.belt_type, target_belt.direction
                     )),
                 });
+            } else if graph.unsupported_at(&output_pos).is_some() {
+                // Unsupported transport is neither a proven gap nor a proven
+                // connection. analysis_scope carries the fail-closed evidence.
             } else if let Some(blocker) = entity_at.get(&output_pos) {
                 // Non-belt entity blocking the path
                 gaps.push(BeltGap {
@@ -59,7 +62,10 @@ pub fn find_belt_gaps(graph: &BeltGraph, all_entities: &[Entity]) -> BeltGapResu
         }
     }
 
+    let certified_gap_free = gaps.is_empty() && graph.analysis_scope().connectivity_model_complete;
     BeltGapResult {
+        analysis_scope: graph.analysis_scope().clone(),
+        certified_gap_free,
         gap_count: gaps.len() as u32,
         gaps,
     }
@@ -108,6 +114,32 @@ mod tests {
         let result = find_belt_gaps(&graph, &entities);
 
         assert_eq!(result.gap_count, 0);
+        assert!(result.certified_gap_free);
+    }
+
+    #[test]
+    fn legitimate_terminal_endpoint_is_not_a_gap() {
+        let entities = vec![make_belt(0, 0, Direction::East)];
+        let graph = BeltGraph::from_entities(&entities);
+        let result = find_belt_gaps(&graph, &entities);
+
+        assert!(result.gaps.is_empty());
+        assert!(result.certified_gap_free);
+    }
+
+    #[test]
+    fn unsupported_transport_prevents_gap_free_certification() {
+        let mut underground = make_belt(1, 0, Direction::East);
+        underground.name = "underground-belt".to_string();
+        underground.entity_type = Some("underground-belt".to_string());
+        let entities = vec![make_belt(0, 0, Direction::East), underground];
+        let graph = BeltGraph::from_entities(&entities);
+        let result = find_belt_gaps(&graph, &entities);
+
+        assert!(result.gaps.is_empty());
+        assert!(!result.certified_gap_free);
+        assert!(!result.analysis_scope.connectivity_model_complete);
+        assert_eq!(result.analysis_scope.unsupported_transports.len(), 1);
     }
 
     #[test]

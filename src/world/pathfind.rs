@@ -969,6 +969,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn belt_route_state_distinguishes_arrival_direction_at_same_tile() {
+        let east = BeltRouteState {
+            pos: GridPos::new(4, 7),
+            arrival: Some(Direction::East),
+        };
+        let north = BeltRouteState {
+            pos: GridPos::new(4, 7),
+            arrival: Some(Direction::North),
+        };
+        let mut states = HashSet::new();
+        states.insert(east);
+        states.insert(north);
+
+        assert_ne!(east, north);
+        assert_eq!(states.len(), 2);
+    }
+
+    #[test]
     fn test_grid_pos_manhattan_distance() {
         let a = GridPos::new(0, 0);
         let b = GridPos::new(3, 4);

@@ -1,6 +1,7 @@
 //! Belt graph data structure for connectivity analysis
 
-use crate::world::{Direction, Entity, TilePos};
+use super::{BeltAnalysisScope, UnsupportedTransport, UnsupportedTransportReason};
+use crate::world::{entity_occupied_tiles, Direction, Entity, TilePos};
 use std::collections::HashMap;
 
 /// A belt entity with connectivity information
@@ -42,16 +43,22 @@ pub struct BeltGraph {
     downstream: HashMap<TilePos, Vec<TilePos>>,
     /// Reverse edges: position -> upstream positions that feed this belt
     upstream: HashMap<TilePos, Vec<TilePos>>,
+    /// Explicit record of exact and unsupported transport entities.
+    analysis_scope: BeltAnalysisScope,
 }
 
 impl BeltGraph {
     /// Build belt graph from a list of entities
     pub fn from_entities(entities: &[Entity]) -> Self {
         let mut nodes = HashMap::new();
+        let mut unsupported_transports = Vec::new();
 
         // First pass: collect all belt nodes
         for entity in entities {
             if !is_surface_transport_belt(entity) {
+                if let Some(unsupported) = unsupported_transport(entity) {
+                    unsupported_transports.push(unsupported);
+                }
                 continue;
             }
 
@@ -93,10 +100,31 @@ impl BeltGraph {
             }
         }
 
+        unsupported_transports.sort_by(|left, right| {
+            (
+                left.position.x,
+                left.position.y,
+                &left.name,
+                left.unit_number,
+            )
+                .cmp(&(
+                    right.position.x,
+                    right.position.y,
+                    &right.name,
+                    right.unit_number,
+                ))
+        });
+        let analysis_scope = BeltAnalysisScope {
+            connectivity_model_complete: unsupported_transports.is_empty(),
+            modeled_surface_belts: nodes.len() as u32,
+            unsupported_transports,
+        };
+
         Self {
             nodes,
             downstream,
             upstream,
+            analysis_scope,
         }
     }
 
@@ -150,6 +178,19 @@ impl BeltGraph {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+
+    /// Completeness evidence for analyses derived from this graph.
+    pub fn analysis_scope(&self) -> &BeltAnalysisScope {
+        &self.analysis_scope
+    }
+
+    /// Unsupported transport occupying a given tile, if any.
+    pub fn unsupported_at(&self, pos: &TilePos) -> Option<&UnsupportedTransport> {
+        self.analysis_scope
+            .unsupported_transports
+            .iter()
+            .find(|transport| transport.occupied_tiles.contains(pos))
+    }
 }
 
 /// Whether an entity can be modeled exactly by the one-tile belt graph.
@@ -162,8 +203,49 @@ pub fn is_surface_transport_belt(entity: &Entity) -> bool {
     entity.entity_type.as_deref() == Some("transport-belt")
         && matches!(
             entity.name.as_str(),
-            "transport-belt" | "fast-transport-belt" | "express-transport-belt"
+            "transport-belt"
+                | "fast-transport-belt"
+                | "express-transport-belt"
+                | "turbo-transport-belt"
         )
+}
+
+/// Whether an entity participates in item transport but is either modeled or
+/// deliberately reported as unsupported by the static belt graph.
+pub fn is_transport_entity(entity: &Entity) -> bool {
+    is_surface_transport_belt(entity) || unsupported_transport(entity).is_some()
+}
+
+fn unsupported_transport(entity: &Entity) -> Option<UnsupportedTransport> {
+    let entity_type = entity.entity_type.as_deref().unwrap_or("unknown");
+    let reason = match entity_type {
+        "splitter" => UnsupportedTransportReason::SplitterSemanticsNotModeled,
+        "underground-belt" => UnsupportedTransportReason::UndergroundPairingNotModeled,
+        "loader" | "loader-1x1" => UnsupportedTransportReason::LoaderSemanticsNotModeled,
+        "linked-belt" => UnsupportedTransportReason::LinkedBeltPairingNotModeled,
+        "transport-belt" => UnsupportedTransportReason::UnsupportedTransportPrototype,
+        _ if transport_like_name(&entity.name) => {
+            UnsupportedTransportReason::UnsupportedTransportPrototype
+        }
+        _ => return None,
+    };
+
+    Some(UnsupportedTransport {
+        unit_number: entity.unit_number,
+        name: entity.name.clone(),
+        entity_type: entity_type.to_string(),
+        position: entity.position.to_tile(),
+        occupied_tiles: entity_occupied_tiles(entity),
+        reason,
+    })
+}
+
+fn transport_like_name(name: &str) -> bool {
+    name.ends_with("transport-belt")
+        || name.ends_with("underground-belt")
+        || name.ends_with("splitter")
+        || name.ends_with("loader")
+        || name.ends_with("linked-belt")
 }
 
 #[cfg(test)]
@@ -244,5 +326,67 @@ mod tests {
 
         assert_eq!(graph.len(), 1);
         assert!(graph.downstream_of(&TilePos::new(0, 0)).is_empty());
+        assert!(!graph.analysis_scope().connectivity_model_complete);
+        assert_eq!(graph.analysis_scope().modeled_surface_belts, 1);
+        assert_eq!(graph.analysis_scope().unsupported_transports.len(), 2);
+        assert_eq!(
+            graph.analysis_scope().unsupported_transports[0].reason,
+            UnsupportedTransportReason::UndergroundPairingNotModeled
+        );
+        assert_eq!(
+            graph.analysis_scope().unsupported_transports[1].reason,
+            UnsupportedTransportReason::SplitterSemanticsNotModeled
+        );
+    }
+
+    #[test]
+    fn all_surface_transport_belt_tiers_are_modeled() {
+        let entities = [
+            "transport-belt",
+            "fast-transport-belt",
+            "express-transport-belt",
+            "turbo-transport-belt",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(x, name)| {
+            let mut belt = make_belt(x as i32, 0, Direction::East);
+            belt.name = name.to_string();
+            belt
+        })
+        .collect::<Vec<_>>();
+        let graph = BeltGraph::from_entities(&entities);
+
+        assert_eq!(graph.len(), 4);
+        assert!(graph.analysis_scope().connectivity_model_complete);
+        assert!(graph.analysis_scope().unsupported_transports.is_empty());
+        assert_eq!(graph.analysis_scope().modeled_surface_belts, 4);
+        assert_eq!(
+            graph.downstream_of(&TilePos::new(0, 0)),
+            &[TilePos::new(1, 0)]
+        );
+        assert_eq!(
+            graph.downstream_of(&TilePos::new(1, 0)),
+            &[TilePos::new(2, 0)]
+        );
+        assert_eq!(
+            graph.downstream_of(&TilePos::new(2, 0)),
+            &[TilePos::new(3, 0)]
+        );
+    }
+
+    #[test]
+    fn unknown_transport_belt_prototype_is_reported_not_silently_ignored() {
+        let mut belt = make_belt(0, 0, Direction::East);
+        belt.name = "modded-ultra-transport-belt".to_string();
+        let graph = BeltGraph::from_entities(&[belt]);
+
+        assert!(graph.is_empty());
+        assert!(!graph.analysis_scope().connectivity_model_complete);
+        assert_eq!(graph.analysis_scope().unsupported_transports.len(), 1);
+        assert_eq!(
+            graph.analysis_scope().unsupported_transports[0].reason,
+            UnsupportedTransportReason::UnsupportedTransportPrototype
+        );
     }
 }

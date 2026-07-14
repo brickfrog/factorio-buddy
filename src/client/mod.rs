@@ -1266,6 +1266,31 @@ impl FactorioClient {
         Ok(())
     }
 
+    /// Get the recipe currently configured on a crafting machine, if any.
+    pub async fn get_entity_recipe(&mut self, unit_number: u32) -> Result<Option<String>> {
+        let response = self
+            .call_remote("get_entity_recipe", &[json!(unit_number)])
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct EntityRecipeResponse {
+            success: bool,
+            #[serde(default)]
+            recipe: Option<String>,
+            #[serde(default)]
+            error: Option<String>,
+        }
+        let result: EntityRecipeResponse = serde_json::from_str(&response)?;
+        if !result.success {
+            anyhow::bail!(
+                "{}",
+                result
+                    .error
+                    .unwrap_or_else(|| "failed to read entity recipe".to_string())
+            );
+        }
+        Ok(result.recipe)
+    }
+
     pub async fn feed_lab_from_inventory(
         &mut self,
         lab_unit_number: u32,

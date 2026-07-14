@@ -55,6 +55,12 @@ test-live: build
         FACTORIO_RCON_PORT=27016 \
         FACTORIO_RCON_PASSWORD=test_password \
         ./scripts/smoke_agent_binding.sh
+    RCON_PORT=27016 ./tests/cleanup.sh
+    FACTORIO_BIN="${FACTORIO_BIN:-/mnt/games/SteamLibrary/steamapps/common/Factorio/bin/x64/factorio}" \
+        BUDDY_BIN="$PWD/target/release/buddy" \
+        FACTORIO_MCP_BIN="$PWD/target/release/mcp" \
+        BUDDY_HEARTBEAT_SECONDS=0 \
+        ./tests/buddy_runtime.sh
 
 doctor:
     @command -v claude >/dev/null && echo "ok  claude  $(claude --version)" || echo "!!  claude CLI missing"

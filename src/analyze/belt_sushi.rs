@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use super::BeltGraph;
+use super::{BeltAnalysisScope, BeltGraph};
 use crate::world::{BeltLaneContentsResult, TilePos};
 
 /// Classification of how items are mixed on a belt
@@ -40,6 +40,8 @@ pub struct BeltMixAnalysis {
 /// Result of sushi belt detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SushiDetectionResult {
+    /// Exact-model coverage for loop detection.
+    pub analysis_scope: BeltAnalysisScope,
     /// Belts with sushi (multiple items on same lane)
     pub sushi_belts: Vec<BeltMixAnalysis>,
     /// Belts with lane separation (different items per lane)
@@ -104,6 +106,7 @@ pub fn detect_sushi_belts(
     let looping_networks = detect_loops(graph);
 
     SushiDetectionResult {
+        analysis_scope: graph.analysis_scope().clone(),
         sushi_belt_count: sushi_belts.len() as u32,
         lane_separated_count: lane_separated_belts.len() as u32,
         pure_belt_count: pure_belts.len() as u32,

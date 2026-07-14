@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use super::BeltGraph;
+use super::{is_transport_entity, BeltAnalysisScope, BeltGraph};
 use crate::world::{Direction, Entity, TilePos};
 
 /// Type of entity that can be a source of items on a belt
@@ -52,6 +52,8 @@ pub struct ItemSource {
 /// Result of tracing sources for a belt position
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeltSourceTraceResult {
+    /// Whether every transport entity in the analyzed input was modeled.
+    pub analysis_scope: BeltAnalysisScope,
     /// Starting position for the trace
     pub origin: TilePos,
     /// Sources that feed the left lane
@@ -147,6 +149,7 @@ pub fn trace_belt_sources(
     }
 
     Some(BeltSourceTraceResult {
+        analysis_scope: graph.analysis_scope().clone(),
         origin,
         left_lane_sources,
         right_lane_sources,
@@ -222,8 +225,10 @@ fn find_sources_for_belt(
             let check_pos = TilePos::new(belt_pos.x + dx, belt_pos.y + dy);
             if let Some(entities) = entity_map.get(&check_pos) {
                 for entity in entities {
-                    // Skip belts - they're handled by the graph
-                    if entity.name.contains("belt") {
+                    // Every transport entity is handled by the exact graph or
+                    // reported in analysis_scope. Never guess splitter or
+                    // underground endpoint behavior here.
+                    if is_transport_entity(entity) {
                         continue;
                     }
 
@@ -328,38 +333,6 @@ fn entity_to_source(
         "inserter" => {
             // Already handled in find_sources_for_belt
             None
-        }
-        "splitter" => {
-            Some(ItemSource {
-                position: entity_pos,
-                output_position: Some(belt_pos),
-                source_type: ItemSourceType::Splitter,
-                entity_name: entity.name.clone(),
-                unit_number: entity.unit_number,
-                target_lane: None, // Splitters output to both lanes
-                possible_items: vec![],
-                pickup_from: None,
-            })
-        }
-        "underground-belt" => {
-            // Check if this is an exit (output mode)
-            let ub_dir = Direction::from_factorio(entity.direction);
-            let output_pos = entity_pos.offset_in_direction(ub_dir);
-
-            if output_pos == belt_pos {
-                Some(ItemSource {
-                    position: entity_pos,
-                    output_position: Some(output_pos),
-                    source_type: ItemSourceType::UndergroundBeltExit,
-                    entity_name: entity.name.clone(),
-                    unit_number: entity.unit_number,
-                    target_lane: None,
-                    possible_items: vec![],
-                    pickup_from: None,
-                })
-            } else {
-                None
-            }
         }
         _ => None,
     }

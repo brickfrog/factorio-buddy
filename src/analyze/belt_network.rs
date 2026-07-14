@@ -68,6 +68,7 @@ pub fn find_belt_networks(graph: &BeltGraph) -> BeltNetworkResult {
     let total_belts = networks.iter().map(|n| n.belt_count).sum();
 
     BeltNetworkResult {
+        analysis_scope: graph.analysis_scope().clone(),
         total_networks: networks.len() as u32,
         total_belts,
         networks,
@@ -135,5 +136,25 @@ mod tests {
 
         assert_eq!(result.total_networks, 0);
         assert_eq!(result.total_belts, 0);
+    }
+
+    #[test]
+    fn network_totals_disclose_unsupported_transport_scope() {
+        let mut splitter = make_belt(2, 0, Direction::East);
+        splitter.name = "splitter".to_string();
+        splitter.entity_type = Some("splitter".to_string());
+        let entities = vec![
+            make_belt(0, 0, Direction::East),
+            make_belt(1, 0, Direction::East),
+            splitter,
+        ];
+        let graph = BeltGraph::from_entities(&entities);
+        let result = find_belt_networks(&graph);
+
+        assert_eq!(result.total_networks, 1);
+        assert_eq!(result.total_belts, 2);
+        assert!(!result.analysis_scope.connectivity_model_complete);
+        assert_eq!(result.analysis_scope.modeled_surface_belts, 2);
+        assert_eq!(result.analysis_scope.unsupported_transports.len(), 1);
     }
 }

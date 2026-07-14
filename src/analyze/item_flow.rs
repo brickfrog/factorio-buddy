@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
-use super::{analyze_inserters, BeltGraph, BeltReachResult, GapType, InserterAnalysis};
+use super::{
+    analyze_inserters, BeltAnalysisScope, BeltGraph, BeltReachResult, GapType, InserterAnalysis,
+    UnsupportedTransport,
+};
 use crate::world::{BeltLaneSummary, Direction, Entity, InventoryItem, TilePos};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +61,10 @@ pub struct ItemFlowBeltItems {
 pub struct ItemFlowReport {
     pub status: String,
     pub connected: bool,
+    /// True only when connectivity was proven without unsupported transport semantics.
+    pub connectivity_certified: bool,
+    /// Exact-model coverage for all transport entities in the analyzed input.
+    pub analysis_scope: BeltAnalysisScope,
     pub source: ItemFlowEndpoint,
     pub target: ItemFlowEndpoint,
     pub source_belt_tile: Option<TilePos>,
@@ -97,6 +104,8 @@ pub fn analyze_item_flow(
     let mut report = ItemFlowReport {
         status: "blocked".to_string(),
         connected: false,
+        connectivity_certified: false,
+        analysis_scope: graph.analysis_scope().clone(),
         source: source.endpoint,
         target: target.endpoint,
         source_belt_tile: source.belt_tile,
@@ -109,6 +118,15 @@ pub fn analyze_item_flow(
         guidance: "Fix repair first, then rerun analyze_item_flow and verify_production."
             .to_string(),
     };
+
+    if let Some(unsupported) = source.unsupported_transport {
+        mark_unsupported_endpoint(&mut report, unsupported, "source");
+        return report;
+    }
+    if let Some(unsupported) = target.unsupported_transport {
+        mark_unsupported_endpoint(&mut report, unsupported, "target");
+        return report;
+    }
 
     let Some(source_belt) = source.belt_tile else {
         let repair = ItemFlowRepair {
@@ -164,11 +182,19 @@ pub fn analyze_item_flow(
     if source_belt == target_belt || reach.downstream.contains(&target_belt) {
         report.status = "connected".to_string();
         report.connected = true;
+        report.connectivity_certified = true;
         report.guidance = "Source belt reaches target belt. If production is still blocked, inspect inserter power/filtering and target inventory.".to_string();
         return report;
     }
 
     let first_break = first_reachable_break(&graph, entities, &report.reachable_belts, target_belt);
+    if first_break
+        .as_ref()
+        .is_some_and(|breakage| breakage.reason == "unsupported_transport")
+    {
+        report.status = "unsupported_transport".to_string();
+        report.guidance = "Static analysis stopped at an unsupported splitter, underground belt, loader, or linked belt. Inspect live endpoint/pairing state; no connectivity claim or automatic repair is safe from this model.".to_string();
+    }
     report.repair = first_break.as_ref().and_then(|b| b.repair.clone());
     report.first_break = first_break;
     report
@@ -188,6 +214,7 @@ enum EndpointRole {
 struct ResolvedEndpoint {
     endpoint: ItemFlowEndpoint,
     belt_tile: Option<TilePos>,
+    unsupported_transport: Option<UnsupportedTransport>,
 }
 
 fn resolve_endpoint(
@@ -237,7 +264,28 @@ fn resolve_endpoint(
             ..endpoint
         },
         belt_tile,
+        unsupported_transport: graph.unsupported_at(&endpoint.position).cloned(),
     }
+}
+
+fn mark_unsupported_endpoint(
+    report: &mut ItemFlowReport,
+    unsupported: UnsupportedTransport,
+    endpoint_role: &str,
+) {
+    report.status = "unsupported_transport".to_string();
+    report.guidance = format!(
+        "Cannot certify {endpoint_role} connectivity through {}: {:?}. Inspect the live transport topology instead of treating omitted entities as connected.",
+        unsupported.name, unsupported.reason
+    );
+    report.first_break = Some(ItemFlowBreak {
+        from: unsupported.position,
+        to: unsupported.position,
+        reason: "unsupported_transport".to_string(),
+        blocker: Some(unsupported.name),
+        repair: None,
+    });
+    report.repair = None;
 }
 
 fn source_belt_from_inserter(
@@ -300,6 +348,7 @@ fn downstream_reach(graph: &BeltGraph, source_belt: TilePos) -> BeltReachResult 
     }
 
     BeltReachResult {
+        analysis_scope: graph.analysis_scope().clone(),
         origin: source_belt,
         upstream: Vec::new(),
         upstream_endpoints: Vec::new(),
@@ -368,6 +417,18 @@ fn first_reachable_break(
                 return None;
             }
             let to = node.output_tile();
+            if let Some(unsupported) = graph.unsupported_at(&to) {
+                return Some((
+                    (to.x - target.x).abs() + (to.y - target.y).abs(),
+                    ItemFlowBreak {
+                        from: *from,
+                        to,
+                        reason: "unsupported_transport".to_string(),
+                        blocker: Some(unsupported.name.clone()),
+                        repair: None,
+                    },
+                ));
+            }
             let blocker = entities.iter().find(|e| e.position.to_tile() == to);
             let reason = match blocker {
                 Some(entity) if entity.name.contains("belt") => "wrong_direction",
@@ -480,6 +541,7 @@ fn first_reachable_break(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyze::UnsupportedTransportReason;
     use crate::world::{Entity, LaneContents, Position};
 
     fn belt(x: i32, y: i32, direction: Direction) -> Entity {
@@ -487,6 +549,25 @@ mod tests {
             unit_number: Some((1000 + x * 10 + y) as u32),
             name: "transport-belt".to_string(),
             entity_type: Some("transport-belt".to_string()),
+            position: Position::new(x as f64 + 0.5, y as f64 + 0.5),
+            direction: direction.to_factorio(),
+            health: Some(100.0),
+            force: Some("player".to_string()),
+            bounding_box: None,
+        }
+    }
+
+    fn unsupported_transport(
+        x: i32,
+        y: i32,
+        direction: Direction,
+        name: &str,
+        entity_type: &str,
+    ) -> Entity {
+        Entity {
+            unit_number: Some((2000 + x * 10 + y) as u32),
+            name: name.to_string(),
+            entity_type: Some(entity_type.to_string()),
             position: Position::new(x as f64 + 0.5, y as f64 + 0.5),
             direction: direction.to_factorio(),
             health: Some(100.0),
@@ -511,8 +592,63 @@ mod tests {
         );
 
         assert!(report.connected);
+        assert!(report.connectivity_certified);
         assert_eq!(report.status, "connected");
         assert!(report.repair.is_none());
+    }
+
+    #[test]
+    fn underground_network_fails_closed_with_explicit_scope_evidence() {
+        let entities = vec![
+            belt(0, 0, Direction::East),
+            unsupported_transport(
+                1,
+                0,
+                Direction::East,
+                "underground-belt",
+                "underground-belt",
+            ),
+            belt(4, 0, Direction::East),
+        ];
+
+        let report = analyze_item_flow(
+            &entities,
+            &[],
+            EntityLookup::Tile(TilePos::new(0, 0)),
+            EntityLookup::Tile(TilePos::new(4, 0)),
+        );
+
+        assert!(!report.connected);
+        assert!(!report.connectivity_certified);
+        assert_eq!(report.status, "unsupported_transport");
+        assert_eq!(
+            report.first_break.as_ref().map(|b| b.reason.as_str()),
+            Some("unsupported_transport")
+        );
+        assert!(report.repair.is_none());
+        assert!(!report.analysis_scope.connectivity_model_complete);
+        assert_eq!(report.analysis_scope.unsupported_transports.len(), 1);
+    }
+
+    #[test]
+    fn splitter_endpoint_fails_closed_instead_of_becoming_a_belt() {
+        let splitter = unsupported_transport(1, 0, Direction::North, "splitter", "splitter");
+        let entities = vec![belt(0, 0, Direction::East), splitter];
+
+        let report = analyze_item_flow(
+            &entities,
+            &[],
+            EntityLookup::Tile(TilePos::new(0, 0)),
+            EntityLookup::Tile(TilePos::new(1, 0)),
+        );
+
+        assert!(!report.connected);
+        assert!(!report.connectivity_certified);
+        assert_eq!(report.status, "unsupported_transport");
+        assert_eq!(
+            report.analysis_scope.unsupported_transports[0].reason,
+            UnsupportedTransportReason::SplitterSemanticsNotModeled
+        );
     }
 
     #[test]

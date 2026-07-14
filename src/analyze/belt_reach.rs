@@ -34,6 +34,7 @@ pub fn analyze_belt_reach(graph: &BeltGraph, start: TilePos) -> Option<BeltReach
     let total_belts = (upstream.len() + downstream.len() + 1) as u32;
 
     Some(BeltReachResult {
+        analysis_scope: graph.analysis_scope().clone(),
         origin: start,
         upstream,
         downstream,

@@ -28,18 +28,106 @@ use factorioctl::world::{
 fn production_verification_json(
     entities: Vec<EntityProduction>,
 ) -> (serde_json::Value, bool, bool) {
+    let producer_count = entities
+        .iter()
+        .filter(|entity| is_production_entity_name(&entity.name))
+        .count();
     let has_working_producer = entities
         .iter()
         .any(|entity| is_production_entity_name(&entity.name) && entity.working);
     let report = build_production_report(entities);
     (
         serde_json::json!({
-            "success": true,
+            "success": has_working_producer,
+            "proof": if has_working_producer { "currently_working" } else { "no_active_producer" },
+            "producer_count": producer_count,
             "report": report,
         }),
         true,
         has_working_producer,
     )
+}
+
+fn production_observation_json(
+    before: Vec<EntityProduction>,
+    after: Vec<EntityProduction>,
+    observation_ticks: u32,
+) -> serde_json::Value {
+    let before_finished: HashMap<u32, u64> = before
+        .iter()
+        .filter_map(|entity| Some((entity.unit_number?, entity.products_finished?)))
+        .collect();
+    let mut progressed_units = Vec::new();
+    let mut working_units = Vec::new();
+    let producers: Vec<EntityProduction> = after
+        .into_iter()
+        .filter(|entity| is_production_entity_name(&entity.name))
+        .collect();
+
+    for entity in &producers {
+        if entity.working {
+            if let Some(unit_number) = entity.unit_number {
+                working_units.push(unit_number);
+            }
+        }
+        if let (Some(unit_number), Some(after_finished)) =
+            (entity.unit_number, entity.products_finished)
+        {
+            if before_finished
+                .get(&unit_number)
+                .is_some_and(|before_finished| after_finished > *before_finished)
+            {
+                progressed_units.push(unit_number);
+            }
+        }
+    }
+
+    let report = build_production_report(producers);
+    let success = !progressed_units.is_empty() || report.working_count > 0;
+    let report_json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "success": success,
+        "proof": if !progressed_units.is_empty() {
+            "products_finished_increased"
+        } else if report.working_count > 0 {
+            "currently_working"
+        } else if report.total == 0 {
+            "no_producers"
+        } else {
+            "no_active_production"
+        },
+        "observation_ticks": observation_ticks,
+        "progressed_units": progressed_units,
+        "working_units": working_units,
+        "producer_count": report.total,
+        "working_count": report.working_count,
+        "total": report.total,
+        "status_counts": report.status_counts,
+        "entities": report.entities,
+        "report": report_json,
+    })
+}
+
+fn production_unit_verified(verification: &serde_json::Value, unit_number: Option<u32>) -> bool {
+    let Some(unit_number) = unit_number else {
+        return false;
+    };
+    verification
+        .get("progressed_units")
+        .and_then(|units| units.as_array())
+        .is_some_and(|units| {
+            units
+                .iter()
+                .any(|unit| unit.as_u64() == Some(unit_number as u64))
+        })
+        || verification
+            .get("working_units")
+            .and_then(|units| units.as_array())
+            .is_some_and(|units| {
+                units
+                    .iter()
+                    .any(|unit| unit.as_u64() == Some(unit_number as u64))
+            })
 }
 
 fn is_production_entity_name(name: &str) -> bool {
@@ -113,6 +201,7 @@ fn compound_route_preflight(
     additional_items: &BTreeMap<String, u32>,
     surface_belt_name: &str,
     allowed_shared_tiles: &HashSet<GridPos>,
+    reserved_entity_tiles: &[(&str, GridPos)],
 ) -> serde_json::Value {
     let underground_name = UndergroundConfig::from_belt_type(surface_belt_name)
         .map(|config| config.entity_name)
@@ -204,10 +293,34 @@ fn compound_route_preflight(
         );
     }
 
+    let mut reserved_entities: HashMap<GridPos, String> = HashMap::new();
+    for (label, tile) in reserved_entity_tiles {
+        if let Some((route, belt)) = occupied.get(tile) {
+            errors.push(serde_json::json!({
+                "kind": "route_entity_overlap",
+                "tile": tile,
+                "route": route,
+                "entity": label,
+                "belt": belt,
+                "error": "A planned route occupies a reserved entity footprint.",
+            }));
+        }
+        if let Some(first) = reserved_entities.insert(*tile, (*label).to_string()) {
+            errors.push(serde_json::json!({
+                "kind": "entity_footprint_overlap",
+                "tile": tile,
+                "entities": [first, label],
+                "error": "Two planned entities reserve the same footprint.",
+            }));
+        }
+    }
+
     serde_json::json!({
         "ready": errors.is_empty(),
         "materials": materials,
-        "reserved_tiles": occupied.len(),
+        "reserved_route_tiles": occupied.len(),
+        "reserved_entity_tiles": reserved_entities.len(),
+        "reserved_tiles": occupied.len() + reserved_entities.len(),
         "new_belt_tiles": new_placements.len(),
         "errors": errors,
     })
@@ -281,6 +394,238 @@ async fn rollback_exact_units(
     })
 }
 
+#[derive(Clone, Copy)]
+struct ControllerPlacement<'a> {
+    label: &'a str,
+    item_name: &'a str,
+    entity_name: &'a str,
+    position: Position,
+    direction: Direction,
+}
+
+#[derive(Clone)]
+struct PlannedPlacement {
+    label: String,
+    entity_name: String,
+    position: Position,
+    direction: Direction,
+}
+
+#[derive(Clone, Copy)]
+struct PlannedRotation {
+    unit_number: u32,
+    direction: Direction,
+}
+
+fn parse_controller_steps(
+    steps: &[serde_json::Value],
+) -> Result<(Vec<PlannedPlacement>, Vec<PlannedRotation>), String> {
+    let mut placements = Vec::new();
+    let mut rotations = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let tool = step
+            .get("tool")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("step {index} is missing tool"))?;
+        let args = step
+            .get("tool_args")
+            .ok_or_else(|| format!("step {index} is missing tool_args"))?;
+        let direction_name = args
+            .get("direction")
+            .and_then(|value| value.as_str())
+            .unwrap_or("north");
+        let direction = Direction::parse(direction_name)
+            .ok_or_else(|| format!("step {index} has invalid direction {direction_name}"))?;
+        match tool {
+            "place_entity" => {
+                let entity_name = args
+                    .get("entity_name")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| format!("step {index} is missing entity_name"))?;
+                let x = args
+                    .get("x")
+                    .and_then(|value| value.as_f64())
+                    .ok_or_else(|| format!("step {index} is missing x"))?;
+                let y = args
+                    .get("y")
+                    .and_then(|value| value.as_f64())
+                    .ok_or_else(|| format!("step {index} is missing y"))?;
+                placements.push(PlannedPlacement {
+                    label: format!("step_{index}_{entity_name}"),
+                    entity_name: entity_name.to_string(),
+                    position: Position::new(x, y),
+                    direction,
+                });
+            }
+            "rotate_entity" => {
+                let unit_number = args
+                    .get("unit_number")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| format!("step {index} is missing unit_number"))?;
+                rotations.push(PlannedRotation {
+                    unit_number,
+                    direction,
+                });
+            }
+            other => return Err(format!("step {index} uses unsupported tool {other}")),
+        }
+    }
+    Ok((placements, rotations))
+}
+
+async fn controller_preflight(
+    client: &mut FactorioClient,
+    routes: &[(&str, &serde_json::Value)],
+    surface_belt_name: &str,
+    allowed_shared_tiles: &HashSet<GridPos>,
+    placements: &[ControllerPlacement<'_>],
+) -> Result<serde_json::Value, String> {
+    let inventory = client
+        .character_inventory()
+        .await
+        .map_err(|error| format!("checking controller materials: {error}"))?;
+    let available_items: BTreeMap<String, u32> = inventory
+        .items
+        .iter()
+        .map(|item| (item.name.clone(), item.count))
+        .collect();
+    let mut additional_items = BTreeMap::new();
+    for placement in placements {
+        *additional_items
+            .entry(placement.item_name.to_string())
+            .or_default() += 1;
+    }
+    let reserved_entity_tiles: Vec<(&str, GridPos)> = placements
+        .iter()
+        .map(|placement| (placement.label, GridPos::from_position(&placement.position)))
+        .collect();
+    let route_preflight = compound_route_preflight(
+        routes,
+        &available_items,
+        &additional_items,
+        surface_belt_name,
+        allowed_shared_tiles,
+        &reserved_entity_tiles,
+    );
+
+    let mut placement_reports = serde_json::Map::new();
+    let mut placements_ready = true;
+    for placement in placements {
+        let report = client
+            .check_entity_placement(
+                placement.entity_name,
+                placement.position,
+                placement.direction,
+            )
+            .await;
+        let allowed = report.as_ref().ok().and_then(|value| {
+            value
+                .get("factorio_allowed")
+                .and_then(|allowed| allowed.as_bool())
+        }) == Some(true);
+        placements_ready &= allowed;
+        placement_reports.insert(
+            placement.label.to_string(),
+            match report {
+                Ok(value) => serde_json::json!({
+                    "allowed": allowed,
+                    "item_name": placement.item_name,
+                    "entity_name": placement.entity_name,
+                    "position": placement.position,
+                    "direction": placement.direction,
+                    "report": value,
+                }),
+                Err(error) => serde_json::json!({
+                    "allowed": false,
+                    "item_name": placement.item_name,
+                    "entity_name": placement.entity_name,
+                    "position": placement.position,
+                    "direction": placement.direction,
+                    "error": error.to_string(),
+                }),
+            },
+        );
+    }
+
+    let ready = route_preflight
+        .get("ready")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+        && placements_ready;
+    Ok(serde_json::json!({
+        "ready": ready,
+        "routes": route_preflight,
+        "placements": placement_reports,
+    }))
+}
+
+async fn observe_production(
+    client: &mut FactorioClient,
+    area: Area,
+    observation_ticks: u32,
+) -> anyhow::Result<serde_json::Value> {
+    let before = client.verify_production(area).await?;
+    client.wait_ticks(observation_ticks).await?;
+    let after = client.verify_production(area).await?;
+    Ok(production_observation_json(
+        before,
+        after,
+        observation_ticks,
+    ))
+}
+
+async fn rollback_controller_transaction(
+    client: &mut FactorioClient,
+    unit_numbers: &[u32],
+    rotated_entities: &[(u32, u8)],
+    recipe_restore: Option<(u32, Option<String>)>,
+) -> serde_json::Value {
+    let units = rollback_exact_units(client, unit_numbers).await;
+    let mut rotation_errors = Vec::new();
+    let mut restored_rotations = Vec::new();
+    for (unit_number, direction) in rotated_entities.iter().rev().copied() {
+        match client.rotate_entity(unit_number, direction).await {
+            Ok(_) => restored_rotations.push(unit_number),
+            Err(error) => rotation_errors.push(serde_json::json!({
+                "unit_number": unit_number,
+                "direction": direction,
+                "error": error.to_string(),
+            })),
+        }
+    }
+
+    let recipe = if let Some((unit_number, recipe)) = recipe_restore {
+        let recipe_name = recipe.unwrap_or_default();
+        match client.set_recipe(unit_number, &recipe_name).await {
+            Ok(()) => serde_json::json!({
+                "success": true,
+                "unit_number": unit_number,
+                "restored_recipe": if recipe_name.is_empty() { serde_json::Value::Null } else { serde_json::json!(recipe_name) },
+            }),
+            Err(error) => serde_json::json!({
+                "success": false,
+                "unit_number": unit_number,
+                "restored_recipe": if recipe_name.is_empty() { serde_json::Value::Null } else { serde_json::json!(recipe_name) },
+                "error": error.to_string(),
+            }),
+        }
+    } else {
+        serde_json::json!({"success": true, "skipped": true})
+    };
+    let success = units.get("success").and_then(|value| value.as_bool()) == Some(true)
+        && rotation_errors.is_empty()
+        && recipe.get("success").and_then(|value| value.as_bool()) == Some(true);
+    serde_json::json!({
+        "success": success,
+        "units": units,
+        "restored_rotations": restored_rotations,
+        "rotation_errors": rotation_errors,
+        "recipe": recipe,
+    })
+}
+
 fn compact_belt_topology(topology: Option<&BeltRouteTopology>) -> serde_json::Value {
     match topology {
         Some(topology) => serde_json::json!({
@@ -306,89 +651,6 @@ where
         return Err(de::Error::custom("tile coordinate out of i32 range"));
     }
     Ok(value.floor() as i32)
-}
-
-fn placed_units_not_dead(
-    verification: &serde_json::Value,
-    unit_numbers: &[u32],
-) -> (bool, Vec<serde_json::Value>) {
-    let entities = verification
-        .get("report")
-        .and_then(|report| report.get("entities"))
-        .and_then(|entities| entities.as_array());
-    let mut statuses = Vec::new();
-    let mut ok = true;
-    for unit_number in unit_numbers {
-        let entity = entities.and_then(|entities| {
-            entities.iter().find(|entity| {
-                entity
-                    .get("unit_number")
-                    .and_then(|value| value.as_u64())
-                    .map(|value| value as u32)
-                    == Some(*unit_number)
-            })
-        });
-        match entity {
-            Some(entity) => {
-                let status = entity
-                    .get("status")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown");
-                let working = entity
-                    .get("working")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-                let name = entity
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let operational = if name.contains("inserter") {
-                    (status == "working" && working) || status == "waiting_for_space_in_destination"
-                } else {
-                    status == "working" && working
-                };
-                ok &= operational;
-                statuses.push(serde_json::json!({
-                    "unit_number": unit_number,
-                    "name": entity.get("name").cloned().unwrap_or(serde_json::Value::Null),
-                    "status": status,
-                    "working": entity.get("working").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                    "ok": operational,
-                }));
-            }
-            None => {
-                ok = false;
-                statuses.push(serde_json::json!({
-                    "unit_number": unit_number,
-                    "status": "missing_from_verification_area",
-                    "ok": false,
-                }));
-            }
-        }
-    }
-    (ok, statuses)
-}
-
-fn placed_unit_working(verification: &serde_json::Value, unit_number: Option<u32>) -> bool {
-    let Some(unit_number) = unit_number else {
-        return false;
-    };
-    verification
-        .get("report")
-        .and_then(|report| report.get("entities"))
-        .and_then(|entities| entities.as_array())
-        .and_then(|entities| {
-            entities.iter().find(|entity| {
-                entity
-                    .get("unit_number")
-                    .and_then(|value| value.as_u64())
-                    .map(|value| value as u32)
-                    == Some(unit_number)
-            })
-        })
-        .and_then(|entity| entity.get("working"))
-        .and_then(|working| working.as_bool())
-        .unwrap_or(false)
 }
 
 fn verification_statuses(verification: &serde_json::Value) -> Vec<String> {
@@ -533,18 +795,19 @@ struct ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        automation_repair_hint, execute_lua_refusal, existing_belt_compatibility, flow_lookup,
-        flow_scan_area, is_machine_output_source, machine_output_build_args, machine_side_layout,
-        placed_unit_working, placed_units_not_dead, production_verification_json, raw_lua_enabled,
-        ready_fuel_supply_args, route_belt_failure_json, route_material_shortfall,
+        automation_repair_hint, compound_route_preflight, execute_lua_refusal,
+        existing_belt_compatibility, flow_lookup, flow_scan_area, is_machine_output_source,
+        machine_output_build_args, machine_side_layout, parse_controller_steps,
+        production_observation_json, production_unit_verified, production_verification_json,
+        raw_lua_enabled, ready_fuel_supply_args, route_belt_failure_json, route_material_shortfall,
         route_segment_waypoint, tool_text_indicates_error, BuildFuelSupplyParams, FactorioMcp,
-        RouteBeltParams, MODEL_HIDDEN_TOOLS,
+        RouteBeltParams, MODEL_VISIBLE_TOOLS,
     };
     use factorioctl::analyze::EntityLookup;
     use factorioctl::world::{
         Area, BeltKind, BeltPlacement, Direction, Entity, GridPos, Position, TilePos,
     };
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
 
     #[test]
     fn raw_lua_enabled_only_accepts_explicit_truthy_values() {
@@ -568,40 +831,48 @@ mod tests {
     }
 
     #[test]
-    fn placed_unit_status_helpers_require_matching_healthy_units() {
+    fn edge_miner_steps_parse_as_one_atomic_placement_set() {
+        let steps = vec![
+            serde_json::json!({
+                "tool": "place_entity",
+                "tool_args": {
+                    "entity_name": "burner-mining-drill",
+                    "x": 10.0,
+                    "y": 20.0,
+                    "direction": "east",
+                },
+            }),
+            serde_json::json!({
+                "tool": "place_entity",
+                "tool_args": {
+                    "entity_name": "transport-belt",
+                    "x": 12.0,
+                    "y": 20.0,
+                    "direction": "east",
+                },
+            }),
+        ];
+
+        let (placements, rotations) = parse_controller_steps(&steps).expect("valid edge plan");
+        assert!(rotations.is_empty());
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].entity_name, "burner-mining-drill");
+        assert_eq!(placements[1].entity_name, "transport-belt");
+        assert_eq!(placements[0].direction, Direction::East);
+    }
+
+    #[test]
+    fn edge_miner_verification_requires_the_new_drill_not_an_unrelated_producer() {
         let verification = serde_json::json!({
             "success": true,
-            "report": {
-                "entities": [
-                    {
-                        "name": "electric-mining-drill",
-                        "unit_number": 10,
-                        "status": "working",
-                        "working": true
-                    },
-                    {
-                        "name": "inserter",
-                        "unit_number": 11,
-                        "status": "no_power",
-                        "working": false
-                    }
-                ]
-            }
+            "working_units": [99],
+            "progressed_units": [88],
         });
 
-        assert!(placed_unit_working(&verification, Some(10)));
-        assert!(!placed_unit_working(&verification, Some(11)));
-        assert!(!placed_unit_working(&verification, Some(99)));
-        assert!(!placed_unit_working(&verification, None));
-
-        let (ok, statuses) = placed_units_not_dead(&verification, &[10, 11, 99]);
-        assert!(!ok);
-        assert_eq!(statuses.len(), 3);
-        assert_eq!(statuses[0]["ok"], true);
-        assert_eq!(statuses[1]["ok"], false);
-        assert_eq!(statuses[1]["status"], "no_power");
-        assert_eq!(statuses[2]["ok"], false);
-        assert_eq!(statuses[2]["status"], "missing_from_verification_area");
+        assert!(!production_unit_verified(&verification, Some(10)));
+        assert!(production_unit_verified(&verification, Some(99)));
+        assert!(production_unit_verified(&verification, Some(88)));
+        assert!(!production_unit_verified(&verification, None));
     }
 
     #[test]
@@ -633,9 +904,77 @@ mod tests {
             },
         ];
 
-        let (_, call_ok, has_working_producer) = production_verification_json(entities);
+        let (verification, call_ok, has_working_producer) = production_verification_json(entities);
         assert!(call_ok);
         assert!(!has_working_producer);
+        assert_eq!(verification["success"], false);
+        assert_eq!(verification["producer_count"], 1);
+    }
+
+    #[test]
+    fn production_observation_rejects_idle_and_accepts_real_progress() {
+        let furnace = |status: &str, products_finished: u64, working: bool| {
+            factorioctl::world::EntityProduction {
+                name: "stone-furnace".to_string(),
+                unit_number: Some(3),
+                position: Position::new(2.0, 0.0),
+                status: status.to_string(),
+                products_finished: Some(products_finished),
+                working,
+            }
+        };
+
+        let idle = production_observation_json(
+            vec![furnace("no_ingredients", 4, false)],
+            vec![furnace("no_ingredients", 4, false)],
+            60,
+        );
+        assert_eq!(idle["success"], false);
+        assert_eq!(idle["proof"], "no_active_production");
+        assert_eq!(idle["working_count"], 0);
+
+        let progressed = production_observation_json(
+            vec![furnace("working", 4, true)],
+            vec![furnace("waiting_for_space_in_destination", 5, false)],
+            60,
+        );
+        assert_eq!(progressed["success"], true);
+        assert_eq!(progressed["proof"], "products_finished_increased");
+        assert_eq!(progressed["progressed_units"], serde_json::json!([3]));
+    }
+
+    #[test]
+    fn compound_preflight_reserves_entity_footprints_against_routes() {
+        let belt = BeltPlacement {
+            position: Position::new(4.5, 7.5),
+            direction: Direction::East,
+            kind: BeltKind::Surface,
+        };
+        let route = serde_json::json!({
+            "success": true,
+            "planned_belts": [belt.clone()],
+            "planned_new_belts": [belt],
+        });
+        let available = BTreeMap::from([
+            ("transport-belt".to_string(), 1),
+            ("inserter".to_string(), 1),
+        ]);
+        let additional = BTreeMap::from([("inserter".to_string(), 1)]);
+        let report = compound_route_preflight(
+            &[("input", &route)],
+            &available,
+            &additional,
+            "transport-belt",
+            &HashSet::new(),
+            &[("input_inserter", GridPos::new(4, 7))],
+        );
+
+        assert_eq!(report["ready"], false);
+        assert!(report["errors"].as_array().is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|error| error["kind"] == "route_entity_overlap")
+        }));
     }
 
     #[test]
@@ -650,52 +989,57 @@ mod tests {
     }
 
     #[test]
-    fn model_tool_surface_hides_bridge_and_manual_courier_tools() {
+    fn model_tool_surface_is_the_exact_competent_gameplay_allowlist() {
         let server = FactorioMcp::new();
-        let visible: HashSet<String> = server
-            .tool_router
-            .list_all()
-            .into_iter()
+        let tools = server.tool_router.list_all();
+        let mut visible: Vec<String> = tools
+            .iter()
             .map(|tool| tool.name.to_string())
             .collect();
+        visible.sort();
+        let expected: Vec<String> = MODEL_VISIBLE_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
 
-        for hidden in MODEL_HIDDEN_TOOLS {
-            assert!(
-                !visible.contains(*hidden),
-                "{hidden} must not be model-visible"
-            );
-        }
-        for durable in [
-            "route_belt",
-            "build_fuel_supply",
-            "build_recipe_assembler_cell",
-            "build_automation_science",
+        assert_eq!(visible, expected, "model tool surface must not drift");
+        assert_eq!(visible.len(), 42);
+        let schema_bytes = serde_json::to_vec(&tools).expect("serialize tool schemas").len();
+        assert!(
+            schema_bytes <= 60 * 1024,
+            "model tool schemas grew to {schema_bytes} bytes"
+        );
+
+        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
+        for forbidden in [
+            "execute_lua",
+            "insert_items",
+            "extract_items",
+            "hand_feed_furnace",
+            "feed_lab_from_inventory",
+            "place_character",
+            "register_agent",
+            "broadcast_thought",
+            "create_zone",
+            "clear_area",
         ] {
             assert!(
-                visible.contains(durable),
-                "{durable} must remain model-visible"
+                !visible_set.contains(forbidden),
+                "{forbidden} must never be model-visible"
             );
         }
     }
 
     #[test]
-    fn idle_placed_units_are_not_verified_as_operational() {
-        let verification = serde_json::json!({
-            "success": true,
-            "report": {
-                "entities": [{
-                    "name": "inserter",
-                    "unit_number": 11,
-                    "status": "waiting_for_source_items",
-                    "working": false
-                }]
-            }
-        });
-
-        let (ok, statuses) = placed_units_not_dead(&verification, &[11]);
-        assert!(!ok);
-        assert_eq!(statuses[0]["ok"], false);
-        assert_eq!(statuses[0]["status"], "waiting_for_source_items");
+    fn model_tool_surface_does_not_depend_on_raw_lua_environment() {
+        let visible: HashSet<String> = FactorioMcp::new()
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(visible.len(), MODEL_VISIBLE_TOOLS.len());
+        assert!(!visible.contains("execute_lua"));
     }
 
     #[test]
@@ -3261,33 +3605,63 @@ struct ChatMessage {
     tick: u64,
 }
 
-const MODEL_HIDDEN_TOOLS: &[&str] = &[
-    "send_chat_response",
-    "tool_status",
-    "set_status",
-    "register_agent",
-    "unregister_agent",
-    "ensure_surface",
-    "place_character",
-    "set_spectator_mode",
-    "ping",
-    "live_state",
-    "connected_player_count",
-    "broadcast_thought",
-    "insert_items",
-    "hand_feed_furnace",
-    "extract_items",
-    "feed_lab_from_inventory",
+const MODEL_VISIBLE_TOOLS: &[&str] = &[
+    "analyze_inserters",
+    "analyze_item_flow",
+    "bootstrap_smelting_once",
+    "build_assembler_feed",
+    "build_assembler_output",
+    "build_automation_science",
+    "build_lab_feed",
+    "build_recipe_assembler_cell",
+    "craft",
+    "diagnose_factory_blockers",
+    "diagnose_steam_power",
+    "execute_direct_smelter",
+    "execute_edge_miner",
+    "execute_entity_placement_near",
+    "extend_power_to",
+    "find_nearest_resource",
+    "get_available_research",
+    "get_belt_lane_contents",
+    "get_entities",
+    "get_machine_belt_positions",
+    "get_power_status",
+    "get_recipe",
+    "get_recipes_for_item",
+    "get_research_status",
+    "mine_at",
+    "place_entity",
+    "plan_automation_science",
+    "plan_machine_output",
+    "plan_recipe_assembler_cell",
+    "plan_steam_power",
+    "production_statistics",
+    "remove_entity",
+    "render_map",
+    "repair_fuel_sustainability",
+    "rotate_entity",
+    "route_belt",
+    "set_recipe",
+    "situation_report",
+    "start_research",
+    "unstuck",
+    "verify_production",
+    "walk_to",
 ];
 
 impl FactorioMcp {
     fn new() -> Self {
         let mut tool_router = Self::tool_router();
-        for hidden in MODEL_HIDDEN_TOOLS {
-            tool_router.remove_route(hidden);
-        }
-        if !raw_lua_enabled(std::env::var("FACTORIOCTL_ALLOW_RAW_LUA").ok().as_deref()) {
-            tool_router.remove_route("execute_lua");
+        let registered: Vec<String> = tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for name in registered {
+            if !MODEL_VISIBLE_TOOLS.contains(&name.as_str()) {
+                tool_router.remove_route(&name);
+            }
         }
         Self {
             config: ConnectionConfig::from_env(),
@@ -4238,7 +4612,7 @@ impl FactorioMcp {
 
     /// Move the character out of a physical collision wedge.
     #[tool(
-        description = "Recovery action for a physically wedged agent character. If the current character footprint is blocked, moves to the nearest verified clear standing position and clears stale walk/mining state. Use is_player_blocked first when diagnosing; pass dry_run=true to preview."
+        description = "Recovery action for a physically wedged agent character. Checks the current character footprint, finds the nearest verified clear standing position, and clears stale walk/mining state. Pass dry_run=true to diagnose and preview without moving."
     )]
     async fn unstuck(&self, Parameters(params): Parameters<UnstuckParams>) -> String {
         let mut client = match self.connect().await {
@@ -4285,7 +4659,7 @@ impl FactorioMcp {
 
     /// Get a compact one-call situational snapshot for orientation.
     #[tool(
-        description = "Compact one-call situational snapshot with position, health, walking, tick, inventory, nearby entity counts, and resource patches. Use this to orient instead of separate render_map + get_inventory + get_resources scans."
+        description = "Compact one-call situational snapshot with position, health, walking, tick, inventory, nearby entity counts, and resource patches. Use this first to orient; call render_map only when spatial detail is needed."
     )]
     async fn situation_report(
         &self,
@@ -4347,7 +4721,7 @@ impl FactorioMcp {
 
     /// Verify producing entities are actually working after building.
     #[tool(
-        description = "Call this after building or modifying production to confirm the intended outcome. Reports each producing entity's status (working/no_power/no_fuel/no_ingredients/full_output/etc.) plus products_finished so you can diagnose failures and derive rates by calling twice."
+        description = "Observe real production over 60 game ticks after building or modifying a factory. success is true only when a producing machine either remains actively working or its products_finished counter increases; idle, no-input, no-fuel, no-power, disabled, and output-blocked machines return success=false. Belts and inserters are never counted as producers."
     )]
     async fn verify_production(
         &self,
@@ -4385,11 +4759,20 @@ impl FactorioMcp {
             left_top: Position::new(position.x - r, position.y - r),
             right_bottom: Position::new(position.x + r, position.y + r),
         };
-        let entities = match client.verify_production(area).await {
+        let before = match client.verify_production(area).await {
             Ok(entities) => entities,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
-        let report = build_production_report(entities);
+        if let Err(error) = client.wait_ticks(60).await {
+            return self
+                .with_player_messages(format!("Error: observing production: {error}"))
+                .await;
+        }
+        let after = match client.verify_production(area).await {
+            Ok(entities) => entities,
+            Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
+        };
+        let report = production_observation_json(before, after, 60);
         let result =
             serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(result).await
@@ -4910,7 +5293,7 @@ impl FactorioMcp {
 
     /// Execute a safe entity placement selected by plan_entity_placement_near.
     #[tool(
-        description = "Place one isolated entity using a nearby safe position selected by plan_entity_placement_near. This may change the requested coordinate, so do not use it to execute exact placement arguments returned by another planner. Use dry_run=true to preview the selected position."
+        description = "Safely place one isolated non-belt entity near a requested coordinate. The tool derives a collision-free position that does not trap the NPC and may adjust the requested coordinate. Use dry_run=true to preview the exact selected position."
     )]
     async fn execute_entity_placement_near(
         &self,
@@ -5085,7 +5468,7 @@ impl FactorioMcp {
 
     /// Execute a checked edge mining drill and output belt plan.
     #[tool(
-        description = "Build a patch-edge mining setup from build_edge_miner geometry: places the selected drill, places the output belt, bootstraps burner drill fuel, verifies production, and returns the placed drill unit/output tile. Prefer this over manually replaying build_edge_miner steps. Use dry_run=true during planner turns."
+        description = "Plan or atomically build a patch-edge mining setup: select a resource-backed drill position with a clear output, place the drill and output belt, bootstrap burner fuel, and verify that the new drill produces. Use dry_run=true to preview the complete transaction."
     )]
     async fn execute_edge_miner(
         &self,
@@ -5113,18 +5496,6 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        if params.dry_run {
-            let result = serde_json::json!({
-                "success": plan.get("success").and_then(|value| value.as_bool()).unwrap_or(false),
-                "dry_run": true,
-                "plan": plan,
-                "guidance": "If success/ready are true and missing_items is empty, call execute_edge_miner again with dry_run=false. For coal, follow with diagnose_fuel_sustainability/build_fuel_supply for nearby consumers.",
-            });
-            let msg =
-                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
-            return self.with_player_messages(msg).await;
-        }
-
         if !plan
             .get("success")
             .and_then(|value| value.as_bool())
@@ -5144,73 +5515,110 @@ impl FactorioMcp {
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
+        let (planned_placements, planned_rotations) = match parse_controller_steps(&steps) {
+            Ok(steps) => steps,
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        if !planned_rotations.is_empty() {
+            return self
+                .with_player_messages(
+                    "Error: edge miner plan unexpectedly contains a rotation step".to_string(),
+                )
+                .await;
+        }
+        let placement_reservations: Vec<ControllerPlacement<'_>> = planned_placements
+            .iter()
+            .map(|placement| ControllerPlacement {
+                label: &placement.label,
+                item_name: &placement.entity_name,
+                entity_name: &placement.entity_name,
+                position: placement.position,
+                direction: placement.direction,
+            })
+            .collect();
+        let preflight = match controller_preflight(
+            &mut client,
+            &[],
+            "transport-belt",
+            &HashSet::new(),
+            &placement_reservations,
+        )
+        .await
+        {
+            Ok(preflight) => preflight,
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let preflight_ready = preflight["ready"].as_bool() == Some(true);
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": preflight_ready,
+                "dry_run": true,
+                "plan": plan,
+                "preflight": preflight,
+                "guidance": "Execute only when preflight.ready is true; the drill and output belt are reserved and placed as one transaction.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+        if !preflight_ready {
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "compound_preflight_failed",
+                "error": "Edge miner failed complete material or placement preflight. Nothing was placed.",
+                "plan": plan,
+                "preflight": preflight,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
+
+        let mut transaction_units = Vec::new();
         let mut actions = Vec::new();
         let mut placed_drill_unit = None;
         let mut placed_belt_unit = None;
-
-        for step in steps {
-            let tool = step
-                .get("tool")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let args = step.get("tool_args").unwrap_or(&serde_json::Value::Null);
-            if tool != "place_entity" {
-                actions.push(serde_json::json!({
-                    "tool": tool,
-                    "args": args,
-                    "success": false,
-                    "skipped": true,
-                    "error": "unsupported step in execute_edge_miner",
-                }));
-                continue;
-            }
-
-            let entity_name = args
-                .get("entity_name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let x = args
-                .get("x")
-                .and_then(|value| value.as_f64())
-                .unwrap_or(0.0);
-            let y = args
-                .get("y")
-                .and_then(|value| value.as_f64())
-                .unwrap_or(0.0);
-            let direction_name = args
-                .get("direction")
-                .and_then(|value| value.as_str())
-                .unwrap_or("north");
-            let direction = match Direction::parse(direction_name) {
-                Some(direction) => direction,
-                None => {
-                    actions.push(serde_json::json!({
-                        "tool": "place_entity",
-                        "args": args,
+        for placement in planned_placements {
+            let entity = match client
+                .place_entity(
+                    &placement.entity_name,
+                    placement.position,
+                    placement.direction,
+                )
+                .await
+            {
+                Ok(entity) => entity,
+                Err(error) => {
+                    let rollback =
+                        rollback_controller_transaction(&mut client, &transaction_units, &[], None)
+                            .await;
+                    let result = serde_json::json!({
                         "success": false,
-                        "error": format!("invalid direction '{}'", direction_name),
-                    }));
-                    continue;
+                        "error_kind": "placement_execution_failed",
+                        "failed_entity": placement.entity_name,
+                        "error": error.to_string(),
+                        "rollback": rollback,
+                    });
+                    return self
+                        .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                        .await;
                 }
             };
-            let placed = client
-                .place_entity(entity_name, Position::new(x, y), direction)
-                .await;
-            match &placed {
-                Ok(entity) if entity.name.contains("mining-drill") => {
-                    placed_drill_unit = entity.unit_number;
-                }
-                Ok(entity) if entity.name.contains("transport-belt") => {
-                    placed_belt_unit = entity.unit_number;
-                }
-                _ => {}
+            if entity.name.contains("mining-drill") {
+                placed_drill_unit = entity.unit_number;
+            }
+            if entity.name.contains("transport-belt") {
+                placed_belt_unit = entity.unit_number;
+            }
+            if let Some(unit_number) = entity.unit_number {
+                transaction_units.push(unit_number);
             }
             actions.push(serde_json::json!({
                 "tool": "place_entity",
-                "args": args,
-                "success": placed.is_ok(),
-                "entity": placed.as_ref().ok(),
-                "error": placed.as_ref().err().map(|e| e.to_string()),
+                "success": true,
+                "entity_name": entity.name,
+                "unit_number": entity.unit_number,
             }));
         }
 
@@ -5223,6 +5631,20 @@ impl FactorioMcp {
                 let inserted = client
                     .insert_items(unit, &params.fuel_item, params.fuel_count, "fuel")
                     .await;
+                if let Err(error) = &inserted {
+                    let rollback =
+                        rollback_controller_transaction(&mut client, &transaction_units, &[], None)
+                            .await;
+                    let result = serde_json::json!({
+                        "success": false,
+                        "error_kind": "bootstrap_fuel_failed",
+                        "error": error.to_string(),
+                        "rollback": rollback,
+                    });
+                    return self
+                        .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                        .await;
+                }
                 fuel_report = serde_json::json!({
                     "tool": "insert_items",
                     "unit_number": unit,
@@ -5243,56 +5665,54 @@ impl FactorioMcp {
             center.x + verify_radius,
             center.y + verify_radius,
         );
-        let (verification, verification_call_ok, _) =
-            match client.verify_production(verify_area).await {
-                Ok(entities) => production_verification_json(entities),
-                Err(e) => (
-                    serde_json::json!({
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    false,
-                    false,
-                ),
-            };
-        let drill_working = placed_unit_working(&verification, placed_drill_unit);
-        let placed_units: Vec<u32> = placed_drill_unit.into_iter().collect();
-        let (_, placed_unit_statuses) = placed_units_not_dead(&verification, &placed_units);
-        let action_success = actions.iter().all(|action| {
-            action
-                .get("success")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-        });
+        let verification = match observe_production(&mut client, verify_area, 180).await {
+            Ok(verification) => verification,
+            Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
+        };
+        let drill_working = production_unit_verified(&verification, placed_drill_unit);
+        let mut placed_units_exist = placed_drill_unit.is_some() && placed_belt_unit.is_some();
+        for unit_number in [placed_drill_unit, placed_belt_unit].into_iter().flatten() {
+            placed_units_exist &= client.get_entity(unit_number).await.is_ok();
+        }
         let repair_hint = automation_repair_hint(
             "execute_edge_miner",
             "edge miner output belt",
-            verification_call_ok,
+            verification.get("error").is_none(),
             &verification,
-            &placed_unit_statuses,
-            Some(action_success),
+            &[],
+            Some(true),
         );
 
-        let success = action_success
-            && fuel_report
-                .get("success")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true)
-            && verification_call_ok
-            && drill_working;
+        let success = drill_working && placed_units_exist;
+        if !success {
+            let rollback =
+                rollback_controller_transaction(&mut client, &transaction_units, &[], None).await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "verification_failed",
+                "error": "Edge miner did not prove the newly placed drill actively producing; the drill and output belt were rolled back.",
+                "verification": verification,
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
         let result = serde_json::json!({
-            "success": success,
+            "success": true,
             "dry_run": false,
             "plan": plan,
+            "preflight": preflight,
             "selected": selected,
             "placed_drill_unit_number": placed_drill_unit,
             "placed_belt_unit_number": placed_belt_unit,
             "actions": actions,
             "bootstrap_fuel": fuel_report,
             "automation_verified": {
+                "success": true,
                 "placed_drill_working": drill_working,
-                "verification_call_ok": verification_call_ok,
-                "placed_unit_statuses": placed_unit_statuses,
+                "placed_units_exist": placed_units_exist,
             },
             "verification": verification,
             "repair_hint": repair_hint,
@@ -5362,7 +5782,7 @@ impl FactorioMcp {
 
     /// Execute a checked direct drill-output smelter plan.
     #[tool(
-        description = "Build a direct drill-output smelter cell from build_direct_smelter geometry: places/rotates the output belt, places furnace and inserter, bootstraps any burner fuel, verifies production, and diagnoses durable fuel supply. Prefer this over manually executing individual smelter placement steps."
+        description = "Plan and atomically build a direct drill-output smelter cell: derive checked geometry, place or align the output belt, furnace, and inserter, bootstrap burner fuel, then verify the new cell. Rolls the whole cell back if it cannot be proven."
     )]
     async fn execute_direct_smelter(
         &self,
@@ -5414,18 +5834,6 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        if params.dry_run {
-            let result = serde_json::json!({
-                "success": plan.get("success").and_then(|value| value.as_bool()).unwrap_or(false),
-                "dry_run": true,
-                "plan": plan,
-                "guidance": "If success/ready are true and missing_items is empty, call execute_direct_smelter again with dry_run=false.",
-            });
-            let msg =
-                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
-            return self.with_player_messages(msg).await;
-        }
-
         if !plan
             .get("success")
             .and_then(|value| value.as_bool())
@@ -5436,121 +5844,216 @@ impl FactorioMcp {
             return self.with_player_messages(msg).await;
         }
 
-        let mut actions = Vec::new();
-        let mut placed_furnace_unit = None;
-        let mut placed_inserter_unit = None;
         let steps = plan
             .get("steps")
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
-
-        for step in steps {
-            let tool = step
-                .get("tool")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let args = step.get("tool_args").unwrap_or(&serde_json::Value::Null);
-            match tool {
-                "place_entity" => {
-                    let entity_name = args
-                        .get("entity_name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    let x = args
-                        .get("x")
-                        .and_then(|value| value.as_f64())
-                        .unwrap_or(0.0);
-                    let y = args
-                        .get("y")
-                        .and_then(|value| value.as_f64())
-                        .unwrap_or(0.0);
-                    let direction_name = args
-                        .get("direction")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("north");
-                    let direction = match Direction::parse(direction_name) {
-                        Some(direction) => direction,
-                        None => {
-                            actions.push(serde_json::json!({
-                                "tool": tool,
-                                "args": args,
-                                "success": false,
-                                "error": format!("invalid direction {}", direction_name),
-                            }));
-                            continue;
-                        }
-                    };
-                    let placed = client
-                        .place_entity(entity_name, Position::new(x, y), direction)
-                        .await;
-                    match placed {
-                        Ok(entity) => {
-                            if entity_name == params.furnace_name {
-                                placed_furnace_unit = entity.unit_number;
-                            }
-                            if entity_name == params.inserter_name {
-                                placed_inserter_unit = entity.unit_number;
-                            }
-                            actions.push(serde_json::json!({
-                                "tool": tool,
-                                "args": args,
-                                "success": true,
-                                "unit_number": entity.unit_number,
-                            }));
-                        }
-                        Err(e) => actions.push(serde_json::json!({
-                            "tool": tool,
-                            "args": args,
-                            "success": false,
-                            "error": e.to_string(),
-                        })),
-                    }
-                }
-                "rotate_entity" => {
-                    let unit_number = args
-                        .get("unit_number")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0) as u32;
-                    let direction_name = args
-                        .get("direction")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("north");
-                    let direction = match Direction::parse(direction_name) {
-                        Some(direction) => direction,
-                        None => {
-                            actions.push(serde_json::json!({
-                                "tool": tool,
-                                "args": args,
-                                "success": false,
-                                "error": format!("invalid direction {}", direction_name),
-                            }));
-                            continue;
-                        }
-                    };
-                    let rotated = client
-                        .rotate_entity(unit_number, direction.to_factorio())
-                        .await;
-                    actions.push(serde_json::json!({
-                        "tool": tool,
-                        "args": args,
-                        "success": rotated.is_ok(),
-                        "error": rotated.as_ref().err().map(|e| e.to_string()),
+        let (planned_placements, planned_rotations) = match parse_controller_steps(&steps) {
+            Ok(steps) => steps,
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let placement_reservations: Vec<ControllerPlacement<'_>> = planned_placements
+            .iter()
+            .map(|placement| ControllerPlacement {
+                label: &placement.label,
+                item_name: &placement.entity_name,
+                entity_name: &placement.entity_name,
+                position: placement.position,
+                direction: placement.direction,
+            })
+            .collect();
+        let mut preflight = match controller_preflight(
+            &mut client,
+            &[],
+            &params.belt_name,
+            &HashSet::new(),
+            &placement_reservations,
+        )
+        .await
+        {
+            Ok(preflight) => preflight,
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let mut rotation_reports = Vec::new();
+        let mut rotations_ready = true;
+        for rotation in &planned_rotations {
+            match client.get_entity(rotation.unit_number).await {
+                Ok(entity) => rotation_reports.push(serde_json::json!({
+                    "success": true,
+                    "unit_number": rotation.unit_number,
+                    "name": entity.name,
+                    "previous_direction": entity.direction,
+                    "requested_direction": rotation.direction,
+                })),
+                Err(error) => {
+                    rotations_ready = false;
+                    rotation_reports.push(serde_json::json!({
+                        "success": false,
+                        "unit_number": rotation.unit_number,
+                        "error": error.to_string(),
                     }));
                 }
-                _ => actions.push(serde_json::json!({
-                    "tool": tool,
-                    "args": args,
-                    "success": false,
-                    "error": "unsupported execute_direct_smelter step",
-                })),
             }
+        }
+        let preflight_ready = preflight["ready"].as_bool() == Some(true) && rotations_ready;
+        if let Some(object) = preflight.as_object_mut() {
+            object.insert("ready".to_string(), serde_json::json!(preflight_ready));
+            object.insert("rotations".to_string(), serde_json::json!(rotation_reports));
+        }
+
+        if params.dry_run {
+            let result = serde_json::json!({
+                "success": preflight_ready,
+                "dry_run": true,
+                "plan": plan,
+                "preflight": preflight,
+                "guidance": "Execute only when preflight.ready is true; every placement, inventory reservation, and existing-belt rotation is one transaction.",
+            });
+            let msg =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
+            return self.with_player_messages(msg).await;
+        }
+        if !preflight_ready {
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "compound_preflight_failed",
+                "error": "Direct smelter failed complete placement, material, or rotation preflight. Nothing was changed.",
+                "plan": plan,
+                "preflight": preflight,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
+
+        let mut transaction_units = Vec::new();
+        let mut rotated_entities = Vec::new();
+        let mut actions = Vec::new();
+        for rotation in planned_rotations {
+            let previous = match client.get_entity(rotation.unit_number).await {
+                Ok(entity) => entity.direction,
+                Err(error) => {
+                    let rollback = rollback_controller_transaction(
+                        &mut client,
+                        &transaction_units,
+                        &rotated_entities,
+                        None,
+                    )
+                    .await;
+                    let result = serde_json::json!({
+                        "success": false,
+                        "error_kind": "rotation_execution_failed",
+                        "error": error.to_string(),
+                        "rollback": rollback,
+                    });
+                    return self
+                        .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                        .await;
+                }
+            };
+            if let Err(error) = client
+                .rotate_entity(rotation.unit_number, rotation.direction.to_factorio())
+                .await
+            {
+                let rollback = rollback_controller_transaction(
+                    &mut client,
+                    &transaction_units,
+                    &rotated_entities,
+                    None,
+                )
+                .await;
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "rotation_execution_failed",
+                    "error": error.to_string(),
+                    "rollback": rollback,
+                });
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                    .await;
+            }
+            rotated_entities.push((rotation.unit_number, previous));
+            actions.push(serde_json::json!({
+                "tool": "rotate_entity",
+                "success": true,
+                "unit_number": rotation.unit_number,
+                "previous_direction": previous,
+                "direction": rotation.direction,
+            }));
+        }
+
+        let mut placed_furnace_unit = None;
+        let mut placed_inserter_unit = None;
+        for placement in planned_placements {
+            let entity = match client
+                .place_entity(
+                    &placement.entity_name,
+                    placement.position,
+                    placement.direction,
+                )
+                .await
+            {
+                Ok(entity) => entity,
+                Err(error) => {
+                    let rollback = rollback_controller_transaction(
+                        &mut client,
+                        &transaction_units,
+                        &rotated_entities,
+                        None,
+                    )
+                    .await;
+                    let result = serde_json::json!({
+                        "success": false,
+                        "error_kind": "placement_execution_failed",
+                        "failed_entity": placement.entity_name,
+                        "error": error.to_string(),
+                        "rollback": rollback,
+                    });
+                    return self
+                        .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                        .await;
+                }
+            };
+            if placement.entity_name == params.furnace_name {
+                placed_furnace_unit = entity.unit_number;
+            }
+            if placement.entity_name == params.inserter_name {
+                placed_inserter_unit = entity.unit_number;
+            }
+            if let Some(unit_number) = entity.unit_number {
+                transaction_units.push(unit_number);
+            }
+            actions.push(serde_json::json!({
+                "tool": "place_entity",
+                "success": true,
+                "entity_name": placement.entity_name,
+                "unit_number": entity.unit_number,
+            }));
         }
 
         let mut bootstrap_fuel = Vec::new();
         if params.furnace_name != "electric-furnace" {
             if let Some(unit) = placed_furnace_unit {
                 let inserted = client.insert_items(unit, "coal", 25, "fuel").await;
+                if let Err(error) = &inserted {
+                    let rollback = rollback_controller_transaction(
+                        &mut client,
+                        &transaction_units,
+                        &rotated_entities,
+                        None,
+                    )
+                    .await;
+                    let result = serde_json::json!({
+                        "success": false,
+                        "error_kind": "bootstrap_fuel_failed",
+                        "error": error.to_string(),
+                        "rollback": rollback,
+                    });
+                    return self
+                        .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                        .await;
+                }
                 bootstrap_fuel.push(serde_json::json!({
                     "unit_number": unit,
                     "item": "coal",
@@ -5565,6 +6068,24 @@ impl FactorioMcp {
         if params.inserter_name.contains("burner") {
             if let Some(unit) = placed_inserter_unit {
                 let inserted = client.insert_items(unit, "coal", 5, "fuel").await;
+                if let Err(error) = &inserted {
+                    let rollback = rollback_controller_transaction(
+                        &mut client,
+                        &transaction_units,
+                        &rotated_entities,
+                        None,
+                    )
+                    .await;
+                    let result = serde_json::json!({
+                        "success": false,
+                        "error_kind": "bootstrap_fuel_failed",
+                        "error": error.to_string(),
+                        "rollback": rollback,
+                    });
+                    return self
+                        .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                        .await;
+                }
                 bootstrap_fuel.push(serde_json::json!({
                     "unit_number": unit,
                     "item": "coal",
@@ -5590,18 +6111,10 @@ impl FactorioMcp {
             verify_x + 8.0,
             verify_y + 8.0,
         );
-        let (verification, verification_call_ok, has_working_entity) =
-            match client.verify_production(verify_area).await {
-                Ok(entities) => production_verification_json(entities),
-                Err(e) => (
-                    serde_json::json!({
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    false,
-                    false,
-                ),
-            };
+        let verification = match observe_production(&mut client, verify_area, 180).await {
+            Ok(verification) => verification,
+            Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
+        };
         let fuel_sustainability = match client.diagnose_fuel_sustainability(verify_area, 20).await {
             Ok(report) => serde_json::json!({
                 "success": true,
@@ -5613,40 +6126,56 @@ impl FactorioMcp {
             }),
         };
 
-        let action_success = actions.iter().all(|action| {
-            action
-                .get("success")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        });
-        let placed_units: Vec<u32> = [placed_furnace_unit, placed_inserter_unit]
+        let furnace_working = production_unit_verified(&verification, placed_furnace_unit);
+        let mut placed_units_exist =
+            placed_furnace_unit.is_some() && placed_inserter_unit.is_some();
+        for unit_number in [placed_furnace_unit, placed_inserter_unit]
             .into_iter()
             .flatten()
-            .collect();
-        let (placed_units_ready, placed_unit_statuses) =
-            placed_units_not_dead(&verification, &placed_units);
-        let automation_verified = verification_call_ok && has_working_entity && placed_units_ready;
+        {
+            placed_units_exist &= client.get_entity(unit_number).await.is_ok();
+        }
         let repair_hint = automation_repair_hint(
             "execute_direct_smelter",
             "direct drill-to-furnace smelter cell",
-            verification_call_ok,
+            verification.get("error").is_none(),
             &verification,
-            &placed_unit_statuses,
-            Some(action_success),
+            &[],
+            Some(true),
         );
+        let automation_verified = furnace_working && placed_units_exist;
+        if !automation_verified {
+            let rollback = rollback_controller_transaction(
+                &mut client,
+                &transaction_units,
+                &rotated_entities,
+                None,
+            )
+            .await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "verification_failed",
+                "error": "Direct smelter did not prove the newly placed furnace actively producing; all placements and rotations were rolled back.",
+                "verification": verification,
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
         let result = serde_json::json!({
-            "success": action_success && automation_verified,
-            "placement_success": action_success,
+            "success": true,
+            "placement_success": true,
             "dry_run": false,
             "plan": plan,
+            "preflight": preflight,
             "actions": actions,
             "bootstrap_fuel": bootstrap_fuel,
             "automation_verified": {
-                "success": automation_verified,
-                "verification_call_ok": verification_call_ok,
-                "has_working_entity_near_cell": has_working_entity,
-                "placed_units_ready": placed_units_ready,
-                "placed_unit_statuses": placed_unit_statuses,
+                "success": true,
+                "furnace_working": furnace_working,
+                "placed_units_exist": placed_units_exist,
             },
             "verification": verification,
             "fuel_sustainability": fuel_sustainability,
@@ -5912,7 +6441,7 @@ impl FactorioMcp {
 
     /// Perform one bounded bootstrap smelt to create the first automation parts.
     #[tool(
-        description = "Bounded bootstrap controller for breaking first-inserter deadlocks. Internally walks to one furnace, inserts a short fuel/ore buffer, waits for smelting, extracts a small plate batch, and optionally crafts one bootstrap component such as burner-inserter. Use this instead of raw insert_items/extract_items/hand_feed_furnace when no inserter exists yet; after it succeeds, immediately build durable fuel/output automation."
+        description = "Bounded first-inserter bootstrap only: walk to one furnace, add a short fuel/ore buffer, wait for a small plate batch, and optionally craft one bootstrap component. This is temporary recovery, never automation completion; immediately use durable mining, fuel, input, and output controllers afterward."
     )]
     async fn bootstrap_smelting_once(
         &self,
@@ -6194,7 +6723,7 @@ impl FactorioMcp {
 
     /// Rotate an existing entity by unit number.
     #[tool(
-        description = "Rotate an existing entity by unit number. For inserters, direction is the PICKUP side and the result reports Factorio's exact pickup_position and drop_position. Use when place_entity/check_placement recommends rotate_entity for same-tile belts or other rotatable entities."
+        description = "Rotate an existing entity by exact unit number. For inserters, direction is the PICKUP side and the result reports Factorio's exact pickup_position and drop_position. Never use coordinate-based guessing when changing existing infrastructure."
     )]
     async fn rotate_entity(&self, Parameters(params): Parameters<RotateEntityParams>) -> String {
         let mut client = match self.connect().await {
@@ -6826,30 +7355,39 @@ impl FactorioMcp {
             allow_underground: params.allow_underground,
             extend_existing: params.extend_existing,
         };
-
-        let route = match self.route_belt_core(client, &route_params).await {
-            Ok(report) => report,
-            Err(e) => route_belt_failure_json(&route_params, "infrastructure_failure", e),
-        };
-        let route_success = route
-            .get("success")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let route_materials_sufficient = route
-            .get("materials_sufficient")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(true);
-
+        let route = self
+            .route_belt_core(client, &route_params)
+            .await
+            .unwrap_or_else(|error| {
+                route_belt_failure_json(&route_params, "infrastructure_failure", error)
+            });
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
         let inserter_args = serde_json::json!({
             "entity_name": params.inserter_name,
             "x": params.inserter_x,
             "y": params.inserter_y,
             "direction": params.inserter_direction,
         });
+        let preflight = controller_preflight(
+            client,
+            &[("fuel", &route)],
+            &params.belt_type,
+            &HashSet::new(),
+            &[ControllerPlacement {
+                label: "fuel_inserter",
+                item_name: &params.inserter_name,
+                entity_name: &params.inserter_name,
+                position: inserter_position,
+                direction: inserter_direction,
+            }],
+        )
+        .await?;
+        let preflight_ready =
+            preflight.get("ready").and_then(|value| value.as_bool()) == Some(true);
 
         if params.dry_run {
             return Ok(serde_json::json!({
-                "success": route_success,
+                "success": preflight_ready,
                 "dry_run": true,
                 "consumer": {
                     "unit_number": consumer.unit_number,
@@ -6857,6 +7395,7 @@ impl FactorioMcp {
                     "position": consumer.position,
                 },
                 "route": route,
+                "preflight": preflight,
                 "steps": [{
                     "tool": "route_belt",
                     "args": route_params,
@@ -6871,22 +7410,15 @@ impl FactorioMcp {
                         "radius": params.verify_radius,
                     },
                 }],
-                "guidance": if route_success && route_materials_sufficient {
-                    "If route.materials_sufficient is true and inserter placement is clear, call build_fuel_supply again with dry_run=false."
-                } else if route_success {
-                    "Route is geometrically viable but materials are missing. If the missing item is the first inserter or belts needed to escape bootstrap, call bootstrap_smelting_once exactly once to make the first plates/component, then retry build_fuel_supply. Do not execute this build_fuel_supply yet."
-                } else {
-                    "Route planning failed. Follow route.guidance; for long coal-to-boiler paths, build shorter route_belt segments from the coal output toward the consumer, then call build_fuel_supply for the final consumer feed."
-                },
+                "guidance": "Execute only when preflight.ready is true; the route and inserter are reserved as one transaction.",
             }));
         }
 
-        if !route_success {
+        if !preflight_ready {
             return Ok(serde_json::json!({
                 "success": false,
-                "error_kind": route.get("error_kind")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("route_failed"),
+                "error_kind": "compound_preflight_failed",
+                "error": "Fuel route, shared materials, or inserter placement failed preflight. Nothing was placed.",
                 "dry_run": false,
                 "consumer": {
                     "unit_number": consumer.unit_number,
@@ -6894,46 +7426,47 @@ impl FactorioMcp {
                     "position": consumer.position,
                 },
                 "route": route,
-                "inserter": {
-                    "skipped": true,
-                    "reason": "route planning failed",
-                    "args": inserter_args,
-                },
-                "guidance": "No inserter placed because the fuel belt route failed. If route.next_segment is present, call route_belt with route.next_segment.route_belt_args, then retry build_fuel_supply for the final consumer feed.",
+                "preflight": preflight,
+                "guidance": "Resolve every preflight error before retrying; no partial fuel infrastructure was left behind.",
             }));
         }
 
-        if !route_materials_sufficient {
-            return Ok(serde_json::json!({
-                "success": false,
-                "error_kind": route.get("error_kind")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("insufficient_materials"),
-                "dry_run": false,
-                "consumer": {
-                    "unit_number": consumer.unit_number,
-                    "name": consumer.name,
-                    "position": consumer.position,
-                },
-                "route": route,
-                "inserter": {
-                    "skipped": true,
-                    "reason": "route materials insufficient",
-                    "args": inserter_args,
-                },
-                "next_tool": {
-                    "tool": "bootstrap_smelting_once",
-                    "reason": "first inserter or belt materials are missing; make a bounded plate/component batch before durable fuel routing",
-                },
-                "guidance": "Do not test-place a fuel supply when route.materials_sufficient is false. If this is a first-inserter deadlock, call bootstrap_smelting_once exactly once, optionally craft_recipe=burner-inserter, then retry build_fuel_supply.",
-            }));
-        }
-
-        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
-        let inserter = client
+        let mut route_execute = route_params.clone();
+        route_execute.dry_run = false;
+        let route = match self.route_belt_core(client, &route_execute).await {
+            Ok(report) if report_success(&report) => report,
+            Ok(report) => {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "route_execution_failed",
+                    "route": report,
+                    "rollback": {"success": true, "units": {"success": true, "removed_units": [], "errors": []}},
+                }));
+            }
+            Err(error) => return Err(format!("Error: executing fuel route: {error}")),
+        };
+        let mut transaction_units = route_report_placed_units(&route);
+        let inserter = match client
             .place_entity(&params.inserter_name, inserter_position, inserter_direction)
-            .await;
-        let placed_inserter_unit = inserter.as_ref().ok().and_then(|entity| entity.unit_number);
+            .await
+        {
+            Ok(entity) => entity,
+            Err(error) => {
+                let rollback =
+                    rollback_controller_transaction(client, &transaction_units, &[], None).await;
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "inserter_placement_failed",
+                    "error": error.to_string(),
+                    "route": route,
+                    "rollback": rollback,
+                }));
+            }
+        };
+        let placed_inserter_unit = inserter.unit_number;
+        if let Some(unit_number) = placed_inserter_unit {
+            transaction_units.push(unit_number);
+        }
         let bootstrap_fuel = if params.inserter_name.contains("burner") {
             match placed_inserter_unit {
                 Some(unit) => {
@@ -6945,6 +7478,18 @@ impl FactorioMcp {
                             "fuel",
                         )
                         .await;
+                    if let Err(error) = inserted {
+                        let rollback =
+                            rollback_controller_transaction(client, &transaction_units, &[], None)
+                                .await;
+                        return Ok(serde_json::json!({
+                            "success": false,
+                            "error_kind": "bootstrap_fuel_failed",
+                            "error": error.to_string(),
+                            "route": route,
+                            "rollback": rollback,
+                        }));
+                    }
                     serde_json::json!({
                         "tool": "insert_items",
                         "unit_number": unit,
@@ -6952,8 +7497,8 @@ impl FactorioMcp {
                         "count": params.inserter_fuel_count,
                         "inventory_type": "fuel",
                         "temporary_startup_buffer": true,
-                        "success": inserted.is_ok(),
-                        "error": inserted.as_ref().err().map(|e| e.to_string()),
+                        "success": true,
+                        "error": serde_json::Value::Null,
                     })
                 }
                 None => serde_json::json!({
@@ -6970,9 +7515,9 @@ impl FactorioMcp {
         let inserter_report = serde_json::json!({
             "tool": "place_entity",
             "args": inserter_args,
-            "success": inserter.is_ok(),
+            "success": true,
             "unit_number": placed_inserter_unit,
-            "error": inserter.as_ref().err().map(|e| e.to_string()),
+            "error": serde_json::Value::Null,
         });
 
         let verify_radius = params.verify_radius.clamp(1, 50) as f64;
@@ -6982,47 +7527,43 @@ impl FactorioMcp {
             consumer.position.x + verify_radius,
             consumer.position.y + verify_radius,
         );
-        let (verification, verification_call_ok, _) =
-            match client.verify_production(verify_area).await {
-                Ok(entities) => production_verification_json(entities),
-                Err(e) => (
-                    serde_json::json!({
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    false,
-                    false,
-                ),
-            };
-        let placed_units: Vec<u32> = placed_inserter_unit.into_iter().collect();
-        let (fuel_inserter_ready, placed_unit_statuses) =
-            placed_units_not_dead(&verification, &placed_units);
+        let verification = match observe_production(client, verify_area, 180).await {
+            Ok(verification) => verification,
+            Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
+        };
+        let consumer_working = production_unit_verified(&verification, consumer.unit_number);
+        let inserter_exists = match placed_inserter_unit {
+            Some(unit_number) => client.get_entity(unit_number).await.is_ok(),
+            None => false,
+        };
         let repair_hint = automation_repair_hint(
             "build_fuel_supply",
             "durable fuel delivery",
-            verification_call_ok,
+            verification.get("error").is_none(),
             &verification,
-            &placed_unit_statuses,
-            Some(route_success),
+            &[],
+            Some(true),
         );
-        let bootstrap_ok = bootstrap_fuel
-            .get("skipped")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-            || bootstrap_fuel
-                .get("success")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-
-        let success = route_success
-            && inserter.is_ok()
-            && bootstrap_ok
-            && verification_call_ok
-            && fuel_inserter_ready;
+        let success = consumer_working && inserter_exists;
+        if !success {
+            let rollback =
+                rollback_controller_transaction(client, &transaction_units, &[], None).await;
+            return Ok(serde_json::json!({
+                "success": false,
+                "error_kind": "verification_failed",
+                "error": "Fuel controller did not prove the target consumer actively producing; the entire route and inserter were rolled back.",
+                "dry_run": false,
+                "consumer": consumer,
+                "route": route,
+                "verification": verification,
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            }));
+        }
         Ok(serde_json::json!({
-            "success": success,
-            "error_kind": if success { serde_json::Value::Null } else { serde_json::json!("placement_failed") },
-            "placement_success": inserter.is_ok(),
+            "success": true,
+            "error_kind": serde_json::Value::Null,
+            "placement_success": true,
             "dry_run": false,
             "consumer": {
                 "unit_number": consumer.unit_number,
@@ -7030,13 +7571,13 @@ impl FactorioMcp {
                 "position": consumer.position,
             },
             "route": route,
+            "preflight": preflight,
             "inserter": inserter_report,
             "bootstrap_fuel": bootstrap_fuel,
             "automation_verified": {
-                "success": verification_call_ok && fuel_inserter_ready,
-                "verification_call_ok": verification_call_ok,
-                "fuel_inserter_ready": fuel_inserter_ready,
-                "placed_unit_statuses": placed_unit_statuses,
+                "success": true,
+                "consumer_working": consumer_working,
+                "fuel_inserter_exists": inserter_exists,
             },
             "verification": verification,
             "repair_hint": repair_hint,
@@ -7066,7 +7607,7 @@ impl FactorioMcp {
 
     /// Diagnose and repair the highest-priority missing durable fuel supply.
     #[tool(
-        description = "One-call durable fuel repair. Diagnoses the nearby factory, selects the ranked fuel consumer with ready build_fuel_supply args, then routes coal and places the fuel inserter. Prefer this over manually calling insert_items or hand_feed_furnace when boilers/furnaces/burners run out of fuel. Use dry_run=true during planner turns."
+        description = "One-call durable fuel repair. Diagnoses nearby burners, selects the highest-priority consumer with a proven coal source, then atomically routes coal and places its fuel inserter. Use dry_run=true to inspect the selected consumer and full transaction before building."
     )]
     async fn repair_fuel_sustainability(
         &self,
@@ -7160,7 +7701,7 @@ impl FactorioMcp {
 
     /// Build a science belt plus inserter feed for one lab.
     #[tool(
-        description = "Execute a durable science-pack feed into a lab: route a science belt to the inserter pickup tile, place the inserter feeding the lab, then check research status. Prefer this over repeated feed_lab_from_inventory once science is on a belt or staged source. Use dry_run=true during planner turns."
+        description = "Build a durable science-pack belt and inserter into one lab as a single transaction, then report both infrastructure and live research state. Use dry_run=true to preview the complete route and placement."
     )]
     async fn build_lab_feed(&self, Parameters(params): Parameters<BuildLabFeedParams>) -> String {
         let mut client = match self.connect().await {
@@ -7210,17 +7751,36 @@ impl FactorioMcp {
             Ok(report) => report,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
-
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
         let inserter_args = serde_json::json!({
             "entity_name": "inserter",
             "x": params.inserter_x,
             "y": params.inserter_y,
             "direction": params.inserter_direction,
         });
+        let preflight = match controller_preflight(
+            &mut client,
+            &[("lab_feed", &route)],
+            &params.belt_type,
+            &HashSet::new(),
+            &[ControllerPlacement {
+                label: "lab_inserter",
+                item_name: "inserter",
+                entity_name: "inserter",
+                position: inserter_position,
+                direction: inserter_direction,
+            }],
+        )
+        .await
+        {
+            Ok(preflight) => preflight,
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let preflight_ready = preflight["ready"].as_bool() == Some(true);
 
         if params.dry_run {
             let result = serde_json::json!({
-                "success": report_success(&route),
+                "success": preflight_ready,
                 "dry_run": true,
                 "lab": {
                     "unit_number": lab.unit_number,
@@ -7228,6 +7788,7 @@ impl FactorioMcp {
                     "position": lab.position,
                 },
                 "route": route,
+                "preflight": preflight,
                 "steps": [{
                     "tool": "route_belt",
                     "args": route_params,
@@ -7238,24 +7799,74 @@ impl FactorioMcp {
                     "tool": "get_research_status",
                     "args": {},
                 }],
-                "guidance": "If route.materials_sufficient is true and inserter placement is clear, call build_lab_feed again with dry_run=false.",
+                "guidance": "Execute only when preflight.ready is true; the complete route and lab inserter are reserved together.",
             });
             let msg =
                 serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
             return self.with_player_messages(msg).await;
         }
 
-        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
-        let inserter = client
+        if !preflight_ready {
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "compound_preflight_failed",
+                "error": "Lab route, shared materials, or inserter placement failed preflight. Nothing was placed.",
+                "route": route,
+                "preflight": preflight,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
+
+        let mut route_execute = route_params.clone();
+        route_execute.dry_run = false;
+        let route = match self.route_belt_core(&mut client, &route_execute).await {
+            Ok(report) if report_success(&report) => report,
+            Ok(report) => {
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "route_execution_failed",
+                    "route": report,
+                });
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                    .await;
+            }
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let mut transaction_units = route_report_placed_units(&route);
+        let inserter = match client
             .place_entity("inserter", inserter_position, inserter_direction)
-            .await;
-        let placed_inserter_unit = inserter.as_ref().ok().and_then(|entity| entity.unit_number);
+            .await
+        {
+            Ok(entity) => entity,
+            Err(error) => {
+                let rollback =
+                    rollback_controller_transaction(&mut client, &transaction_units, &[], None)
+                        .await;
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "inserter_placement_failed",
+                    "error": error.to_string(),
+                    "route": route,
+                    "rollback": rollback,
+                });
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                    .await;
+            }
+        };
+        let placed_inserter_unit = inserter.unit_number;
+        if let Some(unit_number) = placed_inserter_unit {
+            transaction_units.push(unit_number);
+        }
         let inserter_report = serde_json::json!({
             "tool": "place_entity",
             "args": inserter_args,
-            "success": inserter.is_ok(),
+            "success": true,
             "unit_number": placed_inserter_unit,
-            "error": inserter.as_ref().err().map(|e| e.to_string()),
+            "error": serde_json::Value::Null,
         });
 
         let verify_area = Area::new(
@@ -7264,32 +7875,22 @@ impl FactorioMcp {
             lab.position.x + 8.0,
             lab.position.y + 8.0,
         );
-        let (verification, verification_call_ok, _) =
-            match client.verify_production(verify_area).await {
-                Ok(entities) => production_verification_json(entities),
-                Err(e) => (
-                    serde_json::json!({
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    false,
-                    false,
-                ),
-            };
-        let placed_units: Vec<u32> = placed_inserter_unit.into_iter().collect();
-        let (feed_inserter_ready, placed_unit_statuses) =
-            placed_units_not_dead(&verification, &placed_units);
-        let route_success = route
-            .get("success")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        let verification = match observe_production(&mut client, verify_area, 180).await {
+            Ok(verification) => verification,
+            Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
+        };
+        let lab_working = production_unit_verified(&verification, lab.unit_number);
+        let inserter_exists = match placed_inserter_unit {
+            Some(unit_number) => client.get_entity(unit_number).await.is_ok(),
+            None => false,
+        };
         let repair_hint = automation_repair_hint(
             "build_lab_feed",
             "science belt to lab feed",
-            verification_call_ok,
+            verification.get("error").is_none(),
             &verification,
-            &placed_unit_statuses,
-            Some(route_success),
+            &[],
+            Some(true),
         );
 
         let agent_id = client.agent_id().as_str().to_string();
@@ -7314,17 +7915,32 @@ impl FactorioMcp {
             }),
         };
 
-        let success = route_success
-            && inserter.is_ok()
-            && verification_call_ok
-            && feed_inserter_ready
+        let success = lab_working
+            && inserter_exists
             && research_status
                 .get("success")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
+        if !success {
+            let rollback =
+                rollback_controller_transaction(&mut client, &transaction_units, &[], None).await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "verification_failed",
+                "error": "Lab feed did not prove active research consumption; the complete route and inserter were rolled back.",
+                "route": route,
+                "verification": verification,
+                "research_status": research_status,
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
         let result = serde_json::json!({
-            "success": success,
-            "placement_success": inserter.is_ok(),
+            "success": true,
+            "placement_success": true,
             "dry_run": false,
             "lab": {
                 "unit_number": lab.unit_number,
@@ -7332,12 +7948,12 @@ impl FactorioMcp {
                 "position": lab.position,
             },
             "route": route,
+            "preflight": preflight,
             "inserter": inserter_report,
             "automation_verified": {
-                "success": verification_call_ok && feed_inserter_ready,
-                "verification_call_ok": verification_call_ok,
-                "feed_inserter_ready": feed_inserter_ready,
-                "placed_unit_statuses": placed_unit_statuses,
+                "success": true,
+                "lab_working": lab_working,
+                "feed_inserter_exists": inserter_exists,
             },
             "verification": verification,
             "research_status": research_status,
@@ -7392,7 +8008,7 @@ impl FactorioMcp {
             to_y: params.pickup_y,
             belt_type: params.belt_type.clone(),
             search_radius: params.search_radius,
-            dry_run: params.dry_run,
+            dry_run: true,
             respect_zones: params.respect_zones,
             allow_underground: params.allow_underground,
             extend_existing: params.extend_existing,
@@ -7413,6 +8029,26 @@ impl FactorioMcp {
             "y": params.inserter_y,
             "direction": params.inserter_direction,
         });
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
+        let preflight = match controller_preflight(
+            &mut client,
+            &[("assembler_feed", &route)],
+            &params.belt_type,
+            &HashSet::new(),
+            &[ControllerPlacement {
+                label: "input_inserter",
+                item_name: "inserter",
+                entity_name: "inserter",
+                position: inserter_position,
+                direction: inserter_direction,
+            }],
+        )
+        .await
+        {
+            Ok(preflight) => preflight,
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let preflight_ready = preflight["ready"].as_bool() == Some(true);
 
         if params.dry_run {
             let mut steps = Vec::new();
@@ -7439,7 +8075,7 @@ impl FactorioMcp {
                 },
             }));
             let result = serde_json::json!({
-                "success": true,
+                "success": preflight_ready,
                 "dry_run": true,
                 "item_name": params.item_name.clone(),
                 "assembler": {
@@ -7448,12 +8084,81 @@ impl FactorioMcp {
                     "position": assembler.position,
                 },
                 "route": route,
+                "preflight": preflight,
                 "steps": steps,
-                "guidance": "If route.materials_sufficient is true and inserter placement is clear, call build_assembler_feed again with dry_run=false. Repeat once per recipe input belt.",
+                "guidance": "Execute only when preflight.ready is true. For multi-input recipes prefer a complete compound cell so verification can prove the assembler working.",
             });
             let msg =
                 serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
             return self.with_player_messages(msg).await;
+        }
+
+        if !preflight_ready {
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "compound_preflight_failed",
+                "error": "Assembler feed route, shared materials, or inserter placement failed preflight. Nothing was changed.",
+                "route": route,
+                "preflight": preflight,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
+
+        let previous_recipe = if params.recipe.trim().is_empty() {
+            None
+        } else {
+            match client.get_entity_recipe(params.assembler_unit_number).await {
+                Ok(recipe) => Some(recipe),
+                Err(error) => {
+                    return self
+                        .with_player_messages(format!("Error: reading previous recipe: {error}"))
+                        .await
+                }
+            }
+        };
+        let mut route_execute = route_params.clone();
+        route_execute.dry_run = false;
+        let route = match self.route_belt_core(&mut client, &route_execute).await {
+            Ok(report) if report_success(&report) => report,
+            Ok(report) => {
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "route_execution_failed",
+                    "route": report,
+                });
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                    .await;
+            }
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let mut transaction_units = route_report_placed_units(&route);
+        let inserter = match client
+            .place_entity("inserter", inserter_position, inserter_direction)
+            .await
+        {
+            Ok(entity) => entity,
+            Err(error) => {
+                let rollback =
+                    rollback_controller_transaction(&mut client, &transaction_units, &[], None)
+                        .await;
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "inserter_placement_failed",
+                    "error": error.to_string(),
+                    "route": route,
+                    "rollback": rollback,
+                });
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                    .await;
+            }
+        };
+        let placed_inserter_unit = inserter.unit_number;
+        if let Some(unit_number) = placed_inserter_unit {
+            transaction_units.push(unit_number);
         }
 
         let recipe_report = if params.recipe.trim().is_empty() {
@@ -7466,6 +8171,28 @@ impl FactorioMcp {
             let set_recipe = client
                 .set_recipe(params.assembler_unit_number, params.recipe.trim())
                 .await;
+            if let Err(error) = &set_recipe {
+                let recipe_restore = previous_recipe
+                    .clone()
+                    .map(|recipe| (params.assembler_unit_number, recipe));
+                let rollback = rollback_controller_transaction(
+                    &mut client,
+                    &transaction_units,
+                    &[],
+                    recipe_restore,
+                )
+                .await;
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "set_recipe_failed",
+                    "error": error.to_string(),
+                    "route": route,
+                    "rollback": rollback,
+                });
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                    .await;
+            }
             serde_json::json!({
                 "tool": "set_recipe",
                 "args": recipe_args,
@@ -7473,18 +8200,12 @@ impl FactorioMcp {
                 "error": set_recipe.as_ref().err().map(|e| e.to_string()),
             })
         };
-
-        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
-        let inserter = client
-            .place_entity("inserter", inserter_position, inserter_direction)
-            .await;
-        let placed_inserter_unit = inserter.as_ref().ok().and_then(|entity| entity.unit_number);
         let inserter_report = serde_json::json!({
             "tool": "place_entity",
             "args": inserter_args,
-            "success": inserter.is_ok(),
+            "success": true,
             "unit_number": placed_inserter_unit,
-            "error": inserter.as_ref().err().map(|e| e.to_string()),
+            "error": serde_json::Value::Null,
         });
 
         let verify_radius = params.verify_radius.clamp(1, 50) as f64;
@@ -7494,50 +8215,51 @@ impl FactorioMcp {
             assembler.position.x + verify_radius,
             assembler.position.y + verify_radius,
         );
-        let (verification, verification_call_ok, _) =
-            match client.verify_production(verify_area).await {
-                Ok(entities) => production_verification_json(entities),
-                Err(e) => (
-                    serde_json::json!({
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    false,
-                    false,
-                ),
-            };
-        let placed_units: Vec<u32> = placed_inserter_unit.into_iter().collect();
-        let (feed_inserter_ready, placed_unit_statuses) =
-            placed_units_not_dead(&verification, &placed_units);
-        let route_success = route
-            .get("success")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        let verification = match observe_production(&mut client, verify_area, 180).await {
+            Ok(verification) => verification,
+            Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
+        };
+        let assembler_working = production_unit_verified(&verification, assembler.unit_number);
+        let inserter_exists = match placed_inserter_unit {
+            Some(unit_number) => client.get_entity(unit_number).await.is_ok(),
+            None => false,
+        };
         let repair_hint = automation_repair_hint(
             "build_assembler_feed",
             "item belt to assembler input feed",
-            verification_call_ok,
+            verification.get("error").is_none(),
             &verification,
-            &placed_unit_statuses,
-            Some(route_success),
+            &[],
+            Some(true),
         );
-
-        let recipe_ok = recipe_report
-            .get("skipped")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-            || recipe_report
-                .get("success")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-        let success = route_success
-            && recipe_ok
-            && inserter.is_ok()
-            && verification_call_ok
-            && feed_inserter_ready;
+        let success = assembler_working && inserter_exists;
+        if !success {
+            let recipe_restore = previous_recipe
+                .clone()
+                .map(|recipe| (params.assembler_unit_number, recipe));
+            let rollback = rollback_controller_transaction(
+                &mut client,
+                &transaction_units,
+                &[],
+                recipe_restore,
+            )
+            .await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "verification_failed",
+                "error": "Assembler feed did not prove the target machine actively producing; the route, inserter, and recipe change were rolled back.",
+                "route": route,
+                "verification": verification,
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
         let result = serde_json::json!({
-            "success": success,
-            "placement_success": inserter.is_ok(),
+            "success": true,
+            "placement_success": true,
             "dry_run": false,
             "item_name": params.item_name.clone(),
             "assembler": {
@@ -7547,12 +8269,12 @@ impl FactorioMcp {
             },
             "recipe": recipe_report,
             "route": route,
+            "preflight": preflight,
             "inserter": inserter_report,
             "automation_verified": {
-                "success": verification_call_ok && feed_inserter_ready,
-                "verification_call_ok": verification_call_ok,
-                "feed_inserter_ready": feed_inserter_ready,
-                "placed_unit_statuses": placed_unit_statuses,
+                "success": true,
+                "assembler_working": assembler_working,
+                "feed_inserter_exists": inserter_exists,
             },
             "verification": verification,
             "repair_hint": repair_hint,
@@ -7689,7 +8411,7 @@ impl FactorioMcp {
             to_y: params.to_y,
             belt_type: params.belt_type.clone(),
             search_radius: params.search_radius,
-            dry_run: params.dry_run,
+            dry_run: true,
             respect_zones: params.respect_zones,
             allow_underground: params.allow_underground,
             extend_existing: params.extend_existing,
@@ -7706,10 +8428,30 @@ impl FactorioMcp {
             "y": params.inserter_y,
             "direction": params.inserter_direction,
         });
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
+        let preflight = match controller_preflight(
+            &mut client,
+            &[("machine_output", &route)],
+            &params.belt_type,
+            &HashSet::new(),
+            &[ControllerPlacement {
+                label: "output_inserter",
+                item_name: "inserter",
+                entity_name: "inserter",
+                position: inserter_position,
+                direction: inserter_direction,
+            }],
+        )
+        .await
+        {
+            Ok(preflight) => preflight,
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let preflight_ready = preflight["ready"].as_bool() == Some(true);
 
         if params.dry_run {
             let result = serde_json::json!({
-                "success": report_success(&route),
+                "success": preflight_ready,
                 "dry_run": true,
                 "item_name": params.item_name.clone(),
                 "source_machine": {
@@ -7723,6 +8465,7 @@ impl FactorioMcp {
                     "position": source_machine.position,
                 },
                 "route": route,
+                "preflight": preflight,
                 "steps": [{
                     "tool": "route_belt",
                     "args": route_params,
@@ -7737,24 +8480,73 @@ impl FactorioMcp {
                         "radius": params.verify_radius,
                     },
                 }],
-                "guidance": "If route.materials_sufficient is true and inserter placement is clear, call build_assembler_output again with dry_run=false. For furnace plates, use the target belt as the plate source for assembler feeds; for science output, connect the target belt to build_lab_feed.",
+                "guidance": "Execute only when preflight.ready is true; the route and output inserter are one transaction.",
             });
             let msg =
                 serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
             return self.with_player_messages(msg).await;
         }
 
-        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
-        let inserter = client
+        if !preflight_ready {
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "compound_preflight_failed",
+                "error": "Output route, shared materials, or inserter placement failed preflight. Nothing was placed.",
+                "route": route,
+                "preflight": preflight,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
+        let mut route_execute = route_params.clone();
+        route_execute.dry_run = false;
+        let route = match self.route_belt_core(&mut client, &route_execute).await {
+            Ok(report) if report_success(&report) => report,
+            Ok(report) => {
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "route_execution_failed",
+                    "route": report,
+                });
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                    .await;
+            }
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+        let mut transaction_units = route_report_placed_units(&route);
+        let inserter = match client
             .place_entity("inserter", inserter_position, inserter_direction)
-            .await;
-        let placed_inserter_unit = inserter.as_ref().ok().and_then(|entity| entity.unit_number);
+            .await
+        {
+            Ok(entity) => entity,
+            Err(error) => {
+                let rollback =
+                    rollback_controller_transaction(&mut client, &transaction_units, &[], None)
+                        .await;
+                let result = serde_json::json!({
+                    "success": false,
+                    "error_kind": "inserter_placement_failed",
+                    "error": error.to_string(),
+                    "route": route,
+                    "rollback": rollback,
+                });
+                return self
+                    .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                    .await;
+            }
+        };
+        let placed_inserter_unit = inserter.unit_number;
+        if let Some(unit_number) = placed_inserter_unit {
+            transaction_units.push(unit_number);
+        }
         let inserter_report = serde_json::json!({
             "tool": "place_entity",
             "args": inserter_args,
-            "success": inserter.is_ok(),
+            "success": true,
             "unit_number": placed_inserter_unit,
-            "error": inserter.as_ref().err().map(|e| e.to_string()),
+            "error": serde_json::Value::Null,
         });
 
         let verify_radius = params.verify_radius.clamp(1, 50) as f64;
@@ -7764,39 +8556,44 @@ impl FactorioMcp {
             source_machine.position.x + verify_radius,
             source_machine.position.y + verify_radius,
         );
-        let (verification, verification_call_ok, _) =
-            match client.verify_production(verify_area).await {
-                Ok(entities) => production_verification_json(entities),
-                Err(e) => (
-                    serde_json::json!({
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    false,
-                    false,
-                ),
-            };
-        let placed_units: Vec<u32> = placed_inserter_unit.into_iter().collect();
-        let (output_inserter_ready, placed_unit_statuses) =
-            placed_units_not_dead(&verification, &placed_units);
-        let route_success = route
-            .get("success")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        let verification = match observe_production(&mut client, verify_area, 180).await {
+            Ok(verification) => verification,
+            Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
+        };
+        let machine_working = production_unit_verified(&verification, source_machine.unit_number);
+        let inserter_exists = match placed_inserter_unit {
+            Some(unit_number) => client.get_entity(unit_number).await.is_ok(),
+            None => false,
+        };
         let repair_hint = automation_repair_hint(
             "build_assembler_output",
             "machine output belt",
-            verification_call_ok,
+            verification.get("error").is_none(),
             &verification,
-            &placed_unit_statuses,
-            Some(route_success),
+            &[],
+            Some(true),
         );
 
-        let success =
-            route_success && inserter.is_ok() && verification_call_ok && output_inserter_ready;
+        let success = machine_working && inserter_exists;
+        if !success {
+            let rollback =
+                rollback_controller_transaction(&mut client, &transaction_units, &[], None).await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "verification_failed",
+                "error": "Machine output did not prove the source machine actively producing; the route and inserter were rolled back.",
+                "route": route,
+                "verification": verification,
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
         let result = serde_json::json!({
-            "success": success,
-            "placement_success": inserter.is_ok(),
+            "success": true,
+            "placement_success": true,
             "dry_run": false,
             "item_name": params.item_name.clone(),
             "source_machine": {
@@ -7810,12 +8607,12 @@ impl FactorioMcp {
                 "position": source_machine.position,
             },
             "route": route,
+            "preflight": preflight,
             "inserter": inserter_report,
             "automation_verified": {
-                "success": verification_call_ok && output_inserter_ready,
-                "verification_call_ok": verification_call_ok,
-                "output_inserter_ready": output_inserter_ready,
-                "placed_unit_statuses": placed_unit_statuses,
+                "success": true,
+                "machine_working": machine_working,
+                "output_inserter_exists": inserter_exists,
             },
             "verification": verification,
             "repair_hint": repair_hint,
@@ -7954,6 +8751,16 @@ impl FactorioMcp {
             &additional_items,
             &params.belt_type,
             &HashSet::new(),
+            &[
+                (
+                    "input_inserter",
+                    GridPos::from_position(&Position::new(input.inserter_x, input.inserter_y)),
+                ),
+                (
+                    "output_inserter",
+                    GridPos::from_position(&Position::new(output.inserter_x, output.inserter_y)),
+                ),
+            ],
         );
         let placement_preflight = serde_json::json!({
             "input_inserter": client.check_entity_placement(
@@ -8118,6 +8925,22 @@ impl FactorioMcp {
             &additional_items,
             &params.belt_type,
             &HashSet::new(),
+            &[
+                (
+                    "input_inserter",
+                    GridPos::from_position(&Position::new(
+                        params.input_inserter_x,
+                        params.input_inserter_y,
+                    )),
+                ),
+                (
+                    "output_inserter",
+                    GridPos::from_position(&Position::new(
+                        params.output_inserter_x,
+                        params.output_inserter_y,
+                    )),
+                ),
+            ],
         );
         let input_placement = client
             .check_entity_placement(
@@ -8232,6 +9055,15 @@ impl FactorioMcp {
                 .await;
         }
 
+        let previous_recipe = match client.get_entity_recipe(params.assembler_unit_number).await {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                return self
+                    .with_player_messages(format!("Error: reading previous recipe: {error}"))
+                    .await
+            }
+        };
+
         let mut input_execute = input_route_params.clone();
         input_execute.dry_run = false;
         let mut output_execute = output_route_params.clone();
@@ -8345,7 +9177,13 @@ impl FactorioMcp {
             .set_recipe(params.assembler_unit_number, params.recipe.trim())
             .await;
         if let Err(error) = &set_recipe {
-            let rollback = rollback_exact_units(&mut client, &transaction_units).await;
+            let rollback = rollback_controller_transaction(
+                &mut client,
+                &transaction_units,
+                &[],
+                Some((params.assembler_unit_number, previous_recipe.clone())),
+            )
+            .await;
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "set_recipe_failed",
@@ -8370,25 +9208,18 @@ impl FactorioMcp {
             assembler.position.x + verify_radius,
             assembler.position.y + verify_radius,
         );
-        let (verification, verification_call_ok, _) =
-            match client.verify_production(verify_area).await {
-                Ok(entities) => production_verification_json(entities),
-                Err(e) => (
-                    serde_json::json!({
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    false,
-                    false,
-                ),
-            };
-        let placed_units: Vec<u32> = [input_inserter_unit, output_inserter_unit]
+        let verification = match observe_production(&mut client, verify_area, 180).await {
+            Ok(verification) => verification,
+            Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
+        };
+        let assembler_working = production_unit_verified(&verification, assembler.unit_number);
+        let mut inserters_exist = input_inserter_unit.is_some() && output_inserter_unit.is_some();
+        for unit_number in [input_inserter_unit, output_inserter_unit]
             .into_iter()
             .flatten()
-            .collect();
-        let (inserters_ready, placed_unit_statuses) =
-            placed_units_not_dead(&verification, &placed_units);
-        let assembler_working = placed_unit_working(&verification, assembler.unit_number);
+        {
+            inserters_exist &= client.get_entity(unit_number).await.is_ok();
+        }
         let route_ok = |value: &serde_json::Value| {
             value
                 .get("success")
@@ -8399,18 +9230,33 @@ impl FactorioMcp {
         let repair_hint = automation_repair_hint(
             "build_recipe_assembler_cell",
             "one-input assembler component cell",
-            verification_call_ok,
+            verification.get("error").is_none(),
             &verification,
-            &placed_unit_statuses,
+            &[],
             Some(routes_success),
         );
-        let success = set_recipe.is_ok()
-            && routes_success
-            && input_inserter.is_ok()
-            && output_inserter.is_ok()
-            && verification_call_ok
-            && assembler_working
-            && inserters_ready;
+        let success = routes_success && assembler_working && inserters_exist;
+        if !success {
+            let rollback = rollback_controller_transaction(
+                &mut client,
+                &transaction_units,
+                &[],
+                Some((params.assembler_unit_number, previous_recipe)),
+            )
+            .await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "verification_failed",
+                "error": "Assembler cell did not prove the target assembler actively producing; both routes, both inserters, and the recipe change were rolled back.",
+                "routes": {"input": input_route, "output": output_route},
+                "verification": verification,
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
 
         let result = serde_json::json!({
             "success": success,
@@ -8446,11 +9292,9 @@ impl FactorioMcp {
                 },
             },
             "automation_verified": {
-                "success": verification_call_ok && assembler_working && inserters_ready,
-                "verification_call_ok": verification_call_ok,
+                "success": true,
                 "assembler_working": assembler_working,
-                "inserters_ready": inserters_ready,
-                "placed_unit_statuses": placed_unit_statuses,
+                "inserters_exist": inserters_exist,
             },
             "verification": verification,
             "repair_hint": repair_hint,
@@ -8678,6 +9522,27 @@ impl FactorioMcp {
             &additional_items,
             &build_args.belt_type,
             &allowed_shared_tiles,
+            &[
+                (
+                    "gear_inserter",
+                    GridPos::from_position(&Position::new(gear.inserter_x, gear.inserter_y)),
+                ),
+                (
+                    "copper_inserter",
+                    GridPos::from_position(&Position::new(copper.inserter_x, copper.inserter_y)),
+                ),
+                (
+                    "output_inserter",
+                    GridPos::from_position(&Position::new(output.inserter_x, output.inserter_y)),
+                ),
+                (
+                    "lab_inserter",
+                    GridPos::from_position(&Position::new(
+                        lab_feed.inserter_x,
+                        lab_feed.inserter_y,
+                    )),
+                ),
+            ],
         );
         let placement_preflight = serde_json::json!({
             "gear_inserter": client.check_entity_placement(
@@ -8938,6 +9803,36 @@ impl FactorioMcp {
             &additional_items,
             &params.belt_type,
             &allowed_shared_tiles,
+            &[
+                (
+                    "gear_inserter",
+                    GridPos::from_position(&Position::new(
+                        params.gear_inserter_x,
+                        params.gear_inserter_y,
+                    )),
+                ),
+                (
+                    "copper_inserter",
+                    GridPos::from_position(&Position::new(
+                        params.copper_inserter_x,
+                        params.copper_inserter_y,
+                    )),
+                ),
+                (
+                    "output_inserter",
+                    GridPos::from_position(&Position::new(
+                        params.output_inserter_x,
+                        params.output_inserter_y,
+                    )),
+                ),
+                (
+                    "lab_inserter",
+                    GridPos::from_position(&Position::new(
+                        params.lab_inserter_x,
+                        params.lab_inserter_y,
+                    )),
+                ),
+            ],
         );
         let gear_placement = client
             .check_entity_placement(
@@ -9111,6 +10006,15 @@ impl FactorioMcp {
                 .await;
         }
 
+        let previous_recipe = match client.get_entity_recipe(params.assembler_unit_number).await {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                return self
+                    .with_player_messages(format!("Error: reading previous recipe: {error}"))
+                    .await
+            }
+        };
+
         let mut gear_execute = gear_route_params.clone();
         gear_execute.dry_run = false;
         let mut copper_execute = copper_route_params.clone();
@@ -9277,7 +10181,13 @@ impl FactorioMcp {
             .set_recipe(params.assembler_unit_number, "automation-science-pack")
             .await;
         if let Err(error) = &set_recipe {
-            let rollback = rollback_exact_units(&mut client, &transaction_units).await;
+            let rollback = rollback_controller_transaction(
+                &mut client,
+                &transaction_units,
+                &[],
+                Some((params.assembler_unit_number, previous_recipe.clone())),
+            )
+            .await;
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "set_recipe_failed",
@@ -9300,12 +10210,6 @@ impl FactorioMcp {
         let output_inserter_unit = output_inserter.unit_number;
         let lab_inserter_unit = lab_inserter.unit_number;
 
-        let wait_error = client
-            .wait_ticks(120)
-            .await
-            .err()
-            .map(|error| error.to_string());
-
         let verify_radius = params.verify_radius.clamp(1, 50) as f64;
         let verify_area = Area::new(
             assembler.position.x.min(lab.position.x) - verify_radius,
@@ -9313,18 +10217,10 @@ impl FactorioMcp {
             assembler.position.x.max(lab.position.x) + verify_radius,
             assembler.position.y.max(lab.position.y) + verify_radius,
         );
-        let (verification, verification_call_ok, _) =
-            match client.verify_production(verify_area).await {
-                Ok(entities) => production_verification_json(entities),
-                Err(e) => (
-                    serde_json::json!({
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    false,
-                    false,
-                ),
-            };
+        let verification = match observe_production(&mut client, verify_area, 180).await {
+            Ok(verification) => verification,
+            Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
+        };
         let placed_units: Vec<u32> = [
             gear_inserter_unit,
             copper_inserter_unit,
@@ -9334,11 +10230,13 @@ impl FactorioMcp {
         .into_iter()
         .flatten()
         .collect();
-        let (inserters_ready, placed_unit_statuses) =
-            placed_units_not_dead(&verification, &placed_units);
+        let mut inserters_exist = placed_units.len() == 4;
+        for unit_number in &placed_units {
+            inserters_exist &= client.get_entity(*unit_number).await.is_ok();
+        }
 
-        let assembler_working = placed_unit_working(&verification, assembler.unit_number);
-        let lab_working = placed_unit_working(&verification, lab.unit_number);
+        let assembler_working = production_unit_verified(&verification, assembler.unit_number);
+        let lab_working = production_unit_verified(&verification, lab.unit_number);
 
         let agent_id = client.agent_id().as_str().to_string();
         let research_status = match client
@@ -9375,20 +10273,40 @@ impl FactorioMcp {
         let repair_hint = automation_repair_hint(
             "build_automation_science",
             "complete automation-science assembler-to-lab cell",
-            verification_call_ok,
+            verification.get("error").is_none(),
             &verification,
-            &placed_unit_statuses,
+            &[],
             Some(routes_success),
         );
-        let success = set_recipe.is_ok()
-            && routes_success
-            && verification_call_ok
+        let success = routes_success
             && assembler_working
-            && inserters_ready
+            && lab_working
+            && inserters_exist
             && research_status
                 .get("success")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
+        if !success {
+            let rollback = rollback_controller_transaction(
+                &mut client,
+                &transaction_units,
+                &[],
+                Some((params.assembler_unit_number, previous_recipe)),
+            )
+            .await;
+            let result = serde_json::json!({
+                "success": false,
+                "error_kind": "verification_failed",
+                "error": "Automation-science cell did not prove both pack production and lab consumption; every route, inserter, and recipe change was rolled back.",
+                "verification": verification,
+                "research_status": research_status,
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            });
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap())
+                .await;
+        }
 
         let result = serde_json::json!({
             "success": success,
@@ -9445,13 +10363,10 @@ impl FactorioMcp {
                 },
             },
             "automation_verified": {
-                "success": verification_call_ok && assembler_working && inserters_ready,
-                "verification_call_ok": verification_call_ok,
+                "success": true,
                 "assembler_working": assembler_working,
                 "lab_working": lab_working,
-                "inserters_ready": inserters_ready,
-                "placed_unit_statuses": placed_unit_statuses,
-                "wait_error": wait_error,
+                "inserters_exist": inserters_exist,
             },
             "verification": verification,
             "research_status": research_status,

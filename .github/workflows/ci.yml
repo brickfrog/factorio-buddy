@@ -33,3 +33,30 @@ jobs:
         run: find mod/claude-interface -name '*.lua' -print0 | xargs -0 luac -p
       - name: Release build
         run: cargo build --release --all-targets --locked
+
+  live-factorio:
+    needs: rust-and-lua
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Install live-test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 jq lua5.4 procps xz-utils
+      - name: Download official Factorio headless server
+        env:
+          FACTORIO_ARCHIVE: ${{ runner.temp }}/factorio-headless.tar.xz
+        run: |
+          curl --fail --location --retry 3 --retry-all-errors \
+            https://www.factorio.com/get-download/stable/headless/linux64 \
+            --output "$FACTORIO_ARCHIVE"
+          tar -xJf "$FACTORIO_ARCHIVE" -C "${{ runner.temp }}"
+          test -x "${{ runner.temp }}/factorio/bin/x64/factorio"
+      - name: Complete live Factorio path
+        env:
+          FACTORIO_BIN: ${{ runner.temp }}/factorio/bin/x64/factorio
+        run: just test-live

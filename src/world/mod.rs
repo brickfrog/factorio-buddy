@@ -273,6 +273,40 @@ pub fn entity_size(name: &str) -> (u32, u32) {
     }
 }
 
+/// Return every map tile occupied by an entity.
+///
+/// Live entity summaries include the authoritative, already-rotated collision
+/// box. The prototype-size fallback exists for synthetic/offline inputs and
+/// rotates non-square footprints for east/west-facing entities.
+pub fn entity_occupied_tiles(entity: &Entity) -> Vec<TilePos> {
+    let (left, top, right, bottom) = match entity.bounding_box {
+        Some(bounds) => (
+            bounds.left_top.x.floor() as i32,
+            bounds.left_top.y.floor() as i32,
+            bounds.right_bottom.x.ceil() as i32,
+            bounds.right_bottom.y.ceil() as i32,
+        ),
+        None => {
+            let (mut width, mut height) = entity_size(&entity.name);
+            if matches!(entity.direction_enum(), Direction::East | Direction::West) {
+                std::mem::swap(&mut width, &mut height);
+            }
+            let half_width = width as f64 / 2.0;
+            let half_height = height as f64 / 2.0;
+            (
+                (entity.position.x - half_width).floor() as i32,
+                (entity.position.y - half_height).floor() as i32,
+                (entity.position.x + half_width).ceil() as i32,
+                (entity.position.y + half_height).ceil() as i32,
+            )
+        }
+    };
+
+    (left..right)
+        .flat_map(|x| (top..bottom).map(move |y| TilePos::new(x, y)))
+        .collect()
+}
+
 /// Direction enum matching Factorio 2.0's defines.direction
 /// In Factorio 2.0, direction values are multiples of 4 for cardinal directions
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -394,5 +428,42 @@ mod tests {
         assert_eq!(entity_size("boiler"), (3, 2));
         assert_eq!(entity_size("steam-engine"), (3, 5));
         assert_eq!(entity_size("small-electric-pole"), (1, 1));
+        assert_eq!(entity_size("electric-mining-drill"), (3, 3));
+    }
+
+    #[test]
+    fn occupied_tiles_use_authoritative_bounding_box() {
+        let entity = Entity {
+            unit_number: Some(1),
+            name: "assembling-machine-1".to_string(),
+            entity_type: Some("assembling-machine".to_string()),
+            position: Position::new(3.5, 0.5),
+            direction: Direction::North.to_factorio(),
+            health: None,
+            force: None,
+            bounding_box: Some(Area::new(2.1, -0.9, 4.9, 1.9)),
+        };
+
+        let occupied = entity_occupied_tiles(&entity);
+        assert_eq!(occupied.len(), 9);
+        assert!(occupied.contains(&TilePos::new(2, -1)));
+        assert!(occupied.contains(&TilePos::new(4, 1)));
+    }
+
+    #[test]
+    fn occupied_tiles_rotate_non_square_fallback_footprint() {
+        let entity = Entity {
+            unit_number: Some(1),
+            name: "splitter".to_string(),
+            entity_type: Some("splitter".to_string()),
+            position: Position::new(0.5, 1.0),
+            direction: Direction::East.to_factorio(),
+            health: None,
+            force: None,
+            bounding_box: None,
+        };
+
+        let occupied = entity_occupied_tiles(&entity);
+        assert_eq!(occupied, vec![TilePos::new(0, 0), TilePos::new(0, 1)]);
     }
 }

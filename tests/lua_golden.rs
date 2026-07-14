@@ -2013,6 +2013,30 @@ fn named_walk_poll_loop_exits_when_driver_clears_target() {
 }
 
 #[test]
+fn mod_walk_target_uses_engine_walking_without_teleporting() {
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let walk_driver = control_lua
+        .split("local WALK_DIRECTION_THRESHOLD")
+        .nth(1)
+        .and_then(|tail| tail.split("local function update_agent_markers()").next())
+        .expect("walk target subsystem should precede marker updates");
+
+    assert!(
+        control_lua.contains("local function walk_direction_toward(dx, dy)")
+            && walk_driver.contains("c.walking_state = {")
+            && walk_driver.contains("walking = true")
+            && walk_driver.contains("direction = walk_direction_toward(dx, dy)")
+            && walk_driver.contains("tgt.stuck_ticks >= 120")
+            && walk_driver.contains("stop_target_walk(agent_id, c)"),
+        "walk targets must use tick-driven Factorio walking with arrival, stuck, and stop handling"
+    );
+    assert!(
+        !walk_driver.contains("teleport("),
+        "the production walk-target driver must never teleport the NPC"
+    );
+}
+
+#[test]
 fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
     for (name, lua, method) in [
         (

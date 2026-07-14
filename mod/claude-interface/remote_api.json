@@ -92,6 +92,7 @@
     "register_character": {"args": ["agent_id", "entity"], "returns": "entity"},
     "set_game_speed": {"args": ["speed"], "returns": "json"},
     "set_recipe": {"args": ["agent_id", "unit_number", "recipe"], "returns": "json"},
+    "get_entity_recipe": {"args": ["unit_number"], "returns": "json"},
     "set_spectator_mode": {"args": ["enabled"], "returns": "nil"},
     "set_status": {"args": ["player_index", "status_text"], "returns": "nil"},
     "set_tick_paused": {"args": ["paused"], "returns": "json"},

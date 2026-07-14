@@ -1,7 +1,7 @@
 //! Inserter pickup/dropoff analysis
 
 use super::{EntityRef, InserterAnalysis};
-use crate::world::{entity_size, Direction, Entity, TilePos};
+use crate::world::{entity_occupied_tiles, Direction, Entity, TilePos};
 use std::collections::HashMap;
 
 /// Analyze all inserters in the entity list
@@ -18,7 +18,7 @@ pub fn analyze_inserters(entities: &[Entity]) -> Vec<InserterAnalysis> {
 fn build_entity_lookup(entities: &[Entity]) -> HashMap<TilePos, &Entity> {
     let mut entity_at: HashMap<TilePos, &Entity> = HashMap::new();
     for entity in entities {
-        for tile in occupied_tiles(entity) {
+        for tile in entity_occupied_tiles(entity) {
             match entity_at.get(&tile) {
                 Some(existing) if entity_priority(existing) >= entity_priority(entity) => {}
                 _ => {
@@ -28,31 +28,6 @@ fn build_entity_lookup(entities: &[Entity]) -> HashMap<TilePos, &Entity> {
         }
     }
     entity_at
-}
-
-fn occupied_tiles(entity: &Entity) -> Vec<TilePos> {
-    let (left, top, right, bottom) = match entity.bounding_box {
-        Some(bounds) => (
-            bounds.left_top.x.floor() as i32,
-            bounds.left_top.y.floor() as i32,
-            bounds.right_bottom.x.ceil() as i32,
-            bounds.right_bottom.y.ceil() as i32,
-        ),
-        None => {
-            let (width, height) = entity_size(&entity.name);
-            let half_width = width as f64 / 2.0;
-            let half_height = height as f64 / 2.0;
-            (
-                (entity.position.x - half_width).floor() as i32,
-                (entity.position.y - half_height).floor() as i32,
-                (entity.position.x + half_width).ceil() as i32,
-                (entity.position.y + half_height).ceil() as i32,
-            )
-        }
-    };
-    (left..right)
-        .flat_map(|x| (top..bottom).map(move |y| TilePos::new(x, y)))
-        .collect()
 }
 
 fn entity_priority(entity: &Entity) -> u8 {
@@ -221,6 +196,32 @@ mod tests {
                 .as_ref()
                 .map(|target| target.name.as_str()),
             Some("assembling-machine-1")
+        );
+    }
+
+    #[test]
+    fn inserter_resolves_edge_of_three_by_three_drill_without_bounding_box() {
+        let entities = vec![
+            make_entity(0, 0, "transport-belt"),
+            make_inserter(1, 0, Direction::East, "inserter"),
+            make_typed_entity(3, 0, "electric-mining-drill", "mining-drill"),
+        ];
+
+        let result = analyze_inserters(&entities);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0]
+                .pickup_target
+                .as_ref()
+                .map(|target| target.name.as_str()),
+            Some("electric-mining-drill")
+        );
+        assert_eq!(
+            result[0]
+                .dropoff_target
+                .as_ref()
+                .map(|target| target.name.as_str()),
+            Some("transport-belt")
         );
     }
 

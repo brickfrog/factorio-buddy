@@ -259,10 +259,46 @@ assert_json "out-of-reach placement is rejected structurally" "$FAR_PLACE" \
 FAR_COUNT="$(raw_lua "local s = game.surfaces['buddy-live-regression']; rcon.print(helpers.table_to_json({count = s.count_entities_filtered{name = 'wooden-chest', position = {50.5, 0.5}, radius = 0.1}}))")"
 assert_json "out-of-reach placement leaves the world unchanged" "$FAR_COUNT" '.count == 0'
 
+# The production walk driver must move through Factorio's ordinary character
+# walking state. Observe an intermediate position before arrival so a hidden
+# endpoint teleport cannot satisfy this regression.
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+c.teleport({-20.5, 20.5}, game.surfaces['buddy-live-regression'])
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+rcon.print(remote.call('claude_interface', 'set_walk_target', '$AGENT_ID', -10.5, 20.5))
+" >/dev/null
+sleep 0.5
+WALKING_MIDPOINT="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+rcon.print(helpers.table_to_json({
+    x = c.position.x,
+    y = c.position.y,
+    walking = c.walking_state.walking,
+    target_active = helpers.json_to_table(remote.call('claude_interface', 'has_walk_target', '$AGENT_ID'))
+}))
+")"
+assert_json "NPC traverses an intermediate position using engine walking" "$WALKING_MIDPOINT" \
+    '.walking == true and .target_active == true and .x > -20.4 and .x < -10.7'
+sleep 6
+WALKING_ARRIVAL="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+rcon.print(helpers.table_to_json({
+    x = c.position.x,
+    y = c.position.y,
+    walking = c.walking_state.walking,
+    target_active = helpers.json_to_table(remote.call('claude_interface', 'has_walk_target', '$AGENT_ID'))
+}))
+")"
+assert_json "NPC arrives and stops ordinary walking" "$WALKING_ARRIVAL" \
+    '.walking == false and .target_active == false and ((.x + 10.5) | fabs) < 0.4'
+
 # A full inventory may cause placement to fail, but must never delete an item
 # from the ground while trying to clear the tile.
 raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+c.teleport({3.5, 0.5}, game.surfaces['buddy-live-regression'])
 local inv = c.get_main_inventory()
 inv.clear()
 inv.insert{name = 'wooden-chest', count = 1}
@@ -339,18 +375,38 @@ local s = c.surface
 for _, e in pairs(s.find_entities_filtered{area = {{29, 8}, {34, 13}}}) do
     if e.type ~= 'resource' and e.type ~= 'character' then e.destroy() end
 end
+for _, e in pairs(s.find_entities_filtered{area = {{28, 18}, {41, 23}}}) do
+    if e.type ~= 'resource' and e.type ~= 'character' then e.destroy() end
+end
 s.create_entity{name = 'transport-belt', position = {31.5, 10.5}, direction = defines.direction.north, force = c.force}
 " >/dev/null
 
-RCON_BEFORE="$(rcon_connection_count)"
 start_mcp
 
 TOOLS="$(mcp_send tools/list '{}')"
-assert_json "model tool surface hides lifecycle and hand-transfer shortcuts" "$TOOLS" \
-    '[.result.tools[].name] as $names
-     | (["execute_lua", "insert_items", "extract_items", "hand_feed_furnace",
-         "feed_lab_from_inventory", "place_character", "register_agent",
-         "broadcast_thought"] | all(. as $name | ($names | index($name) | not)))'
+EXPECTED_TOOLS="$(printf '%s\n' \
+    analyze_inserters analyze_item_flow bootstrap_smelting_once \
+    build_assembler_feed build_assembler_output build_automation_science \
+    build_lab_feed build_recipe_assembler_cell craft diagnose_factory_blockers \
+    diagnose_steam_power execute_direct_smelter execute_edge_miner \
+    execute_entity_placement_near extend_power_to find_nearest_resource \
+    get_available_research get_belt_lane_contents get_entities \
+    get_machine_belt_positions get_power_status get_recipe get_recipes_for_item \
+    get_research_status mine_at place_entity plan_automation_science \
+    plan_machine_output plan_recipe_assembler_cell plan_steam_power \
+    production_statistics remove_entity render_map repair_fuel_sustainability \
+    rotate_entity route_belt set_recipe situation_report start_research unstuck \
+    verify_production walk_to | jq -Rsc 'split("\n")[:-1] | sort')"
+assert_json "model receives the exact 42-tool gameplay surface" "$TOOLS" \
+    --argjson expected "$EXPECTED_TOOLS" \
+    '([.result.tools[].name] | sort) == $expected and (.result.tools | length) == 42'
+TOOLS_SCHEMA_BYTES="$(jq -c '.result.tools' <<<"$TOOLS" | wc -c)"
+if (( TOOLS_SCHEMA_BYTES <= 61440 )); then
+    pass "model tool schema stays below 60 KiB"
+else
+    fail "model tool schema stays below 60 KiB" \
+        "observed $TOOLS_SCHEMA_BYTES bytes"
+fi
 
 INVALID_PLACE="$(mcp_tool place_entity '{"entity_name":"not-a-real-entity","x":28,"y":10,"direction":"north"}')"
 assert_json "semantic MCP failures set isError" "$INVALID_PLACE" '.result.isError == true'
@@ -382,12 +438,137 @@ assert_json "wrong-facing existing belt is never reused as a connected segment" 
          .error_kind == "incompatible_existing_belt"
      end'
 
+# Build a separate clean route, put a real item on its first transport line,
+# and require both Factorio delivery and the static analyzer to agree. This is
+# the end-to-end proof that a geometrically complete route actually transports.
+DELIVERY_ROUTE="$(mcp_tool route_belt '{
+    "from_x":30,
+    "from_y":20,
+    "to_x":38,
+    "to_y":20,
+    "belt_type":"transport-belt",
+    "search_radius":4,
+    "dry_run":false,
+    "extend_existing":true,
+    "allow_underground":false,
+    "respect_zones":false
+}')"
+DELIVERY_ROUTE_PAYLOAD="$(tool_payload "$DELIVERY_ROUTE")"
+assert_json "route_belt builds one complete atomic route" "$DELIVERY_ROUTE_PAYLOAD" \
+    '.success == true and .complete_route == true and .placed > 0'
+ITEM_INSERTED="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local belt = s.find_entity('transport-belt', {30.5, 20.5})
+local inserted = belt and belt.get_transport_line(1).insert_at_back({name = 'iron-plate', count = 1}) or false
+rcon.print(helpers.table_to_json({inserted = inserted}))
+")"
+assert_json "delivery fixture inserts an item on the route source" "$ITEM_INSERTED" '.inserted == true'
+sleep 3
+DELIVERED="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local belt = s.find_entity('transport-belt', {38.5, 20.5})
+local count = 0
+if belt then
+    for line_index = 1, 2 do
+        local contents = belt.get_transport_line(line_index).get_contents()
+        for _, stack in pairs(contents) do
+            if stack.name == 'iron-plate' then count = count + stack.count end
+        end
+    end
+end
+rcon.print(helpers.table_to_json({count = count}))
+")"
+assert_json "Factorio delivers the item to the requested route endpoint" "$DELIVERED" '.count >= 1'
+FLOW="$(mcp_tool analyze_item_flow '{
+    "source_x":30,
+    "source_y":20,
+    "target_x":38,
+    "target_y":20,
+    "radius":12
+}')"
+FLOW_PAYLOAD="$(tool_payload "$FLOW")"
+assert_json "static analyzer agrees with Factorio item delivery" "$FLOW_PAYLOAD" \
+    '.connected == true
+     and .connectivity_certified == true
+     and .analysis_scope.connectivity_model_complete == true
+     and .target_receives_item == true
+     and .first_break == null'
+
+# Force a late verification failure in a complete two-route assembler cell.
+# Every belt/inserter placed by the controller must be removed and the previous
+# recipe restored; this catches controller-wide partial-build debris.
+ROLLBACK_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, e in pairs(s.find_entities_filtered{area = {{42, 15}, {61, 26}}}) do
+    if e.type ~= 'resource' and e.type ~= 'character' then e.destroy() end
+end
+local assembler = s.create_entity{
+    name = 'assembling-machine-1',
+    position = {50.5, 20.5},
+    force = c.force
+}
+assembler.set_recipe('copper-cable')
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'transport-belt', count = 100}
+inv.insert{name = 'inserter', count = 10}
+rcon.print(helpers.table_to_json({unit_number = assembler.unit_number}))
+")"
+ROLLBACK_ASSEMBLER_UNIT="$(jq -r '.unit_number' <<<"$ROLLBACK_FIXTURE")"
+CELL_PLAN="$(mcp_tool plan_recipe_assembler_cell "$(jq -cn \
+    --argjson unit "$ROLLBACK_ASSEMBLER_UNIT" \
+    '{
+        assembler_unit_number:$unit,
+        recipe:"iron-gear-wheel",
+        input_item_name:"iron-plate",
+        output_item_name:"iron-gear-wheel",
+        input_from_x:43,
+        input_from_y:20,
+        output_to_x:58,
+        output_to_y:20,
+        input_side:"west",
+        output_side:"east",
+        belt_type:"transport-belt",
+        search_radius:4,
+        respect_zones:false,
+        allow_underground:false,
+        extend_existing:true,
+        verify_radius:5
+    }')")"
+CELL_PLAN_PAYLOAD="$(tool_payload "$CELL_PLAN")"
+assert_json "compound assembler cell passes one shared preflight" "$CELL_PLAN_PAYLOAD" \
+    '.success == true and .compound_preflight.ready == true'
+CELL_EXEC_ARGS="$(jq -c '.ready_to_call.execute_args' <<<"$CELL_PLAN_PAYLOAD")"
+CELL_RESULT="$(mcp_tool build_recipe_assembler_cell "$CELL_EXEC_ARGS")"
+CELL_RESULT_PAYLOAD="$(tool_payload "$CELL_RESULT")"
+assert_json "late compound verification failure rolls back exact units" "$CELL_RESULT_PAYLOAD" \
+    '.success == false
+     and .error_kind == "verification_failed"
+     and .rollback.success == true
+     and (.rollback.units.removed_units | length) >= 4
+     and (.rollback.units.errors | length) == 0
+     and .rollback.recipe.success == true'
+ROLLBACK_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local assembler = game.get_entity_by_unit_number($ROLLBACK_ASSEMBLER_UNIT)
+local recipe = assembler and assembler.get_recipe()
+rcon.print(helpers.table_to_json({
+    belts = s.count_entities_filtered{type = 'transport-belt', area = {{42, 15}, {61, 26}}},
+    inserters = s.count_entities_filtered{type = 'inserter', area = {{42, 15}, {61, 26}}},
+    recipe = recipe and recipe.name or nil
+}))
+")"
+assert_json "compound rollback leaves no fragments and restores recipe" "$ROLLBACK_WORLD" \
+    '.belts == 0 and .inserters == 0 and .recipe == "copper-cable"'
+
 # Multiple tools in one MCP process must share its RCON transport.
-mcp_tool get_tick '{}' >/dev/null
-mcp_tool get_tick '{}' >/dev/null
+RCON_BEFORE="$(rcon_connection_count)"
+mcp_tool get_power_status '{"x":0,"y":0,"radius":5}' >/dev/null
+mcp_tool get_power_status '{"x":0,"y":0,"radius":5}' >/dev/null
 RCON_AFTER="$(rcon_connection_count)"
 RCON_DELTA=$((RCON_AFTER - RCON_BEFORE))
-if (( RCON_DELTA <= 1 )); then
+if (( RCON_DELTA == 0 )); then
     pass "one MCP process reuses one RCON connection"
 else
     fail "one MCP process reuses one RCON connection" \

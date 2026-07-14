@@ -182,6 +182,15 @@ impl LuaCommand {
         )
     }
 
+    /// Get the recipe currently configured on a crafting machine.
+    pub fn get_entity_recipe(unit_number: u32) -> String {
+        Self::claude_interface_json_call(
+            "get_entity_recipe",
+            &[unit_number.to_string()],
+            "Run just sync/resume so the updated claude-interface mod is loaded before reading entity recipes.",
+        )
+    }
+
     /// Find resources in an area and aggregate by type
     pub fn find_resources(area: Area, resource_type: Option<&str>) -> String {
         Self::claude_interface_json_call(
