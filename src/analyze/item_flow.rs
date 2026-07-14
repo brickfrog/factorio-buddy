@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
 use super::{
-    analyze_inserters, BeltAnalysisScope, BeltGraph, BeltReachResult, GapType, InserterAnalysis,
-    UnsupportedTransport,
+    analyze_inserters, build_entity_occupancy_lookup, BeltAnalysisScope, BeltGraph,
+    BeltReachResult, GapType, InserterAnalysis, UnsupportedTransport,
 };
 use crate::world::{BeltLaneSummary, Direction, Entity, InventoryItem, TilePos};
 
@@ -85,9 +85,11 @@ pub fn analyze_item_flow(
     target_ref: EntityLookup,
 ) -> ItemFlowReport {
     let graph = BeltGraph::from_entities(entities);
+    let entity_at = build_entity_occupancy_lookup(entities);
     let inserters = analyze_inserters(entities);
     let source = resolve_endpoint(
         entities,
+        &entity_at,
         &graph,
         &inserters,
         source_ref,
@@ -95,6 +97,7 @@ pub fn analyze_item_flow(
     );
     let target = resolve_endpoint(
         entities,
+        &entity_at,
         &graph,
         &inserters,
         target_ref,
@@ -187,7 +190,8 @@ pub fn analyze_item_flow(
         return report;
     }
 
-    let first_break = first_reachable_break(&graph, entities, &report.reachable_belts, target_belt);
+    let first_break =
+        first_reachable_break(&graph, &entity_at, &report.reachable_belts, target_belt);
     if first_break
         .as_ref()
         .is_some_and(|breakage| breakage.reason == "unsupported_transport")
@@ -219,6 +223,7 @@ struct ResolvedEndpoint {
 
 fn resolve_endpoint(
     entities: &[Entity],
+    entity_at: &std::collections::HashMap<TilePos, &Entity>,
     graph: &BeltGraph,
     inserters: &[InserterAnalysis],
     lookup: EntityLookup,
@@ -226,7 +231,7 @@ fn resolve_endpoint(
 ) -> ResolvedEndpoint {
     let entity = match lookup {
         EntityLookup::Unit(unit) => entities.iter().find(|e| e.unit_number == Some(unit)),
-        EntityLookup::Tile(tile) => entities.iter().find(|e| e.position.to_tile() == tile),
+        EntityLookup::Tile(tile) => entity_at.get(&tile).copied(),
     };
     let fallback_tile = match lookup {
         EntityLookup::Unit(_) => entity.map(|e| e.position.to_tile()).unwrap_or_default(),
@@ -405,7 +410,7 @@ fn aggregate_belt_items(belt: &BeltLaneSummary) -> Vec<InventoryItem> {
 
 fn first_reachable_break(
     graph: &BeltGraph,
-    entities: &[Entity],
+    entity_at: &std::collections::HashMap<TilePos, &Entity>,
     reachable: &[TilePos],
     target: TilePos,
 ) -> Option<ItemFlowBreak> {
@@ -429,15 +434,18 @@ fn first_reachable_break(
                     },
                 ));
             }
-            let blocker = entities.iter().find(|e| e.position.to_tile() == to);
-            let reason = match blocker {
-                Some(entity) if entity.name.contains("belt") => "wrong_direction",
-                Some(_) => "blocked",
-                None => "missing_belt",
+            let wrong_direction_belt = graph.get(&to);
+            let blocker = entity_at.get(&to).copied();
+            let reason = if wrong_direction_belt.is_some() {
+                "wrong_direction"
+            } else if blocker.is_some() {
+                "blocked"
+            } else {
+                "missing_belt"
             };
             let repair = match reason {
-                "wrong_direction" => blocker.and_then(|entity| {
-                    entity.unit_number.map(|unit| ItemFlowRepair {
+                "wrong_direction" => wrong_direction_belt.and_then(|belt| {
+                    belt.unit_number.map(|unit| ItemFlowRepair {
                         tool: "rotate_entity".to_string(),
                         reason: reason.to_string(),
                         args: None,
@@ -529,7 +537,9 @@ fn first_reachable_break(
                     from: *from,
                     to,
                     reason: reason.to_string(),
-                    blocker: blocker.map(|e| e.name.clone()),
+                    blocker: wrong_direction_belt
+                        .map(|belt| belt.belt_type.clone())
+                        .or_else(|| blocker.map(|entity| entity.name.clone())),
                     repair,
                 },
             ))
@@ -564,6 +574,10 @@ mod tests {
         name: &str,
         entity_type: &str,
     ) -> Entity {
+        typed_entity(x, y, direction, name, entity_type)
+    }
+
+    fn typed_entity(x: i32, y: i32, direction: Direction, name: &str, entity_type: &str) -> Entity {
         Entity {
             unit_number: Some((2000 + x * 10 + y) as u32),
             name: name.to_string(),
@@ -709,6 +723,80 @@ mod tests {
         let repair = report.repair.expect("wrong direction should have repair");
         assert_eq!(repair.tool, "rotate_entity");
         assert_eq!(repair.direction.as_deref(), Some("east"));
+    }
+
+    #[test]
+    fn edge_of_three_by_three_entity_is_a_blocked_break() {
+        let entities = vec![
+            belt(0, 0, Direction::East),
+            typed_entity(
+                2,
+                0,
+                Direction::North,
+                "assembling-machine-1",
+                "assembling-machine",
+            ),
+            belt(5, 0, Direction::East),
+        ];
+
+        let report = analyze_item_flow(
+            &entities,
+            &[],
+            EntityLookup::Tile(TilePos::new(0, 0)),
+            EntityLookup::Tile(TilePos::new(5, 0)),
+        );
+
+        assert!(!report.connected);
+        assert!(!report.connectivity_certified);
+        let breakage = report.first_break.expect("3x3 edge must block the route");
+        assert_eq!(breakage.to, TilePos::new(1, 0));
+        assert_eq!(breakage.reason, "blocked");
+        assert_eq!(breakage.blocker.as_deref(), Some("assembling-machine-1"));
+        assert_eq!(
+            breakage
+                .repair
+                .as_ref()
+                .map(|repair| repair.reason.as_str()),
+            Some("blocked")
+        );
+    }
+
+    #[test]
+    fn shared_resource_and_belt_tile_classifies_wrong_direction_deterministically() {
+        let resource = typed_entity(1, 0, Direction::North, "iron-ore", "resource");
+        let target_belt = belt(1, 0, Direction::West);
+
+        for entities in [
+            vec![
+                belt(0, 0, Direction::East),
+                resource.clone(),
+                target_belt.clone(),
+            ],
+            vec![
+                belt(0, 0, Direction::East),
+                target_belt.clone(),
+                resource.clone(),
+            ],
+        ] {
+            let report = analyze_item_flow(
+                &entities,
+                &[],
+                EntityLookup::Tile(TilePos::new(0, 0)),
+                EntityLookup::Tile(TilePos::new(1, 0)),
+            );
+
+            assert!(!report.connected);
+            assert_eq!(report.target.name, "transport-belt");
+            let breakage = report
+                .first_break
+                .expect("wrong-facing belt must remain visible above ore");
+            assert_eq!(breakage.reason, "wrong_direction");
+            assert_eq!(breakage.blocker.as_deref(), Some("transport-belt"));
+            assert_eq!(
+                breakage.repair.as_ref().map(|repair| repair.tool.as_str()),
+                Some("rotate_entity")
+            );
+        }
     }
 
     #[test]

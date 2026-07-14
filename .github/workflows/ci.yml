@@ -46,7 +46,9 @@ jobs:
       - name: Install live-test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y iproute2 jq lua5.4 procps xz-utils
+          sudo apt-get install -y \
+            coreutils curl findutils gawk grep iproute2 jq lua5.4 procps tar \
+            util-linux xz-utils
       - name: Download official Factorio headless server
         env:
           FACTORIO_ARCHIVE: ${{ runner.temp }}/factorio-headless.tar.xz

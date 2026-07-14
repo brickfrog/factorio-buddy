@@ -909,8 +909,11 @@ fn critical_mod_safety_contracts_are_explicit() {
 
     assert!(
         entities_lua.contains("game.get_entity_by_unit_number(unit_number)")
+            && entities_lua.contains("for _, surface in pairs(game.surfaces) do")
+            && entities_lua.contains("for _, candidate in pairs(surface.find_entities()) do")
+            && entities_lua.contains("candidate.unit_number == unit_number")
             && !entities_lua.contains("radius = 500"),
-        "entity lookup must use Factorio's native global unit-number index"
+        "entity lookup must use Factorio's native index plus an unbounded all-surface fallback for unsupported prototypes"
     );
     assert!(
         entities_lua.contains("local PRODUCTION_ENTITY_TYPES = {")
@@ -958,8 +961,12 @@ fn critical_mod_safety_contracts_are_explicit() {
     assert!(
         entities_lua.contains("local function fuel_connections(surface, force, consumer)")
             && entities_lua.contains("inserter_operational = inserter_operational")
+            && entities_lua.contains("source_durable = source_record.durable == true")
             && entities_lua.contains("source_operational = source_record.operational == true")
-            && entities_lua.contains("live = inserter_operational and source_record.operational == true")
+            && entities_lua.contains("and source_record.durable == true")
+            && entities_lua.contains("stocked_without_proven_upstream")
+            && entities_lua.contains("operational_coal_drill")
+            && entities_lua.contains("if connection.durable then")
             && entities_lua.contains("consumer.fuel_topology_present")
             && entities_lua.contains("source_is_proposed = true")
             && entities_lua.contains("if a.operational ~= b.operational then")
@@ -3306,6 +3313,59 @@ fn research_cli_queries_use_mod_remotes_not_inline_lua() {
             !research_rs.contains(forbidden) && !client_mod.contains(forbidden),
             "research CLI/client should not embed inline gameplay Lua {forbidden:?}"
         );
+    }
+}
+
+#[test]
+fn lua_plans_only_recommend_model_visible_tools() {
+    let allowed = BTreeSet::from([
+        "build_automation_science",
+        "build_lab_feed",
+        "execute_edge_miner",
+        "execute_entity_placement_near",
+        "get_power_status",
+        "get_research_status",
+        "place_entity",
+        "plan_steam_power",
+        "repair_fuel_sustainability",
+        "rotate_entity",
+        "start_research",
+        "verify_production",
+    ]);
+    let sources = [
+        (
+            "entities.lua",
+            include_str!("../mod/claude-interface/entities.lua"),
+        ),
+        (
+            "placement.lua",
+            include_str!("../mod/claude-interface/placement.lua"),
+        ),
+        (
+            "power.lua",
+            include_str!("../mod/claude-interface/power.lua"),
+        ),
+        (
+            "research.lua",
+            include_str!("../mod/claude-interface/research.lua"),
+        ),
+    ];
+
+    for (path, source) in sources {
+        for (line_number, line) in source.lines().enumerate() {
+            let Some((_, suffix)) = line.split_once("tool = \"") else {
+                continue;
+            };
+            let tool = suffix
+                .split_once('"')
+                .map(|(tool, _)| tool)
+                .expect("literal Lua tool assignment should close its quote");
+            assert!(
+                allowed.contains(tool),
+                "{path}:{} recommends hidden or nonexistent tool {tool:?}",
+                line_number + 1
+            );
+        }
     }
 }
 

@@ -23,8 +23,64 @@ pub use entity_reach::*;
 pub use inserter::*;
 pub use item_flow::*;
 
-use crate::world::{Direction, TilePos};
+use crate::world::{entity_occupied_tiles, Direction, Entity, TilePos};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+/// Index entities by every tile in their authoritative occupied footprint.
+///
+/// Factorio permits resources and transport entities to share a tile. The
+/// lookup must therefore use semantic precedence rather than input order: a
+/// belt on ore is the belt, not an arbitrary resource returned first by the
+/// remote query. Stable identity ordering makes all remaining overlaps
+/// deterministic as well.
+pub(crate) fn build_entity_occupancy_lookup(entities: &[Entity]) -> HashMap<TilePos, &Entity> {
+    let mut entities_by_tile: HashMap<TilePos, &Entity> = HashMap::new();
+
+    for entity in entities {
+        for tile in entity_occupied_tiles(entity) {
+            match entities_by_tile.get(&tile) {
+                Some(existing) if !entity_precedes(entity, existing) => {}
+                _ => {
+                    entities_by_tile.insert(tile, entity);
+                }
+            }
+        }
+    }
+
+    entities_by_tile
+}
+
+fn entity_precedes(candidate: &Entity, existing: &Entity) -> bool {
+    match entity_lookup_priority(candidate).cmp(&entity_lookup_priority(existing)) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => stable_entity_order(candidate, existing) == Ordering::Less,
+    }
+}
+
+fn entity_lookup_priority(entity: &Entity) -> u8 {
+    if is_transport_entity(entity) {
+        return 3;
+    }
+
+    match entity.entity_type.as_deref() {
+        Some("resource") | Some("item-entity") => 0,
+        Some("tree") | Some("simple-entity") => 1,
+        _ => 2,
+    }
+}
+
+fn stable_entity_order(left: &Entity, right: &Entity) -> Ordering {
+    left.name
+        .cmp(&right.name)
+        .then_with(|| left.entity_type.cmp(&right.entity_type))
+        .then_with(|| left.unit_number.cmp(&right.unit_number))
+        .then_with(|| left.position.x.total_cmp(&right.position.x))
+        .then_with(|| left.position.y.total_cmp(&right.position.y))
+        .then_with(|| left.direction.cmp(&right.direction))
+}
 
 /// Why a transport entity is outside the exact static belt model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

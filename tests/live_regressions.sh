@@ -17,6 +17,7 @@ AGENT_ID="${FACTORIO_AGENT_ID:-live-regression}"
 CLI_BIN="${FACTORIOCTL_BIN:-$ROOT/target/release/factorioctl}"
 MCP_BIN="${FACTORIO_MCP_BIN:-$ROOT/target/release/mcp}"
 SERVER_LOG="${FACTORIO_TEST_SERVER_LOG:-$ROOT/logs/test-server.log}"
+SCRIPT_OUTPUT="${FACTORIO_TEST_SCRIPT_OUTPUT:-${SERVER_DATA_DIR:-$ROOT/.factorio-test-data}/script-output}"
 
 CLI=(
     "$CLI_BIN"
@@ -58,6 +59,39 @@ assert_json() {
 
 raw_lua() {
     FACTORIOCTL_ALLOW_RAW_LUA=1 "${CLI[@]}" exec "$1"
+}
+
+rcon_i32_le() {
+    local value="$1"
+    printf "\\$(printf '%03o' $((value & 255)))"
+    printf "\\$(printf '%03o' $(((value >> 8) & 255)))"
+    printf "\\$(printf '%03o' $(((value >> 16) & 255)))"
+    printf "\\$(printf '%03o' $(((value >> 24) & 255)))"
+}
+
+rcon_packet() {
+    local request_id="$1"
+    local packet_type="$2"
+    local body="$3"
+    rcon_i32_le "$((10 + ${#body}))"
+    rcon_i32_le "$request_id"
+    rcon_i32_le "$packet_type"
+    printf '%s\0\0' "$body"
+}
+
+# Send actual server-console chat rather than raising an event from the level
+# script. Factorio's RCON protocol is little-endian length-prefixed Source RCON;
+# accepted chat is itself the acknowledgement we assert through the mod inbox.
+send_console_chat() {
+    local message="$1"
+    local socket
+    exec {socket}<>"/dev/tcp/$RCON_HOST/$RCON_PORT"
+    rcon_packet 1 3 "$RCON_PASSWORD" >&"$socket"
+    sleep 0.2
+    rcon_packet 2 2 "$message" >&"$socket"
+    sleep 0.2
+    exec {socket}>&-
+    exec {socket}<&-
 }
 
 rcon_connection_count() {
@@ -176,8 +210,7 @@ local name = 'buddy-live-regression'
 local old = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 if old and old.valid then old.destroy() end
 local surface = game.surfaces[name]
-if surface then game.delete_surface(surface) end
-surface = game.create_surface(name, {peaceful_mode = true})
+if not surface then surface = game.create_surface(name, {peaceful_mode = true}) end
 surface.request_to_generate_chunks({0, 0}, 6)
 surface.request_to_generate_chunks({600, 600}, 1)
 surface.force_generate_chunk_requests()
@@ -196,38 +229,38 @@ surface.set_tiles(tiles, true)
 for _, entity in pairs(surface.find_entities_filtered{area = {{-64, -32}, {65, 33}}}) do
     if entity.type ~= 'resource' then entity.destroy() end
 end
+for _, entity in pairs(surface.find_entities_filtered{area = {{595, 595}, {606, 606}}}) do
+    if entity.type ~= 'resource' then entity.destroy() end
+end
 rcon.print(remote.call('claude_interface', 'pre_place_character_result', '$AGENT_ID', name, 0))
 ")"
 assert_json "NPC is independently created on the requested surface" "$SETUP" \
     '.status == "created" and .planet == "buddy-live-regression"'
 
-# An established NPC must remain distinct from a human character and must not
-# be moved when Buddy repeats its idempotent startup lifecycle call.
+# An established NPC must remain distinct from other character entities and
+# must not be moved when Buddy repeats its idempotent startup lifecycle call.
+# A dedicated headless server has no LuaPlayer until a real client joins, and
+# the runtime API intentionally provides no synthetic-player constructor.
 IDENTITY="$(raw_lua "
-local player = game.get_player('live-regression-human')
-if not player then player = game.create_player{name = 'live-regression-human'} end
-if not player.character then
-    local nauvis = game.surfaces['nauvis']
-    local position = nauvis.find_non_colliding_position('character', {0, 0}, 64, 0.5)
-    local human = nauvis.create_entity{name = 'character', position = position, force = game.forces.player}
-    player.set_controller{type = defines.controllers.character, character = human}
-end
+local nauvis = game.surfaces['nauvis']
+local position = nauvis.find_non_colliding_position('character', {20, 20}, 64, 0.5)
+local other = nauvis.create_entity{name = 'character', position = position, force = game.forces.player}
 local agent = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local agent_unit = agent.unit_number
 local agent_surface = agent.surface.name
 local agent_x = agent.position.x
-local human_unit = player.character and player.character.unit_number or nil
+local other_unit = other and other.unit_number or nil
 local status = remote.call('claude_interface', 'pre_place_character_result', '$AGENT_ID', 'nauvis', 100)
 local after = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 rcon.print(helpers.table_to_json({
     lifecycle = helpers.json_to_table(status),
-    distinct = human_unit ~= nil and human_unit ~= agent_unit,
+    distinct = other_unit ~= nil and other_unit ~= agent_unit,
     same_unit = after.unit_number == agent_unit,
     same_surface = after.surface.name == agent_surface,
     same_x = after.position.x == agent_x
 }))
 ")"
-assert_json "startup never adopts or relocates the human character" "$IDENTITY" \
+assert_json "startup preserves an established independent NPC" "$IDENTITY" \
     '.lifecycle.status == "already_placed"
      and .distinct == true
      and .same_unit == true
@@ -237,10 +270,16 @@ assert_json "startup never adopts or relocates the human character" "$IDENTITY" 
 # Ordinary Factorio chat must append the same inbox that wakes Buddy; it must
 # not be limited to the custom GUI send button.
 CHAT_TOKEN="live-console-chat-$BASHPID"
-raw_lua "local p = game.get_player('live-regression-human'); script.raise_event(defines.events.on_console_chat, {player_index = p.index, message = '$CHAT_TOKEN'})" >/dev/null
-CHAT_RECORD="$(grep -F "\"message\":\"$CHAT_TOKEN\"" "$ROOT/.factorio-test-data/script-output/claude-chat/input.jsonl" | tail -n 1 || true)"
+send_console_chat "$CHAT_TOKEN"
+CHAT_RECORD=""
+for _ in $(seq 1 20); do
+    CHAT_RECORD="$(grep -F "\"message\":\"$CHAT_TOKEN\"" "$SCRIPT_OUTPUT/claude-chat/input.jsonl" 2>/dev/null | tail -n 1 || true)"
+    [[ -z "$CHAT_RECORD" ]] || break
+    sleep 0.1
+done
 assert_json "normal Factorio chat reaches the Buddy inbox" "$CHAT_RECORD" \
-    --arg token "$CHAT_TOKEN" '.message == $token and .target_agent != null'
+    --arg token "$CHAT_TOKEN" \
+    '.message == $token and .player_index == 0 and .player_name == "console" and .target_agent == "all"'
 
 # Trigger technologies must be observed, never assigned researched=true.
 raw_lua "local force = game.forces.player; if force.current_research then force.cancel_current_research() end; force.technologies['steam-power'].researched = false" >/dev/null
@@ -275,7 +314,7 @@ rcon.print(helpers.table_to_json({
     x = c.position.x,
     y = c.position.y,
     walking = c.walking_state.walking,
-    target_active = helpers.json_to_table(remote.call('claude_interface', 'has_walk_target', '$AGENT_ID'))
+    target_active = remote.call('claude_interface', 'has_walk_target', '$AGENT_ID')
 }))
 ")"
 assert_json "NPC traverses an intermediate position using engine walking" "$WALKING_MIDPOINT" \
@@ -287,7 +326,7 @@ rcon.print(helpers.table_to_json({
     x = c.position.x,
     y = c.position.y,
     walking = c.walking_state.walking,
-    target_active = helpers.json_to_table(remote.call('claude_interface', 'has_walk_target', '$AGENT_ID'))
+    target_active = remote.call('claude_interface', 'has_walk_target', '$AGENT_ID')
 }))
 ")"
 assert_json "NPC arrives and stops ordinary walking" "$WALKING_ARRIVAL" \
@@ -318,6 +357,7 @@ assert_json "placement never destroys blocked ground items" "$GROUND_ITEM" '.cou
 # Coordinate removal must fail closed when more than one entity overlaps the
 # target. Exact unit-number removal remains available for deliberate changes.
 raw_lua "
+game.tick_paused = true
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 c.teleport({8.5, 0.5})
 local s = c.surface
@@ -325,9 +365,10 @@ for _, e in pairs(s.find_entities_filtered{position = {10.5, 0.5}, radius = 0.2}
     if e.type ~= 'resource' and e.type ~= 'character' then e.destroy() end
 end
 s.create_entity{name = 'transport-belt', position = {10.5, 0.5}, direction = defines.direction.east, force = c.force}
-s.create_entity{name = 'item-on-ground', position = {10.5, 0.5}, stack = {name = 'iron-plate', count = 1}}
+s.create_entity{name = 'entity-ghost', inner_name = 'small-electric-pole', position = {10.5, 0.5}, force = c.force}
 " >/dev/null
 AMBIGUOUS_REMOVE="$(raw_lua "rcon.print(remote.call('claude_interface', 'remove_entity_at', '$AGENT_ID', 10.5, 0.5))")"
+raw_lua "game.tick_paused = false" >/dev/null
 assert_json "coordinate removal fails closed on overlap" "$AMBIGUOUS_REMOVE" \
     '.success == false and .error_kind == "ambiguous_entity" and (.candidates | length) >= 2'
 BELT_REMAINS="$(raw_lua "local s = game.surfaces['buddy-live-regression']; rcon.print(helpers.table_to_json({count = s.count_entities_filtered{name = 'transport-belt', position = {10.5, 0.5}, radius = 0.2}}))")"
@@ -350,7 +391,8 @@ assert_json "snapshot and blocker scan use the NPC surface" "$SNAPSHOT" \
      and .factory.blockers.scanned_entities > 0
      and any(.factory.blockers.blockers[]?; .unit_number == $unit)'
 
-# Native unit lookup must work beyond the former +/-500 scan boundary.
+# Unit lookup must work beyond the former +/-500 scan boundary, including for
+# prototypes that Factorio does not expose through get_entity_by_unit_number.
 FAR_ENTITY="$(raw_lua "
 local s = game.surfaces['buddy-live-regression']
 local entity = s.create_entity{name = 'stone-furnace', position = {600.5, 600.5}, force = game.forces.player}
@@ -361,6 +403,43 @@ FAR_LOOKUP="$(raw_lua "rcon.print(remote.call('claude_interface', 'get_entity', 
 assert_json "unit-number lookup works beyond 500 tiles" "$FAR_LOOKUP" \
     --argjson unit "$FAR_UNIT" \
     '.unit_number == $unit and .name == "stone-furnace" and .position.x > 500 and .position.y > 500'
+
+# A belt or chest stocked once by the character is not durable fuel
+# automation. The topology proof must trace beyond the adjacent source to an
+# operational coal producer before certifying the consumer as automated.
+SEEDED_FUEL_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+for _, e in pairs(s.find_entities_filtered{area = {{-48, -8}, {-32, 8}}}) do
+    if e.type ~= 'resource' and e.type ~= 'character' then e.destroy() end
+end
+local furnace = s.create_entity{name = 'stone-furnace', position = {-40, 0}, force = game.forces.player}
+local inserter_position = {x = furnace.position.x, y = furnace.bounding_box.left_top.y - 0.5}
+local belt_position = {x = furnace.position.x, y = furnace.bounding_box.left_top.y - 1.5}
+s.create_entity{name = 'inserter', position = inserter_position, direction = defines.direction.north, force = game.forces.player}
+local belt = s.create_entity{name = 'transport-belt', position = belt_position, direction = defines.direction.east, force = game.forces.player}
+belt.get_transport_line(1).insert_at_back({name = 'coal', count = 1})
+local report = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'diagnose_fuel_sustainability',
+    -48,
+    -8,
+    -32,
+    8,
+    20,
+    '$AGENT_ID'
+))
+rcon.print(helpers.table_to_json({consumer_unit = furnace.unit_number, report = report}))
+")"
+assert_json "manually stocked fuel source is not certified as durable automation" "$SEEDED_FUEL_FIXTURE" \
+    '.consumer_unit as $unit
+     | (.report.consumers[] | select(.unit_number == $unit))
+     | .fuel_topology_present == true
+       and .automated == false
+       and any(.fuel_connections[]?;
+           .source.coal_count > 0
+           and .source_durable == false
+           and .durable == false
+           and .source.upstream_proof.reason == "stocked_without_proven_upstream")'
 
 # Install a wrong-facing belt in an otherwise eastbound three-tile corridor.
 # The MCP router may reject it or route around it, but may not count it as a
@@ -463,7 +542,7 @@ local inserted = belt and belt.get_transport_line(1).insert_at_back({name = 'iro
 rcon.print(helpers.table_to_json({inserted = inserted}))
 ")"
 assert_json "delivery fixture inserts an item on the route source" "$ITEM_INSERTED" '.inserted == true'
-sleep 3
+sleep 6
 DELIVERED="$(raw_lua "
 local s = game.surfaces['buddy-live-regression']
 local belt = s.find_entity('transport-belt', {38.5, 20.5})
@@ -503,16 +582,26 @@ local s = c.surface
 for _, e in pairs(s.find_entities_filtered{area = {{42, 15}, {61, 26}}}) do
     if e.type ~= 'resource' and e.type ~= 'character' then e.destroy() end
 end
-local assembler = s.create_entity{
-    name = 'assembling-machine-1',
-    position = {50.5, 20.5},
-    force = c.force
-}
-assembler.set_recipe('copper-cable')
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+c.teleport({48.5, 20.5})
 local inv = c.get_main_inventory()
 inv.clear()
+inv.insert{name = 'assembling-machine-1', count = 1}
 inv.insert{name = 'transport-belt', count = 100}
 inv.insert{name = 'inserter', count = 10}
+local placed = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'place_entity',
+    '$AGENT_ID',
+    'assembling-machine-1',
+    50.5,
+    20.5,
+    defines.direction.north
+))
+local assembler = placed.unit_number and s.find_entity('assembling-machine-1', {50.5, 20.5}) or nil
+if not assembler then error('failed to create registered assembler fixture') end
+assembler.set_recipe('copper-cable')
+c.teleport({50.5, 16.5})
 rcon.print(helpers.table_to_json({unit_number = assembler.unit_number}))
 ")"
 ROLLBACK_ASSEMBLER_UNIT="$(jq -r '.unit_number' <<<"$ROLLBACK_FIXTURE")"
@@ -551,7 +640,7 @@ assert_json "late compound verification failure rolls back exact units" "$CELL_R
      and .rollback.recipe.success == true'
 ROLLBACK_WORLD="$(raw_lua "
 local s = game.surfaces['buddy-live-regression']
-local assembler = game.get_entity_by_unit_number($ROLLBACK_ASSEMBLER_UNIT)
+local assembler = s.find_entity('assembling-machine-1', {50.5, 20.5})
 local recipe = assembler and assembler.get_recipe()
 rcon.print(helpers.table_to_json({
     belts = s.count_entities_filtered{type = 'transport-belt', area = {{42, 15}, {61, 26}}},

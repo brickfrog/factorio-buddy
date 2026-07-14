@@ -189,7 +189,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for command in awk grep jq ss stat timeout tr; do
+for command in awk cmp cp find grep jq seq sleep ss stat timeout touch tr; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
 [[ -x "$FACTORIO_BIN" ]] || fail "Factorio binary is not executable: $FACTORIO_BIN"
@@ -204,8 +204,15 @@ assert_ports_unused
 
 start_buddy() {
     local scenario_name="$1"
+    local mode="${2:-fresh}"
     local scenario="$TEST_ROOT/$scenario_name"
-    local log="$scenario/buddy.log"
+    local log="$scenario/buddy-$mode.log"
+    local fresh_args=()
+    if [[ "$mode" == "fresh" ]]; then
+        fresh_args=(--fresh)
+    elif [[ "$mode" != "resume" ]]; then
+        fail "unknown Buddy start mode: $mode"
+    fi
     mkdir -p "$scenario/home/.factorio/mods" "$scenario/write-data"
     printf 'isolated-home\n' > "$scenario/home/.factorio/mods/runtime-test-sentinel"
 
@@ -221,7 +228,7 @@ start_buddy() {
         RUST_LOG=info \
         "$BUDDY_BIN" \
             --start-server \
-            --fresh \
+            "${fresh_args[@]}" \
             --heartbeat-seconds 0 \
             --agent runtime-live \
             --rcon-host localhost \
@@ -250,7 +257,7 @@ printf 'Game: 127.0.0.1:%s\n' "$GAME_PORT"
 # Clean lifecycle: security boundary, lease exclusivity, and owned cleanup.
 start_buddy clean
 CLEAN_ROOT="$TEST_ROOT/clean"
-CLEAN_LOG="$CLEAN_ROOT/buddy.log"
+CLEAN_LOG="$CLEAN_ROOT/buddy-fresh.log"
 PASSWORD_FILE="$CLEAN_ROOT/write-data/rcon-password"
 MCP_CONFIG="$CLEAN_ROOT/write-data/mcp-runtime-live.json"
 PASSWORD="$(tr -d '\r\n' < "$PASSWORD_FILE")"
@@ -289,6 +296,13 @@ done
 [[ -f "$CLEAN_ROOT/home/.factorio/mods/runtime-test-sentinel" ]] \
     || fail "isolated HOME sentinel was disturbed"
 pass "managed credentials are generated, private, and absent from Buddy argv"
+
+FACTORIO_LOG="$(find "$CLEAN_ROOT/write-data/managed-runs" -name factorio-current.log -type f -print -quit)"
+[[ -f "$FACTORIO_LOG" ]] || fail "managed Factorio runtime log is missing"
+LIFECYCLE_CONNECTIONS="$(grep -c 'New RCON connection from' "$FACTORIO_LOG" 2>/dev/null || true)"
+(( LIFECYCLE_CONNECTIONS == 2 )) \
+    || fail "startup opened $LIFECYCLE_CONNECTIONS RCON connections; expected one readiness connection and one reused lifecycle connection"
+pass "startup lifecycle calls reuse one RCON connection"
 
 SECOND_LOG="$CLEAN_ROOT/second-controller.log"
 set +e
@@ -343,7 +357,7 @@ pass "clean shutdown saves and reaps the owned Factorio server"
 assert_ports_unused
 start_buddy server-death
 DEATH_ROOT="$TEST_ROOT/server-death"
-DEATH_LOG="$DEATH_ROOT/buddy.log"
+DEATH_LOG="$DEATH_ROOT/buddy-fresh.log"
 kill -KILL "$CURRENT_SERVER_PID"
 wait_for_process_stop "$CURRENT_BUDDY_PID" 10 \
     || fail "Buddy stayed alive after its owned Factorio server died"
@@ -363,5 +377,32 @@ jq -e '.version == 2 and .clean_shutdown == false' \
     || fail "unexpected server death was incorrectly recorded as clean"
 pass "owned server death makes Buddy exit promptly and non-zero"
 pass "Buddy runtime leaves no orphaned Factorio process"
+
+# Exercise recovery from the unclean manifest above. A newer autosave beside
+# the primary belongs to no managed run and must not contaminate resume.
+cp "$DEATH_ROOT/save.zip" "$DEATH_ROOT/primary-before-resume.zip"
+cp "$DEATH_ROOT/save.zip" "$DEATH_ROOT/_autosave-foreign.zip"
+touch -d '+2 minutes' "$DEATH_ROOT/_autosave-foreign.zip"
+start_buddy server-death resume
+cmp -s "$DEATH_ROOT/save.zip" "$DEATH_ROOT/primary-before-resume.zip" \
+    || fail "resume replaced the primary save with an unrelated adjacent autosave"
+[[ ! -e "$DEATH_ROOT/save.previous.zip" ]] \
+    || fail "resume attempted to promote an autosave outside the owned run"
+kill -TERM "$CURRENT_BUDDY_PID"
+wait_for_process_stop "$CURRENT_BUDDY_PID" 75 \
+    || fail "resumed Buddy did not complete a clean shutdown within 75 seconds"
+set +e
+wait "$CURRENT_BUDDY_PID"
+RESUME_STATUS=$?
+set -e
+CURRENT_BUDDY_PID=""
+CURRENT_SERVER_PID=""
+(( RESUME_STATUS == 0 )) || fail "resumed Buddy shutdown exited with status $RESUME_STATUS"
+assert_no_owned_server "$DEATH_ROOT" \
+    || fail "resumed Buddy left an owned Factorio process or listener"
+jq -e '.version == 2 and .clean_shutdown == true' \
+    "$DEATH_ROOT/save.zip.buddy-owner.json" >/dev/null \
+    || fail "resumed clean shutdown was not recorded"
+pass "unclean resume ignores autosaves outside the primary save's owned run"
 
 printf 'Buddy managed-runtime live regression passed.\n'

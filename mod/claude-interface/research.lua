@@ -441,11 +441,11 @@ function M.get_available_research(character)
     if has_trigger_tech then
         result.guidance = "Trigger technologies are completed only by their listed in-game trigger. Build or craft what the trigger requires; start_research will not unlock them."
     elseif result.lab_status.count == 0 then
-        result.guidance = "To research: 1) Craft a lab (requires iron-gear-wheel, electronic-circuit, transport-belt), 2) Place it with power, 3) Craft science packs, 4) Insert science packs into lab"
+        result.guidance = "Build and power a lab, then automate science-pack production and use build_lab_feed or build_automation_science to supply it continuously. Manual inventory transfer is bootstrap only, not completed research logistics."
     elseif result.lab_status.powered == 0 then
         result.guidance = "Labs need power! Connect them to your power grid (steam engine -> power poles -> lab)"
     elseif #result.science_available == 0 then
-        result.guidance = "Craft science packs and insert them into labs. Red science (automation-science-pack) requires iron-gear-wheel + copper-plate"
+        result.guidance = "Automate science-pack production and continuous belt/inserter delivery into the lab with build_lab_feed or build_automation_science. Red science requires automated iron-gear-wheel and copper-plate inputs; do not use repeated hand-feeding as the production path."
     end
 
     return result

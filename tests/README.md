@@ -19,7 +19,9 @@ just test-live
 - `../scripts/smoke_agent_binding.sh` - Proves independent NPC character binding
 - `cleanup.sh` - Stops server and cleans up
 
-The live regressions use raw Lua only to create disposable fixtures through the
+The gameplay server's save, write-data, mods, and script output all live under
+one temporary directory created by `just test-live`. The live regressions use
+raw Lua only to create disposable fixtures through the
 explicitly enabled trusted-operator path. Behavior under test goes through the
 shipped `/claude` mod dispatcher or model-facing MCP server: research triggers,
 reach, item conservation, surface scoping, entity lookup, production
@@ -32,8 +34,10 @@ verification, route reuse, protocol errors, and RCON connection reuse.
 - Buddy lifecycle RCON: `127.0.0.1:27217` (override with `BUDDY_TEST_RCON_PORT`)
 - Buddy lifecycle game: `34399` (override with `BUDDY_TEST_GAME_PORT`)
 
-`buddy_runtime.sh` launches Buddy twice with a temporary HOME, write-data
-directory, and save. It proves that managed RCON is loopback-only with private
-generated credentials, a same-agent controller cannot take the active lease,
+`buddy_runtime.sh` exercises clean shutdown, unexpected server death, and
+unclean resume with a temporary HOME, write-data directory, and save. It proves
+that managed RCON is loopback-only with private generated credentials, a
+same-agent controller cannot take the active lease, unrelated autosaves cannot
+contaminate resume, startup lifecycle calls reuse one RCON connection,
 unexpected owned-server death terminates Buddy, and clean shutdown leaves no
 Factorio process behind.

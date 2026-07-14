@@ -734,8 +734,8 @@ function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius,
     if string.find(drill_name, "burner", 1, true) then
         result.after_place_steps = {
             {
-                tool = "insert_items",
-                tool_args = {
+                operation = "bootstrap_burner_fuel",
+                operation_args = {
                     unit_number = "<placed drill unit_number>",
                     item = "coal",
                     count = 5,
@@ -900,7 +900,7 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
         if output_x == nil or output_y == nil or direction == nil then
             table.insert(result.blockers, {
                 type = "missing_output_reference",
-                message = "Pass either drill_unit_number or output_x, output_y, and output_direction from build_edge_miner/get_machine_belt_positions.",
+                message = "Pass either drill_unit_number or output_x, output_y, and output_direction from execute_edge_miner or get_machine_belt_positions.",
             })
             result.next_action = "get_machine_belt_positions"
             return result
@@ -1099,12 +1099,12 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
     if furnace_name ~= "electric-furnace" or string.find(inserter_name, "burner", 1, true) then
         result.fuel_automation_required = true
         result.after_place_steps = {{
-            tool = "diagnose_fuel_sustainability",
+            tool = "repair_fuel_sustainability",
             tool_args = {
-                x1 = belt_tile.x - 12,
-                y1 = belt_tile.y - 12,
-                x2 = belt_tile.x + 12,
-                y2 = belt_tile.y + 12,
+                x = belt_tile.x,
+                y = belt_tile.y,
+                radius = 12,
+                dry_run = false,
             },
             description = "Plan and build a durable coal belt/inserter feed. Do not use repeated inventory inserts as the operating fuel path.",
         }}
@@ -1616,7 +1616,7 @@ function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y,
         result.error = "Only nearby Factorio-valid placements overlap the agent character."
         result.next_action = "move_agent_or_call_unstuck"
         result.recommended_action = "walk_to_clear_placement"
-        result.guidance = "Move the agent away from the requested build area, then call plan_entity_placement_near again."
+        result.guidance = "Move the agent away from the requested build area, then call execute_entity_placement_near with dry_run=true again."
     elseif #result.rejected_blocked > 0 then
         result.error = "No nearby placement was both Factorio-valid and operationally safe for the agent."
         result.next_action = "expand_radius_or_use_edge_planner"

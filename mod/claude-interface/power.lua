@@ -999,7 +999,7 @@ function M.extend_power_to(character, x, y, radius, target_x, target_y)
     result.success = result.ready
     if result.ready then
         result.next_action = "execute_power_extension_steps"
-        result.guidance = "Place steps in order, then call get_power_status or find_power_issues near the target."
+        result.guidance = "Place steps in order, then call get_power_status near the target."
     elseif #result.steps > 0 then
         result.next_action = "gather_missing_items_or_clear_blockers"
         result.guidance = "Power extension steps were found, but missing_items or blockers must be resolved first."
@@ -1079,7 +1079,7 @@ function M.repair_steam_power(character, x, y, radius, target_x, target_y)
             table.insert(result.blockers, {
                 type = "durable_boiler_fuel_required",
                 message = "Boiler unit " .. tostring(entity.unit_number) .. " needs automated coal delivery, not a manual inventory insert.",
-                action = "Run diagnose_fuel_sustainability and build its belt/inserter supply path.",
+                action = "Run repair_fuel_sustainability near this boiler to build and verify its belt/inserter supply path.",
                 entity = {
                     unit_number = entity.unit_number,
                     name = entity.name,

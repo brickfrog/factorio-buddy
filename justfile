@@ -39,6 +39,10 @@ test-live: build
     set -euo pipefail
     temp_dir="$(mktemp -d)"
     save="$temp_dir/factorio-buddy-test.zip"
+    export SERVER_DATA_DIR="$temp_dir/server-data"
+    export RCON_PORT="${FACTORIO_TEST_RCON_PORT:-27016}"
+    export RCON_PASSWORD="${FACTORIO_TEST_RCON_PASSWORD:-test_password}"
+    export GAME_PORT="${FACTORIO_TEST_GAME_PORT:-34198}"
     cleanup() {
         ./tests/cleanup.sh >/dev/null 2>&1 || true
         rm -rf "$temp_dir"
@@ -48,14 +52,12 @@ test-live: build
     ./tests/run_tests.sh
     FACTORIOCTL_BIN="$PWD/target/release/factorioctl" \
         FACTORIO_MCP_BIN="$PWD/target/release/mcp" \
-        RCON_PORT=27016 \
-        RCON_PASSWORD=test_password \
         ./tests/live_regressions.sh
     FACTORIOCTL_BIN="$PWD/target/release/factorioctl" \
-        FACTORIO_RCON_PORT=27016 \
-        FACTORIO_RCON_PASSWORD=test_password \
+        FACTORIO_RCON_PORT="$RCON_PORT" \
+        FACTORIO_RCON_PASSWORD="$RCON_PASSWORD" \
         ./scripts/smoke_agent_binding.sh
-    RCON_PORT=27016 ./tests/cleanup.sh
+    ./tests/cleanup.sh
     FACTORIO_BIN="${FACTORIO_BIN:-/mnt/games/SteamLibrary/steamapps/common/Factorio/bin/x64/factorio}" \
         BUDDY_BIN="$PWD/target/release/buddy" \
         FACTORIO_MCP_BIN="$PWD/target/release/mcp" \

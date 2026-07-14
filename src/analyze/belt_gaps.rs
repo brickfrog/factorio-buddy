@@ -1,17 +1,11 @@
 //! Belt gap detection for finding breaks in belt networks
 
-use super::{BeltGap, BeltGapResult, BeltGraph, GapType};
+use super::{build_entity_occupancy_lookup, BeltGap, BeltGapResult, BeltGraph, GapType};
 use crate::world::{Entity, TilePos};
-use std::collections::HashMap;
 
 /// Analyze belt network for gaps (missing, misaligned, or blocked connections)
 pub fn find_belt_gaps(graph: &BeltGraph, all_entities: &[Entity]) -> BeltGapResult {
-    // Build entity lookup for non-belt entities
-    let entity_at: HashMap<TilePos, &Entity> = all_entities
-        .iter()
-        .filter(|e| !e.name.contains("belt"))
-        .map(|e| (e.position.to_tile(), e))
-        .collect();
+    let entity_at = build_entity_occupancy_lookup(all_entities);
 
     let mut gaps = Vec::new();
 
@@ -200,5 +194,28 @@ mod tests {
             .unwrap();
         assert_eq!(gap.gap_type, GapType::Blocked);
         assert_eq!(gap.blocker, Some("stone-furnace".to_string()));
+    }
+
+    #[test]
+    fn terminal_belt_into_edge_of_three_by_three_entity_is_blocked() {
+        for blocker_name in ["assembling-machine-1", "electric-mining-drill"] {
+            // The 3x3 entity is centered on tile (2, 0), so its west edge
+            // occupies (1, 0), directly in front of the east-facing belt.
+            let entities = vec![
+                make_belt(0, 0, Direction::East),
+                make_entity(2, 0, blocker_name),
+            ];
+
+            let graph = BeltGraph::from_entities(&entities);
+            let result = find_belt_gaps(&graph, &entities);
+
+            assert_eq!(result.gap_count, 1, "blocker={blocker_name}");
+            assert!(!result.certified_gap_free, "blocker={blocker_name}");
+            let gap = &result.gaps[0];
+            assert_eq!(gap.from, TilePos::new(0, 0));
+            assert_eq!(gap.to, TilePos::new(1, 0));
+            assert_eq!(gap.gap_type, GapType::Blocked);
+            assert_eq!(gap.blocker.as_deref(), Some(blocker_name));
+        }
     }
 }
