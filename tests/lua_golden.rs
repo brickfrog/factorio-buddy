@@ -953,10 +953,11 @@ fn critical_mod_safety_contracts_are_explicit() {
     assert!(
         research_lua.contains("error_kind = \"research_trigger_required\"")
             && research_lua.contains("local added = force.add_research(tech)")
-            && research_lua.contains("result.steps = {}")
-            && research_lua.contains("result.next_action = \"automate_science_delivery\"")
+            && research_lua.contains("result.ready_to_call = {")
+            && research_lua.contains("result.next_action = \"feed_lab_from_inventory\"")
+            && research_lua.contains("result.follow_up_action = \"automate_science_delivery\"")
             && !research_lua.contains("tech.researched = true"),
-        "research must use Factorio's queue/trigger mechanics and not advertise hand-feeding as automation"
+        "research must use Factorio's queue/trigger mechanics and return an executable bootstrap transfer before automation"
     );
     assert!(
         entities_lua.contains("local function fuel_connections(surface, force, consumer)")
@@ -1050,6 +1051,425 @@ fn coordinate_removal_requires_exact_identity_without_mutating() {
             && exact_remove.contains("return mine_entity_for_agent(agent_id, entity)"),
         "exact-unit remove_entity must remain the deliberate mutation path"
     );
+}
+
+#[test]
+fn bounded_inventory_actions_preserve_entities_and_conserve_items() {
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let inventory_actions_lua = include_str!("../mod/claude-interface/inventory_actions.lua");
+    let manifest = manifest_remotes();
+    let agent = named_agent();
+
+    let bootstrap_lua = LuaCommand::bootstrap_burner_once(&agent, 71, "coal", 5);
+    assert_remote_request(
+        "bootstrap_burner_once",
+        &bootstrap_lua,
+        "bootstrap_burner_once",
+    );
+    assert_eq!(
+        remote_args(&bootstrap_lua),
+        vec![json!("doug"), json!(71), json!("coal"), json!(5)]
+    );
+    let collect_lua = LuaCommand::collect_from_chest(&agent, 72, "iron-plate", 82);
+    assert_remote_request("collect_from_chest", &collect_lua, "collect_from_chest");
+    assert_eq!(
+        remote_args(&collect_lua),
+        vec![json!("doug"), json!(72), json!("iron-plate"), json!(82)]
+    );
+    for lua in [&bootstrap_lua, &collect_lua] {
+        assert!(
+            !lua.contains("get_inventory(")
+                && !lua.contains("get_main_inventory()")
+                && !lua.contains(".remove{")
+                && !lua.contains(".insert{"),
+            "bounded Rust wrapper should only carry a JSON remote request:\n{lua}"
+        );
+    }
+
+    assert!(
+        control_lua.contains(r#"local inventory_actions = require("inventory_actions")"#)
+            && control_lua.contains(
+                "bootstrap_burner_once = function(agent_id, unit_number, fuel_item, count)",
+            )
+            && control_lua.contains(
+                "json_remote_call(\"bootstrap_burner_once\", inventory_actions.bootstrap_burner_once, agent_id, unit_number, fuel_item, count)",
+            )
+            && control_lua.contains(
+                "collect_from_chest = function(agent_id, unit_number, item, count)",
+            )
+            && control_lua.contains(
+                "json_remote_call(\"collect_from_chest\", inventory_actions.collect_from_chest, agent_id, unit_number, item, count)",
+            ),
+        "control.lua should expose both bounded operations through the shared JSON remote seam"
+    );
+    assert_eq!(
+        manifest.get("bootstrap_burner_once"),
+        Some(&vec![
+            "agent_id".to_string(),
+            "unit_number".to_string(),
+            "fuel_item".to_string(),
+            "count".to_string(),
+        ])
+    );
+    assert_eq!(
+        manifest.get("collect_from_chest"),
+        Some(&vec![
+            "agent_id".to_string(),
+            "unit_number".to_string(),
+            "item".to_string(),
+            "count".to_string(),
+        ])
+    );
+
+    let fuel = inventory_actions_lua
+        .split("function M.bootstrap_burner_once(agent_id, unit_number, fuel_item, count)")
+        .nth(1)
+        .and_then(|tail| tail.split("function M.collect_from_chest").next())
+        .expect("bootstrap_burner_once should precede collect_from_chest");
+    for required in [
+        "MAX_BOOTSTRAP_FUEL_COUNT",
+        "validate_request(",
+        "BOOTSTRAP_BURNER_TYPES[entity.name]",
+        "entity.type ~= expected_type",
+        "defines.inventory.fuel",
+        "available_before < count",
+        "fuel_inventory.can_insert{name = fuel_item, count = 1}",
+        "character_inventory.remove{name = fuel_item, count = count}",
+        "fuel_inventory.insert{name = fuel_item, count = removed}",
+        "returned = character_inventory.insert{name = fuel_item, count = remainder}",
+        "conservation.target_increase = target_after - target_before",
+        "conservation.character_decrease = available_before - character_after",
+        "classification = \"temporary_bootstrap\"",
+        "purpose = \"temporary bootstrap\"",
+        "automation_complete = false",
+        "action_needed = \"repair_fuel_sustainability\"",
+        "entity_identity_preserved = identity_preserved",
+        "conservation = conservation",
+    ] {
+        assert!(
+            fuel.contains(required),
+            "bootstrap_burner_once should retain contract evidence {required:?}"
+        );
+    }
+
+    let collect = inventory_actions_lua
+        .split("function M.collect_from_chest(agent_id, unit_number, item, count)")
+        .nth(1)
+        .and_then(|tail| tail.split("return M").next())
+        .expect("collect_from_chest should precede module return");
+    for required in [
+        "MAX_CHEST_COLLECTION_COUNT",
+        "validate_request(",
+        "COLLECTABLE_CHEST_TYPES[entity.type]",
+        "defines.inventory.chest",
+        "character_inventory.can_insert{name = item, count = 1}",
+        "local attempted = math.min(count, available_before)",
+        "local inserted = character_inventory.insert{name = item, count = removed}",
+        "returned = chest_inventory.insert{name = item, count = remainder}",
+        "conservation.chest_decrease = available_before - chest_after",
+        "conservation.character_increase = character_after - character_before",
+        "classification = \"bounded_construction_or_recovery_collection\"",
+        "purpose = \"bounded construction/recovery collection\"",
+        "automation_complete = false",
+        "partial = inserted < count",
+        "partial_reasons = partial_reasons",
+        "entity_identity_preserved = identity_preserved",
+        "conservation = conservation",
+        "This manual transfer is not automated logistics or production completion.",
+    ] {
+        assert!(
+            collect.contains(required),
+            "collect_from_chest should retain contract evidence {required:?}"
+        );
+    }
+
+    for required in [
+        "result.success = false",
+        "result.error_kind = error_kind",
+        "result.action_needed = action_needed",
+        "entity_identity_changed",
+        "count must be a positive integer",
+        "count_exceeds_limit",
+        "unit_number must be an exact positive integer",
+        "characters.find(agent_id)",
+        "entities.find_by_unit_number(unit_number)",
+        "characters.require_entity_reach(character, entity)",
+        "removed == inserted + returned",
+    ] {
+        assert!(
+            inventory_actions_lua.contains(required),
+            "bounded inventory operations should retain shared safety evidence {required:?}"
+        );
+    }
+    for forbidden in [
+        "entity.destroy",
+        ".destroy()",
+        "mine_entity",
+        "character.mine_entity",
+        "surface.create_entity",
+        "teleport(",
+    ] {
+        assert!(
+            !inventory_actions_lua.contains(forbidden),
+            "bounded inventory operations must preserve target identity and nearby infrastructure; found {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn lab_feed_dry_run_returns_an_executable_bootstrap_step() {
+    let research_lua = include_str!("../mod/claude-interface/research.lua");
+    let feed = research_lua
+        .split("function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)")
+        .nth(1)
+        .and_then(|tail| tail.split("function M.get_research_status").next())
+        .expect("feed_lab_from_inventory should precede get_research_status");
+
+    for required in [
+        "if do_dry_run then",
+        "result.ready_to_call = {",
+        "tool = \"feed_lab_from_inventory\"",
+        "lab_unit_number = result.lab_unit_number",
+        "science_pack = science_pack",
+        "count = count",
+        "dry_run = false",
+        "result.steps = {{",
+        "args = result.ready_to_call.args",
+        "result.ready = true",
+        "result.next_action = \"feed_lab_from_inventory\"",
+        "result.follow_up_action = \"automate_science_delivery\"",
+    ] {
+        assert!(
+            feed.contains(required),
+            "lab feed dry-run should retain executable bootstrap evidence {required:?}"
+        );
+    }
+    assert!(
+        !feed.contains("result.steps = {}") && !feed.contains("result.ready = false"),
+        "a successful lab-feed dry-run must not return an empty/non-executable plan"
+    );
+}
+
+#[test]
+fn lab_feed_is_bounded_identity_preserving_and_conservative() {
+    let research_lua = include_str!("../mod/claude-interface/research.lua");
+    let feed = research_lua
+        .split("function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)")
+        .nth(1)
+        .and_then(|tail| tail.split("function M.get_research_status").next())
+        .expect("feed_lab_from_inventory should precede get_research_status");
+
+    for required in [
+        "local MAX_LAB_FEED_COUNT = 200",
+        "parsed_count ~= math.floor(parsed_count)",
+        "parsed_count > MAX_LAB_FEED_COUNT",
+        "error_kind = parsed_count and parsed_count > MAX_LAB_FEED_COUNT",
+        "result.lab_identity_preserved = lab.valid and lab.unit_number == result.lab_unit_number",
+        "balanced = removed == inserted + returned",
+        "result.conservation.measured_balanced",
+        "result.conservation.character_decrease == inserted",
+        "classification = \"bootstrap_science_transfer\"",
+        "automation_complete = false",
+        "result.follow_up_actions = {\"build_automation_science\", \"build_lab_feed\"}",
+    ] {
+        assert!(
+            research_lua.contains(required) || feed.contains(required),
+            "lab feed should retain bounded conservation contract {required:?}"
+        );
+    }
+}
+
+#[test]
+fn standalone_craft_accounting_is_generic_idempotent_and_factorio_owned() {
+    let accounting = include_str!("../mod/claude-interface/crafting_accounting.lua");
+    let control = include_str!("../mod/claude-interface/control.lua");
+
+    for required in [
+        "local MAX_ITEM_FLOWS = 32",
+        "local MAX_FLOW_COUNT = 100000",
+        "local MAX_RECORDED_OPERATIONS = 1024",
+        "local evictable = 0",
+        "if not crafting.operation_is_referenced(candidate) then evictable = evictable + 1 end",
+        "while evictable > MAX_RECORDED_OPERATIONS",
+        "state.by_operation[operation_id]",
+        "characters.find(agent_id)",
+        "character.force.get_item_production_statistics(character.surface)",
+        "statistics.on_flow(flow.name, flow.produced)",
+        "consumption_target = flow.consumption_before + flow.consumed",
+        "consumption_observed < consumption_target",
+        "production_injected = flow.produced",
+        "consumption_injected = 0",
+        "production_increase = production_after - flow.production_before",
+        "consumption_increase = consumption_after - flow.consumption_before",
+        "production_accounting = \"exact_positive_npc_flow\"",
+        "technology_progression = \"owned_by_factorio\"",
+        "record_verified_craft_flows = function(agent_id, operation_id, flows)",
+        "crafting_accounting.record_verified_flows",
+    ] {
+        assert!(
+            accounting.contains(required) || control.contains(required),
+            "standalone craft accounting should retain {required:?}"
+        );
+    }
+    for forbidden in [
+        ".researched = true",
+        "automation-science-pack",
+        "['lab']",
+        "[\"lab\"]",
+        "statistics.on_flow(flow.name, -",
+    ] {
+        assert!(
+            !accounting.contains(forbidden),
+            "craft accounting must stay generic and leave technologies to Factorio; found {forbidden:?}"
+        );
+    }
+    for obsolete in [
+        "record_verified_craft_products",
+        "record_verified_products",
+        "statistics.on_flow(product.name",
+    ] {
+        assert!(
+            !accounting.contains(obsolete) && !control.contains(obsolete),
+            "product-only craft accounting must be removed; found {obsolete:?}"
+        );
+    }
+}
+
+#[test]
+fn craft_admission_is_save_persisted_exclusive_and_exactly_acknowledged() {
+    let crafting = include_str!("../mod/claude-interface/crafting.lua");
+    let control = include_str!("../mod/claude-interface/control.lua");
+    let mcp = include_str!("../src/bin/mcp.rs");
+    let manifest = manifest_remotes();
+
+    for required in [
+        "storage.factorio_buddy_craft_admissions",
+        "admissions.by_agent = admissions.by_agent or {}",
+        "admissions.terminal_by_agent = admissions.terminal_by_agent or {}",
+        "admissions.next_sequence = admissions.next_sequence or 0",
+        "local previous = admissions.by_agent[agent_id]",
+        "\"craft_admission_pending\"",
+        "operation_id = previous.operation_id",
+        "admissions.by_agent[agent_id] = {",
+        "operation_id = operation_id",
+        "admitted_at_tick = game.tick",
+        "products = before_products",
+        "flows = flows",
+        "flow_accounting_complete = flow_accounting_complete",
+        "character_unit_number = context.character_unit_number",
+        "force_name = context.force_name",
+        "surface_name = context.surface_name",
+        "capture_flow_baselines",
+        "flow.production_before = statistics.get_input_count(flow.name)",
+        "flow.consumption_before = statistics.get_output_count(flow.name)",
+        "#result <= MAX_ITEM_FLOWS",
+        "ingredient.ignored_by_stats",
+        "product.ignored_by_stats",
+        "product.extra_count_fraction",
+        "function M.get_admission(agent_id)",
+        "function M.clear_admission(agent_id, operation_id, terminal_status)",
+        "admission.operation_id ~= operation_id",
+        "\"craft_operation_mismatch\"",
+        "terminal_status_valid(terminal_status)",
+        "receipt.completion_receipt = true",
+        "receipt.terminal_status = terminal_status",
+        "admissions.terminal_by_agent[agent_id] = receipt",
+        "record_with_identity(agent_id, receipt)",
+        "admissions.by_agent[agent_id] = nil",
+    ] {
+        assert!(
+            crafting.contains(required),
+            "save-persisted craft admission should retain {required:?}"
+        );
+    }
+
+    let queue_snapshot = crafting
+        .split("function M.queue_snapshot(agent_id)")
+        .nth(1)
+        .and_then(|tail| tail.split("return M").next())
+        .expect("queue_snapshot should precede the module return");
+    for required in [
+        "if character and character.valid then",
+        "return queue_snapshot(character, admission.operation_id)",
+        "current_recipe = queue[1] and queue[1].recipe or nil",
+        "queue = queue",
+        "success = false",
+        "error_kind = \"no_character\"",
+        "action_needed = \"spawn_character\"",
+    ] {
+        assert!(
+            queue_snapshot.contains(required) || crafting.contains(required),
+            "missing-character queue observation must be structured; missing {required:?}"
+        );
+    }
+    assert!(
+        !queue_snapshot.contains("return \"0\""),
+        "a missing character must never look like a completed empty queue"
+    );
+
+    for required in [
+        r#"local crafting = require("crafting")"#,
+        "craft = function(agent_id, recipe_name, count)",
+        "json_remote_call(\"craft\", crafting.craft, agent_id, recipe_name, count)",
+        "wait_for_crafting = function(agent_id)",
+        "json_remote_call(\"wait_for_crafting\", crafting.queue_snapshot, agent_id)",
+        "get_craft_admission = function(agent_id)",
+        "json_remote_call(\"get_craft_admission\", crafting.get_admission, agent_id)",
+        "clear_craft_admission = function(agent_id, operation_id, terminal_status)",
+        "json_remote_call(\"clear_craft_admission\", crafting.clear_admission, agent_id, operation_id, terminal_status)",
+    ] {
+        assert!(
+            control.contains(required),
+            "control.lua should expose the persisted craft transaction seam {required:?}"
+        );
+    }
+    for obsolete in [
+        "local function crafting_queue_summary",
+        "local function craft_impl",
+        "local function wait_for_crafting_impl",
+    ] {
+        assert!(
+            !control.contains(obsolete),
+            "control.lua must not retain the volatile craft implementation {obsolete:?}"
+        );
+    }
+
+    assert_eq!(
+        manifest.get("get_craft_admission"),
+        Some(&vec!["agent_id".to_string()])
+    );
+    assert_eq!(
+        manifest.get("clear_craft_admission"),
+        Some(&vec![
+            "agent_id".to_string(),
+            "operation_id".to_string(),
+            "terminal_status".to_string(),
+        ])
+    );
+    assert_eq!(
+        manifest.get("record_verified_craft_flows"),
+        Some(&vec![
+            "agent_id".to_string(),
+            "operation_id".to_string(),
+            "flows".to_string(),
+        ])
+    );
+
+    let model_visible = mcp
+        .split("const MODEL_VISIBLE_TOOLS: &[&str] = &[")
+        .nth(1)
+        .and_then(|tail| tail.split("fn model_safe_operation_label").next())
+        .expect("model-visible tool allowlist should precede operation labels");
+    for hidden in [
+        "get_craft_admission",
+        "clear_craft_admission",
+        "record_verified_craft_flows",
+    ] {
+        assert!(
+            !model_visible.contains(&format!("\"{hidden}\"")),
+            "transaction-internal remote {hidden:?} must stay hidden from the model"
+        );
+    }
 }
 
 fn assert_uses_transport_line_contents_shape(case_name: &str, lua: &str) {
@@ -2208,17 +2628,16 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
 
     let control_lua = include_str!("../mod/claude-interface/control.lua");
     let characters_lua = include_str!("../mod/claude-interface/characters.lua");
+    let crafting_lua = include_str!("../mod/claude-interface/crafting.lua");
     let json_response_lua = include_str!("../mod/claude-interface/json_response.lua");
     for required in [
         "local characters = require(\"characters\")",
+        "local crafting = require(\"crafting\")",
         "local remember_factorioctl_character = characters.remember",
         "characters.init",
         "characters.teleport",
         "characters.status",
         "characters.inventory",
-        "local function crafting_queue_summary",
-        "local function craft_impl",
-        "local function wait_for_crafting_impl",
         "init_character = function(agent_id, x, y)",
         "teleport_character = function(agent_id, x, y)",
         "character_status = function(agent_id)",
@@ -2229,6 +2648,8 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
         "get_character_pos = function(agent_id)",
         "craft = function(agent_id, recipe_name, count)",
         "wait_for_crafting = function(agent_id)",
+        "get_craft_admission = function(agent_id)",
+        "clear_craft_admission = function(agent_id, operation_id, terminal_status)",
     ] {
         assert!(
             control_lua.contains(required),
@@ -2240,6 +2661,9 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
         "local function teleport_character_impl",
         "local function character_status_impl",
         "local function character_inventory_impl",
+        "local function crafting_queue_summary",
+        "local function craft_impl",
+        "local function wait_for_crafting_impl",
         "game.surfaces[1].create_entity{",
         "character.teleport({x, y})",
     ] {
@@ -2265,15 +2689,16 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
             && characters_lua.contains("walking to nearest verified clear standing position")
             && !characters_lua.contains("game.surfaces[1]")
             && control_lua.contains("local c = find_factorioctl_character(agent_id)")
-            && control_lua.contains("return character.begin_crafting{recipe = recipe_name, count = count}")
-            && control_lua.contains("pairs(character.crafting_queue or {})")
-            && control_lua.contains("return tostring(character.crafting_queue_size or 0)")
-            && control_lua.contains(
-                "Crafting did not start; check ingredients, recipe category, or character craftability"
+            && crafting_lua.contains(
+                "return character.begin_crafting{recipe = recipe_name, count = count}"
             )
+            && crafting_lua.contains("ipairs(character.crafting_queue or {})")
+            && crafting_lua.contains("function M.queue_snapshot(agent_id)")
+            && crafting_lua.contains("current_recipe = queue[1] and queue[1].recipe or nil")
+            && crafting_lua.contains("crafting did not start; check ingredients, recipe category, or character craftability")
             && json_response_lua
                 .contains("if type(result_or_error) == \"string\" then return result_or_error end"),
-        "control.lua should own character/crafting semantics and preserve return contracts"
+        "the mod should own character/crafting semantics and preserve return contracts"
     );
 }
 
@@ -3413,6 +3838,7 @@ fn lua_plans_only_recommend_model_visible_tools() {
         "build_lab_feed",
         "execute_edge_miner",
         "execute_entity_placement_near",
+        "feed_lab_from_inventory",
         "get_power_status",
         "get_research_status",
         "place_entity",

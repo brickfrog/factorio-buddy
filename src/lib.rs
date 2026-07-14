@@ -16,6 +16,7 @@ pub mod analyze;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod issue_report;
 pub mod memory;
 pub mod output;
 pub mod world;

@@ -6,12 +6,16 @@ pub mod server;
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::world::{
     Area, BeltContentsResult, BeltLaneContentsResult, BeltLaneSummary, BuildResult,
-    CharacterStatus, CollisionMap, CraftResult, Direction, Entity, EntityProduction, GatherResult,
+    CharacterStatus, CollisionMap, CraftAdmissionRecord, CraftResult, CraftingQueueSnapshot,
+    CraftingStatus, CraftingStatusEvidence, Direction, Entity, EntityProduction, GatherResult,
     GridPos, Inventory, InventoryItem, LaneContents, MineResult, PlacementSpec, Position,
     Prototype, Recipe, RecipeSummary, ResourcePatch, Surface, Tick, Tile, TilePos, WalkResult,
 };
@@ -23,6 +27,162 @@ pub const PROXIMITY_RANGE_PLACE: f64 = 10.0;
 pub const PROXIMITY_RANGE_INSERT: f64 = 5.0;
 /// Maximum distance for setting recipes
 pub const PROXIMITY_RANGE_INTERACT: f64 = 5.0;
+
+/// Default wall-clock budget for observing a character crafting queue.
+pub const DEFAULT_CRAFTING_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default delay between character crafting queue observations.
+pub const DEFAULT_CRAFTING_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+type CraftingQueueFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<CraftingQueueSnapshot>> + Send + 'a>>;
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn crafting_poll_status(queue_size: u32, timed_out: bool) -> CraftingStatus {
+    if queue_size == 0 {
+        CraftingStatus::Completed
+    } else if timed_out {
+        CraftingStatus::TimedOut
+    } else {
+        CraftingStatus::Pending
+    }
+}
+
+fn classify_craft_completion(
+    queue_drained: bool,
+    admission_present: bool,
+    product_proof_available: bool,
+    products_verified: bool,
+) -> (bool, &'static str, Option<&'static str>) {
+    if queue_drained && products_verified {
+        (true, "completed", None)
+    } else if !queue_drained {
+        (false, "timed_out", Some("crafting_timeout"))
+    } else if !admission_present {
+        (false, "unverified", Some("missing_craft_admission"))
+    } else if !product_proof_available {
+        (false, "unverified", Some("craft_completion_unverifiable"))
+    } else {
+        (false, "output_missing", Some("craft_output_missing"))
+    }
+}
+
+fn craft_terminal_receipt_response(admission: &CraftAdmissionRecord) -> Value {
+    let terminal_status = admission
+        .terminal_status
+        .as_deref()
+        .unwrap_or("craft_terminal_status_missing");
+    let completed = terminal_status == "completed";
+    let queue_drained = completed
+        || matches!(
+            terminal_status,
+            "craft_output_missing"
+                | "craft_completion_unverifiable"
+                | "craft_flow_accounting_unverifiable"
+        );
+    let status = if completed {
+        "completed"
+    } else {
+        "terminal_failure"
+    };
+    json!({
+        "success": completed,
+        "completed": completed,
+        "queue_drained": queue_drained,
+        "status": status,
+        "operation_id": admission.operation_id,
+        "admission_persisted_in_save": true,
+        "admission_cleared": true,
+        "terminal_receipt_persisted": true,
+        "receipt_replayed": true,
+        "terminal_status": terminal_status,
+        "error_kind": if completed { Value::Null } else { json!(terminal_status) },
+        "error": if completed {
+            Value::Null
+        } else {
+            json!(format!("craft operation previously ended with {terminal_status}"))
+        },
+        "identity_valid": admission.identity_valid,
+        "identity_error": admission.identity_error,
+        "flows": admission.flows,
+    })
+}
+
+fn parse_crafting_queue_snapshot(response: &str) -> Result<CraftingQueueSnapshot> {
+    ensure_lua_success(response)?;
+    serde_json::from_str(response).map_err(|error| {
+        anyhow::anyhow!("invalid crafting queue snapshot from Factorio: {error}: {response:?}")
+    })
+}
+
+async fn poll_crafting_queue<C, F>(
+    context: &mut C,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut read_queue_size: F,
+) -> Result<CraftingStatusEvidence>
+where
+    F: for<'a> FnMut(&'a mut C) -> CraftingQueueFuture<'a>,
+{
+    if poll_interval.is_zero() {
+        bail!("crafting poll interval must be greater than zero");
+    }
+
+    let started = Instant::now();
+    let mut polls = 0_u32;
+    let mut initial_queue_size = None;
+    let mut remaining_queue_size = 0_u32;
+    let mut current_recipe = None;
+    let mut remaining_queue = Vec::new();
+
+    loop {
+        // Every remote queue observation is independently bounded by the RCON
+        // client. Check the overall crafting deadline before starting another
+        // one so polling itself cannot run indefinitely.
+        if polls > 0 && started.elapsed() >= timeout {
+            return Ok(CraftingStatusEvidence {
+                status: CraftingStatus::TimedOut,
+                recipe: None,
+                accepted_count: 0,
+                current_recipe,
+                remaining_queue,
+                initial_queue_size: initial_queue_size.unwrap_or(remaining_queue_size),
+                remaining_queue_size,
+                polls,
+                elapsed_ms: elapsed_millis(started),
+            });
+        }
+
+        let snapshot = read_queue_size(context).await?;
+        remaining_queue_size = snapshot.queue_size;
+        current_recipe = snapshot.current_recipe;
+        remaining_queue = snapshot.queue;
+        polls = polls.saturating_add(1);
+        let initial_queue_size = *initial_queue_size.get_or_insert(remaining_queue_size);
+        let timed_out = started.elapsed() >= timeout;
+        let status = crafting_poll_status(remaining_queue_size, timed_out);
+        let evidence = CraftingStatusEvidence {
+            status,
+            recipe: None,
+            accepted_count: 0,
+            current_recipe: current_recipe.clone(),
+            remaining_queue: remaining_queue.clone(),
+            initial_queue_size,
+            remaining_queue_size,
+            polls,
+            elapsed_ms: elapsed_millis(started),
+        };
+
+        if status != CraftingStatus::Pending {
+            return Ok(evidence);
+        }
+
+        let remaining_time = timeout.saturating_sub(started.elapsed());
+        tokio::time::sleep(poll_interval.min(remaining_time)).await;
+    }
+}
 
 /// Deserialize a `helpers.table_to_json` array response into a `Vec<T>`.
 ///
@@ -323,6 +483,7 @@ impl FactorioClient {
                 ],
             )
             .await?;
+        ensure_lua_success(&response)?;
         Ok(serde_json::from_str(&response)?)
     }
 
@@ -842,11 +1003,492 @@ impl FactorioClient {
         Ok(result)
     }
 
-    /// Wait for crafting to complete
-    pub async fn wait_for_crafting(&mut self) -> Result<()> {
-        self.call_remote("wait_for_crafting", &[json!(self.agent_id.as_str())])
+    /// Read the exact craft transaction persisted by the Factorio mod.
+    ///
+    /// A missing admission is an expected state after acknowledgement, while
+    /// every other Lua or transport failure remains an operation error.
+    pub async fn craft_admission_optional(&mut self) -> Result<Option<CraftAdmissionRecord>> {
+        let response = self
+            .call_remote("get_craft_admission", &[json!(self.agent_id.as_str())])
             .await?;
-        Ok(())
+        let value: Value = serde_json::from_str(&response)?;
+        if value.get("success").and_then(Value::as_bool) == Some(false)
+            && value.get("error_kind").and_then(Value::as_str) == Some("missing_craft_admission")
+        {
+            return Ok(None);
+        }
+        ensure_lua_success(&response)?;
+        Ok(Some(serde_json::from_value(value)?))
+    }
+
+    /// Read the exact craft transaction persisted by the Factorio mod,
+    /// requiring one to exist.
+    pub async fn craft_admission(&mut self) -> Result<CraftAdmissionRecord> {
+        self.craft_admission_optional()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no persisted craft admission for this agent"))
+    }
+
+    /// Clear one exact terminal craft transaction after its result was
+    /// successfully observed by the caller.
+    pub async fn clear_craft_admission(
+        &mut self,
+        operation_id: &str,
+        terminal_status: &str,
+    ) -> Result<Value> {
+        let response = self
+            .call_remote(
+                "clear_craft_admission",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(operation_id),
+                    json!(terminal_status),
+                ],
+            )
+            .await?;
+        ensure_lua_success(&response)?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Account a complete production/consumption flow whose requested output
+    /// was already proven by a standalone character inventory delta. Factorio
+    /// consumes this generic production flow when evaluating craft-item
+    /// technology triggers; the mod never mutates technologies.
+    pub async fn record_verified_craft_flows(
+        &mut self,
+        operation_id: &str,
+        flows: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .call_remote(
+                "record_verified_craft_flows",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(operation_id),
+                    flows.clone(),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    async fn crafting_queue_snapshot(&mut self) -> Result<CraftingQueueSnapshot> {
+        let response = self
+            .call_remote("wait_for_crafting", &[json!(self.agent_id.as_str())])
+            .await?;
+        parse_crafting_queue_snapshot(&response)
+    }
+
+    /// Observe the character crafting queue once.
+    ///
+    /// A non-empty queue is `Pending`; only an observed zero is `Completed`.
+    pub async fn crafting_status(&mut self) -> Result<CraftingStatusEvidence> {
+        let started = Instant::now();
+        let snapshot = self.crafting_queue_snapshot().await?;
+        Ok(CraftingStatusEvidence {
+            status: crafting_poll_status(snapshot.queue_size, false),
+            recipe: None,
+            accepted_count: 0,
+            current_recipe: snapshot.current_recipe,
+            remaining_queue: snapshot.queue,
+            initial_queue_size: snapshot.queue_size,
+            remaining_queue_size: snapshot.queue_size,
+            polls: 1,
+            elapsed_ms: elapsed_millis(started),
+        })
+    }
+
+    /// Poll until the character crafting queue is empty or `timeout` expires.
+    ///
+    /// This lower-level form returns structured `TimedOut` evidence instead of
+    /// converting it into an error so callers such as MCP can report the exact
+    /// remaining queue. Use [`Self::wait_for_crafting`] when timeout should be
+    /// an operation error.
+    pub async fn wait_for_crafting_with_options(
+        &mut self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<CraftingStatusEvidence> {
+        poll_crafting_queue(self, timeout, poll_interval, |client| {
+            Box::pin(async move { client.crafting_queue_snapshot().await })
+        })
+        .await
+    }
+
+    /// Wait for verified crafting completion using the bounded defaults.
+    ///
+    /// Compatibility callers still receive a `Result`, but success now carries
+    /// completion evidence and timeout is an error rather than false success.
+    pub async fn wait_for_crafting(&mut self) -> Result<CraftingStatusEvidence> {
+        let evidence = self
+            .wait_for_crafting_with_options(
+                DEFAULT_CRAFTING_WAIT_TIMEOUT,
+                DEFAULT_CRAFTING_POLL_INTERVAL,
+            )
+            .await?;
+
+        if !evidence.is_completed() {
+            bail!(
+                "timed out waiting for crafting after {} ms; {} queue entries remain after {} polls",
+                evidence.elapsed_ms,
+                evidence.remaining_queue_size,
+                evidence.polls
+            );
+        }
+        Ok(evidence)
+    }
+
+    async fn terminate_changed_craft_identity(
+        &mut self,
+        admission: &CraftAdmissionRecord,
+    ) -> Value {
+        let clear = self
+            .clear_craft_admission(&admission.operation_id, "craft_character_changed")
+            .await;
+        let admission_cleared = clear.is_ok();
+        let clear_error = clear.as_ref().err().map(ToString::to_string);
+        json!({
+            "success": false,
+            "completed": false,
+            "queue_drained": false,
+            "status": "identity_changed",
+            "operation_id": admission.operation_id,
+            "admission_persisted_in_save": true,
+            "admission_cleared": admission_cleared,
+            "terminal_receipt_persisted": admission_cleared,
+            "receipt_replayed": false,
+            "terminal_status": "craft_character_changed",
+            "error_kind": "craft_character_changed",
+            "error": "the persisted craft belongs to a different or missing character context",
+            "identity_valid": false,
+            "identity_error": admission.identity_error,
+            "clear_result": clear.ok(),
+            "clear_error": clear_error,
+        })
+    }
+
+    /// Complete the exact save-persisted craft transaction for this agent.
+    ///
+    /// Queue drain alone is not enough: this verifies the admitted recipe's
+    /// deterministic inventory increase, records the complete produced and
+    /// consumed item flow for standalone NPC characters, gives Factorio a
+    /// bounded trigger-evaluation window, and only then acknowledges the
+    /// admission. Timeouts and retryable accounting failures keep the
+    /// admission in the save so a later MCP/CLI process can resume it.
+    pub async fn complete_craft_admission_with_options(
+        &mut self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<Value> {
+        let mut admission = match self.craft_admission_optional().await? {
+            Some(admission) => admission,
+            None => {
+                return Ok(json!({
+                    "success": false,
+                    "completed": false,
+                    "queue_drained": false,
+                    "status": "unverified",
+                    "error_kind": "missing_craft_admission",
+                    "error": "the crafting state has no matching save-persisted admission",
+                    "admission_persisted_in_save": false,
+                    "admission_cleared": false,
+                    "terminal_receipt_persisted": false,
+                    "receipt_replayed": false,
+                }));
+            }
+        };
+        if admission.completion_receipt {
+            return Ok(craft_terminal_receipt_response(&admission));
+        }
+        if !admission.identity_valid {
+            return Ok(self.terminate_changed_craft_identity(&admission).await);
+        }
+
+        let mut evidence = match self
+            .wait_for_crafting_with_options(timeout, poll_interval)
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                if let Ok(Some(current)) = self.craft_admission_optional().await {
+                    if current.operation_id == admission.operation_id
+                        && !current.completion_receipt
+                        && !current.identity_valid
+                    {
+                        return Ok(self.terminate_changed_craft_identity(&current).await);
+                    }
+                }
+                return Ok(json!({
+                    "success": false,
+                    "completed": false,
+                    "status": "observation_failed",
+                    "error_kind": "craft_observation_failed",
+                    "error": error.to_string(),
+                    "admission_persisted_in_save": true,
+                    "admission_cleared": false,
+                    "terminal_receipt_persisted": false,
+                    "receipt_replayed": false,
+                    "operation_id": &admission.operation_id,
+                }));
+            }
+        };
+        evidence = evidence.with_craft_result(&admission.result);
+
+        // Re-read the save-owned record after queue observation. This closes
+        // the race where the character mapping, force, or surface changes
+        // between admission and inventory/accounting verification.
+        let current = match self.craft_admission_optional().await? {
+            Some(current) => current,
+            None => {
+                return Ok(json!({
+                    "success": false,
+                    "completed": false,
+                    "queue_drained": evidence.is_completed(),
+                    "status": "unverified",
+                    "error_kind": "missing_craft_admission",
+                    "error": "the persisted craft admission disappeared before completion verification",
+                    "operation_id": &admission.operation_id,
+                    "admission_persisted_in_save": false,
+                    "admission_cleared": false,
+                    "terminal_receipt_persisted": false,
+                    "receipt_replayed": false,
+                    "evidence": evidence,
+                }));
+            }
+        };
+        if current.operation_id != admission.operation_id {
+            return Ok(json!({
+                "success": false,
+                "completed": false,
+                "queue_drained": evidence.is_completed(),
+                "status": "operation_changed",
+                "error_kind": "craft_operation_mismatch",
+                "error": "a different craft transaction replaced the admitted operation",
+                "operation_id": &admission.operation_id,
+                "current_operation_id": &current.operation_id,
+                "admission_persisted_in_save": true,
+                "admission_cleared": false,
+                "terminal_receipt_persisted": current.completion_receipt,
+                "receipt_replayed": false,
+                "evidence": evidence,
+            }));
+        }
+        if current.completion_receipt {
+            return Ok(craft_terminal_receipt_response(&current));
+        }
+        if !current.identity_valid {
+            return Ok(self.terminate_changed_craft_identity(&current).await);
+        }
+        admission = current;
+
+        let queue_drained = evidence.is_completed();
+        let inventory_after = match self.character_inventory().await {
+            Ok(inventory) => Some(inventory),
+            Err(error) => {
+                return Ok(json!({
+                    "success": false,
+                    "completed": false,
+                    "queue_drained": queue_drained,
+                    "status": "observation_failed",
+                    "error_kind": "craft_inventory_observation_failed",
+                    "error": error.to_string(),
+                    "operation_id": &admission.operation_id,
+                    "admission_persisted_in_save": true,
+                    "admission_cleared": false,
+                    "terminal_receipt_persisted": false,
+                    "receipt_replayed": false,
+                    "evidence": evidence,
+                }));
+            }
+        };
+        let product_evidence: Vec<Value> = admission
+            .products
+            .iter()
+            .map(|product| {
+                let observed_after = inventory_after
+                    .as_ref()
+                    .map(|inventory| inventory.get_count(&product.name));
+                let observed_increase =
+                    observed_after.map(|count| count.saturating_sub(product.before_count));
+                json!({
+                    "name": product.name,
+                    "before_count": product.before_count,
+                    "expected_increase": product.expected_increase,
+                    "expected_after_minimum": product.before_count.saturating_add(product.expected_increase),
+                    "observed_after": observed_after,
+                    "observed_increase": observed_increase,
+                    "satisfied": observed_increase.is_some_and(|increase| increase >= product.expected_increase),
+                })
+            })
+            .collect();
+        let product_proof_available = admission.product_proof_complete
+            && !admission.products.is_empty()
+            && inventory_after.is_some();
+        let products_verified = product_proof_available
+            && product_evidence
+                .iter()
+                .all(|product| product.get("satisfied").and_then(Value::as_bool) == Some(true));
+        let flow_proof_available =
+            admission.flow_accounting_complete && !admission.flows.is_empty();
+
+        let mut accounting = Value::Null;
+        let mut accounting_verified = false;
+        let mut trigger_evaluation_tick_observed = false;
+        if queue_drained && products_verified && flow_proof_available {
+            let flows = serde_json::to_value(&admission.flows).unwrap_or_default();
+            match self
+                .record_verified_craft_flows(&admission.operation_id, &flows)
+                .await
+            {
+                Ok(result) => {
+                    accounting_verified = result.get("success").and_then(Value::as_bool)
+                        == Some(true)
+                        && result.get("accounted").and_then(Value::as_bool) == Some(true);
+                    // Factorio evaluates craft-item research triggers
+                    // asynchronously after production accounting. Allow a
+                    // conservative full-second window, plus one tick, for
+                    // the engine-owned evaluation to run.
+                    const TRIGGER_EVALUATION_TICKS: u32 = 61;
+                    let tick_result = if accounting_verified {
+                        self.wait_ticks(TRIGGER_EVALUATION_TICKS).await
+                    } else {
+                        Err(anyhow::anyhow!("craft flow accounting was rejected"))
+                    };
+                    trigger_evaluation_tick_observed = tick_result.is_ok();
+                    accounting = json!({
+                        "result": result,
+                        "trigger_evaluation_ticks": TRIGGER_EVALUATION_TICKS,
+                        "tick_advanced": trigger_evaluation_tick_observed,
+                        "tick_error": tick_result.err().map(|error| error.to_string()),
+                    });
+                }
+                Err(error) => {
+                    accounting = json!({
+                        "success": false,
+                        "error": error.to_string(),
+                    });
+                }
+            }
+        }
+
+        let (mut completed, mut status, mut error_kind) = classify_craft_completion(
+            queue_drained,
+            true,
+            product_proof_available,
+            products_verified,
+        );
+        if completed && !flow_proof_available {
+            completed = false;
+            status = "accounting_unverifiable";
+            error_kind = Some("craft_flow_accounting_unverifiable");
+        } else if completed && !accounting_verified {
+            completed = false;
+            status = "accounting_failed";
+            error_kind = Some("craft_accounting_failed");
+        } else if completed && !trigger_evaluation_tick_observed {
+            completed = false;
+            status = "accounting_pending";
+            error_kind = Some("craft_trigger_evaluation_pending");
+        }
+
+        let terminal_without_retry = queue_drained
+            && matches!(
+                error_kind,
+                Some("craft_output_missing")
+                    | Some("craft_completion_unverifiable")
+                    | Some("craft_flow_accounting_unverifiable")
+            );
+        let mut admission_cleared = false;
+        let mut clear_error = None;
+        let terminal_status = if completed {
+            Some("completed")
+        } else if terminal_without_retry {
+            error_kind
+        } else {
+            None
+        };
+        let mut clear_result = None;
+        if let Some(terminal_status) = terminal_status {
+            match self
+                .clear_craft_admission(&admission.operation_id, terminal_status)
+                .await
+            {
+                Ok(result) => {
+                    admission_cleared = true;
+                    clear_result = Some(result);
+                }
+                Err(error) => clear_error = Some(error.to_string()),
+            }
+        }
+        if completed && !admission_cleared {
+            completed = false;
+            status = "acknowledgement_failed";
+            error_kind = Some("craft_admission_clear_failed");
+        }
+
+        let timeout_seconds = timeout.as_secs();
+        let error = match error_kind {
+            None => Value::Null,
+            Some("crafting_timeout") => json!(format!(
+                "crafting did not complete within {} seconds; {} queue entries remain",
+                timeout_seconds, evidence.remaining_queue_size
+            )),
+            Some("missing_craft_admission") => {
+                json!("the crafting state has no matching save-persisted admission")
+            }
+            Some("craft_completion_unverifiable") => json!(
+                "the queue is empty, but deterministic requested-product evidence is unavailable"
+            ),
+            Some("craft_output_missing") => json!(
+                "the queue drained without the admitted craft's expected inventory increase; it may have been cancelled"
+            ),
+            Some("craft_flow_accounting_unverifiable") => json!(
+                "the craft output exists, but its complete deterministic production and consumption flow is unavailable"
+            ),
+            Some("craft_accounting_failed") => json!(
+                "the craft output exists, but standalone-character flow accounting failed"
+            ),
+            Some("craft_trigger_evaluation_pending") => json!(
+                "craft flows were accounted, but Factorio did not advance a trigger-evaluation window"
+            ),
+            Some("craft_admission_clear_failed") => json!(
+                "craft completion was verified, but its persisted admission could not be acknowledged"
+            ),
+            Some(other) => json!(format!("craft completion failed: {other}")),
+        };
+        let mut evidence_json = serde_json::to_value(&evidence).unwrap_or_default();
+        evidence_json["status"] = json!(status);
+        Ok(json!({
+            "success": completed,
+            "completed": completed,
+            "queue_drained": queue_drained,
+            "status": status,
+            "operation_id": &admission.operation_id,
+            "admission_persisted_in_save": true,
+            "admission_cleared": admission_cleared,
+            "terminal_receipt_persisted": admission_cleared,
+            "receipt_replayed": false,
+            "terminal_status": terminal_status,
+            "clear_result": clear_result,
+            "clear_error": clear_error,
+            "error_kind": error_kind,
+            "error": error,
+            "evidence": evidence_json,
+            "product_evidence": product_evidence,
+            "flow_accounting_complete": flow_proof_available,
+            "flows": &admission.flows,
+            "accounting": accounting,
+        }))
+    }
+
+    /// Complete the exact save-persisted craft transaction with the bounded
+    /// production defaults.
+    pub async fn complete_craft_admission(&mut self) -> Result<Value> {
+        self.complete_craft_admission_with_options(
+            DEFAULT_CRAFTING_WAIT_TIMEOUT,
+            DEFAULT_CRAFTING_POLL_INTERVAL,
+        )
+        .await
     }
 
     // --- Entity Actions ---
@@ -1197,6 +1839,54 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
+    /// Add a bounded fuel buffer to an existing burner drill or inserter.
+    pub async fn bootstrap_burner_once(
+        &mut self,
+        unit_number: u32,
+        fuel_item: &str,
+        count: u32,
+    ) -> Result<serde_json::Value> {
+        let position = self.get_entity(unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INSERT)
+            .await?;
+        let response = self
+            .call_remote(
+                "bootstrap_burner_once",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    json!(fuel_item),
+                    json!(count),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Collect bounded construction or recovery stock from an existing chest.
+    pub async fn collect_from_chest(
+        &mut self,
+        unit_number: u32,
+        item: &str,
+        count: u32,
+    ) -> Result<serde_json::Value> {
+        let position = self.get_entity(unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INSERT)
+            .await?;
+        let response = self
+            .call_remote(
+                "collect_from_chest",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    json!(item),
+                    json!(count),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     /// Extract items from an entity into player inventory
     pub async fn extract_items(
         &mut self,
@@ -1300,6 +1990,9 @@ impl FactorioClient {
         count: u32,
         dry_run: bool,
     ) -> Result<serde_json::Value> {
+        let position = self.get_entity(lab_unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INSERT)
+            .await?;
         let response = self
             .call_remote(
                 "feed_lab_from_inventory",
@@ -1953,6 +2646,90 @@ fn entity_collision_padding(entity_name: &str) -> i32 {
 mod tests {
     use super::*;
 
+    fn queue_snapshot(queue_size: u32, recipes: &[(&str, u32)]) -> CraftingQueueSnapshot {
+        let queue = recipes
+            .iter()
+            .map(|(recipe, count)| crate::world::CraftQueueItem {
+                recipe: (*recipe).to_string(),
+                count: *count,
+            })
+            .collect::<Vec<_>>();
+        CraftingQueueSnapshot {
+            queue_size,
+            current_recipe: queue.first().map(|item| item.recipe.clone()),
+            queue,
+        }
+    }
+
+    #[test]
+    fn craft_completion_requires_admission_queue_drain_and_product_evidence() {
+        assert_eq!(
+            classify_craft_completion(true, true, true, true),
+            (true, "completed", None)
+        );
+        assert_eq!(
+            classify_craft_completion(false, true, true, false),
+            (false, "timed_out", Some("crafting_timeout"))
+        );
+        assert_eq!(
+            classify_craft_completion(true, false, false, false),
+            (false, "unverified", Some("missing_craft_admission"))
+        );
+        assert_eq!(
+            classify_craft_completion(true, true, false, false),
+            (false, "unverified", Some("craft_completion_unverifiable"))
+        );
+        assert_eq!(
+            classify_craft_completion(true, true, true, false),
+            (false, "output_missing", Some("craft_output_missing"))
+        );
+    }
+
+    #[test]
+    fn terminal_craft_receipts_replay_exact_success_or_failure() {
+        let mut receipt: CraftAdmissionRecord = serde_json::from_value(json!({
+            "operation_id": "craft-42-7",
+            "admitted_at_tick": 42,
+            "character_unit_number": 99,
+            "force_name": "player",
+            "surface_name": "nauvis",
+            "identity_valid": true,
+            "completion_receipt": true,
+            "terminal_status": "completed",
+            "result": {
+                "success": true,
+                "queued": 1,
+                "queue_size": 1,
+                "queue": [],
+                "operation_id": "craft-42-7",
+                "recipe": "lab"
+            },
+            "flows": [{
+                "name": "lab",
+                "produced": 1,
+                "consumed": 0,
+                "production_before": 3.5,
+                "consumption_before": 0
+            }]
+        }))
+        .expect("terminal receipt should deserialize with fractional statistics baselines");
+
+        let completed = craft_terminal_receipt_response(&receipt);
+        assert_eq!(completed["success"], true);
+        assert_eq!(completed["completed"], true);
+        assert_eq!(completed["receipt_replayed"], true);
+        assert_eq!(completed["terminal_status"], "completed");
+        assert!(completed["error_kind"].is_null());
+
+        receipt.terminal_status = Some("craft_output_missing".to_string());
+        let failed = craft_terminal_receipt_response(&receipt);
+        assert_eq!(failed["success"], false);
+        assert_eq!(failed["completed"], false);
+        assert_eq!(failed["receipt_replayed"], true);
+        assert_eq!(failed["terminal_status"], "craft_output_missing");
+        assert_eq!(failed["error_kind"], "craft_output_missing");
+    }
+
     fn collision_test_entity(name: &str, entity_type: &str) -> Entity {
         Entity {
             unit_number: Some(1),
@@ -2162,5 +2939,92 @@ mod tests {
         let lane: RawLane =
             serde_json::from_str(r#"{"items":{}}"#).expect("raw belt lanes should accept Lua {}");
         assert!(lane.items.is_empty());
+    }
+
+    #[test]
+    fn crafting_queue_snapshot_requires_structured_current_and_remaining_queue() {
+        let snapshot = parse_crafting_queue_snapshot(
+            r#"{"success":true,"queue_size":3,"current_recipe":"copper-cable","queue":[{"recipe":"copper-cable","count":2},{"recipe":"electronic-circuit","count":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.queue_size, 3);
+        assert_eq!(snapshot.current_recipe.as_deref(), Some("copper-cable"));
+        assert_eq!(snapshot.queue.len(), 2);
+        assert_eq!(snapshot.queue[1].recipe, "electronic-circuit");
+
+        for response in [
+            "0",
+            "17",
+            "not-a-number",
+            r#"{"success":false,"error":"no character"}"#,
+        ] {
+            assert!(
+                parse_crafting_queue_snapshot(response).is_err(),
+                "response must not be accepted: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn crafting_poll_state_requires_an_observed_empty_queue() {
+        assert_eq!(crafting_poll_status(2, false), CraftingStatus::Pending);
+        assert_eq!(crafting_poll_status(2, true), CraftingStatus::TimedOut);
+        assert_eq!(crafting_poll_status(0, false), CraftingStatus::Completed);
+        assert_eq!(crafting_poll_status(0, true), CraftingStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn crafting_poll_waits_through_pending_samples_until_zero() {
+        use std::collections::VecDeque;
+
+        let mut samples = VecDeque::from([
+            queue_snapshot(3, &[("copper-cable", 2), ("electronic-circuit", 1)]),
+            queue_snapshot(2, &[("electronic-circuit", 1)]),
+            queue_snapshot(0, &[]),
+        ]);
+        let evidence = poll_crafting_queue(
+            &mut samples,
+            Duration::from_secs(1),
+            Duration::from_nanos(1),
+            |samples| {
+                Box::pin(async move {
+                    samples
+                        .pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("poll read past scripted samples"))
+                })
+            },
+        )
+        .await
+        .expect("scripted queue should complete");
+
+        assert_eq!(evidence.status, CraftingStatus::Completed);
+        assert_eq!(evidence.initial_queue_size, 3);
+        assert_eq!(evidence.remaining_queue_size, 0);
+        assert!(evidence.current_recipe.is_none());
+        assert!(evidence.remaining_queue.is_empty());
+        assert_eq!(evidence.polls, 3);
+        assert!(samples.is_empty());
+    }
+
+    #[tokio::test]
+    async fn crafting_poll_returns_structured_timeout_evidence() {
+        let mut snapshot = queue_snapshot(4, &[("copper-cable", 3), ("electronic-circuit", 1)]);
+        let evidence = poll_crafting_queue(
+            &mut snapshot,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            |snapshot| Box::pin(async move { Ok(snapshot.clone()) }),
+        )
+        .await
+        .expect("craft timeout is a status at the lower-level API");
+
+        assert_eq!(evidence.status, CraftingStatus::TimedOut);
+        assert_eq!(evidence.initial_queue_size, 4);
+        assert_eq!(evidence.remaining_queue_size, 4);
+        assert_eq!(evidence.current_recipe.as_deref(), Some("copper-cable"));
+        assert_eq!(evidence.remaining_queue.len(), 2);
+        assert_eq!(evidence.remaining_queue[1].recipe, "electronic-circuit");
+        assert_eq!(evidence.polls, 1);
+        assert!(!evidence.is_completed());
     }
 }

@@ -195,6 +195,17 @@ tool_payload() {
     jq -r '.result.content[0].text | split("\n\n--- Player Messages ---")[0]' <<<"$1"
 }
 
+beads_issue_snapshot() (
+    local name
+    while IFS= read -r name; do
+        case "$name" in
+            BEADS_* | BD_*) unset "$name" ;;
+        esac
+    done < <(compgen -e)
+    bd --json --actor=factorio-buddy list --all --limit=0 \
+        | jq -cS 'map({id,title,status,issue_type,priority}) | sort_by(.id)'
+)
+
 start_mcp() {
     coproc LIVE_MCP {
         FACTORIO_RCON_HOST="$RCON_HOST" \
@@ -225,6 +236,10 @@ if [[ ! -x "$CLI_BIN" || ! -x "$MCP_BIN" ]]; then
 fi
 if ! command -v jq >/dev/null 2>&1; then
     printf 'ERROR: jq is required\n' >&2
+    exit 1
+fi
+if ! command -v bd >/dev/null 2>&1; then
+    printf 'ERROR: bd is required for the file_issue live regression\n' >&2
     exit 1
 fi
 if ! "${CLI[@]}" get tick >/dev/null 2>&1; then
@@ -870,21 +885,22 @@ start_mcp
 
 TOOLS="$(mcp_send tools/list '{}')"
 EXPECTED_TOOLS="$(printf '%s\n' \
-    analyze_inserters analyze_item_flow bootstrap_smelting_once \
+    analyze_inserters analyze_item_flow bootstrap_burner_once bootstrap_smelting_once \
     build_assembler_feed build_assembler_output build_automation_science \
-    build_lab_feed build_recipe_assembler_cell craft diagnose_factory_blockers \
+    build_lab_feed build_recipe_assembler_cell collect_from_chest craft diagnose_factory_blockers \
     diagnose_steam_power execute_direct_smelter execute_edge_miner \
-    execute_entity_placement_near extend_power_to find_nearest_resource \
+    execute_entity_placement_near extend_power_to feed_lab_from_inventory file_issue \
+    find_nearest_resource \
     get_available_research get_belt_lane_contents get_entities \
     get_machine_belt_positions get_power_status get_recipe get_recipes_for_item \
     get_research_status mine_at place_entity plan_automation_science \
     plan_machine_output plan_recipe_assembler_cell plan_steam_power \
     production_statistics remove_entity render_map repair_fuel_sustainability \
     rotate_entity route_belt set_recipe situation_report start_research unstuck \
-    verify_production walk_to | jq -Rsc 'split("\n")[:-1] | sort')"
-assert_json "model receives the exact 42-tool gameplay surface" "$TOOLS" \
+    verify_production wait_for_crafting walk_to | jq -Rsc 'split("\n")[:-1] | sort')"
+assert_json "model receives the exact 47-tool gameplay surface" "$TOOLS" \
     --argjson expected "$EXPECTED_TOOLS" \
-    '([.result.tools[].name] | sort) == $expected and (.result.tools | length) == 42'
+    '([.result.tools[].name] | sort) == $expected and (.result.tools | length) == 47'
 TOOLS_SCHEMA_BYTES="$(jq -c '.result.tools' <<<"$TOOLS" | wc -c)"
 if (( TOOLS_SCHEMA_BYTES <= 61440 )); then
     pass "model tool schema stays below 60 KiB"
@@ -1137,6 +1153,812 @@ rcon.print(helpers.table_to_json({
 ")"
 assert_json "absent-recipe rollback leaves no fragments or recipe" "$EMPTY_RECIPE_ROLLBACK_WORLD" \
     '.belts == 0 and .inserters == 0 and .recipe == null'
+
+# Bounded inventory recovery must operate on exact existing entities without
+# the destructive remove-and-replace workaround. Freeze ticks so burner fuel
+# cannot begin burning between the transfer response and the conservation
+# observation.
+INVENTORY_PRIMITIVES_FIXTURE="$(raw_lua "
+game.tick_paused = true
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+c.force = game.forces.player
+c.teleport({5, -20}, game.surfaces['buddy-live-regression'])
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{0, -27}, {14, -13}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local inv = c.get_main_inventory()
+inv.clear()
+local seeded_coal = inv.insert{name = 'coal', count = 7}
+local drill = s.create_entity{
+    name = 'burner-mining-drill',
+    position = {8, -20},
+    direction = defines.direction.north,
+    force = c.force
+}
+local inserter = s.create_entity{
+    name = 'burner-inserter',
+    position = {4, -24},
+    direction = defines.direction.north,
+    force = c.force
+}
+local chest = s.create_entity{name = 'iron-chest', position = {3, -17}, force = c.force}
+if not (drill and inserter and chest) then error('failed to construct bounded inventory fixtures') end
+drill.get_fuel_inventory().clear()
+inserter.get_fuel_inventory().clear()
+local seeded_plates = chest.get_inventory(defines.inventory.chest).insert{name = 'iron-plate', count = 37}
+rcon.print(helpers.table_to_json({
+    drill_unit = drill.unit_number,
+    inserter_unit = inserter.unit_number,
+    chest_unit = chest.unit_number,
+    seeded_coal = seeded_coal,
+    seeded_plates = seeded_plates
+}))
+")"
+require_json "bounded inventory fixtures use exact existing entities" "$INVENTORY_PRIMITIVES_FIXTURE" \
+    '.seeded_coal == 7
+     and .seeded_plates == 37
+     and (.drill_unit | type) == "number"
+     and (.inserter_unit | type) == "number"
+     and (.chest_unit | type) == "number"'
+BOOTSTRAP_DRILL_UNIT="$(jq -r '.drill_unit' <<<"$INVENTORY_PRIMITIVES_FIXTURE")"
+BOOTSTRAP_INSERTER_UNIT="$(jq -r '.inserter_unit' <<<"$INVENTORY_PRIMITIVES_FIXTURE")"
+COLLECTION_CHEST_UNIT="$(jq -r '.chest_unit' <<<"$INVENTORY_PRIMITIVES_FIXTURE")"
+
+OVER_CAP_FUEL="$(mcp_tool bootstrap_burner_once "$(jq -cn \
+    --argjson unit "$BOOTSTRAP_DRILL_UNIT" \
+    '{unit_number:$unit, fuel_item:"coal", count:11}')")"
+OVER_CAP_FUEL_PAYLOAD="$(tool_payload "$OVER_CAP_FUEL")"
+assert_json "burner bootstrap rejects fuel requests above its hard cap" "$OVER_CAP_FUEL" \
+    '.result.isError == true'
+assert_json "over-cap burner rejection is structured" "$OVER_CAP_FUEL_PAYLOAD" \
+    '.success == false
+     and .error_kind == "count_exceeds_limit"
+     and .maximum_count == 10'
+OVER_CAP_FUEL_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local drill
+for _, entity in pairs(s.find_entities_filtered{area = {{0, -27}, {14, -13}}}) do
+    if entity.unit_number == $BOOTSTRAP_DRILL_UNIT then drill = entity break end
+end
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+rcon.print(helpers.table_to_json({
+    same_unit = drill and drill.valid and drill.unit_number == $BOOTSTRAP_DRILL_UNIT or false,
+    drill_coal = drill and drill.get_fuel_inventory().get_item_count('coal') or -1,
+    character_coal = c.get_main_inventory().get_item_count('coal')
+}))
+")"
+assert_json "over-cap burner rejection leaves entity and coal untouched" "$OVER_CAP_FUEL_WORLD" \
+    '.same_unit == true and .drill_coal == 0 and .character_coal == 7'
+
+DRILL_BOOTSTRAP="$(mcp_tool bootstrap_burner_once "$(jq -cn \
+    --argjson unit "$BOOTSTRAP_DRILL_UNIT" \
+    '{unit_number:$unit, fuel_item:"coal", count:3}')")"
+DRILL_BOOTSTRAP_PAYLOAD="$(tool_payload "$DRILL_BOOTSTRAP")"
+assert_json "burner drill bootstrap succeeds through the model-visible seam" "$DRILL_BOOTSTRAP" \
+    '(.result.isError // false) == false'
+assert_json "burner drill bootstrap is bounded and explicitly temporary" "$DRILL_BOOTSTRAP_PAYLOAD" \
+    --argjson unit "$BOOTSTRAP_DRILL_UNIT" \
+    '.success == true
+     and .target.unit_number == $unit
+     and .target.name == "burner-mining-drill"
+     and .entity_identity_preserved == true
+     and .classification == "temporary_bootstrap"
+     and .temporary_bootstrap == true
+     and .automation_complete == false
+     and .next_action == "repair_fuel_sustainability"
+     and .requested == 3
+     and .inserted == 3
+     and .target_before == 0
+     and .target_after == 3
+     and .character_after == 4
+     and .conservation.balanced == true
+     and .conservation.measured_balanced == true
+     and .conservation.target_increase == 3
+     and .conservation.character_decrease == 3'
+
+INSERTER_BOOTSTRAP="$(mcp_tool bootstrap_burner_once "$(jq -cn \
+    --argjson unit "$BOOTSTRAP_INSERTER_UNIT" \
+    '{unit_number:$unit, fuel_item:"coal", count:2}')")"
+INSERTER_BOOTSTRAP_PAYLOAD="$(tool_payload "$INSERTER_BOOTSTRAP")"
+assert_json "burner inserter bootstrap succeeds through the same bounded seam" "$INSERTER_BOOTSTRAP" \
+    '(.result.isError // false) == false'
+assert_json "burner inserter bootstrap preserves exact identity and durable follow-up" "$INSERTER_BOOTSTRAP_PAYLOAD" \
+    --argjson unit "$BOOTSTRAP_INSERTER_UNIT" \
+    '.success == true
+     and .target.unit_number == $unit
+     and .target.name == "burner-inserter"
+     and .entity_identity_preserved == true
+     and .classification == "temporary_bootstrap"
+     and .automation_complete == false
+     and .action_needed == "repair_fuel_sustainability"
+     and .inserted == 2
+     and .target_before == 0
+     and .target_after == 2
+     and .character_after == 2
+     and .conservation.balanced == true
+     and .conservation.measured_balanced == true'
+
+CHEST_COLLECTION="$(mcp_tool collect_from_chest "$(jq -cn \
+    --argjson unit "$COLLECTION_CHEST_UNIT" \
+    '{unit_number:$unit, item:"iron-plate", count:12}')")"
+CHEST_COLLECTION_PAYLOAD="$(tool_payload "$CHEST_COLLECTION")"
+assert_json "bounded chest collection succeeds without mining the chest" "$CHEST_COLLECTION" \
+    '(.result.isError // false) == false'
+assert_json "chest collection reports exact identity and item conservation" "$CHEST_COLLECTION_PAYLOAD" \
+    --argjson unit "$COLLECTION_CHEST_UNIT" \
+    '.success == true
+     and .target.unit_number == $unit
+     and .target.name == "iron-chest"
+     and .entity_identity_preserved == true
+     and .bounded_collection == true
+     and .automation_complete == false
+     and .requested == 12
+     and .available_before == 37
+     and .transferred == 12
+     and .chest_after == 25
+     and .character_before == 0
+     and .character_after == 12
+     and .partial == false
+     and .conservation.balanced == true
+     and .conservation.measured_balanced == true
+     and .conservation.chest_decrease == 12
+     and .conservation.character_increase == 12'
+INVENTORY_PRIMITIVES_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local drill, inserter, chest
+for _, entity in pairs(s.find_entities_filtered{area = {{0, -27}, {14, -13}}}) do
+    if entity.unit_number == $BOOTSTRAP_DRILL_UNIT then drill = entity end
+    if entity.unit_number == $BOOTSTRAP_INSERTER_UNIT then inserter = entity end
+    if entity.unit_number == $COLLECTION_CHEST_UNIT then chest = entity end
+end
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+rcon.print(helpers.table_to_json({
+    drill_same_unit = drill and drill.valid and drill.unit_number == $BOOTSTRAP_DRILL_UNIT or false,
+    inserter_same_unit = inserter and inserter.valid and inserter.unit_number == $BOOTSTRAP_INSERTER_UNIT or false,
+    chest_same_unit = chest and chest.valid and chest.unit_number == $COLLECTION_CHEST_UNIT or false,
+    drill_coal = drill and drill.get_fuel_inventory().get_item_count('coal') or -1,
+    inserter_coal = inserter and inserter.get_fuel_inventory().get_item_count('coal') or -1,
+    chest_plates = chest and chest.get_inventory(defines.inventory.chest).get_item_count('iron-plate') or -1,
+    character_coal = c.get_main_inventory().get_item_count('coal'),
+    character_plates = c.get_main_inventory().get_item_count('iron-plate')
+}))
+")"
+assert_json "bounded inventory actions preserve all three entity identities and totals" "$INVENTORY_PRIMITIVES_WORLD" \
+    '.drill_same_unit == true
+     and .inserter_same_unit == true
+     and .chest_same_unit == true
+     and .drill_coal == 3
+     and .inserter_coal == 2
+     and .character_coal == 2
+     and .chest_plates == 25
+     and .character_plates == 12'
+
+# Character crafting is asynchronous admission. A dedicated disposable force
+# isolates the native craft-item trigger: prerequisites are fixture setup, but
+# automation-science-pack itself must remain false until Factorio observes the
+# lab produced by the MCP craft request.
+CRAFT_TRIGGER_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local force = game.forces['buddy-live-craft'] or game.create_force('buddy-live-craft')
+c.force = force
+local inv = c.get_main_inventory()
+inv.clear()
+force.technologies['steam-power'].researched = true
+force.technologies['electronics'].researched = true
+force.technologies['automation-science-pack'].researched = false
+force.reset_technology_effects()
+force.manual_crafting_speed_modifier = 100
+local recipe = force.recipes['lab']
+if not (recipe and recipe.enabled) then error('lab recipe was not enabled by trigger prerequisites') end
+local seeded = 0
+local recipe_ingredients = {}
+local statistics = force.get_item_production_statistics(c.surface)
+for _, ingredient in pairs(recipe.ingredients) do
+    if ingredient.type ~= 'item' then error('live lab fixture only supports item ingredients') end
+    local count = math.ceil(ingredient.amount)
+    seeded = seeded + inv.insert{name = ingredient.name, count = count}
+    table.insert(recipe_ingredients, {
+        name = ingredient.name,
+        count = count,
+        consumption_before = statistics.get_output_count(ingredient.name)
+    })
+end
+rcon.print(helpers.table_to_json({
+    queue_size = c.crafting_queue_size,
+    seeded_ingredients = seeded,
+    recipe_ingredients = recipe_ingredients,
+    lab_recipe_enabled = recipe.enabled,
+    trigger_researched = force.technologies['automation-science-pack'].researched,
+    science_recipe_enabled = force.recipes['automation-science-pack'].enabled,
+    crafted_lab_produced = force.get_item_production_statistics(c.surface).get_input_count('lab'),
+    lab_count = inv.get_item_count('lab')
+}))
+")"
+require_json "craft-trigger fixture starts before the native lab trigger" "$CRAFT_TRIGGER_FIXTURE" \
+    '.queue_size == 0
+     and .seeded_ingredients > 0
+     and .lab_recipe_enabled == true
+     and .trigger_researched == false
+     and .science_recipe_enabled == false
+     and .crafted_lab_produced == 0
+     and .lab_count == 0
+     and (.recipe_ingredients | length) > 0
+     and all(.recipe_ingredients[]; .count > 0 and .consumption_before == 0)'
+LAB_RECIPE_INGREDIENTS="$(jq -c '.recipe_ingredients' <<<"$CRAFT_TRIGGER_FIXTURE")"
+
+LAB_CRAFT="$(mcp_tool craft '{"recipe":"lab","count":1}')"
+LAB_CRAFT_PAYLOAD="$(tool_payload "$LAB_CRAFT")"
+assert_json "craft accepts the lab request without claiming production" "$LAB_CRAFT" \
+    '(.result.isError // false) == false'
+assert_json "craft response is admission evidence, never completion evidence" "$LAB_CRAFT_PAYLOAD" \
+    '.success == true
+     and .completed == false
+     and .admission.status == "queued"
+     and .admission.recipe == "lab"
+     and .admission.accepted_count == 1
+     and .admission.remaining_queue_size > 0
+     and .craft_result.success == true
+     and .craft_result.queue_size > 0
+     and .admission_persisted_in_save == true
+     and (.operation_id | type) == "string"
+     and .operation_id == .craft_result.operation_id
+     and (.next_action | contains("wait_for_crafting"))'
+LAB_OPERATION_ID="$(jq -r '.operation_id // empty' <<<"$LAB_CRAFT_PAYLOAD")"
+LAB_CRAFT_PENDING_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local force = c.force
+local inv = c.get_main_inventory()
+rcon.print(helpers.table_to_json({
+    queue_size = c.crafting_queue_size,
+    lab_count = inv.get_item_count('lab'),
+    trigger_researched = force.technologies['automation-science-pack'].researched,
+    science_recipe_enabled = force.recipes['automation-science-pack'].enabled
+}))
+")"
+assert_json "paused admitted craft has not produced a lab or fired its trigger" "$LAB_CRAFT_PENDING_WORLD" \
+    '.queue_size > 0
+     and .lab_count == 0
+     and .trigger_researched == false
+     and .science_recipe_enabled == false'
+
+# A fresh MCP process must observe the exact transaction stored in the save.
+# It must reject a second admission without overwriting the original one.
+stop_mcp
+start_mcp
+LAB_OVERLAPPING_CRAFT="$(mcp_tool craft '{"recipe":"lab","count":1}')"
+LAB_OVERLAPPING_CRAFT_PAYLOAD="$(tool_payload "$LAB_OVERLAPPING_CRAFT")"
+assert_json "save-persisted admission rejects an overlapping craft after MCP restart" "$LAB_OVERLAPPING_CRAFT" \
+    '.result.isError == true'
+assert_json "overlap rejection preserves the original save-persisted operation" "$LAB_OVERLAPPING_CRAFT_PAYLOAD" \
+    --arg operation_id "$LAB_OPERATION_ID" \
+    '.success == false
+     and .completed == false
+     and .operation_id == $operation_id
+     and .craft_result.operation_id == $operation_id
+     and .craft_result.error_kind == "craft_admission_pending"
+     and .admission.status == "rejected"'
+
+LAB_CRAFT_TIMEOUT="$(mcp_tool wait_for_crafting '{"timeout_seconds":1}')"
+LAB_CRAFT_TIMEOUT_PAYLOAD="$(tool_payload "$LAB_CRAFT_TIMEOUT")"
+assert_json "paused crafting timeout is a semantic MCP error" "$LAB_CRAFT_TIMEOUT" \
+    '.result.isError == true'
+assert_json "craft timeout reports the original save-persisted queue evidence" "$LAB_CRAFT_TIMEOUT_PAYLOAD" \
+    --arg operation_id "$LAB_OPERATION_ID" \
+    '.success == false
+     and .completed == false
+     and .queue_drained == false
+     and .status == "timed_out"
+     and .error_kind == "crafting_timeout"
+     and .operation_id == $operation_id
+     and .admission_persisted_in_save == true
+     and .admission_cleared == false
+     and .evidence.status == "timed_out"
+     and .evidence.recipe == "lab"
+     and .evidence.accepted_count == 1
+     and .evidence.current_recipe == "lab"
+     and (.evidence.remaining_queue | length) > 0
+     and .evidence.remaining_queue[0].recipe == "lab"
+     and .evidence.initial_queue_size > 0
+     and .evidence.remaining_queue_size > 0
+     and .evidence.polls >= 1
+     and any(.product_evidence[];
+         .name == "lab"
+         and .expected_increase == 1
+         and .observed_increase == 0
+         and .satisfied == false)'
+LAB_CRAFT_TIMEOUT_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local force = c.force
+rcon.print(helpers.table_to_json({
+    queue_size = c.crafting_queue_size,
+    lab_count = c.get_main_inventory().get_item_count('lab'),
+    trigger_researched = force.technologies['automation-science-pack'].researched
+}))
+")"
+assert_json "timeout does not fabricate craft completion or trigger research" "$LAB_CRAFT_TIMEOUT_WORLD" \
+    '.queue_size > 0 and .lab_count == 0 and .trigger_researched == false'
+
+raw_lua "game.tick_paused = false" >/dev/null
+LAB_CRAFT_COMPLETION="$(mcp_tool wait_for_crafting '{"timeout_seconds":10}')"
+LAB_CRAFT_COMPLETION_PAYLOAD="$(tool_payload "$LAB_CRAFT_COMPLETION")"
+assert_json "craft wait succeeds only after the queue reaches zero" "$LAB_CRAFT_COMPLETION" \
+    '(.result.isError // false) == false'
+assert_json "craft completion carries an observed empty-queue proof" "$LAB_CRAFT_COMPLETION_PAYLOAD" \
+    --arg operation_id "$LAB_OPERATION_ID" \
+    --argjson ingredients "$LAB_RECIPE_INGREDIENTS" \
+    '. as $completion
+     | .success == true
+     and .completed == true
+     and .queue_drained == true
+     and .status == "completed"
+     and .error_kind == null
+     and .operation_id == $operation_id
+     and .admission_persisted_in_save == true
+     and .admission_cleared == true
+     and .terminal_receipt_persisted == true
+     and .receipt_replayed == false
+     and .terminal_status == "completed"
+     and .clear_result.completion_receipt == true
+     and .evidence.status == "completed"
+     and .evidence.recipe == "lab"
+     and .evidence.accepted_count == 1
+     and .evidence.current_recipe == null
+     and (.evidence.remaining_queue | length) == 0
+     and .evidence.remaining_queue_size == 0
+     and .evidence.polls >= 1
+     and any(.product_evidence[];
+         .name == "lab"
+         and .before_count == 0
+         and .expected_increase == 1
+         and .expected_after_minimum == 1
+         and .observed_after == 1
+         and .observed_increase == 1
+         and .satisfied == true)
+     and .accounting.result.success == true
+     and .accounting.result.accounted == true
+     and .accounting.result.duplicate == false
+     and .accounting.result.technology_progression == "owned_by_factorio"
+     and .accounting.trigger_evaluation_ticks == 61
+     and .accounting.tick_advanced == true
+     and .flow_accounting_complete == true
+     and any(.flows[];
+         .name == "lab"
+         and .produced == 1
+         and .consumed == 0)
+     and all($ingredients[];
+         . as $expected
+         | any($completion.flows[];
+             .name == $expected.name
+             and .produced == 0
+             and .consumed == $expected.count))
+     and any(.accounting.result.flows[];
+         .name == "lab"
+         and .produced == 1
+         and .consumed == 0
+         and .production_injected == 1
+         and .consumption_injected == 0
+         and .production_increase == 1)
+     and all($ingredients[];
+         . as $expected
+         | any($completion.accounting.result.flows[];
+             .name == $expected.name
+             and .produced == 0
+             and .consumed == $expected.count
+             and .consumption_increase == $expected.count))'
+LAB_CRAFT_COMPLETE_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local force = c.force
+local inv = c.get_main_inventory()
+local statistics = force.get_item_production_statistics(c.surface)
+local recipe = force.recipes['lab']
+local consumed_ingredients = {}
+for _, ingredient in pairs(recipe.ingredients) do
+    table.insert(consumed_ingredients, {
+        name = ingredient.name,
+        expected = math.ceil(ingredient.amount),
+        observed = statistics.get_output_count(ingredient.name)
+    })
+end
+rcon.print(helpers.table_to_json({
+    queue_size = c.crafting_queue_size,
+    lab_count = inv.get_item_count('lab'),
+    trigger_researched = force.technologies['automation-science-pack'].researched,
+    science_recipe_enabled = force.recipes['automation-science-pack'].enabled,
+    crafted_lab_produced = statistics.get_input_count('lab'),
+    consumed_ingredients = consumed_ingredients
+}))
+")"
+require_json "native Factorio lab crafting fires automation-science-pack trigger" "$LAB_CRAFT_COMPLETE_WORLD" \
+    --argjson ingredients "$LAB_RECIPE_INGREDIENTS" \
+    '.queue_size == 0
+     and .lab_count == 1
+     and .crafted_lab_produced == 1
+     and .trigger_researched == true
+     and .science_recipe_enabled == true
+     and (.consumed_ingredients | length) == ($ingredients | length)
+     and all(.consumed_ingredients[]; .observed == .expected)'
+
+# A lost MCP/RCON reply after acknowledgement must not lose the result. The
+# save-owned terminal receipt is replayed by a fresh MCP process without
+# accounting the craft a second time.
+stop_mcp
+start_mcp
+LAB_CRAFT_REPLAY="$(mcp_tool wait_for_crafting '{"timeout_seconds":1}')"
+LAB_CRAFT_REPLAY_PAYLOAD="$(tool_payload "$LAB_CRAFT_REPLAY")"
+assert_json "completed craft receipt replays successfully after MCP restart" "$LAB_CRAFT_REPLAY" \
+    '(.result.isError // false) == false'
+assert_json "completion replay preserves the exact terminal operation" "$LAB_CRAFT_REPLAY_PAYLOAD" \
+    --arg operation_id "$LAB_OPERATION_ID" \
+    '.success == true
+     and .completed == true
+     and .queue_drained == true
+     and .status == "completed"
+     and .operation_id == $operation_id
+     and .admission_cleared == true
+     and .terminal_receipt_persisted == true
+     and .receipt_replayed == true
+     and .terminal_status == "completed"
+     and .error_kind == null'
+
+# Exact queue evidence must distinguish the requested recipe from the
+# auto-queued intermediate Factorio is currently crafting.
+AUTO_QUEUE_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local inv = c.get_main_inventory()
+inv.clear()
+local recipe = c.force.recipes['electronic-circuit']
+if not (recipe and recipe.enabled) then error('electronic-circuit recipe is unavailable') end
+c.force.manual_crafting_speed_modifier = 100
+local iron = inv.insert{name = 'iron-plate', count = 1}
+local copper = inv.insert{name = 'copper-plate', count = 3}
+game.tick_paused = true
+rcon.print(helpers.table_to_json({iron = iron, copper = copper, queue_size = c.crafting_queue_size}))
+")"
+require_json "auto-intermediate fixture starts paused with raw ingredients" "$AUTO_QUEUE_FIXTURE" \
+    '.iron == 1 and .copper == 3 and .queue_size == 0'
+AUTO_QUEUE_CRAFT="$(mcp_tool craft '{"recipe":"electronic-circuit","count":1}')"
+AUTO_QUEUE_CRAFT_PAYLOAD="$(tool_payload "$AUTO_QUEUE_CRAFT")"
+assert_json "auto-intermediate craft admission exposes its complete initial queue" "$AUTO_QUEUE_CRAFT_PAYLOAD" \
+    '.success == true
+     and .completed == false
+     and .admission.recipe == "electronic-circuit"
+     and any(.craft_result.queue[]; .recipe == "copper-cable")
+     and any(.craft_result.queue[]; .recipe == "electronic-circuit")'
+AUTO_QUEUE_OPERATION_ID="$(jq -r '.operation_id // empty' <<<"$AUTO_QUEUE_CRAFT_PAYLOAD")"
+AUTO_QUEUE_TIMEOUT="$(mcp_tool wait_for_crafting '{"timeout_seconds":1}')"
+AUTO_QUEUE_TIMEOUT_PAYLOAD="$(tool_payload "$AUTO_QUEUE_TIMEOUT")"
+assert_json "paused auto-intermediate craft times out semantically" "$AUTO_QUEUE_TIMEOUT" \
+    '.result.isError == true'
+assert_json "timeout reports requested recipe, current intermediate, and exact remaining queue" "$AUTO_QUEUE_TIMEOUT_PAYLOAD" \
+    --arg operation_id "$AUTO_QUEUE_OPERATION_ID" \
+    '.success == false
+     and .status == "timed_out"
+     and .operation_id == $operation_id
+     and .evidence.recipe == "electronic-circuit"
+     and .evidence.current_recipe == "copper-cable"
+     and (.evidence.remaining_queue | length) >= 2
+     and .evidence.remaining_queue[0].recipe == "copper-cable"
+     and any(.evidence.remaining_queue[]; .recipe == "electronic-circuit")'
+raw_lua "game.tick_paused = false" >/dev/null
+AUTO_QUEUE_COMPLETION="$(mcp_tool wait_for_crafting '{"timeout_seconds":10}')"
+AUTO_QUEUE_COMPLETION_PAYLOAD="$(tool_payload "$AUTO_QUEUE_COMPLETION")"
+require_json "auto-intermediate transaction completes with an observed empty queue" "$AUTO_QUEUE_COMPLETION_PAYLOAD" \
+    '.success == true
+     and .completed == true
+     and .evidence.recipe == "electronic-circuit"
+     and .evidence.current_recipe == null
+     and (.evidence.remaining_queue | length) == 0
+     and any(.flows[]; .name == "copper-cable" and .produced == 4 and .consumed == 3)
+     and any(.flows[]; .name == "electronic-circuit" and .produced == 1)'
+
+FAILED_CRAFT="$(mcp_tool craft '{"recipe":"definitely-not-a-recipe","count":1}')"
+FAILED_CRAFT_PAYLOAD="$(tool_payload "$FAILED_CRAFT")"
+assert_json "rejected craft is a semantic MCP error" "$FAILED_CRAFT" \
+    '.result.isError == true'
+assert_json "rejected craft never claims admission or completion" "$FAILED_CRAFT_PAYLOAD" \
+    '.success == false
+     and .completed == false
+     and .operation_id == null
+     and .craft_result.error_kind == "unknown_recipe"
+     and .admission.status == "rejected"'
+
+# Cancellation is operator-only fixture setup. The model-facing completion seam
+# must observe the empty queue but reject completion because the admitted
+# deterministic product never appeared and was never production-accounted.
+CANCELLED_CRAFT_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local inv = c.get_main_inventory()
+inv.clear()
+local recipe = c.force.recipes['iron-gear-wheel']
+if not (recipe and recipe.enabled) then error('gear recipe unavailable for cancellation fixture') end
+local seeded = 0
+for _, ingredient in pairs(recipe.ingredients) do
+    if ingredient.type ~= 'item' then error('cancellation fixture only supports item ingredients') end
+    seeded = seeded + inv.insert{name = ingredient.name, count = math.ceil(ingredient.amount)}
+end
+game.tick_paused = true
+rcon.print(helpers.table_to_json({
+    seeded_ingredients = seeded,
+    queue_size = c.crafting_queue_size,
+    gear_count = inv.get_item_count('iron-gear-wheel'),
+    produced_gears = c.force.get_item_production_statistics(c.surface).get_input_count('iron-gear-wheel')
+}))
+")"
+require_json "cancelled-craft fixture starts empty and paused" "$CANCELLED_CRAFT_FIXTURE" \
+    '.seeded_ingredients > 0
+     and .queue_size == 0
+     and .gear_count == 0
+     and .produced_gears == 0'
+
+CANCELLED_CRAFT="$(mcp_tool craft '{"recipe":"iron-gear-wheel","count":1}')"
+CANCELLED_CRAFT_PAYLOAD="$(tool_payload "$CANCELLED_CRAFT")"
+assert_json "cancellation fixture admits one real craft" "$CANCELLED_CRAFT_PAYLOAD" \
+    '.success == true
+     and .completed == false
+     and .admission.status == "queued"
+     and .admission.accepted_count == 1
+     and .admission_persisted_in_save == true
+     and (.operation_id | type) == "string"'
+CANCELLED_OPERATION_ID="$(jq -r '.operation_id // empty' <<<"$CANCELLED_CRAFT_PAYLOAD")"
+raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.cancel_crafting{index = 1, count = 1}" >/dev/null
+CANCELLED_COMPLETION="$(mcp_tool wait_for_crafting '{"timeout_seconds":2}')"
+CANCELLED_COMPLETION_PAYLOAD="$(tool_payload "$CANCELLED_COMPLETION")"
+assert_json "cancelled craft completion is a semantic MCP error" "$CANCELLED_COMPLETION" \
+    '.result.isError == true'
+assert_json "cancelled craft cannot fabricate output or production accounting" "$CANCELLED_COMPLETION_PAYLOAD" \
+    --arg operation_id "$CANCELLED_OPERATION_ID" \
+    '.success == false
+     and .completed == false
+     and .queue_drained == true
+     and .status == "output_missing"
+     and .error_kind == "craft_output_missing"
+     and .operation_id == $operation_id
+     and .admission_persisted_in_save == true
+     and .admission_cleared == true
+     and .accounting == null
+     and any(.product_evidence[];
+         .name == "iron-gear-wheel"
+         and .expected_increase == 1
+         and .observed_increase == 0
+         and .satisfied == false)'
+CANCELLED_CRAFT_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+game.tick_paused = false
+rcon.print(helpers.table_to_json({
+    queue_size = c.crafting_queue_size,
+    gear_count = c.get_main_inventory().get_item_count('iron-gear-wheel'),
+    produced_gears = c.force.get_item_production_statistics(c.surface).get_input_count('iron-gear-wheel')
+}))
+")"
+require_json "cancelled craft leaves no output or production credit" "$CANCELLED_CRAFT_WORLD" \
+    '.queue_size == 0 and .gear_count == 0 and .produced_gears == 0'
+CANCELLED_ADMISSION_AFTER="$(raw_lua \
+    "rcon.print(remote.call('claude_interface', 'get_craft_admission', '$AGENT_ID'))")"
+assert_json "terminal cancellation persists the exact replayable failure receipt" "$CANCELLED_ADMISSION_AFTER" \
+    --arg operation_id "$CANCELLED_OPERATION_ID" \
+    '.operation_id == $operation_id
+     and .completion_receipt == true
+     and .terminal_status == "craft_output_missing"'
+CANCELLED_REPLAY="$(mcp_tool wait_for_crafting '{"timeout_seconds":1}')"
+CANCELLED_REPLAY_PAYLOAD="$(tool_payload "$CANCELLED_REPLAY")"
+assert_json "cancelled craft receipt replays as the same semantic failure" "$CANCELLED_REPLAY" \
+    '.result.isError == true'
+assert_json "cancelled craft replay never fabricates completion" "$CANCELLED_REPLAY_PAYLOAD" \
+    --arg operation_id "$CANCELLED_OPERATION_ID" \
+    '.success == false
+     and .completed == false
+     and .status == "terminal_failure"
+     and .operation_id == $operation_id
+     and .receipt_replayed == true
+     and .terminal_status == "craft_output_missing"
+     and .error_kind == "craft_output_missing"'
+
+# Produce the initial red packs by character crafting, then exercise the one
+# mandatory hand-feed bootstrap. The lab itself is fixture setup; both dry-run
+# validation and the transfer go through the model-visible MCP tool.
+SCIENCE_CRAFT_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local inv = c.get_main_inventory()
+inv.clear()
+local recipe = c.force.recipes['automation-science-pack']
+if not (recipe and recipe.enabled) then error('automation science recipe was not natively unlocked') end
+local seeded = 0
+for _, ingredient in pairs(recipe.ingredients) do
+    if ingredient.type ~= 'item' then error('live science fixture only supports item ingredients') end
+    local count = math.ceil(ingredient.amount * 3)
+    seeded = seeded + inv.insert{name = ingredient.name, count = count}
+end
+rcon.print(helpers.table_to_json({seeded_ingredients = seeded, recipe_enabled = recipe.enabled}))
+")"
+require_json "initial science ingredients are seeded only after native unlock" "$SCIENCE_CRAFT_FIXTURE" \
+    '.seeded_ingredients > 0 and .recipe_enabled == true'
+SCIENCE_CRAFT="$(mcp_tool craft '{"recipe":"automation-science-pack","count":3}')"
+SCIENCE_CRAFT_PAYLOAD="$(tool_payload "$SCIENCE_CRAFT")"
+assert_json "initial automation science is admitted through character crafting" "$SCIENCE_CRAFT_PAYLOAD" \
+    '.success == true
+     and .completed == false
+     and (.admission.status == "queued" or .admission.status == "accepted")
+     and .admission.accepted_count == 3'
+SCIENCE_CRAFT_COMPLETION="$(mcp_tool wait_for_crafting '{"timeout_seconds":10}')"
+SCIENCE_CRAFT_COMPLETION_PAYLOAD="$(tool_payload "$SCIENCE_CRAFT_COMPLETION")"
+require_json "initial automation science character craft completes" "$SCIENCE_CRAFT_COMPLETION_PAYLOAD" \
+    '.success == true
+     and .completed == true
+     and .queue_drained == true
+     and .status == "completed"
+     and .evidence.status == "completed"
+     and .evidence.recipe == "automation-science-pack"
+     and .evidence.accepted_count == 3
+     and .evidence.remaining_queue_size == 0
+     and any(.product_evidence[];
+         .name == "automation-science-pack"
+         and .before_count == 0
+         and .expected_increase == 3
+         and .expected_after_minimum == 3
+         and .observed_after == 3
+         and .observed_increase == 3
+         and .satisfied == true)
+     and .accounting.result.accounted == true
+     and .accounting.result.technology_progression == "owned_by_factorio"
+     and .flow_accounting_complete == true
+     and (.flows | length) > 1
+     and .admission_cleared == true
+     and .accounting.tick_advanced == true'
+
+LAB_FEED_FIXTURE="$(raw_lua "
+game.tick_paused = true
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+c.teleport({21, -20}, game.surfaces['buddy-live-regression'])
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{18, -25}, {29, -15}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local lab = s.create_entity{name = 'lab', position = {25, -20}, force = c.force}
+if not lab then error('failed to construct exact lab feed fixture') end
+local lab_inv = lab.get_inventory(defines.inventory.lab_input)
+rcon.print(helpers.table_to_json({
+    lab_unit = lab.unit_number,
+    character_packs = c.get_main_inventory().get_item_count('automation-science-pack'),
+    lab_packs = lab_inv.get_item_count('automation-science-pack')
+}))
+")"
+require_json "hand-feed fixture has three crafted packs and one exact empty lab" "$LAB_FEED_FIXTURE" \
+    '.character_packs == 3
+     and .lab_packs == 0
+     and (.lab_unit | type) == "number"'
+LAB_FEED_UNIT="$(jq -r '.lab_unit' <<<"$LAB_FEED_FIXTURE")"
+
+LAB_FEED_DRY_RUN="$(mcp_tool feed_lab_from_inventory "$(jq -cn \
+    --argjson unit "$LAB_FEED_UNIT" \
+    '{lab_unit_number:$unit, science_pack:"automation-science-pack", count:2, dry_run:true}')")"
+LAB_FEED_DRY_RUN_PAYLOAD="$(tool_payload "$LAB_FEED_DRY_RUN")"
+assert_json "lab hand-feed dry-run is non-erroring and executable" "$LAB_FEED_DRY_RUN" \
+    '(.result.isError // false) == false'
+assert_json "lab hand-feed dry-run returns the exact guarded execution step" "$LAB_FEED_DRY_RUN_PAYLOAD" \
+    --argjson unit "$LAB_FEED_UNIT" \
+    '.success == true
+     and .dry_run == true
+     and .classification == "bootstrap_science_transfer"
+     and .bootstrap == true
+     and .automation_complete == false
+     and .ready == true
+     and .manual_bootstrap_available == true
+     and .lab_unit_number == $unit
+     and .available == 3
+     and .lab_before == 0
+     and .inserted == 0
+     and .ready_to_call.tool == "feed_lab_from_inventory"
+     and .ready_to_call.args.lab_unit_number == $unit
+     and .ready_to_call.args.science_pack == "automation-science-pack"
+     and .ready_to_call.args.count == 2
+     and .ready_to_call.args.dry_run == false
+     and .next_action == "feed_lab_from_inventory"
+     and .follow_up_action == "automate_science_delivery"'
+LAB_FEED_DRY_RUN_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local lab
+for _, entity in pairs(s.find_entities_filtered{area = {{18, -25}, {29, -15}}}) do
+    if entity.unit_number == $LAB_FEED_UNIT then lab = entity break end
+end
+rcon.print(helpers.table_to_json({
+    same_unit = lab and lab.valid and lab.unit_number == $LAB_FEED_UNIT or false,
+    character_packs = c.get_main_inventory().get_item_count('automation-science-pack'),
+    lab_packs = lab and lab.get_inventory(defines.inventory.lab_input).get_item_count('automation-science-pack') or -1
+}))
+")"
+assert_json "lab hand-feed dry-run leaves both inventories unchanged" "$LAB_FEED_DRY_RUN_WORLD" \
+    '.same_unit == true and .character_packs == 3 and .lab_packs == 0'
+
+LAB_FEED_EXECUTION="$(mcp_tool feed_lab_from_inventory "$(jq -cn \
+    --argjson unit "$LAB_FEED_UNIT" \
+    '{lab_unit_number:$unit, science_pack:"automation-science-pack", count:2, dry_run:false}')")"
+LAB_FEED_EXECUTION_PAYLOAD="$(tool_payload "$LAB_FEED_EXECUTION")"
+assert_json "initial science hand-feed executes through the model-visible seam" "$LAB_FEED_EXECUTION" \
+    '(.result.isError // false) == false'
+assert_json "initial science hand-feed reports the exact bounded transfer" "$LAB_FEED_EXECUTION_PAYLOAD" \
+    --argjson unit "$LAB_FEED_UNIT" \
+    '.success == true
+     and .dry_run == false
+     and .classification == "bootstrap_science_transfer"
+     and .bootstrap == true
+     and .automation_complete == false
+     and .lab_unit_number == $unit
+     and .lab_identity_preserved == true
+     and .science_pack == "automation-science-pack"
+     and .requested_count == 2
+     and .available == 3
+     and .lab_before == 0
+     and .inserted == 2
+     and .returned_to_inventory == 0
+     and .lab_after == 2
+     and .inventory_after == 1
+     and .conservation.removed == 2
+     and .conservation.inserted == 2
+     and .conservation.returned == 0
+     and .conservation.balanced == true
+     and .conservation.lab_increase == 2
+     and .conservation.character_decrease == 2
+     and .conservation.measured_balanced == true
+     and .next_action == "get_research_status"
+     and (.follow_up_actions | index("build_automation_science")) != null
+     and (.follow_up_actions | index("build_lab_feed")) != null'
+LAB_FEED_EXECUTION_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local lab
+for _, entity in pairs(s.find_entities_filtered{area = {{18, -25}, {29, -15}}}) do
+    if entity.unit_number == $LAB_FEED_UNIT then lab = entity break end
+end
+rcon.print(helpers.table_to_json({
+    same_unit = lab and lab.valid and lab.unit_number == $LAB_FEED_UNIT or false,
+    character_packs = c.get_main_inventory().get_item_count('automation-science-pack'),
+    lab_packs = lab and lab.get_inventory(defines.inventory.lab_input).get_item_count('automation-science-pack') or -1,
+    conserved_total = c.get_main_inventory().get_item_count('automation-science-pack')
+        + (lab and lab.get_inventory(defines.inventory.lab_input).get_item_count('automation-science-pack') or 0)
+}))
+")"
+assert_json "initial science hand-feed preserves exact lab identity and pack total" "$LAB_FEED_EXECUTION_WORLD" \
+    '.same_unit == true
+     and .character_packs == 1
+     and .lab_packs == 2
+     and .conserved_total == 3'
+
+# Restore ordinary runtime state before the remaining shared-transport probe.
+raw_lua "
+game.tick_paused = false
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+c.force = game.forces.player
+c.teleport({28.5, 10.5}, game.surfaces['buddy-live-regression'])
+" >/dev/null
+
+# Invalid model-authored issue fields must fail validation before `bd create`.
+# Snapshot the full issue identity/state projection around the MCP call so this
+# live test cannot silently mutate the real repository tracker.
+BEADS_BEFORE="$(beads_issue_snapshot)"
+INVALID_ISSUE="$(mcp_tool file_issue '{
+    "title":"",
+    "observed_behavior":"This request must be rejected before issue creation.",
+    "expected_behavior":"No issue is created for an empty title.",
+    "evidence":["live-regression-invalid-input"],
+    "labels":["mcp"],
+    "priority":2
+}')"
+INVALID_ISSUE_PAYLOAD="$(tool_payload "$INVALID_ISSUE")"
+assert_json "invalid file_issue input is a semantic MCP error" "$INVALID_ISSUE" \
+    '.result.isError == true'
+assert_json "invalid file_issue input reports bounded validation failure" "$INVALID_ISSUE_PAYLOAD" \
+    '.success == false and .error_kind == "invalid_issue_report"'
+BEADS_AFTER="$(beads_issue_snapshot)"
+if [[ "$BEADS_AFTER" == "$BEADS_BEFORE" ]]; then
+    pass "invalid file_issue cannot mutate the real Beads issue set"
+else
+    fail "invalid file_issue cannot mutate the real Beads issue set" \
+        "Beads issue identity/state projection changed"
+fi
 
 # Multiple tools in one MCP process must share its RCON transport.
 RCON_BEFORE="$(rcon_connection_count)"

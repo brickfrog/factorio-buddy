@@ -461,6 +461,50 @@ impl LuaCommand {
         )
     }
 
+    /// Read the exact craft admission persisted in the Factorio save.
+    pub fn get_craft_admission(agent_id: &AgentId) -> String {
+        Self::claude_interface_json_call(
+            "get_craft_admission",
+            &[Self::lua_string_arg(agent_id.as_str())],
+            "Run just sync/resume so the updated claude-interface mod is loaded before reading craft admission evidence.",
+        )
+    }
+
+    /// Acknowledge and clear one exact terminal craft admission.
+    pub fn clear_craft_admission(
+        agent_id: &AgentId,
+        operation_id: &str,
+        terminal_status: &str,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "clear_craft_admission",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                Self::lua_string_arg(operation_id),
+                Self::lua_string_arg(terminal_status),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before clearing craft admission evidence.",
+        )
+    }
+
+    /// Account inventory-verified standalone-character production and
+    /// consumption flows so Factorio can evaluate craft triggers.
+    pub fn record_verified_craft_flows(
+        agent_id: &AgentId,
+        operation_id: &str,
+        flows: &Value,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "record_verified_craft_flows",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                Self::lua_string_arg(operation_id),
+                flows.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before accounting verified character crafts.",
+        )
+    }
+
     /// Place an entity from inventory
     pub fn place_entity(
         agent_id: &AgentId,
@@ -749,6 +793,46 @@ impl LuaCommand {
                 Self::lua_string_arg(inventory_type),
             ],
             "Run just sync/resume so the updated claude-interface mod is loaded before inserting items.",
+        )
+    }
+
+    /// Insert a small, bounded fuel buffer into an existing burner drill or
+    /// burner inserter without replacing the entity.
+    pub fn bootstrap_burner_once(
+        agent_id: &AgentId,
+        unit_number: u32,
+        fuel_item: &str,
+        count: u32,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "bootstrap_burner_once",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                unit_number.to_string(),
+                Self::lua_string_arg(fuel_item),
+                count.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before bootstrapping burner fuel.",
+        )
+    }
+
+    /// Collect a bounded item count from an existing chest without mining or
+    /// replacing the chest.
+    pub fn collect_from_chest(
+        agent_id: &AgentId,
+        unit_number: u32,
+        item: &str,
+        count: u32,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "collect_from_chest",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                unit_number.to_string(),
+                Self::lua_string_arg(item),
+                count.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before collecting from a chest.",
         )
     }
 

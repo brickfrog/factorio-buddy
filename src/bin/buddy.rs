@@ -1078,6 +1078,7 @@ fn mcp_config(args: &Args, mcp: &Path) -> String {
             "FACTORIO_RCON_PORT": args.rcon_port.to_string(),
             "FACTORIO_RCON_PASSWORD": rcon_password(args).expect("password configured"),
             "FACTORIO_AGENT_ID": args.agent,
+            "FACTORIO_BUDDY_PROJECT_ROOT": env!("CARGO_MANIFEST_DIR"),
         }
     }}})
     .to_string()
@@ -2147,6 +2148,9 @@ mod tests {
         assert!(std::fs::read_to_string(&config_path)
             .unwrap()
             .contains(password));
+        assert!(std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(env!("CARGO_MANIFEST_DIR")));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

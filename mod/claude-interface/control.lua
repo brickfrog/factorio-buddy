@@ -6,6 +6,8 @@ local MAX_MESSAGES = 100
 local INPUT_FILE = "claude-chat/input.jsonl"
 local autonomy = require("autonomy")
 local characters = require("characters")
+local crafting = require("crafting")
+local crafting_accounting = require("crafting_accounting")
 local diagnostics = require("diagnostics")
 local entities = require("entities")
 local json_response = require("json_response")
@@ -13,6 +15,7 @@ local json_remote_call = json_response.remote_call
 local inventory = require("inventory")
 local inventory_contents = inventory.contents
 local inventory_define_for = inventory.define_for
+local inventory_actions = require("inventory_actions")
 local placement = require("placement")
 local power = require("power")
 local recipes = require("recipes")
@@ -1083,70 +1086,6 @@ local function delete_blueprint_impl(name)
         return {success = true}
     end
     return {success = false, error = "Blueprint not found"}
-end
-
-local function crafting_queue_summary(character)
-    local queue = {}
-    if not character then return queue end
-    for _, item in pairs(character.crafting_queue or {}) do
-        table.insert(queue, {recipe = item.recipe, count = item.count})
-    end
-    return queue
-end
-
-local function craft_failure(character, recipe_name, error)
-    return {
-        success = false,
-        queued = 0,
-        queue_size = character and character.crafting_queue_size or 0,
-        queue = crafting_queue_summary(character),
-        recipe = recipe_name,
-        error = error,
-    }
-end
-
-local function craft_impl(agent_id, recipe_name, count)
-    local character = find_factorioctl_character(agent_id)
-    if not (character and character.valid) then
-        return craft_failure(nil, recipe_name, "no character for agent " .. tostring(agent_id) .. "; spawn first")
-    end
-
-    if not prototypes.recipe[recipe_name] then
-        return craft_failure(character, recipe_name, "Unknown recipe")
-    end
-
-    local force_recipe = character.force.recipes[recipe_name]
-    if force_recipe and not force_recipe.enabled then
-        return craft_failure(character, recipe_name, "Recipe is disabled")
-    end
-
-    local ok, crafted_or_error = pcall(function()
-        return character.begin_crafting{recipe = recipe_name, count = count}
-    end)
-    if not ok then
-        return craft_failure(character, recipe_name, tostring(crafted_or_error))
-    end
-
-    local crafted = crafted_or_error
-    local result = {
-        success = crafted > 0,
-        queued = crafted,
-        queue_size = character.crafting_queue_size,
-        queue = crafting_queue_summary(character),
-        recipe = recipe_name,
-    }
-    if crafted <= 0 then
-        result.error = "Crafting did not start; check ingredients, recipe category, or character craftability"
-    end
-    return result
-end
-
-local function wait_for_crafting_impl(agent_id)
-    local character = find_factorioctl_character(agent_id)
-    if character and character.valid then
-        return tostring(character.crafting_queue_size or 0)
-    end
-    return "0"
 end
 
 local function inventory_item_total(inv)
@@ -2310,11 +2249,23 @@ local api = {
     end,
 
     craft = function(agent_id, recipe_name, count)
-        return json_remote_call("craft", craft_impl, agent_id, recipe_name, count)
+        return json_remote_call("craft", crafting.craft, agent_id, recipe_name, count)
     end,
 
     wait_for_crafting = function(agent_id)
-        return json_remote_call("wait_for_crafting", wait_for_crafting_impl, agent_id)
+        return json_remote_call("wait_for_crafting", crafting.queue_snapshot, agent_id)
+    end,
+
+    get_craft_admission = function(agent_id)
+        return json_remote_call("get_craft_admission", crafting.get_admission, agent_id)
+    end,
+
+    clear_craft_admission = function(agent_id, operation_id, terminal_status)
+        return json_remote_call("clear_craft_admission", crafting.clear_admission, agent_id, operation_id, terminal_status)
+    end,
+
+    record_verified_craft_flows = function(agent_id, operation_id, flows)
+        return json_remote_call("record_verified_craft_flows", crafting_accounting.record_verified_flows, agent_id, operation_id, flows)
     end,
 
     create_native_blueprint = function(agent_id, x1, y1, x2, y2)
@@ -2431,6 +2382,14 @@ local api = {
 
     extract_items = function(agent_id, unit_number, item, count, inventory_type)
         return json_remote_call("extract_items", extract_items_impl, agent_id, unit_number, item, count, inventory_type)
+    end,
+
+    bootstrap_burner_once = function(agent_id, unit_number, fuel_item, count)
+        return json_remote_call("bootstrap_burner_once", inventory_actions.bootstrap_burner_once, agent_id, unit_number, fuel_item, count)
+    end,
+
+    collect_from_chest = function(agent_id, unit_number, item, count)
+        return json_remote_call("collect_from_chest", inventory_actions.collect_from_chest, agent_id, unit_number, item, count)
     end,
 
     set_recipe = function(agent_id, unit_number, recipe)

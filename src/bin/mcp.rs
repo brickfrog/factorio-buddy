@@ -3,7 +3,9 @@
 //! Exposes Factorio control as MCP tools for LLM agents.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use rmcp::{
@@ -18,6 +20,7 @@ use factorioctl::analyze::{
     find_belt_networks, trace_belt_sources, BeltGraph, EntityLookup,
 };
 use factorioctl::client::{AgentId, FactorioClient};
+use factorioctl::issue_report::{BeadsIssueReporter, IssueReportRequest, TrustedIssueContext};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
 use factorioctl::world::{
     build_production_report, build_situation_report, entity_occupied_tiles, entity_size,
@@ -1752,7 +1755,7 @@ mod tests {
             .collect();
 
         assert_eq!(visible, expected, "model tool surface must not drift");
-        assert_eq!(visible.len(), 42);
+        assert_eq!(visible.len(), 47);
         let schema_bytes = serde_json::to_vec(&tools)
             .expect("serialize tool schemas")
             .len();
@@ -1767,7 +1770,6 @@ mod tests {
             "insert_items",
             "extract_items",
             "hand_feed_furnace",
-            "feed_lab_from_inventory",
             "place_character",
             "register_agent",
             "broadcast_thought",
@@ -1777,6 +1779,18 @@ mod tests {
             assert!(
                 !visible_set.contains(forbidden),
                 "{forbidden} must never be model-visible"
+            );
+        }
+        for required in [
+            "bootstrap_burner_once",
+            "collect_from_chest",
+            "feed_lab_from_inventory",
+            "file_issue",
+            "wait_for_crafting",
+        ] {
+            assert!(
+                visible_set.contains(required),
+                "{required} must remain model-visible"
             );
         }
     }
@@ -2179,8 +2193,9 @@ mod tests {
         for required in [
             "check_entity_placement",
             "Complete route preflight failed; no belts were placed.",
-            "client.remove_entity(unit_number).await",
-            "rollback_missing_identity_error(entity)",
+            "rollback_exact_units(client, &placed_unit_numbers).await",
+            ".map(rollback_missing_identity_error)",
+            "\"missing_identity_errors\"",
             "\"complete_route\": true",
             "\"ready_to_call\"",
         ] {
@@ -2189,6 +2204,10 @@ mod tests {
                 "route_belt_core should retain atomic-route invariant {required:?}"
             );
         }
+        assert!(
+            !route_core.contains("client.remove_entity(unit_number).await"),
+            "route_belt_core must use the retrying exact-unit rollback helper instead of a one-pass removal loop"
+        );
     }
 
     #[test]
@@ -2861,6 +2880,69 @@ pub struct CraftParams {
     /// Number to craft
     #[serde(default = "default_count")]
     pub count: u32,
+}
+
+/// Parameters for observing a previously accepted character craft.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct WaitForCraftingParams {
+    /// Wait limit, from 1 through 120 seconds.
+    #[serde(default = "default_crafting_timeout_seconds")]
+    pub timeout_seconds: u32,
+}
+
+fn default_crafting_timeout_seconds() -> u32 {
+    30
+}
+
+/// Parameters for a one-shot, bounded burner bootstrap.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BootstrapBurnerOnceParams {
+    /// Existing burner drill/inserter unit number.
+    pub unit_number: u32,
+    /// Fuel item to transfer from the agent inventory.
+    #[serde(default = "default_fuel_item")]
+    pub fuel_item: String,
+    /// Fuel count, from 1 through 10.
+    #[serde(default = "default_bootstrap_fuel_count")]
+    pub count: u32,
+}
+
+/// Parameters for bounded, non-destructive chest collection.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct CollectFromChestParams {
+    /// Existing chest unit number.
+    pub unit_number: u32,
+    /// Item to transfer into the agent inventory.
+    pub item: String,
+    /// Item count, from 1 through 1000.
+    #[serde(default = "default_count")]
+    pub count: u32,
+}
+
+/// Structured model-authored fields accepted by the bounded Beads reporter.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct FileIssueParams {
+    /// Concise bug title.
+    pub title: String,
+    /// What happened in the game or tool call.
+    pub observed_behavior: String,
+    /// What should have happened instead.
+    pub expected_behavior: String,
+    /// One to ten concrete facts or errors.
+    pub evidence: Vec<String>,
+    /// Optional bounded reproduction steps.
+    #[serde(default)]
+    pub reproduction: Option<String>,
+    /// Optional allowlisted labels; omit if unsure.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Priority from 0 (highest) through 4.
+    #[serde(default = "default_issue_priority")]
+    pub priority: u8,
+}
+
+fn default_issue_priority() -> u8 {
+    2
 }
 
 /// Parameters for get_recipe tool
@@ -4069,7 +4151,7 @@ pub struct FeedLabFromInventoryParams {
     pub lab_unit_number: u32,
     /// Science pack item name to transfer from the agent inventory
     pub science_pack: String,
-    /// Number of packs to transfer
+    /// Pack count, from 1 through 200.
     #[serde(default = "default_count")]
     pub count: u32,
     /// If true, only validate and return an execution step. Defaults to true.
@@ -4454,11 +4536,11 @@ fn default_clear_rocks() -> bool {
 
 // === The MCP Server ===
 
-/// The MCP server for Factorio control
 #[derive(Clone)]
 pub struct FactorioMcp {
     config: ConnectionConfig,
     client: Arc<Mutex<Option<FactorioClient>>>,
+    issue_project_root: Arc<PathBuf>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -4474,12 +4556,14 @@ struct ChatMessage {
 const MODEL_VISIBLE_TOOLS: &[&str] = &[
     "analyze_inserters",
     "analyze_item_flow",
+    "bootstrap_burner_once",
     "bootstrap_smelting_once",
     "build_assembler_feed",
     "build_assembler_output",
     "build_automation_science",
     "build_lab_feed",
     "build_recipe_assembler_cell",
+    "collect_from_chest",
     "craft",
     "diagnose_factory_blockers",
     "diagnose_steam_power",
@@ -4487,6 +4571,8 @@ const MODEL_VISIBLE_TOOLS: &[&str] = &[
     "execute_edge_miner",
     "execute_entity_placement_near",
     "extend_power_to",
+    "feed_lab_from_inventory",
+    "file_issue",
     "find_nearest_resource",
     "get_available_research",
     "get_belt_lane_contents",
@@ -4513,6 +4599,7 @@ const MODEL_VISIBLE_TOOLS: &[&str] = &[
     "start_research",
     "unstuck",
     "verify_production",
+    "wait_for_crafting",
     "walk_to",
 ];
 
@@ -4521,7 +4608,6 @@ fn model_safe_operation_label(tool: &str) -> &'static str {
         "insert_items" => "load_inventory",
         "extract_items" => "collect_inventory",
         "wait_ticks" => "wait_for_process",
-        "wait_for_crafting" => "wait_for_crafting_completion",
         "build_fuel_supply" => "durable_fuel_transaction",
         "diagnose_fuel_sustainability" => "fuel_sustainability_check",
         "analyze_belt_gaps" => "belt_flow_check",
@@ -4548,7 +4634,6 @@ fn model_safe_text(text: &str) -> String {
         ("insert_items", "bounded inventory load"),
         ("extract_items", "bounded inventory collection"),
         ("wait_ticks", "bounded process wait"),
-        ("wait_for_crafting", "bounded crafting wait"),
     ]
     .into_iter()
     .fold(text.to_string(), |text, (hidden, replacement)| {
@@ -4568,7 +4653,6 @@ fn model_safe_key(key: &str) -> String {
         ("insert_items", "load_inventory"),
         ("extract_items", "collect_inventory"),
         ("wait_ticks", "wait_for_process"),
-        ("wait_for_crafting", "wait_for_crafting_completion"),
     ]
     .into_iter()
     .fold(key.to_string(), |key, (hidden, replacement)| {
@@ -4636,6 +4720,11 @@ impl FactorioMcp {
         Self {
             config: ConnectionConfig::from_env(),
             client: Arc::new(Mutex::new(None)),
+            issue_project_root: Arc::new(
+                std::env::var_os("FACTORIO_BUDDY_PROJECT_ROOT")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            ),
             tool_router,
         }
     }
@@ -7206,8 +7295,10 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
-    /// Craft items.
-    #[tool(description = "Craft items using character's crafting ability.")]
+    /// Admit a character-crafting request.
+    #[tool(
+        description = "Start character crafting. Success means accepted/queued, not produced; call wait_for_crafting before using the output or trusting craft triggers."
+    )]
     async fn craft(&self, Parameters(params): Parameters<CraftParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -7216,11 +7307,159 @@ impl FactorioMcp {
 
         let result = match client.craft(&params.recipe, params.count).await {
             Ok(result) => {
-                serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e))
+                let admission = result.status_evidence();
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": result.success,
+                    "completed": false,
+                    "operation_id": result.operation_id.as_deref(),
+                    "admission_persisted_in_save": result.operation_id.is_some(),
+                    "admission": admission,
+                    "craft_result": result,
+                    "next_action": if admission.status == factorioctl::world::CraftingStatus::Rejected {
+                        "inspect the craft error and recipe availability"
+                    } else {
+                        "call wait_for_crafting before using the output"
+                    },
+                }))
+                .unwrap_or_else(|e| format!("Error: {}", e))
             }
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
+    }
+
+    /// Verify and complete the exact persisted character-crafting transaction.
+    #[tool(
+        description = "Wait for the persisted craft transaction. Completion requires queue drain, exact output evidence, and full produced/consumed flow accounting; timeout remains resumable."
+    )]
+    async fn wait_for_crafting(
+        &self,
+        Parameters(params): Parameters<WaitForCraftingParams>,
+    ) -> String {
+        if !(1..=120).contains(&params.timeout_seconds) {
+            return semantic_failure(
+                "invalid_crafting_timeout",
+                "timeout_seconds must be between 1 and 120",
+            );
+        }
+
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return format!("Error: {}", e),
+        };
+        let payload = match client
+            .complete_craft_admission_with_options(
+                Duration::from_secs(u64::from(params.timeout_seconds)),
+                Duration::from_millis(250),
+            )
+            .await
+        {
+            Ok(payload) => payload,
+            Err(error) => serde_json::json!({
+                "success": false,
+                "completed": false,
+                "status": "observation_failed",
+                "error_kind": "craft_observation_failed",
+                "error": error.to_string(),
+            }),
+        };
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|error| format!("Error: {error}"))
+    }
+
+    /// Add one bounded fuel buffer to an existing burner entity.
+    #[tool(
+        description = "Put 1-10 fuel items into an existing burner drill/inserter without replacing it. Temporary bootstrap only; then repair_fuel_sustainability."
+    )]
+    async fn bootstrap_burner_once(
+        &self,
+        Parameters(params): Parameters<BootstrapBurnerOnceParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(client) => client,
+            Err(error) => return format!("Error: {error}"),
+        };
+        let result = match client
+            .bootstrap_burner_once(params.unit_number, &params.fuel_item, params.count)
+            .await
+        {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .unwrap_or_else(|error| format!("Error: {error}")),
+            Err(error) => format!("Error: {error}"),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// Collect a bounded item count from an existing chest.
+    #[tool(
+        description = "Collect 1-1000 items from an existing chest without mining it. Reports identity, conservation, and partial transfer; not automated logistics."
+    )]
+    async fn collect_from_chest(
+        &self,
+        Parameters(params): Parameters<CollectFromChestParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(client) => client,
+            Err(error) => return format!("Error: {error}"),
+        };
+        let result = match client
+            .collect_from_chest(params.unit_number, &params.item, params.count)
+            .await
+        {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .unwrap_or_else(|error| format!("Error: {error}")),
+            Err(error) => format!("Error: {error}"),
+        };
+        self.with_player_messages(result).await
+    }
+
+    /// File a bounded bug report in the repository's Beads tracker.
+    #[tool(
+        description = "File one structured bug in this repo's fixed Beads tracker, or return an exact-title duplicate. Concrete evidence required; priority is 0-4; labels are allowlisted and optional."
+    )]
+    async fn file_issue(&self, Parameters(params): Parameters<FileIssueParams>) -> String {
+        let reporter = match BeadsIssueReporter::new(self.issue_project_root.as_ref()) {
+            Ok(reporter) => reporter,
+            Err(error) => {
+                return serde_json::json!({
+                    "success": false,
+                    "error_kind": error.kind(),
+                    "error": error.to_string(),
+                })
+                .to_string()
+            }
+        };
+
+        let request = IssueReportRequest {
+            title: params.title,
+            observed_behavior: params.observed_behavior,
+            expected_behavior: params.expected_behavior,
+            evidence: params.evidence,
+            reproduction: params.reproduction,
+            labels: params.labels,
+            priority: params.priority,
+        };
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| format!("unix:{}", duration.as_secs()))
+            .unwrap_or_else(|_| "unix:0".to_string());
+        let context = TrustedIssueContext {
+            agent_id: std::env::var("FACTORIO_AGENT_ID").unwrap_or_else(|_| "default".to_string()),
+            session_id: std::env::var("FACTORIO_BUDDY_SESSION_ID").ok(),
+            commit_sha: option_env!("GIT_COMMIT_SHA").map(str::to_string),
+            timestamp,
+            factorio_version: std::env::var("FACTORIO_VERSION").ok(),
+        };
+
+        match reporter.file_issue(request, context).await {
+            Ok(result) => serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|error| format!("Error: {error}")),
+            Err(error) => serde_json::to_string_pretty(&serde_json::json!({
+                "success": false,
+                "error_kind": error.kind(),
+                "error": error.to_string(),
+            }))
+            .unwrap_or_else(|serialization_error| format!("Error: {serialization_error}")),
+        }
     }
 
     /// Get a recipe by exact name.
@@ -7596,25 +7835,58 @@ impl FactorioMcp {
             Some(Err(anyhow::anyhow!("plate extraction failed")))
         };
         if let Some(craft_result) = &craft {
-            success &= craft_result.is_ok();
-            actions.push(serde_json::json!({
-                "tool": "craft",
-                "internal": true,
-                "recipe": craft_recipe,
-                "count": params.craft_count,
-                "success": craft_result.is_ok(),
-                "result": craft_result.as_ref().ok(),
-                "error": craft_result.as_ref().err().map(|e| e.to_string()),
-            }));
-            if craft_result.is_ok() {
-                let wait_craft = client.wait_for_crafting().await;
-                success &= wait_craft.is_ok();
-                actions.push(serde_json::json!({
-                    "operation": "wait_for_crafting_completion",
-                    "internal": true,
-                    "success": wait_craft.is_ok(),
-                    "error": wait_craft.as_ref().err().map(|e| e.to_string()),
-                }));
+            match craft_result {
+                Ok(result) => {
+                    let admitted = result.success;
+                    success &= admitted;
+                    actions.push(serde_json::json!({
+                        "tool": "craft",
+                        "internal": true,
+                        "recipe": craft_recipe,
+                        "count": params.craft_count,
+                        "success": admitted,
+                        "completed": false,
+                        "admission": result.status_evidence(),
+                        "result": result,
+                        "error": result.error,
+                    }));
+                    if admitted {
+                        let completion = match client.complete_craft_admission().await {
+                            Ok(completion) => completion,
+                            Err(error) => serde_json::json!({
+                                "success": false,
+                                "completed": false,
+                                "status": "observation_failed",
+                                "error_kind": "craft_observation_failed",
+                                "error": error.to_string(),
+                            }),
+                        };
+                        let completed = completion
+                            .get("completed")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true);
+                        success &= completed;
+                        actions.push(serde_json::json!({
+                            "tool": "wait_for_crafting",
+                            "internal": true,
+                            "success": completed,
+                            "completed": completed,
+                            "result": completion,
+                        }));
+                    }
+                }
+                Err(error) => {
+                    success = false;
+                    actions.push(serde_json::json!({
+                        "tool": "craft",
+                        "internal": true,
+                        "recipe": craft_recipe,
+                        "count": params.craft_count,
+                        "success": false,
+                        "completed": false,
+                        "error": error.to_string(),
+                    }));
+                }
             }
         } else {
             actions.push(serde_json::json!({
@@ -8223,20 +8495,63 @@ impl FactorioMcp {
 
         if let Some(error) = placement_error {
             let attempted_placements = placed_entities.len();
-            let mut rolled_back = 0;
-            let mut rollback_errors = Vec::new();
-            for entity in placed_entities.iter().rev() {
-                match entity.unit_number {
-                    Some(unit_number) => match client.remove_entity(unit_number).await {
-                        Ok(()) => rolled_back += 1,
-                        Err(rollback_error) => rollback_errors.push(serde_json::json!({
-                            "unit_number": unit_number,
-                            "position": entity.position,
-                            "error": rollback_error.to_string(),
-                        })),
-                    },
-                    None => rollback_errors.push(rollback_missing_identity_error(entity)),
+            let placed_unit_numbers: Vec<u32> = placed_entities
+                .iter()
+                .filter_map(|entity| entity.unit_number)
+                .collect();
+            let missing_identity_errors: Vec<serde_json::Value> = placed_entities
+                .iter()
+                .filter(|entity| entity.unit_number.is_none())
+                .map(rollback_missing_identity_error)
+                .collect();
+            let mut rollback = rollback_exact_units(client, &placed_unit_numbers).await;
+            let rolled_back = rollback
+                .get("removed_units")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let mut rollback_errors = rollback
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for rollback_error in &mut rollback_errors {
+                let Some(unit_number) = rollback_error
+                    .get("unit_number")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|unit_number| u32::try_from(unit_number).ok())
+                else {
+                    continue;
+                };
+                let Some(entity) = placed_entities
+                    .iter()
+                    .find(|entity| entity.unit_number == Some(unit_number))
+                else {
+                    continue;
+                };
+                if let Some(error) = rollback_error.as_object_mut() {
+                    error.insert("name".to_string(), serde_json::json!(entity.name));
+                    error.insert("position".to_string(), serde_json::json!(entity.position));
                 }
+            }
+            rollback_errors.extend(missing_identity_errors.iter().cloned());
+            let rollback_success = rollback
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && missing_identity_errors.is_empty();
+            if let Some(report) = rollback.as_object_mut() {
+                report.insert(
+                    "success".to_string(),
+                    serde_json::Value::Bool(rollback_success),
+                );
+                report.insert(
+                    "identified_units".to_string(),
+                    serde_json::json!(placed_unit_numbers),
+                );
+                report.insert(
+                    "missing_identity_errors".to_string(),
+                    serde_json::json!(missing_identity_errors),
+                );
             }
             return Ok(serde_json::json!({
                 "success": false,
@@ -8256,8 +8571,9 @@ impl FactorioMcp {
                 "materials": materials,
                 "materials_sufficient": true,
                 "topology": compact_belt_topology(result.topology.as_ref()),
+                "rollback": rollback,
                 "rollback_errors": rollback_errors,
-                "guidance": if rollback_errors.is_empty() {
+                "guidance": if rollback_success {
                     "The failed route was rolled back. Inspect the reported tile and retry the complete route."
                 } else {
                     "Rollback was incomplete. Inspect rollback_errors; entries missing unit identity were deliberately not removed by coordinates."
@@ -11711,7 +12027,7 @@ impl FactorioMcp {
 
     /// Feed science packs from the agent inventory into a lab.
     #[tool(
-        description = "Validate or execute science-pack transfer from the agent inventory into a lab. Defaults to dry_run=true and returns a guarded feed_lab_from_inventory dry_run=false step. With dry_run=false it removes packs from the character inventory and inserts them into the lab_input inventory, returning explicit expected misses for missing packs or invalid lab inventories."
+        description = "Dry-run or transfer 1-200 packs into an exact lab for bootstrap/recovery. Preserves identity and items; then automate with build_automation_science/build_lab_feed."
     )]
     async fn feed_lab_from_inventory(
         &self,

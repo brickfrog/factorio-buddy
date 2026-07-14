@@ -2,6 +2,7 @@ local entities = require("entities")
 local characters = require("characters")
 
 local M = {}
+local MAX_LAB_FEED_COUNT = 200
 
 local function pos_table(pos)
     if not pos then return nil end
@@ -143,19 +144,40 @@ local function expected_miss(result, next_action)
 end
 
 function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)
-    count = math.max(1, math.floor(tonumber(count) or 1))
+    local parsed_count = tonumber(count)
     local do_dry_run = dry_run ~= false
     local result = {
         success = false,
         dry_run = do_dry_run,
         lab_unit_number = tonumber(lab_unit_number),
         science_pack = science_pack,
-        requested_count = count,
+        requested_count = parsed_count or count,
+        maximum_count = MAX_LAB_FEED_COUNT,
         inserted = 0,
         missing_items = {},
         blockers = {},
         steps = {},
+        classification = "bootstrap_science_transfer",
+        bootstrap = true,
+        automation_complete = false,
     }
+
+    if not parsed_count
+        or parsed_count ~= parsed_count
+        or parsed_count == math.huge
+        or parsed_count == -math.huge
+        or parsed_count <= 0
+        or parsed_count ~= math.floor(parsed_count)
+        or parsed_count > MAX_LAB_FEED_COUNT
+    then
+        result.error_kind = parsed_count and parsed_count > MAX_LAB_FEED_COUNT
+            and "count_exceeds_limit" or "invalid_count"
+        result.error = "count must be a positive integer no greater than " .. tostring(MAX_LAB_FEED_COUNT)
+        result.action_needed = "choose_bounded_science_pack_count"
+        add_blocker(result, result.error_kind, result.error)
+        return result
+    end
+    count = parsed_count
 
     if not (character and character.valid) then
         add_blocker(result, "no_character", "No character for agent; spawn first.")
@@ -233,12 +255,26 @@ function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, cou
     }
 
     if do_dry_run then
-        result.steps = {}
+        result.ready_to_call = {
+            tool = "feed_lab_from_inventory",
+            args = {
+                lab_unit_number = result.lab_unit_number,
+                science_pack = science_pack,
+                count = count,
+                dry_run = false,
+            },
+        }
+        result.steps = {{
+            tool = result.ready_to_call.tool,
+            args = result.ready_to_call.args,
+            description = "Execute the validated one-time science-pack transfer into this exact lab.",
+        }}
         result.success = true
-        result.ready = false
+        result.ready = true
         result.manual_bootstrap_available = true
-        result.next_action = "automate_science_delivery"
-        result.guidance = "This transfer is in reach but is only a manual bootstrap action. Prefer belts and inserters that keep labs supplied without the character."
+        result.next_action = "feed_lab_from_inventory"
+        result.follow_up_action = "automate_science_delivery"
+        result.guidance = "Execute ready_to_call for the required one-time bootstrap transfer, then use belts and inserters for durable lab supply."
         return result
     end
 
@@ -249,14 +285,40 @@ function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, cou
     end
 
     local inserted = lab_inv.insert{name = science_pack, count = removed}
+    local returned = 0
     if inserted < removed then
-        player_inv.insert{name = science_pack, count = removed - inserted}
+        returned = player_inv.insert{name = science_pack, count = removed - inserted}
     end
 
     result.inserted = inserted
-    result.returned_to_inventory = math.max(0, removed - inserted)
+    result.returned_to_inventory = returned
     result.lab_after = lab_inv.get_item_count(science_pack)
     result.inventory_after = player_inv.get_item_count(science_pack)
+    result.lab_identity_preserved = lab.valid and lab.unit_number == result.lab_unit_number
+    result.conservation = {
+        removed = removed,
+        inserted = inserted,
+        returned = returned,
+        balanced = removed == inserted + returned,
+        lab_increase = result.lab_after - lab_before,
+        character_decrease = available - result.inventory_after,
+    }
+    result.conservation.measured_balanced = result.conservation.lab_increase == inserted
+        and result.conservation.character_decrease == inserted
+    if not result.conservation.balanced or not result.conservation.measured_balanced then
+        result.error_kind = "item_conservation_failure"
+        result.error = "science-pack transfer did not conserve the measured lab and character inventories"
+        result.action_needed = "stop_and_inspect_inventories"
+        add_blocker(result, result.error_kind, result.error)
+        return result
+    end
+    if not result.lab_identity_preserved then
+        result.error_kind = "entity_identity_changed"
+        result.error = "lab identity changed during science-pack transfer"
+        result.action_needed = "stop_and_inspect_lab"
+        add_blocker(result, result.error_kind, result.error)
+        return result
+    end
     if inserted == 0 then
         add_blocker(result, "lab_inventory_full", "Lab input inventory accepted 0 " .. tostring(science_pack) .. ".")
         return expected_miss(result, "free_lab_inventory_or_choose_another_lab")
@@ -264,7 +326,8 @@ function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, cou
 
     result.success = true
     result.next_action = "get_research_status"
-    result.guidance = "Science packs transferred once. Build automated lab delivery before treating research logistics as complete."
+    result.follow_up_actions = {"build_automation_science", "build_lab_feed"}
+    result.guidance = "Science packs transferred once. Use build_automation_science and build_lab_feed before treating research logistics as complete."
     return result
 end
 
