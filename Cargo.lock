@@ -267,6 +267,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "rmcp",
  "serde",
  "serde_json",

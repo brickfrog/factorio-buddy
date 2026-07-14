@@ -230,25 +230,25 @@ local function inserter_fuel_candidates(surface, force, entity)
             side = "north",
             inserter = {x = center.x, y = bb.left_top.y - 0.5},
             pickup = {x = center.x, y = bb.left_top.y - 1.5},
-            direction = defines.direction.south,
+            direction = defines.direction.north,
         },
         {
             side = "east",
             inserter = {x = bb.right_bottom.x + 0.5, y = center.y},
             pickup = {x = bb.right_bottom.x + 1.5, y = center.y},
-            direction = defines.direction.west,
+            direction = defines.direction.east,
         },
         {
             side = "south",
             inserter = {x = center.x, y = bb.right_bottom.y + 0.5},
             pickup = {x = center.x, y = bb.right_bottom.y + 1.5},
-            direction = defines.direction.north,
+            direction = defines.direction.south,
         },
         {
             side = "west",
             inserter = {x = bb.left_top.x - 0.5, y = center.y},
             pickup = {x = bb.left_top.x - 1.5, y = center.y},
-            direction = defines.direction.east,
+            direction = defines.direction.west,
         },
     }
 
@@ -763,4 +763,3 @@ function M.get_drop_position(unit_number)
 end
 
 return M
-

@@ -9,7 +9,7 @@ local function pos_table(pos)
 end
 
 local function placement_entity_result(entity)
-    return {
+    local result = {
         unit_number = entity.unit_number,
         name = entity.name,
         type = entity.type,
@@ -19,6 +19,11 @@ local function placement_entity_result(entity)
         health = entity.health,
         force = entity.force and entity.force.name or nil,
     }
+    if entity.type == "inserter" then
+        result.pickup_position = pos_table(entity.pickup_position)
+        result.drop_position = pos_table(entity.drop_position)
+    end
+    return result
 end
 
 local function bounding_box_table(entity)

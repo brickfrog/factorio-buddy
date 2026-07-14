@@ -511,8 +511,8 @@ mod tests {
         assert_eq!(north.belt_y, 17);
         assert_eq!(north.upstream_x, 10);
         assert_eq!(north.upstream_y, 16);
-        assert_eq!(north.input_direction, "south");
-        assert_eq!(north.output_direction, "north");
+        assert_eq!(north.input_direction, "north");
+        assert_eq!(north.output_direction, "south");
 
         let east = machine_side_layout(&entity, "east").expect("east side");
         assert_eq!(east.inserter_x, 12.5);
@@ -521,8 +521,16 @@ mod tests {
         assert_eq!(east.belt_y, 20);
         assert_eq!(east.upstream_x, 14);
         assert_eq!(east.upstream_y, 20);
-        assert_eq!(east.input_direction, "west");
-        assert_eq!(east.output_direction, "east");
+        assert_eq!(east.input_direction, "east");
+        assert_eq!(east.output_direction, "west");
+
+        let south = machine_side_layout(&entity, "south").expect("south side");
+        assert_eq!(south.input_direction, "south");
+        assert_eq!(south.output_direction, "north");
+
+        let west = machine_side_layout(&entity, "west").expect("west side");
+        assert_eq!(west.input_direction, "west");
+        assert_eq!(west.output_direction, "east");
 
         let furnace = Entity {
             unit_number: Some(15),
@@ -539,7 +547,7 @@ mod tests {
         assert_eq!(furnace_north.inserter_y, -23.5);
         assert_eq!(furnace_north.belt_x, 42);
         assert_eq!(furnace_north.belt_y, -25);
-        assert_eq!(furnace_north.output_direction, "north");
+        assert_eq!(furnace_north.output_direction, "south");
 
         let assembler_without_bbox = Entity {
             unit_number: Some(339),
@@ -557,7 +565,7 @@ mod tests {
         assert_eq!(assembler_south.inserter_y, -12.5);
         assert_eq!(assembler_south.belt_x, 51);
         assert_eq!(assembler_south.belt_y, -12);
-        assert_eq!(assembler_south.input_direction, "north");
+        assert_eq!(assembler_south.input_direction, "south");
     }
 
     #[test]
@@ -808,7 +816,7 @@ mod tests {
         assert_eq!(args.to_x, 50);
         assert_eq!(args.inserter_x, 42.5);
         assert_eq!(args.inserter_y, -23.5);
-        assert_eq!(args.inserter_direction, "north");
+        assert_eq!(args.inserter_direction, "south");
         assert!(args.dry_run);
     }
 }
@@ -1082,7 +1090,8 @@ pub struct PlaceEntityParams {
     pub x: f64,
     /// Y coordinate to place at
     pub y: f64,
-    /// Direction: "north", "east", "south", "west" (or shorthand "n", "e", "s", "w", or numbers 0/4/8/12)
+    /// Direction: "north", "east", "south", "west" (or shorthand/numeric).
+    /// For inserters this is the pickup side; the item drops on the opposite side.
     #[serde(default)]
     pub direction: String,
 }
@@ -2222,8 +2231,8 @@ fn machine_side_layout(entity: &Entity, side: &str) -> Result<MachineSideLayout,
             belt_y: (bbox.left_top.y - 1.5).floor() as i32,
             upstream_x: lane_x.floor() as i32,
             upstream_y: (bbox.left_top.y - 2.5).floor() as i32,
-            input_direction: "south",
-            output_direction: "north",
+            input_direction: "north",
+            output_direction: "south",
         }),
         "east" | "e" | "right" => Ok(MachineSideLayout {
             side: "east",
@@ -2233,8 +2242,8 @@ fn machine_side_layout(entity: &Entity, side: &str) -> Result<MachineSideLayout,
             belt_y: lane_y.floor() as i32,
             upstream_x: (bbox.right_bottom.x + 2.5).floor() as i32,
             upstream_y: lane_y.floor() as i32,
-            input_direction: "west",
-            output_direction: "east",
+            input_direction: "east",
+            output_direction: "west",
         }),
         "south" | "s" | "down" => Ok(MachineSideLayout {
             side: "south",
@@ -2244,8 +2253,8 @@ fn machine_side_layout(entity: &Entity, side: &str) -> Result<MachineSideLayout,
             belt_y: (bbox.right_bottom.y + 1.5).floor() as i32,
             upstream_x: lane_x.floor() as i32,
             upstream_y: (bbox.right_bottom.y + 2.5).floor() as i32,
-            input_direction: "north",
-            output_direction: "south",
+            input_direction: "south",
+            output_direction: "north",
         }),
         "west" | "w" | "left" => Ok(MachineSideLayout {
             side: "west",
@@ -2255,8 +2264,8 @@ fn machine_side_layout(entity: &Entity, side: &str) -> Result<MachineSideLayout,
             belt_y: lane_y.floor() as i32,
             upstream_x: (bbox.left_top.x - 2.5).floor() as i32,
             upstream_y: lane_y.floor() as i32,
-            input_direction: "east",
-            output_direction: "west",
+            input_direction: "west",
+            output_direction: "east",
         }),
         _ => Err(format!(
             "invalid side '{}'; use north, east, south, or west",
@@ -2394,7 +2403,8 @@ pub struct RemoveEntityParams {
 pub struct RotateEntityParams {
     /// Entity unit number to rotate
     pub unit_number: u32,
-    /// Direction: "north", "east", "south", "west" (or shorthand "n", "e", "s", "w", or numbers 0/4/8/12)
+    /// Direction: "north", "east", "south", "west" (or shorthand/numeric).
+    /// For inserters this is the pickup side; the item drops on the opposite side.
     pub direction: String,
 }
 
@@ -4251,7 +4261,7 @@ impl FactorioMcp {
 
     /// Place an entity from character inventory.
     #[tool(
-        description = "Place one non-belt entity from character inventory at an exact position, or execute a single-belt placement returned verbatim by an automation planner/flow repair. Do not improvise transport routes one belt at a time; use route_belt or a higher-level automation controller. On failure, returns structured diagnostics including can_place, inventory_count, direction, and position."
+        description = "Place one non-belt entity from character inventory at an exact position, or execute a single-belt placement returned verbatim by an automation planner/flow repair. For inserters, direction is the PICKUP side and the result reports Factorio's exact pickup_position and drop_position. Do not improvise transport routes one belt at a time; use route_belt or a higher-level automation controller. On failure, returns structured diagnostics including can_place, inventory_count, direction, and position."
     )]
     async fn place_entity(&self, Parameters(params): Parameters<PlaceEntityParams>) -> String {
         let mut client = match self.connect().await {
@@ -5743,7 +5753,7 @@ impl FactorioMcp {
 
     /// Rotate an existing entity by unit number.
     #[tool(
-        description = "Rotate an existing entity by unit number. Use when place_entity/check_placement recommends rotate_entity for same-tile belts or other rotatable entities."
+        description = "Rotate an existing entity by unit number. For inserters, direction is the PICKUP side and the result reports Factorio's exact pickup_position and drop_position. Use when place_entity/check_placement recommends rotate_entity for same-tile belts or other rotatable entities."
     )]
     async fn rotate_entity(&self, Parameters(params): Parameters<RotateEntityParams>) -> String {
         let mut client = match self.connect().await {

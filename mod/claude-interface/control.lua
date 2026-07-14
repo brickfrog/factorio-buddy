@@ -4,6 +4,7 @@
 local GUI_FRAME = "claude_interface_frame"
 local MAX_MESSAGES = 100
 local INPUT_FILE = "claude-chat/input.jsonl"
+local autonomy = require("autonomy")
 local characters = require("characters")
 local diagnostics = require("diagnostics")
 local entities = require("entities")
@@ -619,14 +620,18 @@ local function process_rcon_queue()
     local queue = storage._rcon_queue
     storage._rcon_queue = {}
     for _, item in ipairs(queue) do
-        -- Skip GUI updates for injected/synthetic messages (player_index=0)
         local pi = item.pi or 0
         if item.type == "response" then
             if pi > 0 then
                 local player = game.get_player(pi)
                 if player then
                     add_chat_message(player, item.agent, "claude", item.text)
-                    set_status(player, "[color=0.4,0.8,0.4]Ready[/color]")
+                end
+            else
+                -- Autonomous turns are not tied to one player. Deliver their
+                -- chat to every connected player instead of silently dropping it.
+                for _, player in pairs(game.connected_players) do
+                    add_chat_message(player, item.agent, "claude", item.text)
                 end
             end
         elseif item.type == "tool" then
@@ -641,6 +646,10 @@ local function process_rcon_queue()
             if pi > 0 then
                 local player = game.get_player(pi)
                 if player then
+                    set_status(player, item.text)
+                end
+            else
+                for _, player in pairs(game.connected_players) do
                     set_status(player, item.text)
                 end
             end
@@ -2260,6 +2269,11 @@ local api = {
 
     production_statistics = function(surface_name)
         return json_remote_call("production_statistics", diagnostics.production_statistics, surface_name)
+    end,
+
+    autonomy_snapshot = function(agent_id)
+        local character = find_factorioctl_character(agent_id)
+        return json_remote_call("autonomy_snapshot", autonomy.snapshot, character)
     end,
 
     -- Get character position (read-only, safe from any context)

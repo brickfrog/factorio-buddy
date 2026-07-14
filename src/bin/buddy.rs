@@ -11,7 +11,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -26,6 +26,8 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Build belts as complete source-to-destination routes with route_belt or a higher-level automation controller; do not improvise disconnected one-tile belt fragments. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
+
+const AUTONOMY_DIRECTIVE: &str = "Autonomy tick: re-evaluate the whole factory from the authoritative snapshot below before acting. The factory is a set of independent subsystems that keep running while you work elsewhere. Choose from the current evidence, not from conversational momentum or the previous turn's focus. If research or another subsystem is healthy and progressing, leave it running; do not wait for it, repeatedly poll it, or keep embellishing it. Select the highest-leverage stalled or underdeveloped subsystem shown by the current data, inspect the relevant location with tools, take concrete action toward durable automation, and verify the result. Do not merely describe a plan.";
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the autonomous Factorio buddy using the Rust MCP tool server")]
@@ -122,6 +124,11 @@ struct ClaudeResult {
     is_error: bool,
 }
 
+struct ClaudeReply {
+    text: String,
+    already_delivered: bool,
+}
+
 struct Inbox {
     path: PathBuf,
     offset: u64,
@@ -137,8 +144,29 @@ struct LocalServer {
 
 impl LocalServer {
     async fn stop(mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+        info!("requesting Factorio shutdown and final save");
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            // The server runs in its own process group, so terminal Ctrl-C only
+            // reaches Buddy. Deliver one SIGINT here and then give Factorio time
+            // to finish its normal save-before-exit path.
+            let result = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+            if result != 0 {
+                warn!(error = %std::io::Error::last_os_error(), pid, "failed to interrupt Factorio server");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = self.child.start_kill();
+
+        match timeout(Duration::from_secs(60), self.child.wait()).await {
+            Ok(Ok(status)) => info!(%status, "Factorio server stopped after final save"),
+            Ok(Err(error)) => warn!(%error, "failed while waiting for Factorio server to stop"),
+            Err(_) => {
+                warn!("Factorio did not stop within 60 seconds; forcing shutdown");
+                let _ = self.child.kill().await;
+                let _ = self.child.wait().await;
+            }
+        }
         let _ = self.output_task.await;
     }
 }
@@ -280,6 +308,95 @@ fn install_mods(write_data: &Path) -> Result<()> {
     Ok(())
 }
 
+fn newest_autosave(save: &Path) -> Result<Option<(PathBuf, SystemTime)>> {
+    let Some(directory) = save.parent() else {
+        return Ok(None);
+    };
+    let mut newest: Option<(PathBuf, SystemTime)> = None;
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Ok(None);
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("_autosave")
+            || path.extension().and_then(|ext| ext.to_str()) != Some("zip")
+        {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if newest
+            .as_ref()
+            .is_none_or(|(newest_path, newest_modified)| {
+                modified > *newest_modified || (modified == *newest_modified && path > *newest_path)
+            })
+        {
+            newest = Some((path, modified));
+        }
+    }
+    Ok(newest)
+}
+
+fn promote_newer_autosave(save: &Path) -> Result<Option<PathBuf>> {
+    let Some((autosave, autosave_modified)) = newest_autosave(save)? else {
+        return Ok(None);
+    };
+    if save.exists() {
+        let save_modified = std::fs::metadata(save)?.modified()?;
+        if save_modified >= autosave_modified {
+            return Ok(None);
+        }
+    }
+
+    let directory = save.parent().context("save path has no parent directory")?;
+    let stem = save
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("save");
+    let backup = directory.join(format!("{stem}.previous.zip"));
+    let staged = directory.join(format!(".{stem}.recovering.zip"));
+
+    if save.exists() {
+        std::fs::copy(save, &backup).with_context(|| {
+            format!(
+                "failed to preserve stale save {} as {}",
+                save.display(),
+                backup.display()
+            )
+        })?;
+    }
+    if staged.exists() {
+        std::fs::remove_file(&staged)?;
+    }
+    std::fs::copy(&autosave, &staged).with_context(|| {
+        format!(
+            "failed to stage autosave {} as {}",
+            autosave.display(),
+            staged.display()
+        )
+    })?;
+    std::fs::File::open(&staged)?.sync_all()?;
+    std::fs::rename(&staged, save).with_context(|| {
+        format!(
+            "failed to promote autosave {} to {}",
+            autosave.display(),
+            save.display()
+        )
+    })?;
+
+    info!(
+        source = %autosave.display(),
+        save = %save.display(),
+        backup = %backup.display(),
+        "promoted newer autosave before resume"
+    );
+    Ok(Some(autosave))
+}
+
 async fn start_local_server(args: &Args) -> Result<LocalServer> {
     if tokio::net::TcpStream::connect((&*args.rcon_host, args.rcon_port))
         .await
@@ -321,6 +438,9 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         std::fs::remove_file(&save)
             .with_context(|| format!("failed to remove old save: {}", save.display()))?;
     }
+    if !args.fresh && args.save.is_none() {
+        promote_newer_autosave(&save)?;
+    }
     if !save.exists() {
         info!(save = %save.display(), "creating Factorio save");
         let status = Command::new(&factorio)
@@ -337,7 +457,8 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         }
     }
 
-    let mut child = Command::new(&factorio)
+    let mut server_command = Command::new(&factorio);
+    server_command
         .arg("--config")
         .arg(&config)
         .arg("--start-server")
@@ -352,8 +473,10 @@ async fn start_local_server(args: &Args) -> Result<LocalServer> {
         .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/server.json"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    server_command.process_group(0);
+    let mut child = server_command.spawn()?;
     let stdin = child
         .stdin
         .take()
@@ -425,12 +548,31 @@ fn stream_event_session_id(event: &Value) -> Option<&str> {
     event.get("session_id").and_then(Value::as_str)
 }
 
+fn autonomy_prompt(snapshot: &str) -> String {
+    let formatted_snapshot = serde_json::from_str::<Value>(snapshot)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| snapshot.to_owned());
+    format!("{AUTONOMY_DIRECTIVE}\n\nAuthoritative current factory snapshot:\n{formatted_snapshot}")
+}
+
+async fn collect_autonomy_prompt(args: &Args) -> String {
+    match lifecycle(args, "autonomy_snapshot", &[json!(args.agent)]).await {
+        Ok(snapshot) => autonomy_prompt(&snapshot),
+        Err(error) => {
+            warn!(%error, "failed to collect autonomy snapshot");
+            format!("{AUTONOMY_DIRECTIVE}\n\nThe automatic snapshot failed. Inspect the whole factory with read-only tools before choosing what to work on.")
+        }
+    }
+}
+
 async fn invoke_claude(
     args: &Args,
     config: &str,
     prompt: &str,
+    player_index: u32,
+    response_agent: &str,
     session_id: &mut Option<String>,
-) -> Result<String> {
+) -> Result<ClaudeReply> {
     let started = Instant::now();
     info!(event = "turn_start", session = session_id.as_deref().unwrap_or("new"), prompt = %prompt, "Claude turn started");
     let mut command = Command::new("claude");
@@ -483,6 +625,7 @@ async fn invoke_claude(
     let stream = async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut final_result = None;
+        let mut delivered_text = Vec::new();
         let mut tool_names: HashMap<String, String> = HashMap::new();
         while let Some(line) = lines.next_line().await? {
             let event: Value = match serde_json::from_str(&line) {
@@ -524,7 +667,31 @@ async fn invoke_claude(
                                     info!(event = "tool_call", tool, tool_use_id = id, arguments = %arguments, "Tool call");
                                 }
                                 "text" => {
-                                    info!(event = "model_text", text = %block.get("text").and_then(|value| value.as_str()).unwrap_or(""), "Claude text")
+                                    let text = block
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .trim();
+                                    info!(event = "model_text", text, "Claude text");
+                                    if !text.is_empty() {
+                                        match lifecycle(
+                                            args,
+                                            "receive_response",
+                                            &[
+                                                json!(player_index),
+                                                json!(response_agent),
+                                                json!(text),
+                                            ],
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => delivered_text.push(text.to_owned()),
+                                            Err(error) => warn!(
+                                                %error,
+                                                "failed to stream Claude text to Factorio"
+                                            ),
+                                        }
+                                    }
                                 }
                                 "thinking" => {
                                     info!(event = "model_thinking", thinking = %block.get("thinking").and_then(|value| value.as_str()).unwrap_or(""), "Claude thinking")
@@ -567,7 +734,7 @@ async fn invoke_claude(
             }
         }
         let status = child.wait().await?;
-        Ok::<_, anyhow::Error>((status, final_result))
+        Ok::<_, anyhow::Error>((status, final_result, delivered_text))
     };
 
     let outcome = timeout(Duration::from_secs(args.turn_timeout_seconds), stream).await;
@@ -579,7 +746,7 @@ async fn invoke_claude(
             }
         }
     }
-    let (status, parsed) = match outcome {
+    let (status, parsed, delivered_text) = match outcome {
         Ok(result) => result?,
         Err(error) => {
             stderr_task.abort();
@@ -599,7 +766,13 @@ async fn invoke_claude(
         }
         if !parsed.result.trim().is_empty() {
             info!(event = "turn_complete", response = %parsed.result, "Claude turn completed");
-            return Ok(parsed.result);
+            let already_delivered = delivered_text
+                .iter()
+                .any(|text| text.trim() == parsed.result.trim());
+            return Ok(ClaudeReply {
+                text: parsed.result,
+                already_delivered,
+            });
         }
     }
     if !status.success() {
@@ -625,16 +798,31 @@ async fn handle_turn(
         ],
     )
     .await;
-    match invoke_claude(args, config, &prompt, session_id).await {
+    match invoke_claude(
+        args,
+        config,
+        &prompt,
+        player_index,
+        response_agent,
+        session_id,
+    )
+    .await
+    {
         Ok(reply) => {
-            if let Err(error) = lifecycle(
-                args,
-                "receive_response",
-                &[json!(player_index), json!(response_agent), json!(reply)],
-            )
-            .await
-            {
-                warn!(%error, "failed to send response to Factorio");
+            if !reply.already_delivered {
+                if let Err(error) = lifecycle(
+                    args,
+                    "receive_response",
+                    &[
+                        json!(player_index),
+                        json!(response_agent),
+                        json!(reply.text),
+                    ],
+                )
+                .await
+                {
+                    warn!(%error, "failed to send response to Factorio");
+                }
             }
         }
         Err(error) => {
@@ -752,15 +940,8 @@ async fn main() -> Result<()> {
                 continue;
             }
         }
-        handle_turn(
-            &args,
-            &config,
-            "Autonomy tick: inspect the current game state and take the next useful concrete action toward a functioning automated factory. Use tools; do not merely describe a plan.".to_owned(),
-            0,
-            &args.agent,
-            &mut session_id,
-        )
-        .await;
+        let prompt = collect_autonomy_prompt(&args).await;
+        handle_turn(&args, &config, prompt, 0, &args.agent, &mut session_id).await;
         next_autonomy = Instant::now() + Duration::from_secs(args.heartbeat_seconds);
     }
 
@@ -817,5 +998,44 @@ mod tests {
         assert!(
             DEFAULT_SYSTEM_PROMPT.contains("do not improvise disconnected one-tile belt fragments")
         );
+    }
+
+    #[test]
+    fn autonomy_prompt_requires_global_reprioritization_and_includes_snapshot() {
+        let prompt = autonomy_prompt(r#"{"research":{"research_progress":0.5}}"#);
+        assert!(prompt.contains("re-evaluate the whole factory"));
+        assert!(prompt.contains("leave it running"));
+        assert!(prompt.contains("\"research_progress\": 0.5"));
+    }
+
+    #[test]
+    fn resume_promotes_newer_autosave_and_preserves_stale_primary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let save = directory.path().join("buddy.zip");
+        let autosave = directory.path().join("_autosave2.zip");
+        std::fs::write(&save, b"stale").expect("write primary");
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&autosave, b"newer").expect("write autosave");
+
+        assert_eq!(promote_newer_autosave(&save).unwrap(), Some(autosave));
+        assert_eq!(std::fs::read(&save).unwrap(), b"newer");
+        assert_eq!(
+            std::fs::read(directory.path().join("buddy.previous.zip")).unwrap(),
+            b"stale"
+        );
+    }
+
+    #[test]
+    fn resume_keeps_primary_when_it_is_newest() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let autosave = directory.path().join("_autosave1.zip");
+        let save = directory.path().join("buddy.zip");
+        std::fs::write(&autosave, b"old autosave").expect("write autosave");
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&save, b"current").expect("write primary");
+
+        assert_eq!(promote_newer_autosave(&save).unwrap(), None);
+        assert_eq!(std::fs::read(&save).unwrap(), b"current");
+        assert!(!directory.path().join("buddy.previous.zip").exists());
     }
 }

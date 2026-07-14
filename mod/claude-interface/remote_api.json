@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "remotes": {
+    "autonomy_snapshot": {"args": ["agent_id"], "returns": "json"},
     "broadcast_console": {"args": ["message"], "returns": "json"},
     "broadcast_flying_text": {"args": ["message"], "returns": "json"},
     "build_direct_smelter": {"args": ["agent_id", "drill_unit_number", "output_x", "output_y", "output_direction", "furnace_name", "inserter_name", "belt_name", "radius"], "returns": "json"},

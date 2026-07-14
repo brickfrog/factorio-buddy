@@ -144,6 +144,7 @@ fn control_lua_remote_signatures() -> BTreeMap<String, Vec<String>> {
 
 fn lifecycle_remote_names() -> BTreeSet<String> {
     [
+        "autonomy_snapshot",
         "clear_chat",
         "connected_player_count",
         "connected_player_count_result",
@@ -1115,6 +1116,107 @@ fn lifecycle_remotes_have_thin_rust_mcp_wrappers() {
             mcp_rs.contains(&format!("async fn {tool}"))
                 && mcp_rs.contains(&format!("\"{remote}\"")),
             "MCP lifecycle tool {tool:?} should call mod remote {remote:?}"
+        );
+    }
+}
+
+#[test]
+fn autonomous_agent_responses_are_broadcast_to_connected_players() {
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    for required in [
+        "if item.type == \"response\" then",
+        "for _, player in pairs(game.connected_players) do",
+        "add_chat_message(player, item.agent, \"claude\", item.text)",
+    ] {
+        assert!(
+            control_lua.contains(required),
+            "autonomous response delivery should include {required:?}"
+        );
+    }
+    assert!(
+        !control_lua.contains("Skip GUI updates for injected/synthetic messages (player_index=0)"),
+        "autonomous responses must not be documented or implemented as discarded"
+    );
+
+    let response_start = control_lua
+        .find("if item.type == \"response\" then")
+        .expect("response queue branch");
+    let tool_start = control_lua[response_start..]
+        .find("elseif item.type == \"tool\" then")
+        .map(|offset| response_start + offset)
+        .expect("tool queue branch");
+    assert!(
+        !control_lua[response_start..tool_start].contains("set_status("),
+        "streamed response chunks must not mark a still-running turn Ready"
+    );
+
+    let status_start = control_lua
+        .find("elseif item.type == \"status\" then")
+        .expect("status queue branch");
+    let register_start = control_lua[status_start..]
+        .find("elseif item.type == \"register\" then")
+        .map(|offset| status_start + offset)
+        .expect("register queue branch");
+    let status_branch = &control_lua[status_start..register_start];
+    assert!(status_branch.contains("for _, player in pairs(game.connected_players) do"));
+    assert!(status_branch.contains("set_status(player, item.text)"));
+}
+
+#[test]
+fn inserter_mutations_report_engine_geometry_and_direct_smelter_uses_pickup_direction() {
+    let placement_lua = include_str!("../mod/claude-interface/placement.lua");
+    for required in [
+        "result.pickup_position = pos_table(entity.pickup_position)",
+        "result.drop_position = pos_table(entity.drop_position)",
+        "local inserter_pos = {belt_tile.x - vec.x, belt_tile.y - vec.y}",
+        "local drop_tile = {x = belt_tile.x - (vec.x * 2), y = belt_tile.y - (vec.y * 2)}",
+        "direction = pickup_dir",
+    ] {
+        assert!(
+            placement_lua.contains(required),
+            "inserter geometry should include {required:?}"
+        );
+    }
+    for reversed in [
+        "local inserter_pos = {belt_tile.x + vec.x, belt_tile.y + vec.y}",
+        "local drop_tile = {x = belt_tile.x + (vec.x * 2), y = belt_tile.y + (vec.y * 2)}",
+        "for _, drop_dir in pairs(directions) do",
+    ] {
+        assert!(
+            !placement_lua.contains(reversed),
+            "direct-smelter planning must use Factorio's pickup-direction geometry, not {reversed:?}"
+        );
+    }
+}
+
+#[test]
+fn fuel_inserter_candidates_use_the_belt_as_factorio_pickup_side() {
+    let entities_lua = include_str!("../mod/claude-interface/entities.lua");
+    let function_start = entities_lua
+        .find("local function inserter_fuel_candidates")
+        .expect("fuel candidate function");
+    let function_end = entities_lua[function_start..]
+        .find("\nlocal function add_action")
+        .map(|offset| function_start + offset)
+        .expect("end of fuel candidate function");
+    let function = &entities_lua[function_start..function_end];
+    let expected = [
+        ("north", "north"),
+        ("east", "east"),
+        ("south", "south"),
+        ("west", "west"),
+    ];
+    for (index, (side, direction)) in expected.iter().enumerate() {
+        let start = function
+            .find(&format!("side = \"{side}\""))
+            .unwrap_or_else(|| panic!("missing {side} fuel candidate"));
+        let end = expected
+            .get(index + 1)
+            .and_then(|(next_side, _)| function.find(&format!("side = \"{next_side}\"")))
+            .unwrap_or(function.len());
+        assert!(
+            function[start..end].contains(&format!("direction = defines.direction.{direction}")),
+            "{side} fuel candidate must pick up from the {direction} belt side"
         );
     }
 }
