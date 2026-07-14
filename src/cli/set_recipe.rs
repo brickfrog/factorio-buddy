@@ -22,8 +22,13 @@ pub async fn execute(cmd: SetRecipeCommand, conn: &ResolvedConnectionArgs) -> Re
         .ensure_proximity_to_entity(cmd.unit_number, crate::client::PROXIMITY_RANGE_INTERACT)
         .await?;
 
-    client.set_recipe(cmd.unit_number, &cmd.recipe).await?;
-    println!("Set recipe '{}' on entity #{}", cmd.recipe, cmd.unit_number);
+    if cmd.recipe.is_empty() {
+        client.clear_recipe(cmd.unit_number).await?;
+        println!("Cleared recipe on entity #{}", cmd.unit_number);
+    } else {
+        client.set_recipe(cmd.unit_number, &cmd.recipe).await?;
+        println!("Set recipe '{}' on entity #{}", cmd.recipe, cmd.unit_number);
+    }
 
     client.close().await?;
     Ok(())

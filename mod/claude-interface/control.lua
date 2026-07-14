@@ -1845,12 +1845,39 @@ local function set_recipe_impl(agent_id, unit_number, recipe)
         return {error = "Entity cannot have recipes"}
     end
 
-    local result = entity.set_recipe(recipe)
-    if result == nil then
-        return {error = "Could not set recipe (unknown or incompatible recipe)"}
+    -- JSON null arrives as Lua nil. Keep empty-string compatibility at the
+    -- public tool boundary, but never pass an empty recipe name to Factorio:
+    -- clearing a crafting machine is explicitly set_recipe(nil).
+    local requested_recipe = recipe
+    if requested_recipe == "" then requested_recipe = nil end
+    local ok, set_error = pcall(function()
+        entity.set_recipe(requested_recipe)
+    end)
+    if not ok then
+        return {success = false, error = tostring(set_error)}
     end
 
-    return {success = true}
+    local current = entity.get_recipe and entity.get_recipe() or nil
+    if requested_recipe == nil then
+        if current ~= nil then
+            return {
+                success = false,
+                error = "Could not clear recipe",
+                current_recipe = current.name,
+            }
+        end
+        return {success = true, cleared = true, recipe = nil}
+    end
+    if not current or current.name ~= requested_recipe then
+        return {
+            success = false,
+            error = "Could not set recipe (unknown or incompatible recipe)",
+            requested_recipe = requested_recipe,
+            current_recipe = current and current.name or nil,
+        }
+    end
+
+    return {success = true, cleared = false, recipe = current.name}
 end
 
 local function get_entity_recipe_impl(unit_number)

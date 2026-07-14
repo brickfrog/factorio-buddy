@@ -1,7 +1,35 @@
 //! Belt gap detection for finding breaks in belt networks
 
 use super::{build_entity_occupancy_lookup, BeltGap, BeltGapResult, BeltGraph, GapType};
-use crate::world::{Entity, TilePos};
+use crate::world::{Direction, Entity, TilePos};
+
+fn modeled_inserter_pickup_tile(entity: &Entity) -> Option<TilePos> {
+    if entity.entity_type.as_deref() != Some("inserter") {
+        return None;
+    }
+
+    let pickup_distance = match entity.name.as_str() {
+        "long-handed-inserter" => 2,
+        "inserter" | "burner-inserter" | "fast-inserter" | "bulk-inserter" | "stack-inserter" => 1,
+        _ => return None,
+    };
+
+    if !matches!(entity.direction, 0 | 4 | 8 | 12) {
+        return None;
+    }
+
+    let direction = Direction::from_factorio(entity.direction);
+    Some(
+        entity
+            .position
+            .to_tile()
+            .offset_in_direction_by(direction, pickup_distance),
+    )
+}
+
+fn is_intended_inserter_terminal(entity: &Entity, belt_tile: TilePos) -> bool {
+    modeled_inserter_pickup_tile(entity) == Some(belt_tile)
+}
 
 /// Analyze belt network for gaps (missing, misaligned, or blocked connections)
 pub fn find_belt_gaps(graph: &BeltGraph, all_entities: &[Entity]) -> BeltGapResult {
@@ -31,6 +59,9 @@ pub fn find_belt_gaps(graph: &BeltGraph, all_entities: &[Entity]) -> BeltGapResu
                 // Unsupported transport is neither a proven gap nor a proven
                 // connection. analysis_scope carries the fail-closed evidence.
             } else if let Some(blocker) = entity_at.get(&output_pos) {
+                if is_intended_inserter_terminal(blocker, *pos) {
+                    continue;
+                }
                 // Non-belt entity blocking the path
                 gaps.push(BeltGap {
                     from: *pos,
@@ -194,6 +225,65 @@ mod tests {
             .unwrap();
         assert_eq!(gap.gap_type, GapType::Blocked);
         assert_eq!(gap.blocker, Some("stone-furnace".to_string()));
+    }
+
+    #[test]
+    fn inserter_picking_from_terminal_belt_is_not_a_blocked_gap() {
+        let mut inserter = make_entity(1, 0, "inserter");
+        inserter.entity_type = Some("inserter".to_string());
+        inserter.direction = Direction::West.to_factorio();
+        let entities = vec![make_belt(0, 0, Direction::East), inserter];
+
+        let graph = BeltGraph::from_entities(&entities);
+        let result = find_belt_gaps(&graph, &entities);
+
+        assert!(result.gaps.is_empty());
+        assert!(result.certified_gap_free);
+    }
+
+    #[test]
+    fn wrong_facing_inserter_still_blocks_the_terminal_belt() {
+        let mut inserter = make_entity(1, 0, "inserter");
+        inserter.entity_type = Some("inserter".to_string());
+        inserter.direction = Direction::East.to_factorio();
+        let entities = vec![make_belt(0, 0, Direction::East), inserter];
+
+        let graph = BeltGraph::from_entities(&entities);
+        let result = find_belt_gaps(&graph, &entities);
+
+        assert_eq!(result.gap_count, 1);
+        assert_eq!(result.gaps[0].gap_type, GapType::Blocked);
+        assert_eq!(result.gaps[0].blocker.as_deref(), Some("inserter"));
+    }
+
+    #[test]
+    fn unknown_modded_inserter_still_blocks_the_terminal_belt() {
+        let mut inserter = make_entity(1, 0, "super-inserter");
+        inserter.entity_type = Some("inserter".to_string());
+        inserter.direction = Direction::West.to_factorio();
+        let entities = vec![make_belt(0, 0, Direction::East), inserter];
+
+        let graph = BeltGraph::from_entities(&entities);
+        let result = find_belt_gaps(&graph, &entities);
+
+        assert_eq!(result.gap_count, 1);
+        assert_eq!(result.gaps[0].gap_type, GapType::Blocked);
+        assert_eq!(result.gaps[0].blocker.as_deref(), Some("super-inserter"));
+    }
+
+    #[test]
+    fn malformed_inserter_direction_still_blocks_the_terminal_belt() {
+        let mut inserter = make_entity(1, 0, "inserter");
+        inserter.entity_type = Some("inserter".to_string());
+        inserter.direction = 1;
+        let entities = vec![make_belt(0, 0, Direction::East), inserter];
+
+        let graph = BeltGraph::from_entities(&entities);
+        let result = find_belt_gaps(&graph, &entities);
+
+        assert_eq!(result.gap_count, 1);
+        assert_eq!(result.gaps[0].gap_type, GapType::Blocked);
+        assert_eq!(result.gaps[0].blocker.as_deref(), Some("inserter"));
     }
 
     #[test]

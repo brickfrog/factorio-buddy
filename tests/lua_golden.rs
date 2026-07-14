@@ -973,6 +973,25 @@ fn critical_mod_safety_contracts_are_explicit() {
             && entities_lua.contains("if a.distance_sq ~= b.distance_sq then"),
         "fuel diagnosis must prove adjacent inserter/source operation and rank unproven sources explicitly"
     );
+    assert!(
+        entities_lua.contains("local function mining_drill_energy_source(entity)")
+            && entities_lua
+                .contains("local function burner_coal_drill_fuel_proof(surface, force, drill, state)")
+            && entities_lua.contains("closed_self_sustaining_coal_cycle")
+            && entities_lua.contains("manual_burner_fuel_buffer")
+            && entities_lua.contains("burner_coal_drill_fuel_not_durable")
+            && entities_lua.contains("frame.targets[key]")
+            && entities_lua
+                .contains("local proof = coal_upstream_proof(surface, force, drill, state)")
+            && entities_lua.contains("return entity.is_connected_to_electric_network()")
+            && entities_lua.contains("return entity.energy")
+            && entities_lua.contains(
+                "local source = coal_source_record(surface, force, entity, source_proof_cache)",
+            )
+            && !entities_lua.contains("local certified = operational_coal_drill(entity)")
+            && !entities_lua.contains("durable = operational_coal_drill(entity)"),
+        "coal producers must prove their own durable energy supply; a manually buffered burner drill is not a terminal source"
+    );
 
     assert!(
         control_lua
@@ -1874,6 +1893,36 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
             && characters_lua.contains("storage.characters[agent_id] = character")
             && control_lua.contains("init_character = function(agent_id, x, y)"),
         "characters.lua init_character should populate mod character storage through control.lua remotes"
+    );
+}
+
+#[test]
+fn recipe_clear_is_an_explicit_nil_operation_across_lua_and_rust() {
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    for required in [
+        "if requested_recipe == \"\" then requested_recipe = nil end",
+        "entity.set_recipe(requested_recipe)",
+        "if requested_recipe == nil then",
+        "if current ~= nil then",
+        "return {success = true, cleared = true, recipe = nil}",
+    ] {
+        assert!(
+            control_lua.contains(required),
+            "control.lua must explicitly clear and verify recipes via {required:?}"
+        );
+    }
+
+    let client = include_str!("../src/client/mod.rs");
+    assert!(client.contains("pub async fn clear_recipe"));
+    assert!(client.contains("recipe.map_or(Value::Null"));
+
+    let mcp = include_str!("../src/bin/mcp.rs");
+    assert!(mcp.contains("RecipeRestoreAction::Set(recipe_name)"));
+    assert!(mcp.contains("RecipeRestoreAction::Clear => client.clear_recipe(unit_number).await"));
+    assert!(mcp.contains("client.clear_recipe(params.unit_number).await"));
+    assert!(
+        !mcp.contains("client.set_recipe(params.unit_number, \"\").await"),
+        "empty recipe strings must not be sent to Factorio as recipe names"
     );
 }
 

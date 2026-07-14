@@ -57,8 +57,37 @@ assert_json() {
     fi
 }
 
+require_json() {
+    local description="$1"
+    local payload="$2"
+    shift 2
+    if jq -e "$@" >/dev/null 2>&1 <<<"$payload"; then
+        pass "$description"
+    else
+        fail "$description" "$payload"
+        return 1
+    fi
+}
+
 raw_lua() {
     FACTORIOCTL_ALLOW_RAW_LUA=1 "${CLI[@]}" exec "$1"
+}
+
+enable_raw_lua_for_fixtures() {
+    local marker="factorio-buddy-raw-lua-ready"
+    local command="rcon.print('$marker')"
+    local output
+
+    # A fresh Factorio save refuses the first /c command and asks the operator
+    # to repeat it before achievements are disabled. The refusal is not
+    # reliably returned in the RCON response, so use an idempotent probe twice
+    # and require the second response before executing any fixture mutation.
+    FACTORIOCTL_ALLOW_RAW_LUA=1 "${CLI[@]}" exec "$command" >/dev/null 2>&1 || true
+    output="$(FACTORIOCTL_ALLOW_RAW_LUA=1 "${CLI[@]}" exec "$command")"
+    if [[ "$output" != *"$marker"* ]]; then
+        printf 'ERROR: Factorio did not enable trusted raw-Lua fixture setup: %s\n' "$output" >&2
+        return 1
+    fi
 }
 
 rcon_i32_le() {
@@ -202,6 +231,7 @@ if ! "${CLI[@]}" get tick >/dev/null 2>&1; then
     printf 'ERROR: isolated Factorio server is not reachable at %s:%s\n' "$RCON_HOST" "$RCON_PORT" >&2
     exit 1
 fi
+enable_raw_lua_for_fixtures
 
 # Build a clean test surface and an independent NPC. Raw Lua is fixture setup;
 # the lifecycle behavior under test goes through the shipped mod remote.
@@ -234,7 +264,7 @@ for _, entity in pairs(surface.find_entities_filtered{area = {{595, 595}, {606, 
 end
 rcon.print(remote.call('claude_interface', 'pre_place_character_result', '$AGENT_ID', name, 0))
 ")"
-assert_json "NPC is independently created on the requested surface" "$SETUP" \
+require_json "NPC is independently created on the requested surface" "$SETUP" \
     '.status == "created" and .planet == "buddy-live-regression"'
 
 # An established NPC must remain distinct from other character entities and
@@ -441,6 +471,337 @@ assert_json "manually stocked fuel source is not certified as durable automation
            and .durable == false
            and .source.upstream_proof.reason == "stocked_without_proven_upstream")'
 
+# A currently working burner coal drill is not a durable terminal producer just
+# because the character put one coal in its burner. Prove the false-positive
+# window while that manual fuel is still burning, then exhaust it and prove the
+# downstream furnace remains uncertified.
+BUFFERED_DRILL_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local area = {{-64, 12}, {-46, 31}}
+for _, entity in pairs(s.find_entities_filtered{area = area}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+for x = -58, -55 do
+    for y = 21, 24 do
+        s.create_entity{name = 'coal', position = {x + 0.5, y + 0.5}, amount = 100000}
+    end
+end
+local drill = s.create_entity{
+    name = 'burner-mining-drill',
+    position = {-56, 23},
+    direction = defines.direction.north,
+    force = game.forces.player
+}
+if not drill then
+    rcon.print(helpers.table_to_json({error = 'burner drill creation failed'}))
+    return
+end
+local drill_fuel = drill.get_fuel_inventory()
+drill_fuel.insert{name = 'coal', count = 1}
+local belt = s.create_entity{
+    name = 'transport-belt',
+    position = drill.drop_position,
+    direction = defines.direction.north,
+    force = game.forces.player
+}
+if not belt then
+    rcon.print(helpers.table_to_json({error = 'drill output belt creation failed'}))
+    return
+end
+local inserter = s.create_entity{
+    name = 'burner-inserter',
+    position = {belt.position.x, belt.position.y - 1},
+    direction = defines.direction.south,
+    force = game.forces.player
+}
+local furnace = s.create_entity{
+    name = 'stone-furnace',
+    position = {belt.position.x, belt.position.y - 2.5},
+    force = game.forces.player
+}
+if not (inserter and furnace) then
+    rcon.print(helpers.table_to_json({error = 'downstream fuel consumer creation failed'}))
+    return
+end
+inserter.active = false
+inserter.get_fuel_inventory().insert{name = 'coal', count = 1}
+rcon.print(helpers.table_to_json({
+    drill_unit = drill.unit_number,
+    belt_unit = belt.unit_number,
+    inserter_unit = inserter.unit_number,
+    furnace_unit = furnace.unit_number,
+    mining_target = drill.mining_target and drill.mining_target.name or nil,
+    drill_drop_position = drill.drop_position,
+    belt_position = belt.position,
+    inserter_position = inserter.position,
+    furnace_position = furnace.position
+}))
+")"
+require_json "manual-buffer burner drill fixture is physically constructed" "$BUFFERED_DRILL_FIXTURE" \
+    '.error == null
+     and (.drill_unit | type) == "number"
+     and (.belt_unit | type) == "number"
+     and (.inserter_unit | type) == "number"
+     and (.furnace_unit | type) == "number"'
+BUFFERED_DRILL_UNIT="$(jq -r '.drill_unit' <<<"$BUFFERED_DRILL_FIXTURE")"
+BUFFERED_BELT_UNIT="$(jq -r '.belt_unit' <<<"$BUFFERED_DRILL_FIXTURE")"
+BUFFERED_INSERTER_UNIT="$(jq -r '.inserter_unit' <<<"$BUFFERED_DRILL_FIXTURE")"
+BUFFERED_FURNACE_UNIT="$(jq -r '.furnace_unit' <<<"$BUFFERED_DRILL_FIXTURE")"
+
+BUFFERED_DRILL_STATE='{}'
+for _ in $(seq 1 100); do
+    BUFFERED_DRILL_STATE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local drill, belt
+for _, entity in pairs(s.find_entities_filtered{area = {{-64, 12}, {-46, 31}}}) do
+    if entity.unit_number == $BUFFERED_DRILL_UNIT then drill = entity end
+    if entity.unit_number == $BUFFERED_BELT_UNIT then belt = entity end
+end
+local coal = 0
+if belt then
+    for line_index = 1, 2 do
+        coal = coal + belt.get_transport_line(line_index).get_item_count('coal')
+    end
+end
+local status = nil
+if drill then
+    for name, value in pairs(defines.entity_status) do
+        if value == drill.status then status = name break end
+    end
+end
+rcon.print(helpers.table_to_json({
+    belt_coal = coal,
+    status = status,
+    remaining_burning_fuel = drill and drill.burner and drill.burner.remaining_burning_fuel or 0
+}))
+")"
+    if jq -e '.belt_coal > 0
+        and .remaining_burning_fuel > 0
+        and (.status == "working" or .status == "waiting_for_space_in_destination")' \
+        >/dev/null 2>&1 <<<"$BUFFERED_DRILL_STATE"; then
+        break
+    fi
+    sleep 0.1
+done
+require_json "manually fueled burner drill emits coal while its finite buffer is burning" "$BUFFERED_DRILL_STATE" \
+    '.belt_coal > 0
+     and .remaining_burning_fuel > 0
+     and (.status == "working" or .status == "waiting_for_space_in_destination")'
+
+BUFFERED_DRILL_REPORT="$(raw_lua "
+local report = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'diagnose_fuel_sustainability',
+    -64,
+    12,
+    -46,
+    31,
+    30,
+    '$AGENT_ID'
+))
+rcon.print(helpers.table_to_json({report = report}))
+")"
+require_json "manual-buffer burner drill is not a durable downstream coal source while running" "$BUFFERED_DRILL_REPORT" \
+    --argjson furnace "$BUFFERED_FURNACE_UNIT" \
+    --argjson belt "$BUFFERED_BELT_UNIT" \
+    '.report.consumers[]
+     | select(.unit_number == $furnace)
+     | .fuel_topology_present == true
+       and .automated == false
+       and any(.fuel_connections[]?;
+           .source.unit_number == $belt
+           and .source.coal_count > 0
+           and .source_durable == false
+           and .durable == false
+           and .source.upstream_proof.reason == "coal_drill_upstream_not_durable"
+           and .source.upstream_proof.upstream_proof.reason == "burner_coal_drill_fuel_not_durable"
+           and .source.upstream_proof.upstream_proof.fuel_proof.reason == "manual_burner_fuel_buffer")'
+
+# Shorten only the already-burning test buffer after observing real output, then
+# let the game advance into no_fuel. This keeps the regression fast without
+# fabricating coal or a durable feed.
+raw_lua "
+local s = game.surfaces['buddy-live-regression']
+for _, entity in pairs(s.find_entities_filtered{area = {{-64, 12}, {-46, 31}}}) do
+    if entity.unit_number == $BUFFERED_DRILL_UNIT and entity.burner then
+        entity.get_fuel_inventory().clear()
+        entity.burner.remaining_burning_fuel = math.min(entity.burner.remaining_burning_fuel, 1)
+    elseif entity.unit_number == $BUFFERED_INSERTER_UNIT then
+        entity.active = true
+    end
+end
+" >/dev/null
+
+EXHAUSTED_DRILL_STATE='{}'
+for _ in $(seq 1 50); do
+    EXHAUSTED_DRILL_STATE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local drill
+for _, entity in pairs(s.find_entities_filtered{area = {{-64, 12}, {-46, 31}}}) do
+    if entity.unit_number == $BUFFERED_DRILL_UNIT then drill = entity break end
+end
+local status = nil
+if drill then
+    for name, value in pairs(defines.entity_status) do
+        if value == drill.status then status = name break end
+    end
+end
+rcon.print(helpers.table_to_json({
+    status = status,
+    remaining_burning_fuel = drill and drill.burner and drill.burner.remaining_burning_fuel or 0,
+    fuel_count = drill and drill.get_fuel_inventory().get_item_count() or 0
+}))
+")"
+    if jq -e '.status == "no_fuel"
+        and .remaining_burning_fuel <= 0
+        and .fuel_count == 0' >/dev/null 2>&1 <<<"$EXHAUSTED_DRILL_STATE"; then
+        break
+    fi
+    sleep 0.1
+done
+require_json "the manually fueled burner drill exhausts its finite buffer" "$EXHAUSTED_DRILL_STATE" \
+    '.status == "no_fuel" and .remaining_burning_fuel <= 0 and .fuel_count == 0'
+
+EXHAUSTED_DRILL_REPORT="$(raw_lua "
+local report = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'diagnose_fuel_sustainability',
+    -64,
+    12,
+    -46,
+    31,
+    30,
+    '$AGENT_ID'
+))
+rcon.print(helpers.table_to_json({report = report}))
+")"
+require_json "exhausted manual burner drill remains non-durable downstream" "$EXHAUSTED_DRILL_REPORT" \
+    --argjson furnace "$BUFFERED_FURNACE_UNIT" \
+    --argjson belt "$BUFFERED_BELT_UNIT" \
+    '.report.consumers[]
+     | select(.unit_number == $furnace)
+     | .automated == false
+       and any(.fuel_connections[]?;
+           .source.unit_number == $belt
+           and .source_durable == false
+           and .durable == false
+           and .source.upstream_proof.reason == "coal_drill_upstream_not_durable"
+           and .source.upstream_proof.upstream_proof.reason == "burner_coal_drill_fuel_not_durable")'
+
+# The fail-closed producer proof must still recognize genuine automated coal
+# production. Exercise a powered electric drill and its real output belt so the
+# negative burner checks cannot be satisfied by rejecting every producer.
+ELECTRIC_COAL_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local area = {{-31, -31}, {-8, -10}}
+for _, entity in pairs(s.find_entities_filtered{area = area}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+for x = -24, -21 do
+    for y = -24, -21 do
+        s.create_entity{name = 'coal', position = {x + 0.5, y + 0.5}, amount = 100000}
+    end
+end
+local interface = s.create_entity{
+    name = 'electric-energy-interface',
+    position = {-13, -22},
+    force = game.forces.player
+}
+local substation = s.create_entity{name = 'substation', position = {-17, -22}, force = game.forces.player}
+local drill = s.create_entity{
+    name = 'electric-mining-drill',
+    position = {-22.5, -22.5},
+    direction = defines.direction.north,
+    force = game.forces.player
+}
+local belt = drill and s.create_entity{
+    name = 'transport-belt',
+    position = drill.drop_position,
+    direction = defines.direction.north,
+    force = game.forces.player
+} or nil
+rcon.print(helpers.table_to_json({
+    interface_unit = interface and interface.unit_number or nil,
+    substation_unit = substation and substation.unit_number or nil,
+    drill_unit = drill and drill.unit_number or nil,
+    belt_unit = belt and belt.unit_number or nil
+}))
+")"
+require_json "powered electric coal fixture is physically constructed" "$ELECTRIC_COAL_FIXTURE" \
+    '(.interface_unit | type) == "number"
+     and (.substation_unit | type) == "number"
+     and (.drill_unit | type) == "number"
+     and (.belt_unit | type) == "number"'
+ELECTRIC_DRILL_UNIT="$(jq -r '.drill_unit' <<<"$ELECTRIC_COAL_FIXTURE")"
+ELECTRIC_BELT_UNIT="$(jq -r '.belt_unit' <<<"$ELECTRIC_COAL_FIXTURE")"
+
+ELECTRIC_COAL_STATE='{}'
+for _ in $(seq 1 100); do
+    ELECTRIC_COAL_STATE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local drill, belt
+for _, entity in pairs(s.find_entities_filtered{area = {{-31, -31}, {-8, -10}}}) do
+    if entity.unit_number == $ELECTRIC_DRILL_UNIT then drill = entity end
+    if entity.unit_number == $ELECTRIC_BELT_UNIT then belt = entity end
+end
+local coal = 0
+if belt then
+    for line_index = 1, 2 do
+        coal = coal + belt.get_transport_line(line_index).get_item_count('coal')
+    end
+end
+local status = nil
+if drill then
+    for name, value in pairs(defines.entity_status) do
+        if value == drill.status then status = name break end
+    end
+end
+rcon.print(helpers.table_to_json({
+    belt_coal = coal,
+    status = status,
+    connected = drill and drill.is_connected_to_electric_network() or false,
+    energy = drill and drill.energy or 0
+}))
+")"
+    if jq -e '.belt_coal > 0 and .connected == true and .energy > 0
+        and (.status == "working" or .status == "waiting_for_space_in_destination")' \
+        >/dev/null 2>&1 <<<"$ELECTRIC_COAL_STATE"; then
+        break
+    fi
+    sleep 0.1
+done
+require_json "powered electric drill produces real coal onto its belt" "$ELECTRIC_COAL_STATE" \
+    '.belt_coal > 0 and .connected == true and .energy > 0
+     and (.status == "working" or .status == "waiting_for_space_in_destination")'
+
+ELECTRIC_COAL_REPORT="$(raw_lua "
+local report = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'diagnose_fuel_sustainability',
+    -31,
+    -31,
+    -8,
+    -10,
+    30,
+    '$AGENT_ID'
+))
+rcon.print(helpers.table_to_json({report = report}))
+")"
+require_json "powered electric coal production is certified durable and live" "$ELECTRIC_COAL_REPORT" \
+    --argjson drill "$ELECTRIC_DRILL_UNIT" \
+    --argjson belt "$ELECTRIC_BELT_UNIT" \
+    'any(.report.coal_sources.mining_drills[]?;
+         .unit_number == $drill
+         and .durable == true
+         and .operational == true
+         and .upstream_proof.reason == "powered_operational_electric_coal_drill")
+     and any(.report.coal_sources.belts[]?;
+         .unit_number == $belt
+         and .coal_count > 0
+         and .durable == true
+         and .operational == true
+         and .upstream_proof.reason == "direct_durable_coal_drill")'
+
 # Install a wrong-facing belt in an otherwise eastbound three-tile corridor.
 # The MCP router may reject it or route around it, but may not count it as a
 # connected, reusable segment.
@@ -450,6 +811,7 @@ c.teleport({28.5, 10.5})
 local inv = c.get_main_inventory()
 inv.clear()
 inv.insert{name = 'transport-belt', count = 100}
+inv.insert{name = 'inserter', count = 20}
 local s = c.surface
 for _, e in pairs(s.find_entities_filtered{area = {{29, 8}, {34, 13}}}) do
     if e.type ~= 'resource' and e.type ~= 'character' then e.destroy() end
@@ -459,6 +821,22 @@ for _, e in pairs(s.find_entities_filtered{area = {{28, 18}, {41, 23}}}) do
 end
 s.create_entity{name = 'transport-belt', position = {31.5, 10.5}, direction = defines.direction.north, force = c.force}
 " >/dev/null
+
+# A controller may not retain a geometrically complete belt plus an inserter
+# that touches neither the route endpoint nor its named machine. This is the
+# exact pointless-infrastructure failure reproduced by the final audit.
+DISCONNECTED_LAB_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{0, 24}, {21, 33}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local lab = s.create_entity{name = 'lab', position = {5.5, 28.5}, force = c.force}
+rcon.print(helpers.table_to_json({lab_unit = lab and lab.unit_number or nil}))
+")"
+require_json "disconnected controller fixture has a real target lab" "$DISCONNECTED_LAB_FIXTURE" \
+    '(.lab_unit | type) == "number"'
+DISCONNECTED_LAB_UNIT="$(jq -r '.lab_unit' <<<"$DISCONNECTED_LAB_FIXTURE")"
 
 start_mcp
 
@@ -489,6 +867,44 @@ fi
 
 INVALID_PLACE="$(mcp_tool place_entity '{"entity_name":"not-a-real-entity","x":28,"y":10,"direction":"north"}')"
 assert_json "semantic MCP failures set isError" "$INVALID_PLACE" '.result.isError == true'
+
+DISCONNECTED_LAB="$(mcp_tool build_lab_feed "$(jq -cn \
+    --argjson unit "$DISCONNECTED_LAB_UNIT" \
+    '{
+        lab_unit_number:$unit,
+        from_x:12,
+        from_y:28,
+        pickup_x:14,
+        pickup_y:28,
+        inserter_x:17.5,
+        inserter_y:28.5,
+        inserter_direction:"north",
+        belt_type:"transport-belt",
+        search_radius:4,
+        dry_run:false,
+        respect_zones:false,
+        allow_underground:false,
+        extend_existing:true
+    }')")"
+DISCONNECTED_LAB_PAYLOAD="$(tool_payload "$DISCONNECTED_LAB")"
+assert_json "disconnected controller geometry fails before mutation" "$DISCONNECTED_LAB" \
+    '.result.isError == true'
+assert_json "controller reports the failed route-inserter-machine proof" "$DISCONNECTED_LAB_PAYLOAD" \
+    '.success == false
+     and .error_kind == "compound_preflight_failed"
+     and .preflight.ready == false
+     and .preflight.endpoint_topology.success == false
+     and .preflight.endpoint_topology.inserter.route_endpoint_matches == false
+     and .preflight.endpoint_topology.machine.interaction_intersects_footprint == false'
+DISCONNECTED_LAB_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+rcon.print(helpers.table_to_json({
+    belts = s.count_entities_filtered{type = 'transport-belt', area = {{0, 24}, {21, 33}}},
+    inserters = s.count_entities_filtered{type = 'inserter', area = {{0, 24}, {21, 33}}}
+}))
+")"
+assert_json "disconnected controller leaves no pointless belts or inserters" "$DISCONNECTED_LAB_WORLD" \
+    '.belts == 0 and .inserters == 0'
 
 PRODUCTION="$(mcp_tool verify_production '{"x":16,"y":1,"radius":5}')"
 PRODUCTION_PAYLOAD="$(tool_payload "$PRODUCTION")"
@@ -650,6 +1066,44 @@ rcon.print(helpers.table_to_json({
 ")"
 assert_json "compound rollback leaves no fragments and restores recipe" "$ROLLBACK_WORLD" \
     '.belts == 0 and .inserters == 0 and .recipe == "copper-cable"'
+
+# The same rollback must restore an actually absent recipe. Factorio rejects
+# set_recipe(""); the shipped seam must explicitly send nil and verify clear.
+CLEAR_RECIPE="$(mcp_tool set_recipe "$(jq -cn \
+    --argjson unit "$ROLLBACK_ASSEMBLER_UNIT" \
+    '{unit_number:$unit, recipe:""}')")"
+assert_json "recipe clear uses the shipped nullable recipe seam" "$CLEAR_RECIPE" \
+    '(.result.isError // false) == false'
+CLEARED_RECIPE_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local assembler = s.find_entity('assembling-machine-1', {50.5, 20.5})
+local recipe = assembler and assembler.get_recipe()
+rcon.print(helpers.table_to_json({recipe = recipe and recipe.name or nil}))
+")"
+assert_json "assembler really has no recipe before rollback test" "$CLEARED_RECIPE_WORLD" \
+    '.recipe == null'
+
+EMPTY_RECIPE_CELL_RESULT="$(mcp_tool build_recipe_assembler_cell "$CELL_EXEC_ARGS")"
+EMPTY_RECIPE_CELL_PAYLOAD="$(tool_payload "$EMPTY_RECIPE_CELL_RESULT")"
+assert_json "late rollback explicitly restores an absent recipe" "$EMPTY_RECIPE_CELL_PAYLOAD" \
+    '.success == false
+     and .error_kind == "verification_failed"
+     and .rollback.success == true
+     and .rollback.recipe.success == true
+     and .rollback.recipe.operation == "clear"
+     and .rollback.recipe.restored_recipe == null'
+EMPTY_RECIPE_ROLLBACK_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local assembler = s.find_entity('assembling-machine-1', {50.5, 20.5})
+local recipe = assembler and assembler.get_recipe()
+rcon.print(helpers.table_to_json({
+    belts = s.count_entities_filtered{type = 'transport-belt', area = {{42, 15}, {61, 26}}},
+    inserters = s.count_entities_filtered{type = 'inserter', area = {{42, 15}, {61, 26}}},
+    recipe = recipe and recipe.name or nil
+}))
+")"
+assert_json "absent-recipe rollback leaves no fragments or recipe" "$EMPTY_RECIPE_ROLLBACK_WORLD" \
+    '.belts == 0 and .inserters == 0 and .recipe == null'
 
 # Multiple tools in one MCP process must share its RCON transport.
 RCON_BEFORE="$(rcon_connection_count)"

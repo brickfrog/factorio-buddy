@@ -20,9 +20,9 @@ use factorioctl::analyze::{
 use factorioctl::client::{AgentId, FactorioClient};
 use factorioctl::memory::{AgentMemory, BeltRouting, ProtectedResource, Zone, ZoneType};
 use factorioctl::world::{
-    build_production_report, build_situation_report, entity_size, find_belt_route_with_options,
-    Area, BeltKind, BeltPlacement, BeltRouteTopology, Direction, Entity, EntityProduction, GridPos,
-    Position, RoutingOptions, TilePos, UndergroundConfig,
+    build_production_report, build_situation_report, entity_occupied_tiles, entity_size,
+    find_belt_route_with_options, Area, BeltKind, BeltPlacement, BeltRouteTopology, Direction,
+    Entity, EntityProduction, GridPos, Position, RoutingOptions, TilePos, UndergroundConfig,
 };
 
 fn production_verification_json(
@@ -399,6 +399,178 @@ fn incremental_infrastructure_verification(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InserterMachineFlow {
+    Input,
+    Output,
+}
+
+impl InserterMachineFlow {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input_to_machine",
+            Self::Output => "output_from_machine",
+        }
+    }
+
+    fn route_endpoint_name(self) -> &'static str {
+        match self {
+            Self::Input => "goal",
+            Self::Output => "start",
+        }
+    }
+
+    fn machine_interaction_name(self) -> &'static str {
+        match self {
+            Self::Input => "drop",
+            Self::Output => "pickup",
+        }
+    }
+}
+
+fn cardinal_direction_step(direction: Direction) -> Option<(i32, i32)> {
+    match direction {
+        Direction::North => Some((0, -1)),
+        Direction::East => Some((1, 0)),
+        Direction::South => Some((0, 1)),
+        Direction::West => Some((-1, 0)),
+        Direction::NorthEast
+        | Direction::SouthEast
+        | Direction::SouthWest
+        | Direction::NorthWest => None,
+    }
+}
+
+fn route_topology_tile(route: &serde_json::Value, field: &str) -> Option<GridPos> {
+    route
+        .get("topology")
+        .and_then(|topology| topology.get(field))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// Prove that one standard inserter joins the routed belt to the exact target
+/// machine. Route connectivity and inserter intent are insufficient on their
+/// own: arbitrary remote geometry can satisfy both while moving no items.
+fn inserter_machine_endpoint_verification(
+    route: &serde_json::Value,
+    inserter_position: Option<Position>,
+    inserter_direction: Option<Direction>,
+    machine: &Entity,
+    flow: InserterMachineFlow,
+    phase: &str,
+) -> serde_json::Value {
+    let route_success = report_success(route);
+    let topology_connected = route
+        .get("topology")
+        .and_then(|topology| topology.get("connected"))
+        .and_then(|value| value.as_bool())
+        == Some(true);
+    let route_start = route_topology_tile(route, "start_tile");
+    let route_goal = route_topology_tile(route, "goal_tile");
+    let required_route_endpoint = match flow {
+        InserterMachineFlow::Input => route_goal,
+        InserterMachineFlow::Output => route_start,
+    };
+
+    let inserter_tile = inserter_position.as_ref().map(GridPos::from_position);
+    let direction_step = inserter_direction.and_then(cardinal_direction_step);
+    let pickup_tile = inserter_tile
+        .zip(direction_step)
+        .map(|(tile, (dx, dy))| GridPos::new(tile.x + dx, tile.y + dy));
+    let drop_tile = inserter_tile
+        .zip(direction_step)
+        .map(|(tile, (dx, dy))| GridPos::new(tile.x - dx, tile.y - dy));
+    let inserter_route_endpoint = match flow {
+        InserterMachineFlow::Input => pickup_tile,
+        InserterMachineFlow::Output => drop_tile,
+    };
+    let machine_interaction_tile = match flow {
+        InserterMachineFlow::Input => drop_tile,
+        InserterMachineFlow::Output => pickup_tile,
+    };
+    let endpoint_matches_route =
+        inserter_route_endpoint.is_some() && inserter_route_endpoint == required_route_endpoint;
+
+    let machine_bounds = machine_bounding_box(machine).ok();
+    let machine_tiles = if machine_bounds.is_some() {
+        entity_occupied_tiles(machine)
+    } else {
+        Vec::new()
+    };
+    let machine_interaction_matches = machine_interaction_tile.is_some_and(|interaction| {
+        machine_tiles
+            .iter()
+            .any(|tile| tile.x == interaction.x && tile.y == interaction.y)
+    });
+    let success = route_success
+        && topology_connected
+        && direction_step.is_some()
+        && endpoint_matches_route
+        && machine_bounds.is_some()
+        && machine_interaction_matches;
+
+    serde_json::json!({
+        "success": success,
+        "scope": "route_inserter_machine_topology",
+        "phase": phase,
+        "flow": flow.as_str(),
+        "route": {
+            "success": route_success,
+            "topology_connected": topology_connected,
+            "start_tile": route_start,
+            "goal_tile": route_goal,
+            "required_endpoint": flow.route_endpoint_name(),
+            "required_endpoint_tile": required_route_endpoint,
+        },
+        "inserter": {
+            "position": inserter_position,
+            "direction": inserter_direction,
+            "cardinal_geometry": direction_step.is_some(),
+            "tile": inserter_tile,
+            "pickup_tile": pickup_tile,
+            "drop_tile": drop_tile,
+            "route_endpoint_tile": inserter_route_endpoint,
+            "route_endpoint_matches": endpoint_matches_route,
+        },
+        "machine": {
+            "unit_number": machine.unit_number,
+            "name": machine.name,
+            "position": machine.position,
+            "bounding_box": machine_bounds,
+            "footprint_known": machine_bounds.is_some(),
+            "required_interaction": flow.machine_interaction_name(),
+            "interaction_tile": machine_interaction_tile,
+            "interaction_intersects_footprint": machine_interaction_matches,
+        },
+    })
+}
+
+fn attach_endpoint_verification(
+    mut infrastructure: serde_json::Value,
+    endpoint: serde_json::Value,
+) -> serde_json::Value {
+    let success = report_success(&infrastructure) && report_success(&endpoint);
+    if let Some(report) = infrastructure.as_object_mut() {
+        report.insert("success".to_string(), serde_json::json!(success));
+        report.insert("endpoint_topology".to_string(), endpoint);
+    }
+    infrastructure
+}
+
+fn attach_endpoint_preflight(
+    mut preflight: serde_json::Value,
+    endpoint: serde_json::Value,
+) -> serde_json::Value {
+    let ready = preflight.get("ready").and_then(|value| value.as_bool()) == Some(true)
+        && report_success(&endpoint);
+    if let Some(report) = preflight.as_object_mut() {
+        report.insert("ready".to_string(), serde_json::json!(ready));
+        report.insert("endpoint_topology".to_string(), endpoint);
+    }
+    preflight
+}
+
 fn production_verification_summary(
     observation: &serde_json::Value,
     target_unit_number: Option<u32>,
@@ -514,24 +686,89 @@ fn mark_semantic_tool_errors(result: &mut rmcp::model::CallToolResult) {
     }
 }
 
+fn rollback_retry_order(unit_numbers: &[u32]) -> Vec<u32> {
+    let mut seen = HashSet::new();
+    unit_numbers
+        .iter()
+        .rev()
+        .copied()
+        .filter(|unit_number| seen.insert(*unit_number))
+        .collect()
+}
+
+fn rollback_pending_after_pass(attempted: &[u32], removed_this_pass: &HashSet<u32>) -> Vec<u32> {
+    attempted
+        .iter()
+        .copied()
+        .filter(|unit_number| !removed_this_pass.contains(unit_number))
+        .collect()
+}
+
 async fn rollback_exact_units(
     client: &mut FactorioClient,
     unit_numbers: &[u32],
 ) -> serde_json::Value {
+    let mut pending = rollback_retry_order(unit_numbers);
     let mut removed = Vec::new();
-    let mut errors = Vec::new();
-    for unit_number in unit_numbers.iter().rev().copied() {
-        match client.remove_entity(unit_number).await {
-            Ok(()) => removed.push(unit_number),
-            Err(error) => errors.push(serde_json::json!({
-                "unit_number": unit_number,
-                "error": error.to_string(),
-            })),
+    let mut last_errors = HashMap::new();
+    let mut attempts = Vec::new();
+    let mut pass = 0_u32;
+
+    // Reverse-order rollback can encounter a remote belt before a nearer belt
+    // whose removal opens the physical approach. Retry only still-pending exact
+    // units after every progress-making pass. A zero-progress pass terminates
+    // with the real errors instead of pretending rollback succeeded.
+    while !pending.is_empty() {
+        pass += 1;
+        let pass_units = pending;
+        let mut removed_this_pass = HashSet::new();
+        for unit_number in pass_units.iter().copied() {
+            match client.remove_entity(unit_number).await {
+                Ok(()) => {
+                    removed_this_pass.insert(unit_number);
+                    removed.push(unit_number);
+                    last_errors.remove(&unit_number);
+                    attempts.push(serde_json::json!({
+                        "pass": pass,
+                        "unit_number": unit_number,
+                        "success": true,
+                    }));
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    last_errors.insert(unit_number, error.clone());
+                    attempts.push(serde_json::json!({
+                        "pass": pass,
+                        "unit_number": unit_number,
+                        "success": false,
+                        "error": error,
+                    }));
+                }
+            }
+        }
+        pending = rollback_pending_after_pass(&pass_units, &removed_this_pass);
+        if removed_this_pass.is_empty() {
+            break;
         }
     }
+    let errors: Vec<_> = pending
+        .iter()
+        .map(|unit_number| {
+            serde_json::json!({
+                "unit_number": unit_number,
+                "error": last_errors
+                    .get(unit_number)
+                    .cloned()
+                    .unwrap_or_else(|| "rollback failed without an error detail".to_string()),
+            })
+        })
+        .collect();
     serde_json::json!({
         "success": errors.is_empty(),
         "removed_units": removed,
+        "pending_units": pending,
+        "passes": pass,
+        "attempts": attempts,
         "errors": errors,
     })
 }
@@ -718,6 +955,28 @@ async fn observe_production(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecipeRestoreAction<'a> {
+    Set(&'a str),
+    Clear,
+}
+
+impl RecipeRestoreAction<'_> {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Set(_) => "set",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+fn recipe_restore_action(recipe: Option<&str>) -> RecipeRestoreAction<'_> {
+    match recipe {
+        Some(recipe) => RecipeRestoreAction::Set(recipe),
+        None => RecipeRestoreAction::Clear,
+    }
+}
+
 async fn rollback_controller_transaction(
     client: &mut FactorioClient,
     unit_numbers: &[u32],
@@ -739,17 +998,25 @@ async fn rollback_controller_transaction(
     }
 
     let recipe = if let Some((unit_number, recipe)) = recipe_restore {
-        let recipe_name = recipe.unwrap_or_default();
-        match client.set_recipe(unit_number, &recipe_name).await {
+        let action = recipe_restore_action(recipe.as_deref());
+        let restore_result = match action {
+            RecipeRestoreAction::Set(recipe_name) => {
+                client.set_recipe(unit_number, recipe_name).await
+            }
+            RecipeRestoreAction::Clear => client.clear_recipe(unit_number).await,
+        };
+        match restore_result {
             Ok(()) => serde_json::json!({
                 "success": true,
                 "unit_number": unit_number,
-                "restored_recipe": if recipe_name.is_empty() { serde_json::Value::Null } else { serde_json::json!(recipe_name) },
+                "operation": action.operation(),
+                "restored_recipe": recipe,
             }),
             Err(error) => serde_json::json!({
                 "success": false,
                 "unit_number": unit_number,
-                "restored_recipe": if recipe_name.is_empty() { serde_json::Value::Null } else { serde_json::json!(recipe_name) },
+                "operation": action.operation(),
+                "restored_recipe": recipe,
                 "error": error.to_string(),
             }),
         }
@@ -933,15 +1200,17 @@ struct ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        automation_repair_hint, compound_route_preflight, execute_lua_refusal,
-        existing_belt_compatibility, flow_lookup, flow_scan_area, fuel_topology_verification,
-        incremental_infrastructure_verification, is_machine_output_source,
+        attach_endpoint_preflight, automation_repair_hint, compound_route_preflight,
+        execute_lua_refusal, existing_belt_compatibility, flow_lookup, flow_scan_area,
+        fuel_topology_verification, incremental_infrastructure_verification,
+        inserter_machine_endpoint_verification, is_machine_output_source,
         machine_output_build_args, machine_side_layout, model_safe_payload, parse_controller_steps,
         production_observation_json, production_unit_verified, production_verification_json,
         production_verification_summary, raw_lua_enabled, ready_fuel_supply_args,
+        recipe_restore_action, rollback_pending_after_pass, rollback_retry_order,
         route_belt_failure_json, route_material_shortfall, route_segment_waypoint,
-        tool_text_indicates_error, BuildFuelSupplyParams, FactorioMcp, RouteBeltParams,
-        MODEL_VISIBLE_TOOLS,
+        tool_text_indicates_error, BuildFuelSupplyParams, FactorioMcp, InserterMachineFlow,
+        RecipeRestoreAction, RouteBeltParams, MODEL_VISIBLE_TOOLS,
     };
     use factorioctl::analyze::EntityLookup;
     use factorioctl::world::{
@@ -1177,6 +1446,132 @@ mod tests {
         assert_eq!(report["inserter"]["exists"], true);
         assert_eq!(report["inserter"]["direction_matches"], false);
         assert_eq!(report["inserter"]["matches_intent"], false);
+    }
+
+    fn endpoint_test_machine(name: &str, entity_type: &str) -> Entity {
+        Entity {
+            unit_number: Some(900),
+            name: name.to_string(),
+            entity_type: Some(entity_type.to_string()),
+            position: Position::new(11.5, 11.5),
+            direction: Direction::North.to_factorio(),
+            health: Some(300.0),
+            force: Some("player".to_string()),
+            bounding_box: Some(Area::new(10.0, 10.0, 13.0, 13.0)),
+        }
+    }
+
+    fn endpoint_test_route(start: GridPos, goal: GridPos) -> serde_json::Value {
+        serde_json::json!({
+            "success": true,
+            "complete_route": true,
+            "topology": {
+                "connected": true,
+                "start_tile": start,
+                "goal_tile": goal,
+            },
+        })
+    }
+
+    #[test]
+    fn input_endpoint_proof_requires_route_goal_pickup_and_machine_drop() {
+        let lab = endpoint_test_machine("lab", "lab");
+        let route = endpoint_test_route(GridPos::new(0, 8), GridPos::new(11, 8));
+        let valid = inserter_machine_endpoint_verification(
+            &route,
+            Some(Position::new(11.5, 9.5)),
+            Some(Direction::North),
+            &lab,
+            InserterMachineFlow::Input,
+            "planned",
+        );
+
+        assert_eq!(valid["success"], true);
+        assert_eq!(valid["flow"], "input_to_machine");
+        assert_eq!(valid["route"]["required_endpoint"], "goal");
+        assert_eq!(valid["inserter"]["pickup_tile"]["x"], 11);
+        assert_eq!(valid["inserter"]["pickup_tile"]["y"], 8);
+        assert_eq!(valid["inserter"]["route_endpoint_matches"], true);
+        assert_eq!(valid["machine"]["interaction_intersects_footprint"], true);
+
+        let remote = inserter_machine_endpoint_verification(
+            &route,
+            Some(Position::new(40.5, 40.5)),
+            Some(Direction::North),
+            &lab,
+            InserterMachineFlow::Input,
+            "planned",
+        );
+        assert_eq!(remote["success"], false);
+        assert_eq!(remote["inserter"]["route_endpoint_matches"], false);
+        assert_eq!(remote["machine"]["interaction_intersects_footprint"], false);
+
+        let admitted =
+            attach_endpoint_preflight(serde_json::json!({"ready": true, "errors": []}), remote);
+        assert_eq!(admitted["ready"], false);
+        assert_eq!(admitted["endpoint_topology"]["success"], false);
+    }
+
+    #[test]
+    fn output_endpoint_proof_requires_machine_pickup_and_route_start_drop() {
+        let assembler = endpoint_test_machine("assembling-machine-1", "assembling-machine");
+        let route = endpoint_test_route(GridPos::new(11, 8), GridPos::new(20, 8));
+        let valid = inserter_machine_endpoint_verification(
+            &route,
+            Some(Position::new(11.5, 9.5)),
+            Some(Direction::South),
+            &assembler,
+            InserterMachineFlow::Output,
+            "persisted",
+        );
+
+        assert_eq!(valid["success"], true);
+        assert_eq!(valid["flow"], "output_from_machine");
+        assert_eq!(valid["route"]["required_endpoint"], "start");
+        assert_eq!(valid["inserter"]["drop_tile"]["x"], 11);
+        assert_eq!(valid["inserter"]["drop_tile"]["y"], 8);
+        assert_eq!(valid["inserter"]["route_endpoint_matches"], true);
+        assert_eq!(valid["machine"]["interaction_intersects_footprint"], true);
+
+        let disconnected = inserter_machine_endpoint_verification(
+            &endpoint_test_route(GridPos::new(12, 8), GridPos::new(20, 8)),
+            Some(Position::new(11.5, 9.5)),
+            Some(Direction::South),
+            &assembler,
+            InserterMachineFlow::Output,
+            "persisted",
+        );
+        assert_eq!(disconnected["success"], false);
+        assert_eq!(disconnected["inserter"]["route_endpoint_matches"], false);
+        assert_eq!(
+            disconnected["machine"]["interaction_intersects_footprint"],
+            true
+        );
+    }
+
+    #[test]
+    fn recipe_rollback_restores_named_and_absent_recipes_distinctly() {
+        assert_eq!(
+            recipe_restore_action(Some("iron-gear-wheel")),
+            RecipeRestoreAction::Set("iron-gear-wheel")
+        );
+        assert_eq!(recipe_restore_action(None), RecipeRestoreAction::Clear);
+        assert_eq!(recipe_restore_action(Some("x")).operation(), "set");
+        assert_eq!(recipe_restore_action(None).operation(), "clear");
+    }
+
+    #[test]
+    fn rollback_retry_plan_retries_only_pending_exact_units_in_reverse_order() {
+        let first_pass = rollback_retry_order(&[55, 56, 57, 58, 59, 60, 59]);
+        assert_eq!(first_pass, vec![59, 60, 58, 57, 56, 55]);
+
+        let removed_this_pass = HashSet::from([60, 56, 55]);
+        let second_pass = rollback_pending_after_pass(&first_pass, &removed_this_pass);
+        assert_eq!(second_pass, vec![59, 58, 57]);
+
+        let removed_second_pass = HashSet::from([58, 57]);
+        let final_pass = rollback_pending_after_pass(&second_pass, &removed_second_pass);
+        assert_eq!(final_pass, vec![59]);
     }
 
     #[test]
@@ -7184,7 +7579,7 @@ impl FactorioMcp {
         };
 
         let result = if params.recipe.is_empty() {
-            match client.set_recipe(params.unit_number, "").await {
+            match client.clear_recipe(params.unit_number).await {
                 Ok(()) => "Recipe cleared".to_string(),
                 Err(e) => format!("Error: {}", e),
             }
@@ -8311,6 +8706,15 @@ impl FactorioMcp {
             Ok(preflight) => preflight,
             Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
         };
+        let planned_endpoint_topology = inserter_machine_endpoint_verification(
+            &route,
+            Some(inserter_position),
+            Some(inserter_direction),
+            &lab,
+            InserterMachineFlow::Input,
+            "planned",
+        );
+        let preflight = attach_endpoint_preflight(preflight, planned_endpoint_topology);
         let preflight_ready = preflight["ready"].as_bool() == Some(true);
 
         if params.dry_run {
@@ -8345,7 +8749,7 @@ impl FactorioMcp {
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "compound_preflight_failed",
-                "error": "Lab route, shared materials, or inserter placement failed preflight. Nothing was placed.",
+                "error": "Lab route, endpoint topology, shared materials, or inserter placement failed preflight. Nothing was placed.",
                 "route": route,
                 "preflight": preflight,
             });
@@ -8422,13 +8826,23 @@ impl FactorioMcp {
             inserter_position,
             inserter_direction,
         );
+        let persisted_endpoint_topology = inserter_machine_endpoint_verification(
+            &route,
+            persisted_inserter.as_ref().map(|entity| entity.position),
+            persisted_inserter.as_ref().map(Entity::direction_enum),
+            &lab,
+            InserterMachineFlow::Input,
+            "persisted",
+        );
+        let infrastructure_verified =
+            attach_endpoint_verification(infrastructure_verified, persisted_endpoint_topology);
         if !report_success(&infrastructure_verified) {
             let rollback =
                 rollback_controller_transaction(&mut client, &transaction_units, &[], None).await;
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "infrastructure_verification_failed",
-                "error": "Lab feed could not verify its complete route and exact inserter placement; the route and inserter were rolled back.",
+                "error": "Lab feed could not verify its complete route, exact inserter placement, and route-to-lab endpoint topology; the route and inserter were rolled back.",
                 "route": route,
                 "infrastructure_verified": infrastructure_verified,
                 "rollback": rollback,
@@ -8595,6 +9009,15 @@ impl FactorioMcp {
             Ok(preflight) => preflight,
             Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
         };
+        let planned_endpoint_topology = inserter_machine_endpoint_verification(
+            &route,
+            Some(inserter_position),
+            Some(inserter_direction),
+            &assembler,
+            InserterMachineFlow::Input,
+            "planned",
+        );
+        let preflight = attach_endpoint_preflight(preflight, planned_endpoint_topology);
         let preflight_ready = preflight["ready"].as_bool() == Some(true);
 
         if params.dry_run {
@@ -8644,7 +9067,7 @@ impl FactorioMcp {
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "compound_preflight_failed",
-                "error": "Assembler feed route, shared materials, or inserter placement failed preflight. Nothing was changed.",
+                "error": "Assembler feed route, endpoint topology, shared materials, or inserter placement failed preflight. Nothing was changed.",
                 "route": route,
                 "preflight": preflight,
             });
@@ -8774,6 +9197,16 @@ impl FactorioMcp {
             inserter_position,
             inserter_direction,
         );
+        let persisted_endpoint_topology = inserter_machine_endpoint_verification(
+            &route,
+            persisted_inserter.as_ref().map(|entity| entity.position),
+            persisted_inserter.as_ref().map(Entity::direction_enum),
+            &assembler,
+            InserterMachineFlow::Input,
+            "persisted",
+        );
+        let infrastructure_verified =
+            attach_endpoint_verification(infrastructure_verified, persisted_endpoint_topology);
         if !report_success(&infrastructure_verified) {
             let recipe_restore = previous_recipe
                 .clone()
@@ -8788,7 +9221,7 @@ impl FactorioMcp {
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "infrastructure_verification_failed",
-                "error": "Assembler feed could not verify its complete route and exact inserter placement; the route, inserter, and recipe change were rolled back.",
+                "error": "Assembler feed could not verify its complete route, exact inserter placement, and route-to-assembler endpoint topology; the route, inserter, and recipe change were rolled back.",
                 "route": route,
                 "infrastructure_verified": infrastructure_verified,
                 "rollback": rollback,
@@ -9010,6 +9443,15 @@ impl FactorioMcp {
             Ok(preflight) => preflight,
             Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
         };
+        let planned_endpoint_topology = inserter_machine_endpoint_verification(
+            &route,
+            Some(inserter_position),
+            Some(inserter_direction),
+            &source_machine,
+            InserterMachineFlow::Output,
+            "planned",
+        );
+        let preflight = attach_endpoint_preflight(preflight, planned_endpoint_topology);
         let preflight_ready = preflight["ready"].as_bool() == Some(true);
 
         if params.dry_run {
@@ -9054,7 +9496,7 @@ impl FactorioMcp {
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "compound_preflight_failed",
-                "error": "Output route, shared materials, or inserter placement failed preflight. Nothing was placed.",
+                "error": "Output route, endpoint topology, shared materials, or inserter placement failed preflight. Nothing was placed.",
                 "route": route,
                 "preflight": preflight,
             });
@@ -9131,13 +9573,23 @@ impl FactorioMcp {
             inserter_position,
             inserter_direction,
         );
+        let persisted_endpoint_topology = inserter_machine_endpoint_verification(
+            &route,
+            persisted_inserter.as_ref().map(|entity| entity.position),
+            persisted_inserter.as_ref().map(Entity::direction_enum),
+            &source_machine,
+            InserterMachineFlow::Output,
+            "persisted",
+        );
+        let infrastructure_verified =
+            attach_endpoint_verification(infrastructure_verified, persisted_endpoint_topology);
         if !report_success(&infrastructure_verified) {
             let rollback =
                 rollback_controller_transaction(&mut client, &transaction_units, &[], None).await;
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "infrastructure_verification_failed",
-                "error": "Machine output could not verify its complete route and exact inserter placement; the route and inserter were rolled back.",
+                "error": "Machine output could not verify its complete route, exact inserter placement, and machine-to-route endpoint topology; the route and inserter were rolled back.",
                 "route": route,
                 "infrastructure_verified": infrastructure_verified,
                 "rollback": rollback,

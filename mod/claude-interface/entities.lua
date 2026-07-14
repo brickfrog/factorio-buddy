@@ -302,8 +302,155 @@ end
 
 local coal_upstream_proof
 
+local function mining_drill_energy_source(entity)
+    local burner_ok, burner = pcall(function() return entity.burner end)
+    if burner_ok and burner then return "burner" end
+
+    local prototype = entity and entity.prototype or nil
+    local electric_ok, electric = pcall(function()
+        return prototype and prototype.electric_energy_source_prototype
+    end)
+    if electric_ok and electric then return "electric" end
+    return "unsupported"
+end
+
+local function electric_coal_drill_power_proof(entity)
+    local operational = operational_coal_drill(entity)
+    local connected_ok, connected = pcall(function()
+        return entity.is_connected_to_electric_network()
+    end)
+    local energy_ok, energy = pcall(function() return entity.energy end)
+    local network_ok, network_id = pcall(function() return entity.electric_network_id end)
+    local powered = operational
+        and connected_ok
+        and connected == true
+        and energy_ok
+        and (tonumber(energy) or 0) > 0
+
+    local reason = "powered_operational_electric_coal_drill"
+    if not operational then
+        reason = "electric_coal_drill_not_operational"
+    elseif not connected_ok or connected ~= true then
+        reason = "electric_coal_drill_not_connected"
+    elseif not energy_ok or (tonumber(energy) or 0) <= 0 then
+        reason = "electric_coal_drill_no_energy"
+    end
+
+    return {
+        certified = powered,
+        live = powered,
+        reason = reason,
+        energy_source = "electric",
+        connected = connected_ok and connected == true,
+        energy = energy_ok and energy or nil,
+        electric_network_id = network_ok and network_id or nil,
+        producer_unit_number = entity.unit_number,
+        hops = 0,
+    }
+end
+
+local function burner_coal_drill_fuel_proof(surface, force, drill, state)
+    state.producer_frames = state.producer_frames or {}
+    local frame = {
+        producer_unit_number = drill.unit_number,
+        targets = {},
+    }
+    -- Only a return to the path that already proved this drill's coal output
+    -- closes a self-sustaining producer cycle. A new loop encountered solely
+    -- inside the drill's fuel path is just manually stocked transport and must
+    -- remain uncertified.
+    for key in pairs(state.visited) do frame.targets[key] = true end
+    table.insert(state.producer_frames, frame)
+
+    local best = nil
+    local function consider(proof)
+        if proof and proof.certified
+            and (not best or (proof.live and not best.live))
+        then
+            best = proof
+        end
+    end
+
+    for _, source in pairs(surface.find_entities_filtered{
+        type = "mining-drill",
+        force = force,
+        area = expanded_box(drill.bounding_box, 4),
+    }) do
+        if source ~= drill and point_in_bounding_box(source.drop_position, drill.bounding_box) then
+            local proof = coal_upstream_proof(surface, force, source, state)
+            if proof.certified then
+                consider({
+                    certified = true,
+                    live = proof.live == true,
+                    reason = "direct_durable_coal_drill_fuel",
+                    producer_unit_number = proof.producer_unit_number,
+                    via_unit_number = source.unit_number,
+                    hops = (proof.hops or 0) + 1,
+                    upstream_proof = proof,
+                })
+            end
+        end
+    end
+
+    for _, feeder in pairs(surface.find_entities_filtered{
+        type = "inserter",
+        force = force,
+        area = expanded_box(drill.bounding_box, 3),
+    }) do
+        local feeder_status = entity_status_string(feeder)
+        if point_in_bounding_box(feeder.drop_position, drill.bounding_box)
+            and inserter_can_operate(feeder_status)
+        then
+            local pickup = feeder.pickup_position
+            local pickup_area = {{pickup.x - 0.25, pickup.y - 0.25}, {pickup.x + 0.25, pickup.y + 0.25}}
+            for _, source in pairs(surface.find_entities_filtered{area = pickup_area, force = force}) do
+                if source ~= feeder
+                    and source ~= drill
+                    and point_in_bounding_box(pickup, source.bounding_box)
+                then
+                    local proof = coal_upstream_proof(surface, force, source, state)
+                    if proof.certified then
+                        consider({
+                            certified = true,
+                            live = proof.live == true,
+                            reason = "operational_inserter_durable_fuel",
+                            producer_unit_number = proof.producer_unit_number,
+                            via_unit_number = feeder.unit_number,
+                            inserter_status = feeder_status,
+                            hops = (proof.hops or 0) + 1,
+                            upstream_proof = proof,
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    table.remove(state.producer_frames)
+    if best then return best end
+
+    local fuel_count = inventory_total(safe_fuel_inventory(drill)) or 0
+    local remaining_ok, remaining = pcall(function()
+        return drill.burner and drill.burner.remaining_burning_fuel or 0
+    end)
+    remaining = remaining_ok and (tonumber(remaining) or 0) or 0
+    return {
+        certified = false,
+        live = false,
+        reason = (fuel_count > 0 or remaining > 0)
+            and "manual_burner_fuel_buffer"
+            or "burner_coal_drill_fuel_not_durable",
+        energy_source = "burner",
+        fuel_count = fuel_count,
+        remaining_burning_fuel = remaining,
+        producer_unit_number = drill.unit_number,
+        hops = 0,
+    }
+end
+
 coal_upstream_proof = function(surface, force, entity, state)
-    state = state or {visited = {}, cache = {}, nodes = 0, max_nodes = 512}
+    state = state or {visited = {}, cache = {}, nodes = 0, max_nodes = 512, producer_frames = {}}
+    state.producer_frames = state.producer_frames or {}
     if not (entity and entity.valid) then
         return {certified = false, live = false, reason = "invalid_source", hops = 0}
     end
@@ -311,6 +458,19 @@ coal_upstream_proof = function(surface, force, entity, state)
     local key = entity_trace_key(entity)
     if state.cache[key] then return state.cache[key] end
     if state.visited[key] then
+        for index = #state.producer_frames, 1, -1 do
+            local frame = state.producer_frames[index]
+            if frame.targets[key] then
+                return {
+                    certified = true,
+                    live = true,
+                    reason = "closed_self_sustaining_coal_cycle",
+                    producer_unit_number = frame.producer_unit_number,
+                    cycle_unit_number = entity.unit_number,
+                    hops = 0,
+                }
+            end
+        end
         return {certified = false, live = false, reason = "transport_cycle", hops = 0}
     end
     if state.nodes >= state.max_nodes then
@@ -326,11 +486,43 @@ coal_upstream_proof = function(surface, force, entity, state)
     end
 
     if entity.type == "mining-drill" then
-        local certified = operational_coal_drill(entity)
+        if not (entity.mining_target and entity.mining_target.name == "coal") then
+            return finish({
+                certified = false,
+                live = false,
+                reason = "mining_drill_not_on_coal",
+                producer_unit_number = entity.unit_number,
+                hops = 0,
+            })
+        end
+
+        local energy_source = mining_drill_energy_source(entity)
+        if energy_source == "electric" then
+            return finish(electric_coal_drill_power_proof(entity))
+        end
+        if energy_source == "burner" then
+            local fuel_proof = burner_coal_drill_fuel_proof(surface, force, entity, state)
+            local operational = operational_coal_drill(entity)
+            return finish({
+                certified = fuel_proof.certified == true,
+                live = fuel_proof.certified == true and fuel_proof.live == true and operational,
+                reason = fuel_proof.certified
+                    and (operational
+                        and "durably_fueled_operational_burner_coal_drill"
+                        or "durably_fueled_burner_coal_drill_not_operational")
+                    or "burner_coal_drill_fuel_not_durable",
+                energy_source = "burner",
+                operational = operational,
+                producer_unit_number = entity.unit_number,
+                fuel_proof = fuel_proof,
+                hops = (fuel_proof.hops or 0) + 1,
+            })
+        end
         return finish({
-            certified = certified,
-            live = certified,
-            reason = certified and "operational_coal_drill" or "coal_drill_not_operational",
+            certified = false,
+            live = false,
+            reason = "unsupported_coal_drill_energy_source",
+            energy_source = energy_source,
             producer_unit_number = entity.unit_number,
             hops = 0,
         })
@@ -353,26 +545,30 @@ coal_upstream_proof = function(surface, force, entity, state)
         and (belt_line_item_count(entity, "coal") or 0)
         or (inventory_item_count(first_inventory(entity, {defines.inventory.chest}), "coal") or 0)
 
-    if supported_belt then
-        for _, drill in pairs(surface.find_entities_filtered{
-            type = "mining-drill",
-            force = force,
-            area = expanded_box(entity.bounding_box, 4),
-        }) do
-            if operational_coal_drill(drill)
-                and point_in_bounding_box(drill.drop_position, entity.bounding_box)
-            then
+    local failed_producer_proof = nil
+    for _, drill in pairs(surface.find_entities_filtered{
+        type = "mining-drill",
+        force = force,
+        area = expanded_box(entity.bounding_box, 4),
+    }) do
+        if point_in_bounding_box(drill.drop_position, entity.bounding_box) then
+            local proof = coal_upstream_proof(surface, force, drill, state)
+            if proof.certified then
                 return finish({
                     certified = true,
-                    live = coal_count > 0,
-                    reason = coal_count > 0 and "direct_operational_coal_drill" or "upstream_ready_but_source_empty",
+                    live = coal_count > 0 and proof.live,
+                    reason = coal_count > 0 and "direct_durable_coal_drill" or "upstream_ready_but_source_empty",
                     producer_unit_number = drill.unit_number,
                     via_unit_number = entity.unit_number,
-                    hops = 1,
+                    hops = (proof.hops or 0) + 1,
+                    upstream_proof = proof,
                 })
             end
+            failed_producer_proof = failed_producer_proof or proof
         end
+    end
 
+    if supported_belt then
         for _, upstream in pairs(surface.find_entities_filtered{
             type = "transport-belt",
             force = force,
@@ -430,7 +626,10 @@ coal_upstream_proof = function(surface, force, entity, state)
     return finish({
         certified = false,
         live = false,
-        reason = coal_count > 0 and "stocked_without_proven_upstream" or "empty_without_proven_upstream",
+        reason = failed_producer_proof
+            and "coal_drill_upstream_not_durable"
+            or (coal_count > 0 and "stocked_without_proven_upstream" or "empty_without_proven_upstream"),
+        upstream_proof = failed_producer_proof,
         hops = 0,
     })
 end
@@ -868,18 +1067,8 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
             end
 
             if entity.type == "mining-drill" and entity.mining_target and entity.mining_target.name == "coal" then
-                local source_tile = route_source_tile(entity)
-                table.insert(coal_drills, {
-                    unit_number = entity.unit_number,
-                    name = entity.name,
-                    position = pos_table(entity.position),
-                    route_position = pos_table(route_source_position(entity)),
-                    route_tile = source_tile,
-                    status = entity_status_string(entity),
-                    durable = operational_coal_drill(entity),
-                    operational = entity_status_string(entity) == "working"
-                        or entity_status_string(entity) == "waiting_for_space_in_destination",
-                })
+                local source = coal_source_record(surface, force, entity, source_proof_cache)
+                if source then table.insert(coal_drills, source) end
             elseif entity.type == "transport-belt"
                 or entity.type == "underground-belt"
                 or entity.type == "splitter"

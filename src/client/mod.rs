@@ -448,16 +448,7 @@ impl FactorioClient {
         // Query entities for structure obstacles
         let entities = self.find_entities(area, None, None).await?;
         for entity in entities {
-            // Skip resources (can build on top of ore)
-            if entity.entity_type.as_deref() == Some("resource") {
-                continue;
-            }
-            // Skip character
-            if entity.name == "character" {
-                continue;
-            }
-            // Skip items on ground
-            if entity.entity_type.as_deref() == Some("item-entity") {
+            if !entity_blocks_character_path(&entity) {
                 continue;
             }
 
@@ -1247,23 +1238,34 @@ impl FactorioClient {
         Ok(result.extracted.unwrap_or(0))
     }
 
-    /// Set recipe on an assembling machine
-    pub async fn set_recipe(&mut self, unit_number: u32, recipe: &str) -> Result<()> {
+    async fn set_recipe_value(&mut self, unit_number: u32, recipe: Option<&str>) -> Result<()> {
         let position = self.get_entity(unit_number).await?.position;
         self.approach_position(position, PROXIMITY_RANGE_INTERACT)
             .await?;
+        let recipe = recipe.map_or(Value::Null, |name| json!(name));
         let response = self
             .call_remote(
                 "set_recipe",
-                &[
-                    json!(self.agent_id.as_str()),
-                    json!(unit_number),
-                    json!(recipe),
-                ],
+                &[json!(self.agent_id.as_str()), json!(unit_number), recipe],
             )
             .await?;
         ensure_lua_success(&response)?;
         Ok(())
+    }
+
+    /// Set recipe on an assembling machine.
+    pub async fn set_recipe(&mut self, unit_number: u32, recipe: &str) -> Result<()> {
+        if recipe.is_empty() {
+            self.clear_recipe(unit_number).await
+        } else {
+            self.set_recipe_value(unit_number, Some(recipe)).await
+        }
+    }
+
+    /// Clear the recipe on an assembling machine using a JSON null/Lua nil
+    /// recipe argument. An empty recipe name is not a valid Factorio recipe.
+    pub async fn clear_recipe(&mut self, unit_number: u32) -> Result<()> {
+        self.set_recipe_value(unit_number, None).await
     }
 
     /// Get the recipe currently configured on a crafting machine, if any.
@@ -1427,7 +1429,11 @@ impl FactorioClient {
     async fn approach_position(&mut self, target: Position, max_distance: f64) -> Result<()> {
         let current = self.get_character_position().await?;
         if current.distance(&target) > max_distance {
-            let result = self.walk_to(target, false).await?;
+            // Mutations remain character-bound, but a straight line can run
+            // through the very machine or factory row being repaired. Use the
+            // shared collision-map/A* walker; it still drives the character's
+            // ordinary walking state and never teleports.
+            let result = self.walk_to_pathfind(target, 16).await?;
             if result.final_position.distance(&target) > max_distance {
                 anyhow::bail!(
                     "Could not move within interaction range of ({:.1}, {:.1}): {}",
@@ -1895,6 +1901,22 @@ impl FactorioClient {
     }
 }
 
+/// Whether an entity should occupy tiles in the character walking map.
+///
+/// Entity bounding boxes are placement/collision metadata, but surface
+/// transport belts deliberately remain walkable by characters in Factorio.
+/// Treating their boxes as walls turns an ordinary belt row into an artificial
+/// impassable barrier for physical interaction and rollback movement.
+fn entity_blocks_character_path(entity: &Entity) -> bool {
+    if entity.name == "character" {
+        return false;
+    }
+    !matches!(
+        entity.entity_type.as_deref(),
+        Some("resource" | "item-entity" | "entity-ghost" | "tile-ghost" | "transport-belt")
+    )
+}
+
 /// Get collision padding for entity types based on their size
 /// Returns the half-size rounded down (0 for 1x1, 1 for 2x2 or 3x3)
 fn entity_collision_padding(entity_name: &str) -> i32 {
@@ -1931,6 +1953,49 @@ fn entity_collision_padding(entity_name: &str) -> i32 {
 mod tests {
     use super::*;
 
+    fn collision_test_entity(name: &str, entity_type: &str) -> Entity {
+        Entity {
+            unit_number: Some(1),
+            name: name.to_string(),
+            entity_type: Some(entity_type.to_string()),
+            position: Position::new(0.5, 0.5),
+            direction: 0,
+            health: Some(100.0),
+            force: Some("player".to_string()),
+            bounding_box: Some(Area::new(0.1, 0.1, 0.9, 0.9)),
+        }
+    }
+
+    #[test]
+    fn character_collision_map_keeps_surface_transport_belts_walkable() {
+        for name in [
+            "transport-belt",
+            "fast-transport-belt",
+            "express-transport-belt",
+        ] {
+            assert!(
+                !entity_blocks_character_path(&collision_test_entity(name, "transport-belt")),
+                "surface belt {name} should not become an artificial walking wall"
+            );
+        }
+
+        assert!(entity_blocks_character_path(&collision_test_entity(
+            "assembling-machine-1",
+            "assembling-machine"
+        )));
+        assert!(entity_blocks_character_path(&collision_test_entity(
+            "underground-belt",
+            "underground-belt"
+        )));
+        assert!(!entity_blocks_character_path(&collision_test_entity(
+            "iron-ore", "resource"
+        )));
+        assert!(!entity_blocks_character_path(&collision_test_entity(
+            "entity-ghost",
+            "entity-ghost"
+        )));
+    }
+
     #[test]
     fn claude_command_uses_json_envelope_with_explicit_arg_count() {
         let command = claude_command(
@@ -1955,6 +2020,31 @@ mod tests {
             !command.contains("remote.call") && !command.contains("/silent-command"),
             "normal remote requests should not generate Lua"
         );
+    }
+
+    #[test]
+    fn recipe_remote_protocol_distinguishes_set_from_clear() {
+        let set = claude_command(
+            "set_recipe",
+            &[json!("default"), json!(47), json!("copper-cable")],
+        );
+        let clear = claude_command("set_recipe", &[json!("default"), json!(47), Value::Null]);
+        let set: Value = serde_json::from_str(
+            set.strip_prefix("/claude ")
+                .expect("set command should use the /claude envelope"),
+        )
+        .expect("set command should contain JSON");
+        let clear: Value = serde_json::from_str(
+            clear
+                .strip_prefix("/claude ")
+                .expect("clear command should use the /claude envelope"),
+        )
+        .expect("clear command should contain JSON");
+
+        assert_eq!(set["args"][2], "copper-cable");
+        assert!(clear["args"][2].is_null());
+        assert_eq!(set["n"], 3);
+        assert_eq!(clear["n"], 3);
     }
 
     #[test]
