@@ -127,9 +127,7 @@ impl BeltGraph {
     pub fn can_receive_from(&self, target: &TilePos, source: &TilePos) -> bool {
         self.nodes.get(target).is_some_and(|target| {
             let [side_left, side_right] = target.side_input_tiles();
-            *source == target.primary_input_tile()
-                || *source == side_left
-                || *source == side_right
+            *source == target.primary_input_tile() || *source == side_left || *source == side_right
         })
     }
 
@@ -241,11 +239,8 @@ mod tests {
         splitter.name = "splitter".to_string();
         splitter.entity_type = Some("splitter".to_string());
 
-        let graph = BeltGraph::from_entities(&[
-            make_belt(0, 0, Direction::East),
-            underground,
-            splitter,
-        ]);
+        let graph =
+            BeltGraph::from_entities(&[make_belt(0, 0, Direction::East), underground, splitter]);
 
         assert_eq!(graph.len(), 1);
         assert!(graph.downstream_of(&TilePos::new(0, 0)).is_empty());

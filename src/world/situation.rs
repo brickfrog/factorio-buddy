@@ -31,6 +31,7 @@ pub struct SituationReport {
     pub radius: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_situation_report(
     position: Position,
     health: Option<f64>,

@@ -204,12 +204,7 @@ mod tests {
 
     #[test]
     fn inserter_resolves_edge_tile_of_multitile_machine() {
-        let mut assembler = make_typed_entity(
-            3,
-            0,
-            "assembling-machine-1",
-            "assembling-machine",
-        );
+        let mut assembler = make_typed_entity(3, 0, "assembling-machine-1", "assembling-machine");
         assembler.position = Position::new(3.5, 0.5);
         assembler.bounding_box = Some(crate::world::Area::new(2.0, -1.0, 5.0, 2.0));
         let entities = vec![
@@ -221,7 +216,10 @@ mod tests {
         let result = analyze_inserters(&entities);
         assert_eq!(result.len(), 1);
         assert_eq!(
-            result[0].dropoff_target.as_ref().map(|target| target.name.as_str()),
+            result[0]
+                .dropoff_target
+                .as_ref()
+                .map(|target| target.name.as_str()),
             Some("assembling-machine-1")
         );
     }

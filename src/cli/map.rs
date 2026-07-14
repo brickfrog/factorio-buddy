@@ -90,6 +90,7 @@ impl MapCommand {
 
         // Query power coverage if requested
         let power_coverage = if self.show_power {
+            let agent_id = client.agent_id().as_str().to_string();
             match client
                 .call_remote(
                     "get_power_coverage",
@@ -97,6 +98,7 @@ impl MapCommand {
                         serde_json::json!(center.x as i32),
                         serde_json::json!(center.y as i32),
                         serde_json::json!(self.radius),
+                        serde_json::json!(agent_id),
                     ],
                 )
                 .await

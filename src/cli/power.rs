@@ -234,6 +234,7 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
         }
 
         PowerSubcommand::Status { x, y, radius } => {
+            let agent_id = client.agent_id().as_str().to_string();
             let response = client
                 .call_remote(
                     "get_power_status",
@@ -241,6 +242,7 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
                         serde_json::json!(x),
                         serde_json::json!(y),
                         serde_json::json!(radius),
+                        serde_json::json!(agent_id),
                     ],
                 )
                 .await?;
@@ -248,6 +250,7 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
         }
 
         PowerSubcommand::Issues { x, y, radius } => {
+            let agent_id = client.agent_id().as_str().to_string();
             let response = client
                 .call_remote(
                     "find_power_issues",
@@ -255,6 +258,7 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
                         serde_json::json!(x),
                         serde_json::json!(y),
                         serde_json::json!(radius),
+                        serde_json::json!(agent_id),
                     ],
                 )
                 .await?;
@@ -262,6 +266,7 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
         }
 
         PowerSubcommand::Networks { x, y, radius } => {
+            let agent_id = client.agent_id().as_str().to_string();
             let response = client
                 .call_remote(
                     "get_power_networks",
@@ -269,6 +274,7 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
                         serde_json::json!(x),
                         serde_json::json!(y),
                         serde_json::json!(radius),
+                        serde_json::json!(agent_id),
                     ],
                 )
                 .await?;
@@ -276,6 +282,7 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
         }
 
         PowerSubcommand::Steam { x, y, radius } => {
+            let agent_id = client.agent_id().as_str().to_string();
             let response = client
                 .call_remote(
                     "diagnose_steam_power",
@@ -283,6 +290,7 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
                         serde_json::json!(x),
                         serde_json::json!(y),
                         serde_json::json!(radius),
+                        serde_json::json!(agent_id),
                     ],
                 )
                 .await?;

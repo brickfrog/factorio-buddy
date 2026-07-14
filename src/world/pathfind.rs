@@ -43,20 +43,15 @@ impl UndergroundConfig {
 }
 
 /// Type of belt placement
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BeltKind {
     /// Normal surface belt
+    #[default]
     Surface,
     /// Underground belt entry (goes underground)
     UndergroundEntry,
     /// Underground belt exit (comes up from underground)
     UndergroundExit,
-}
-
-impl Default for BeltKind {
-    fn default() -> Self {
-        Self::Surface
-    }
 }
 
 /// Options for belt routing
@@ -114,7 +109,7 @@ impl GridPos {
     }
 
     /// Convert to world Position (tile center at x.5, y.5)
-    pub fn to_position(&self) -> Position {
+    pub fn to_position(self) -> Position {
         Position {
             x: self.x as f64 + 0.5,
             y: self.y as f64 + 0.5,
@@ -542,10 +537,7 @@ pub fn find_belt_route_with_options(
                         };
                         let tentative_g = current.g_cost + ug_cost + turn_cost;
 
-                        let current_g = g_score
-                            .get(&exit_state)
-                            .copied()
-                            .unwrap_or(f64::INFINITY);
+                        let current_g = g_score.get(&exit_state).copied().unwrap_or(f64::INFINITY);
                         if tentative_g < current_g {
                             // This underground path is better
                             came_from.insert(

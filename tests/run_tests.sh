@@ -110,13 +110,13 @@ else
 fi
 echo ""
 
-# Test 4: Teleportation
+# Test 4: Character movement through the shipped walk driver
 echo "4. Character Movement"
-OUTPUT=$("${CLI[@]}" character teleport 15,15 2>&1 || true)
-if echo "$OUTPUT" | grep -q "Teleported"; then
-    pass "character teleport"
+OUTPUT=$("${CLI[@]}" walk-to --run --pathfind 8,0 2>&1 || true)
+if echo "$OUTPUT" | grep -q "Arrived at"; then
+    pass "walk-to pathfinding"
 else
-    fail "character teleport" "$OUTPUT"
+    fail "walk-to pathfinding" "$OUTPUT"
 fi
 echo ""
 

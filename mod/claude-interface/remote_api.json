@@ -87,7 +87,6 @@
     "save_blueprint": {"args": ["agent_id", "name", "x1", "y1", "x2", "y2"], "returns": "json"},
     "pre_place_character": {"args": ["agent_id", "planet_name", "spawn_x"], "returns": "string"},
     "pre_place_character_result": {"args": ["agent_id", "planet_name", "spawn_x"], "returns": "json"},
-    "queue_rotate": {"args": ["unit_number", "direction", "surface_name"], "returns": "nil"},
     "receive_response": {"args": ["player_index", "agent_name", "text"], "returns": "nil"},
     "register_agent": {"args": ["agent_name", "label"], "returns": "nil"},
     "register_character": {"args": ["agent_id", "entity"], "returns": "entity"},

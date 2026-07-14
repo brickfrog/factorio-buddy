@@ -218,6 +218,7 @@ local function is_player_character(character)
 end
 
 function M.find(agent_id)
+    if type(agent_id) ~= "string" or agent_id == "" then return nil end
     if not storage.characters then return nil end
     local character = storage.characters[agent_id]
     if character and character.valid and not is_player_character(character) then
@@ -230,6 +231,7 @@ end
 function M.remember(agent_id, character)
     storage.characters = storage.characters or {}
     storage.factorioctl_entities = storage.factorioctl_entities or {}
+    if type(agent_id) ~= "string" or agent_id == "" then return false end
     if not (character and character.valid) or is_player_character(character) then
         storage.characters[agent_id] = nil
         return false
@@ -361,10 +363,18 @@ function M.pre_place(agent_id, planet_name, spawn_x)
     target_surface.request_to_generate_chunks({spawn_x, 0}, 4)
     target_surface.force_generate_chunk_requests()
 
+    local spawn_position = target_surface.find_non_colliding_position(
+        "character",
+        {spawn_x, 0},
+        32,
+        0.5
+    )
+    if not spawn_position then return "creation_failed" end
+
     local status = nil
     character = target_surface.create_entity{
         name = "character",
-        position = {spawn_x, 0},
+        position = spawn_position,
         force = game.forces.player,
     }
     if character then status = "created" end
@@ -383,6 +393,7 @@ function M.pre_place_result(agent_id, planet_name, spawn_x)
         agent_name = agent_id,
         requested_planet = planet_name,
         planet = character and character.valid and character.surface.name or nil,
+        position = character and character.valid and pos_table(character.position) or nil,
         status = status,
     })
 end
@@ -467,10 +478,18 @@ end
 function M.init(agent_id, x, y)
     local character = M.find(agent_id)
     if not (character and character.valid) then
-        character = game.surfaces[1].create_entity{
+        local surface = game.get_surface("nauvis")
+        if not surface then
+            for _, candidate in pairs(game.surfaces) do
+                surface = candidate
+                break
+            end
+        end
+        if not surface then return {error = "No surface available for character creation"} end
+        character = surface.create_entity{
             name = "character",
             position = {x, y},
-            force = "player",
+            force = game.forces.player,
         }
         if not character then
             return {error = "Failed to create character"}
@@ -616,28 +635,24 @@ function M.unstuck(agent_id, radius, dry_run)
 
     local target = candidates[1].position
     result.to = target
-    result.recommended_action = "teleport_character"
+    result.recommended_action = "walk_to"
     if dry_run == true then
         result.reason = "dry_run"
         return result
     end
 
-    if storage.walk_targets then storage.walk_targets[agent_id] = nil end
-    if storage.walk_state then storage.walk_state[agent_id] = nil end
-    character.walking_state = {walking = false}
-    character.mining_state = {mining = false}
-
-    if character.teleport({target.x, target.y}) then
-        M.remember(agent_id, character)
-        result.moved = true
+    local started = M.set_walk_target(agent_id, target.x, target.y)
+    if not started.success then
+        result.success = false
+        result.error = started.error or "could not start movement to clear standing position"
         result.position = pos_table(character.position)
-        result.reason = "teleported to nearest verified clear standing position"
         return result
     end
 
-    result.success = false
-    result.error = "teleport to verified clear standing position was blocked"
-    result.position = pos_table(character.position)
+    character.mining_state = {mining = false}
+    result.action_started = true
+    result.action_needed = "wait_for_walk"
+    result.reason = "walking to nearest verified clear standing position"
     return result
 end
 

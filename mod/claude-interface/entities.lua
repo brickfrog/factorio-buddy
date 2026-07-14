@@ -31,6 +31,23 @@ local function raw_entity_status(entity)
     return nil
 end
 
+-- verify_production is a machine-level diagnostic, not a census of every
+-- status-bearing entity in an area. Belts and inserters expose status too, but
+-- including them makes a working transport line look like production.
+local PRODUCTION_ENTITY_TYPES = {
+    ["assembling-machine"] = true,
+    ["furnace"] = true,
+    ["mining-drill"] = true,
+    ["lab"] = true,
+    ["rocket-silo"] = true,
+    ["agricultural-tower"] = true,
+    ["asteroid-collector"] = true,
+}
+
+local function is_production_entity(entity)
+    return entity and PRODUCTION_ENTITY_TYPES[entity.type] == true
+end
+
 function M.find_by_unit_number(unit_number)
     unit_number = tonumber(unit_number)
     if not unit_number then return nil end
@@ -101,8 +118,8 @@ function M.verify_production(surface, force, x1, y1, x2, y2)
     }
 
     for _, entity in pairs(found) do
-        local status_value = raw_entity_status(entity)
-        if status_value ~= nil then
+        if is_production_entity(entity) then
+            local status_value = raw_entity_status(entity)
             local products_finished = nil
             local products_ok, products_value = pcall(function()
                 return entity.products_finished
@@ -113,6 +130,7 @@ function M.verify_production(surface, force, x1, y1, x2, y2)
 
             table.insert(result, {
                 name = entity.name,
+                type = entity.type,
                 unit_number = entity.unit_number,
                 position = pos_table(entity.position),
                 status = status_name(status_value),
@@ -259,7 +277,16 @@ local function coal_source_record(entity)
     return nil
 end
 
-local function proven_fuel_connections(surface, force, consumer)
+local function inserter_can_operate(status)
+    return status ~= nil
+        and status ~= "no_power"
+        and status ~= "low_power"
+        and status ~= "no_fuel"
+        and status ~= "disabled"
+        and status ~= "marked_for_deconstruction"
+end
+
+local function fuel_connections(surface, force, consumer)
     local box = consumer.bounding_box
     if not box then return {} end
     local search_area = {
@@ -274,14 +301,19 @@ local function proven_fuel_connections(surface, force, consumer)
             for _, source in pairs(surface.find_entities_filtered{area = pickup_area, force = force}) do
                 if source ~= inserter and point_in_bounding_box(pickup, source.bounding_box) then
                     local source_record = coal_source_record(source)
-                    if source_record and source_record.operational then
+                    if source_record then
+                        local inserter_status = entity_status_string(inserter)
+                        local inserter_operational = inserter_can_operate(inserter_status)
                         table.insert(result, {
                             inserter_unit_number = inserter.unit_number,
                             inserter_name = inserter.name,
-                            inserter_status = entity_status_string(inserter),
+                            inserter_status = inserter_status,
+                            inserter_operational = inserter_operational,
                             pickup_position = pos_table(pickup),
                             drop_position = pos_table(inserter.drop_position),
                             source = source_record,
+                            source_operational = source_record.operational == true,
+                            live = inserter_operational and source_record.operational == true,
                         })
                     end
                 end
@@ -663,10 +695,17 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
     end
 
     for _, consumer in ipairs(consumers) do
-        consumer.proven_fuel_connections = proven_fuel_connections(surface, force, consumer)
+        consumer.fuel_connections = fuel_connections(surface, force, consumer)
+        consumer.proven_fuel_connections = {}
+        for _, connection in ipairs(consumer.fuel_connections) do
+            if connection.live then table.insert(consumer.proven_fuel_connections, connection) end
+        end
+        consumer.fuel_topology_present = #consumer.fuel_connections > 0
         consumer.automated = #consumer.proven_fuel_connections > 0
         if consumer.automated then
             consumer.issue = consumer.fuel_count == 0 and "automated_supply_starved" or nil
+        elseif consumer.fuel_topology_present then
+            consumer.issue = "fuel_topology_not_operational"
         else
             consumer.issue = consumer.fuel_count == 0 and "empty_fuel"
                 or (consumer.fuel_count < 5 and "low_fuel" or "manual_or_unknown_fuel_supply")
@@ -747,12 +786,12 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
                 target_unit_number = target.unit_number,
                 description = "An adjacent inserter with an operational coal source is feeding this consumer; no manual fuel action is needed.",
             })
-        elseif target.automated then
+        elseif target.automated or target.fuel_topology_present then
             table.insert(suggested_actions, {
                 type = "repair_upstream_coal_flow",
                 target_unit_number = target.unit_number,
-                connections = target.proven_fuel_connections,
-                description = "The fuel inserter topology exists, but the consumer is starved. Repair coal flow upstream instead of hand-feeding it.",
+                connections = target.fuel_connections,
+                description = "The adjacent fuel inserter topology exists, but either the inserter or its coal source is not operational. Repair that exact connection instead of hand-feeding or building a duplicate route.",
             })
         elseif target.ready_to_call then
             table.insert(suggested_actions, {

@@ -417,13 +417,15 @@ fn first_reachable_break(
                     &to.offset_in_direction(node.direction),
                     &to,
                 ) => Some(ItemFlowRepair {
-                    tool: "place_entity".to_string(),
+                    tool: "route_belt".to_string(),
                     reason: "verified_one_tile_gap".to_string(),
                     args: Some(serde_json::json!({
-                        "entity_name": node.belt_type,
-                        "x": to.x,
-                        "y": to.y,
-                        "direction": node.direction.to_name(),
+                        "from_x": from.x,
+                        "from_y": from.y,
+                        "to_x": target.x,
+                        "to_y": target.y,
+                        "belt_type": node.belt_type,
+                        "extend_existing": true,
                     })),
                     unit_number: None,
                     entity_name: Some(node.belt_type.clone()),
@@ -431,7 +433,7 @@ fn first_reachable_break(
                     y: Some(to.y),
                     direction: Some(node.direction.to_name().to_string()),
                     description: format!(
-                        "Fill the verified one-tile gap at ({}, {}) facing {}.",
+                        "Repair the complete route through the verified one-tile gap at ({}, {}) facing {}.",
                         to.x,
                         to.y,
                         node.direction.to_name()
@@ -526,12 +528,15 @@ mod tests {
 
         assert!(!report.connected);
         let repair = report.repair.expect("missing belt should have repair");
-        assert_eq!(repair.tool, "place_entity");
+        assert_eq!(repair.tool, "route_belt");
         assert_eq!(repair.entity_name.as_deref(), Some("transport-belt"));
         assert_eq!(repair.x, Some(1));
         assert_eq!(repair.y, Some(0));
         assert_eq!(repair.direction.as_deref(), Some("east"));
         assert_eq!(repair.reason, "verified_one_tile_gap");
+        assert_eq!(repair.args.as_ref().unwrap()["from_x"], 0);
+        assert_eq!(repair.args.as_ref().unwrap()["to_x"], 2);
+        assert_eq!(repair.args.as_ref().unwrap()["extend_existing"], true);
     }
 
     #[test]

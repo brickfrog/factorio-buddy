@@ -92,6 +92,115 @@ fn manifest_remotes() -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
+fn literal_call_remote_arguments(source: &str) -> Vec<(String, Vec<String>)> {
+    let mut calls = Vec::new();
+    let mut rest = source;
+    let needle = ".call_remote(";
+    while let Some(call_index) = rest.find(needle) {
+        let after_call = &rest[call_index + needle.len()..];
+        let trimmed = after_call.trim_start();
+        let Some(after_quote) = trimmed.strip_prefix('"') else {
+            rest = after_call;
+            continue;
+        };
+        let Some(name_end) = after_quote.find('"') else {
+            break;
+        };
+        let name = &after_quote[..name_end];
+        let call_tail = &after_quote[name_end + 1..];
+        let await_index = call_tail.find(".await").unwrap_or(call_tail.len());
+        let call_expression = &call_tail[..await_index];
+        let Some(array_index) = call_expression.find("&[") else {
+            rest = after_call;
+            continue;
+        };
+        let array = &call_expression[array_index + 1..];
+        let Some(array_end) = matching_square_bracket(array) else {
+            rest = after_call;
+            continue;
+        };
+        calls.push((
+            name.to_string(),
+            split_top_level_arguments(&array[1..array_end]),
+        ));
+        rest = after_call;
+    }
+    calls
+}
+
+fn matching_square_bracket(value: &str) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+        } else if ch == '[' {
+            depth += 1;
+        } else if ch == ']' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn split_top_level_arguments(value: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut start = 0;
+    let mut parens = 0_i32;
+    let mut squares = 0_i32;
+    let mut braces = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => squares += 1,
+            ']' => squares -= 1,
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            ',' if parens == 0 && squares == 0 && braces == 0 => {
+                let argument = value[start..index].trim();
+                if !argument.is_empty() {
+                    arguments.push(argument.to_string());
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let argument = value[start..].trim();
+    if !argument.is_empty() {
+        arguments.push(argument.to_string());
+    }
+    arguments
+}
+
 fn rust_wrapper_remote_names() -> BTreeSet<String> {
     let source = include_str!("../src/client/lua.rs");
     let needle = "claude_interface_json_call(";
@@ -160,7 +269,6 @@ fn lifecycle_remote_names() -> BTreeSet<String> {
         "ping",
         "pre_place_character",
         "pre_place_character_result",
-        "queue_rotate",
         "receive_response",
         "register_agent",
         "register_character",
@@ -630,6 +738,44 @@ fn remote_api_manifest_matches_rust_wrappers_and_mod_exports() {
 }
 
 #[test]
+fn literal_rust_remote_calls_match_manifest_argument_contracts() {
+    let manifest = manifest_remotes();
+    let sources = [
+        ("src/client/mod.rs", include_str!("../src/client/mod.rs")),
+        ("src/bin/mcp.rs", include_str!("../src/bin/mcp.rs")),
+        ("src/cli/map.rs", include_str!("../src/cli/map.rs")),
+        ("src/cli/power.rs", include_str!("../src/cli/power.rs")),
+        (
+            "src/cli/research.rs",
+            include_str!("../src/cli/research.rs"),
+        ),
+        ("src/cli/say.rs", include_str!("../src/cli/say.rs")),
+    ];
+
+    for (path, source) in sources {
+        for (remote, arguments) in literal_call_remote_arguments(source) {
+            let expected = manifest
+                .get(&remote)
+                .unwrap_or_else(|| panic!("{path} calls unmanifested remote {remote:?}"));
+            assert_eq!(
+                arguments.len(),
+                expected.len(),
+                "{path} remote {remote:?} argument count/order drifted: {arguments:?}"
+            );
+            for (index, name) in expected.iter().enumerate() {
+                if name == "agent_id" {
+                    assert!(
+                        arguments[index].contains("agent_id")
+                            || arguments[index].contains("character_storage_key"),
+                        "{path} remote {remote:?} must pass agent_id at argument {index}: {arguments:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn mod_json_response_helper_lives_in_domain_module() {
     let control_lua = include_str!("../mod/claude-interface/control.lua");
     let json_response_lua = include_str!("../mod/claude-interface/json_response.lua");
@@ -670,6 +816,11 @@ fn claude_command_dispatcher_uses_shared_api_and_structured_errors() {
         "/claude dispatcher should parse one JSON envelope and preserve nil holes via explicit n"
     );
     assert!(
+        control_lua.contains("if cmd.player_index ~= nil then")
+            && control_lua.contains("restricted to the server RCON console"),
+        "/claude must reject in-game callers and remain an authenticated server/RCON bridge"
+    );
+    assert!(
         control_lua.contains(r#"json_response.error("bad_request""#)
             && control_lua.contains(r#"json_response.error("unknown_function""#)
             && control_lua.contains(r#"json_response.error("lua_error""#)
@@ -681,6 +832,148 @@ fn claude_command_dispatcher_uses_shared_api_and_structured_errors() {
             && json_response_lua.contains("result.error_kind = error_kind")
             && json_response_lua.contains("result.success = false"),
         "json_response.error should produce the structured error_kind envelope"
+    );
+}
+
+#[test]
+fn critical_mod_safety_contracts_are_explicit() {
+    let characters_lua = include_str!("../mod/claude-interface/characters.lua");
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let entities_lua = include_str!("../mod/claude-interface/entities.lua");
+    let placement_lua = include_str!("../mod/claude-interface/placement.lua");
+    let power_lua = include_str!("../mod/claude-interface/power.lua");
+    let research_lua = include_str!("../mod/claude-interface/research.lua");
+    let transport_lua = include_str!("../mod/claude-interface/transport.lua");
+    let world_lua = include_str!("../mod/claude-interface/world.lua");
+
+    let pre_place = characters_lua
+        .split("function M.pre_place(agent_id, planet_name, spawn_x)")
+        .nth(1)
+        .and_then(|tail| tail.split("function M.pre_place_result").next())
+        .expect("pre_place should precede pre_place_result");
+    let find_character = characters_lua
+        .split("function M.find(agent_id)")
+        .nth(1)
+        .and_then(|tail| tail.split("function M.remember").next())
+        .expect("find should precede remember");
+    assert!(
+        characters_lua.contains("local function is_player_character(character)")
+            && find_character.contains("and not is_player_character(character)")
+            && !find_character.contains("game.connected_players")
+            && pre_place.contains("local character = M.find(agent_id)")
+            && pre_place.contains("return \"already_placed\"")
+            && pre_place.contains("target_surface.find_non_colliding_position(")
+            && !pre_place.contains("teleport("),
+        "agent identity must be exact, reject human characters, and preserve an existing NPC without relocating it"
+    );
+    assert!(
+        control_lua.contains("local c = find_factorioctl_character(agent_id)")
+            && !control_lua.contains("local c = storage.characters[agent_id]")
+            && !control_lua.contains("queue_rotate = function")
+            && !control_lua.contains("process_entity_queue"),
+        "tick movement must revalidate NPC identity and no queued rotation may bypass reach"
+    );
+
+    assert!(
+        characters_lua.contains("error_kind = \"out_of_reach\"")
+            && characters_lua.contains("action_needed = \"walk_to\"")
+            && placement_lua
+                .matches("characters.require_position_reach")
+                .count()
+                >= 3
+            && placement_lua.contains("characters.require_entity_reach(character, entity)")
+            && control_lua
+                .matches("characters.require_entity_reach")
+                .count()
+                >= 8
+            && control_lua
+                .matches("characters.require_position_reach")
+                .count()
+                >= 2
+            && research_lua.contains("characters.require_entity_reach(character, lab)")
+            && control_lua.contains("local function require_blueprint_reach"),
+        "every direct world/entity mutation family must enforce structured character reach"
+    );
+    assert!(
+        placement_lua.contains("function M.place_entity(agent_id")
+            && !placement_lua.contains("clear_ground_items_for_placement")
+            && !placement_lua.contains("item_entity.destroy"),
+        "placement must fail on blocking ground items rather than deleting them"
+    );
+    assert!(
+        control_lua.contains("error_kind = \"ambiguous_entity\"")
+            && control_lua.contains("action_needed = \"remove_entity_by_unit_number\"")
+            && control_lua.contains("#candidates > 1"),
+        "coordinate removal must fail closed and require an exact unit number when ambiguous"
+    );
+
+    assert!(
+        entities_lua.contains("game.get_entity_by_unit_number(unit_number)")
+            && !entities_lua.contains("radius = 500"),
+        "entity lookup must use Factorio's native global unit-number index"
+    );
+    assert!(
+        entities_lua.contains("local PRODUCTION_ENTITY_TYPES = {")
+            && entities_lua.contains("[\"assembling-machine\"] = true")
+            && entities_lua.contains("[\"furnace\"] = true")
+            && entities_lua.contains("[\"mining-drill\"] = true")
+            && entities_lua.contains("[\"lab\"] = true")
+            && entities_lua.contains("[\"rocket-silo\"] = true")
+            && entities_lua.contains("if is_production_entity(entity) then")
+            && entities_lua.contains("type = entity.type")
+            && !entities_lua
+                .contains("if status_value ~= nil then\n            local products_finished"),
+        "verify_production must report actual producers, not every status-bearing belt or inserter"
+    );
+    for (name, source) in [
+        ("characters.lua", characters_lua),
+        ("entities.lua", entities_lua),
+        ("placement.lua", placement_lua),
+        ("power.lua", power_lua),
+        ("research.lua", research_lua),
+        ("transport.lua", transport_lua),
+        ("world.lua", world_lua),
+    ] {
+        assert!(
+            !source.contains("game.surfaces[1]"),
+            "{name} must not silently redirect agent work to surface 1"
+        );
+    }
+    assert!(
+        power_lua.contains("local surface = character.surface")
+            && power_lua.contains("local force = character.force")
+            && !power_lua.contains("surface.create_entity")
+            && !power_lua.contains("entity.destroy"),
+        "power diagnostics/planners must be character-scoped and observational"
+    );
+
+    assert!(
+        research_lua.contains("error_kind = \"research_trigger_required\"")
+            && research_lua.contains("local added = force.add_research(tech)")
+            && research_lua.contains("result.steps = {}")
+            && research_lua.contains("result.next_action = \"automate_science_delivery\"")
+            && !research_lua.contains("tech.researched = true"),
+        "research must use Factorio's queue/trigger mechanics and not advertise hand-feeding as automation"
+    );
+    assert!(
+        entities_lua.contains("local function fuel_connections(surface, force, consumer)")
+            && entities_lua.contains("inserter_operational = inserter_operational")
+            && entities_lua.contains("source_operational = source_record.operational == true")
+            && entities_lua.contains("live = inserter_operational and source_record.operational == true")
+            && entities_lua.contains("consumer.fuel_topology_present")
+            && entities_lua.contains("source_is_proposed = true")
+            && entities_lua.contains("if a.operational ~= b.operational then")
+            && entities_lua.contains("if a.distance_sq ~= b.distance_sq then"),
+        "fuel diagnosis must prove adjacent inserter/source operation and rank unproven sources explicitly"
+    );
+
+    assert!(
+        control_lua
+            .contains("player.print(\"[\" .. get_agent_label(agent_name) .. \"] \" .. text)")
+            && control_lua.contains("script.on_event(defines.events.on_console_chat")
+            && control_lua.contains("write_bridge_message(")
+            && transport_lua.contains("quality = inventory.quality_name(item)"),
+        "normal chat must wake/display the bot and transport observations must retain item quality"
     );
 }
 
@@ -744,10 +1037,11 @@ fn transport_line_readers_document_factorio_2_object_array_shape() {
     let transport_lua = include_str!("../mod/claude-interface/transport.lua");
     assert!(
         control_lua.contains("local transport = require(\"transport\")")
-            && control_lua.contains("get_belt_contents = function(x1, y1, x2, y2)")
+            && control_lua.contains("get_belt_contents = function(x1, y1, x2, y2, agent_id)")
             && control_lua.contains("transport.get_belt_contents")
-            && control_lua.contains("get_belt_lane_contents = function(x1, y1, x2, y2)")
-            && control_lua.contains("transport.get_belt_lane_contents"),
+            && control_lua.contains("get_belt_lane_contents = function(x1, y1, x2, y2, agent_id)")
+            && control_lua.contains("transport.get_belt_lane_contents")
+            && control_lua.contains("character and character.surface or nil"),
         "control.lua should expose both belt contents remotes through transport.lua"
     );
     assert!(
@@ -955,14 +1249,14 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
         "world.get_tiles",
         "world.get_tile",
         "get_surfaces = function()",
-        "find_entities = function(x1, y1, x2, y2, entity_type, name)",
-        "verify_production = function(x1, y1, x2, y2)",
+        "find_entities = function(x1, y1, x2, y2, entity_type, name, agent_id)",
+        "verify_production = function(x1, y1, x2, y2, agent_id)",
         "get_entity = function(unit_number)",
         "get_entity_drop_position = function(unit_number)",
-        "find_resources = function(x1, y1, x2, y2, resource_type)",
-        "find_nearest_resource = function(resource_name, from_x, from_y)",
-        "get_tiles = function(x1, y1, x2, y2)",
-        "get_tile = function(x, y)",
+        "find_resources = function(x1, y1, x2, y2, resource_type, agent_id)",
+        "find_nearest_resource = function(resource_name, from_x, from_y, agent_id)",
+        "get_tiles = function(x1, y1, x2, y2, agent_id)",
+        "get_tile = function(x, y, agent_id)",
     ] {
         assert!(
             control_lua.contains(required),
@@ -1237,7 +1531,7 @@ fn broadcast_display_gameplay_lives_in_the_mod_not_cli_or_mcp_strings() {
             "broadcast_flying_text",
         ),
     ] {
-        assert_remote_request(name, &lua, method);
+        assert_remote_request(name, lua, method);
         for forbidden in ["game.print", "game.players[1]", "create_local_flying_text"] {
             assert!(
                 !lua.contains(forbidden),
@@ -1521,10 +1815,10 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
         "local function set_recipe_impl",
         "remove_entity_at = function(agent_id, x, y)",
         "remove_entity = function(agent_id, unit_number)",
-        "rotate_entity = function(unit_number, direction)",
+        "rotate_entity = function(agent_id, unit_number, direction)",
         "insert_items = function(agent_id, unit_number, item, count, inventory_type)",
         "extract_items = function(agent_id, unit_number, item, count, inventory_type)",
-        "set_recipe = function(unit_number, recipe)",
+        "set_recipe = function(agent_id, unit_number, recipe)",
     ] {
         assert!(
             control_lua.contains(required),
@@ -1836,7 +2130,7 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
 
     assert!(
         characters_lua.contains("storage.characters[agent_id] = character")
-            && characters_lua.contains("game.surfaces[1].create_entity{")
+            && characters_lua.contains("local surface = game.get_surface(\"nauvis\")")
             && characters_lua.contains("character.teleport({x, y})")
             && characters_lua.contains("items = inventory.contents(inv)")
             && characters_lua.contains("return {items = {}, free_slots = 0}")
@@ -1846,7 +2140,9 @@ fn character_and_crafting_queries_live_in_the_mod_not_rust_strings() {
             && characters_lua.contains("local function stand_blockers(character, position)")
             && characters_lua.contains("unstuck_candidates")
             && characters_lua.contains("walk_to_clear_position")
-            && characters_lua.contains("teleported to nearest verified clear standing position")
+            && characters_lua.contains("local started = M.set_walk_target(agent_id, target.x, target.y)")
+            && characters_lua.contains("walking to nearest verified clear standing position")
+            && !characters_lua.contains("game.surfaces[1]")
             && control_lua.contains("local c = find_factorioctl_character(agent_id)")
             && control_lua.contains("return character.begin_crafting{recipe = recipe_name, count = count}")
             && control_lua.contains("pairs(character.crafting_queue or {})")
@@ -2015,7 +2311,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "build_edge_miner = function(agent_id, resource_name, center_x, center_y, radius, drill_name, limit)",
         "build_direct_smelter = function(agent_id, drill_unit_number, output_x, output_y, output_direction, furnace_name, inserter_name, belt_name, radius)",
         "place_ghost = function(agent_id, entity_name, x, y, direction)",
-        "rotate_entity = function(unit_number, direction)",
+        "rotate_entity = function(agent_id, unit_number, direction)",
     ] {
         assert!(
             control_lua.contains(required),
@@ -2092,7 +2388,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("item_in_inventory = inventory_count > 0")
             && placement_lua.contains("type = belt_type")
             && placement_lua.contains("result.belt_to_ground_type = entity.belt_to_ground_type")
-            && placement_lua.contains("function M.rotate_entity(unit_number, direction)")
+            && placement_lua.contains("function M.rotate_entity(agent_id, unit_number, direction)")
             && placement_lua.contains("result.previous_direction = previous_direction")
             && placement_lua.contains("requested_direction = direction")
             && placement_lua.contains("table.sort(placements")
@@ -2314,8 +2610,8 @@ fn steam_power_planner_lives_in_power_module() {
         "local first_pole = find_machine_connection_pole(surface, force, from_pos)",
         "local function opposite_direction",
         "local function validate_cumulative_placement",
-        "surface.create_entity{",
-        "cleanup_simulated_entities(created)",
+        "local function planned_collision_box",
+        "local function collision_boxes_overlap",
         "local land_dir = opposite_direction(pump.dir)",
         "candidate_layouts(pump, land_dir)",
         "surface.can_place_entity",
@@ -2334,6 +2630,11 @@ fn steam_power_planner_lives_in_power_module() {
             "power.lua steam planner should include {required:?}"
         );
     }
+    assert!(
+        !power_lua.contains("surface.create_entity{")
+            && !power_lua.contains("cleanup_simulated_entities"),
+        "steam-power planning must validate geometry without temporarily mutating the live surface"
+    );
 }
 
 #[test]
@@ -2397,12 +2698,12 @@ fn steam_power_repair_lives_in_power_module() {
 
     for required in [
         "function M.repair_steam_power(character, x, y, radius, target_x, target_y)",
-        "diagnostic = M.diagnose_steam_power(x, y, r)",
+        "local diagnostic = M.diagnose_steam_power(character, x, y, r)",
         "dry_run = true",
         "repair_steps = {}",
         "missing_items = {}",
         "append_repair_step(",
-        "\"insert_items\"",
+        "durable_boiler_fuel_required",
         "\"place_entity\"",
         "steam_engine_no_steam_may_clear_after_fuel",
         "manual_inspection_required",
@@ -2451,9 +2752,9 @@ fn steam_power_diagnostic_lives_in_mod_remote_interface() {
 
     assert!(
         control_lua.contains(r#"local power = require("power")"#)
-            && control_lua.contains("diagnose_steam_power = function(x, y, radius)")
+            && control_lua.contains("diagnose_steam_power = function(x, y, radius, agent_id)")
             && control_lua.contains(
-                r#"json_remote_call("diagnose_steam_power", power.diagnose_steam_power, x, y, radius)"#
+                r#"json_remote_call("diagnose_steam_power", power.diagnose_steam_power, scoped_character(agent_id), x, y, radius)"#
             ),
         "claude-interface control.lua should expose the steam diagnostic remote"
     );
@@ -2500,11 +2801,11 @@ fn power_diagnostics_live_in_mod_remote_interface() {
     let power_lua = include_str!("../mod/claude-interface/power.lua");
 
     for required in [
-        "get_power_status = function(x, y, radius)",
-        "get_power_networks = function(x, y, radius)",
-        "find_power_issues = function(x, y, radius)",
-        "get_power_coverage = function(x, y, radius)",
-        "get_alerts = function(x, y, radius)",
+        "get_power_status = function(x, y, radius, agent_id)",
+        "get_power_networks = function(x, y, radius, agent_id)",
+        "find_power_issues = function(x, y, radius, agent_id)",
+        "get_power_coverage = function(x, y, radius, agent_id)",
+        "get_alerts = function(x, y, radius, agent_id)",
         "json_remote_call",
     ] {
         assert!(
@@ -2529,11 +2830,11 @@ fn power_diagnostics_live_in_mod_remote_interface() {
     }
 
     for required in [
-        "function M.get_power_status(x, y, radius)",
-        "function M.get_power_networks(x, y, radius)",
-        "function M.find_power_issues(x, y, radius)",
-        "function M.get_power_coverage(x, y, radius)",
-        "function M.get_alerts(x, y, radius)",
+        "function M.get_power_status(character, x, y, radius)",
+        "function M.get_power_networks(character, x, y, radius)",
+        "function M.find_power_issues(character, x, y, radius)",
+        "function M.get_power_coverage(character, x, y, radius)",
+        "function M.get_alerts(character, x, y, radius)",
         "POWER_CONSUMER_TYPES",
         "POLE_SUPPLY_AREAS",
     ] {
@@ -2661,8 +2962,8 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
             && control_lua.contains("local inventory_progress = iteration_after_count > iteration_before_count")
             && control_lua.contains("local resource_progress = target.valid and target_amount_before")
             && control_lua.contains("picked_up = picked_up + pick_up_item_entity")
-            && control_lua.contains("local trees = surface.find_entities_filtered{type = \"tree\", area = area}")
-            && control_lua.contains("local entities = surface.find_entities_filtered{type = \"simple-entity\", area = area}")
+            && control_lua.contains("local trees = clear_trees and surface.find_entities_filtered{type = \"tree\", area = area} or {}")
+            && control_lua.contains("surface.find_entities_filtered{type = \"simple-entity\", area = area}")
             && control_lua.contains("find_entities_filtered{"),
         "control.lua should own mining scans and measure mining progress from state changes"
     );
@@ -2875,17 +3176,17 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
         "get_recipes_for_item = function(item)",
         "json_remote_call(\"get_recipes_for_item\", recipes.get_recipes_for_item, item)",
         "get_prototype = function(name)",
-        "get_research_status = function()",
-        "json_remote_call(\"get_research_status\", research.get_research_status)",
+        "get_research_status = function(agent_id)",
+        "json_remote_call(\"get_research_status\", research.get_research_status, scoped_character(agent_id))",
         "get_available_research = function(agent_id)",
         "local character = find_factorioctl_character(agent_id)",
         "json_remote_call(\"get_available_research\", research.get_available_research, character)",
         "feed_lab_from_inventory = function(agent_id, lab_unit_number, science_pack, count, dry_run)",
         "json_remote_call(\"feed_lab_from_inventory\", research.feed_lab_from_inventory, character, lab_unit_number, science_pack, count, dry_run)",
-        "start_research = function(tech_name)",
-        "json_remote_call(\"start_research\", research.start_research, tech_name)",
-        "is_tech_researched = function(tech_name)",
-        "json_remote_call(\"is_tech_researched\", research.is_tech_researched, tech_name)",
+        "start_research = function(tech_name, agent_id)",
+        "json_remote_call(\"start_research\", research.start_research, scoped_character(agent_id), tech_name)",
+        "is_tech_researched = function(tech_name, agent_id)",
+        "json_remote_call(\"is_tech_researched\", research.is_tech_researched, scoped_character(agent_id), tech_name)",
     ] {
         assert!(
             control_lua.contains(required),
@@ -2899,10 +3200,10 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
         "local function science_totals_from_labs",
         "local function count_science_from_inventory",
         "function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)",
-        "function M.get_research_status()",
+        "function M.get_research_status(character)",
         "function M.get_available_research(character)",
-        "function M.start_research(tech_name)",
-        "function M.is_tech_researched(tech_name)",
+        "function M.start_research(character, tech_name)",
+        "function M.is_tech_researched(character, tech_name)",
     ] {
         assert!(
             research_lua.contains(required),
@@ -2916,10 +3217,10 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
         "local function science_totals_from_labs",
         "local function count_science_from_inventory",
         "function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, count, dry_run)",
-        "function M.get_research_status()",
+        "function M.get_research_status(character)",
         "function M.get_available_research(character)",
-        "function M.start_research(tech_name)",
-        "function M.is_tech_researched(tech_name)",
+        "function M.start_research(character, tech_name)",
+        "function M.is_tech_researched(character, tech_name)",
     ] {
         assert!(
             !control_lua.contains(forbidden),
@@ -2939,11 +3240,10 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
             && research_lua.contains("expected_miss")
             && research_lua.contains("local have = science_totals[ing.name] or 0")
             && research_lua.contains("requires_lab = needs_science")
-            && research_lua.contains("Free bootstrap technologies need no lab or science packs")
-            && research_lua.contains("if not needs_science then")
-            && research_lua.contains("tech.researched = true")
-            && research_lua
-                .contains("Research completed. This technology requires no labs or science packs.")
+            && research_lua.contains("if trigger then")
+            && research_lua.contains("error_kind = \"research_trigger_required\"")
+            && research_lua.contains("force.add_research(tech)")
+            && !research_lua.contains("tech.researched = true")
             && research_lua.contains("return {success = false, error = \"Technology not found\"}"),
         "research.lua should own research lab scans, science accounting, and queueing"
     );

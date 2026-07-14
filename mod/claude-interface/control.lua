@@ -39,7 +39,6 @@ local function init_storage()
     storage.characters = storage.characters or {}
     storage.walk_state = storage.walk_state or {}
     storage.walk_targets = storage.walk_targets or {}
-    storage.entity_queue = storage.entity_queue or {}
     storage.blueprints = storage.blueprints or {}
     -- Map markers for agent characters (chart tag references)
     storage.agent_tags = storage.agent_tags or {}
@@ -494,7 +493,7 @@ local function process_walk_states()
     if not storage.walk_state then return end
     local to_remove = {}
     for agent_id, ws in pairs(storage.walk_state) do
-        local c = storage.characters[agent_id]
+        local c = find_factorioctl_character(agent_id)
         if c and c.valid then
             c.walking_state = ws
         end
@@ -513,7 +512,7 @@ end
 local function process_walk_targets()
     if not storage.walk_targets then return end
     for agent_id, tgt in pairs(storage.walk_targets) do
-        local c = storage.characters[agent_id]
+        local c = find_factorioctl_character(agent_id)
         if not (c and c.valid) then
             storage.walk_targets[agent_id] = nil
             if storage.walk_state then storage.walk_state[agent_id] = nil end
@@ -569,29 +568,12 @@ local function process_walk_targets()
     end
 end
 
--- Apply queued entity operations each tick (rotation, etc.).
--- Processed in on_tick for deterministic multiplayer behavior.
-local function process_entity_queue()
-    if not storage.entity_queue or #storage.entity_queue == 0 then return end
-    local queue = storage.entity_queue
-    storage.entity_queue = {}
-    for _, item in ipairs(queue) do
-        if item.action == "rotate" then
-            local surface = game.surfaces[item.surface_name]
-            local unit_number = tonumber(item.unit_number)
-            local entity = unit_number and game.get_entity_by_unit_number(unit_number) or nil
-            if surface and entity and entity.valid and entity.surface == surface and entity.supports_direction then
-                entity.direction = item.direction
-            end
-        end
-    end
-end
-
 -- Update map markers for agent characters (every 60 ticks = 1 second)
 local function update_agent_markers()
     if not storage.characters then return end
     if not storage.agent_tags then storage.agent_tags = {} end
-    for agent_id, c in pairs(storage.characters) do
+    for agent_id, _ in pairs(storage.characters) do
+        local c = find_factorioctl_character(agent_id)
         if c and c.valid then
             local tag = storage.agent_tags[agent_id]
             if tag and tag.valid then
@@ -849,6 +831,57 @@ local function blueprint_scratch_stack(inv)
     return slot, cleanup_scratch
 end
 
+local function blueprint_relative_position(spec)
+    local position = spec and spec.position or nil
+    if not position then return nil end
+    return {
+        x = position.x or position[1] or 0,
+        y = position.y or position[2] or 0,
+    }
+end
+
+local function blueprint_max_offset(slot)
+    local max_offset = 0
+    local function include(specs)
+        for _, spec in pairs(specs or {}) do
+            local position = blueprint_relative_position(spec)
+            if position then
+                max_offset = math.max(max_offset, math.sqrt(position.x * position.x + position.y * position.y))
+            end
+        end
+    end
+    local entities_ok, blueprint_entities = pcall(function() return slot.get_blueprint_entities() end)
+    if entities_ok then include(blueprint_entities) end
+    local tiles_ok, blueprint_tiles = pcall(function() return slot.get_blueprint_tiles() end)
+    if tiles_ok then include(blueprint_tiles) end
+    return max_offset
+end
+
+local function require_blueprint_reach(character, slot, x, y)
+    local reach_error = characters.require_position_reach(character, x, y, "build")
+    if reach_error then return reach_error end
+
+    local dx = x - character.position.x
+    local dy = y - character.position.y
+    local anchor_distance = math.sqrt(dx * dx + dy * dy)
+    local max_offset = blueprint_max_offset(slot)
+    local build_distance = character.build_distance or character.reach_distance or 0
+    if anchor_distance + max_offset <= build_distance then return nil end
+
+    return {
+        success = false,
+        error = "blueprint footprint extends outside character build reach",
+        error_kind = "out_of_reach",
+        action_needed = "walk_to",
+        surface = character.surface.name,
+        character_position = pos_table(character.position),
+        target_position = {x = x, y = y},
+        distance = anchor_distance,
+        max_distance = build_distance,
+        blueprint_max_offset = max_offset,
+    }
+end
+
 local function register_blueprint_ghosts(ghosts)
     storage.factorioctl_entities = storage.factorioctl_entities or {}
     for _, ghost in pairs(ghosts) do
@@ -949,9 +982,6 @@ local function place_blueprint_impl(agent_id, name, x, y, direction)
     if not (character and character.valid) then
         return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
-    local reach_error = characters.require_position_reach(character, x, y, "build")
-    if reach_error then return reach_error end
-
     storage.blueprints = storage.blueprints or {}
     local data = storage.blueprints[name]
     if not data then return {success = false, error = "Blueprint not found"} end
@@ -964,6 +994,12 @@ local function place_blueprint_impl(agent_id, name, x, y, direction)
     if not ok then
         cleanup_scratch()
         return {success = false, error = "Invalid stored blueprint string"}
+    end
+
+    local reach_error = require_blueprint_reach(character, slot, x, y)
+    if reach_error then
+        cleanup_scratch()
+        return reach_error
     end
 
     local ghosts = slot.build_blueprint{
@@ -989,9 +1025,6 @@ local function import_blueprint_impl(agent_id, bp_string, x, y, direction)
     if not (character and character.valid) then
         return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
-    local reach_error = characters.require_position_reach(character, x, y, "build")
-    if reach_error then return reach_error end
-
     local inv = character.get_main_inventory()
     if not inv then return {success = false, error = "No inventory"} end
 
@@ -1000,6 +1033,12 @@ local function import_blueprint_impl(agent_id, bp_string, x, y, direction)
     if not ok then
         cleanup_scratch()
         return {success = false, error = "Invalid blueprint string"}
+    end
+
+    local reach_error = require_blueprint_reach(character, slot, x, y)
+    if reach_error then
+        cleanup_scratch()
+        return reach_error
     end
 
     local ghosts = slot.build_blueprint{
@@ -2043,17 +2082,15 @@ local api = {
 
     -- Get character entity (safe from any context, uses synced mod storage)
     get_character = function(agent_id)
-        if not storage.characters then return nil end
-        local c = storage.characters[agent_id]
-        if c and c.valid then return c end
-        return nil
+        return find_factorioctl_character(agent_id)
     end,
 
     -- List all agent characters as JSON string
     list_characters = function()
         if not storage.characters then return "[]" end
         local result = {}
-        for agent_id, c in pairs(storage.characters) do
+        for agent_id, _ in pairs(storage.characters) do
+            local c = find_factorioctl_character(agent_id)
             if c and c.valid then
                 table.insert(result, {
                     agent_id = agent_id,
@@ -2394,17 +2431,6 @@ local api = {
         })
     end,
 
-    -- Queue entity rotation (processed in on_tick for MP determinism)
-    queue_rotate = function(unit_number, direction, surface_name)
-        if not storage.entity_queue then storage.entity_queue = {} end
-        table.insert(storage.entity_queue, {
-            action = "rotate",
-            unit_number = unit_number,
-            direction = direction,
-            surface_name = surface_name,
-        })
-    end,
-
     -- Inject a message into the bridge input as if from a player.
     -- Used by supervisor sessions to send tasks to agents.
     inject_message = function(from_name, target_agent, message)
@@ -2468,7 +2494,6 @@ script.on_event(defines.events.on_tick, function(event)
     process_rcon_queue()
     process_walk_states()
     process_walk_targets()
-    process_entity_queue()
     -- Update map markers every 60 ticks (~1 second)
     if event.tick % 60 == 0 then
         update_agent_markers()

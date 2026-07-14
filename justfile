@@ -37,14 +37,20 @@ check:
 test-live: build
     #!/usr/bin/env bash
     set -euo pipefail
-    save="$(mktemp --suffix=.factorio-buddy-test.zip)"
+    temp_dir="$(mktemp -d)"
+    save="$temp_dir/factorio-buddy-test.zip"
     cleanup() {
         ./tests/cleanup.sh >/dev/null 2>&1 || true
-        rm -f "$save"
+        rm -rf "$temp_dir"
     }
     trap cleanup EXIT
     ./tests/setup.sh "$save"
     ./tests/run_tests.sh
+    FACTORIOCTL_BIN="$PWD/target/release/factorioctl" \
+        FACTORIO_MCP_BIN="$PWD/target/release/mcp" \
+        RCON_PORT=27016 \
+        RCON_PASSWORD=test_password \
+        ./tests/live_regressions.sh
     FACTORIOCTL_BIN="$PWD/target/release/factorioctl" \
         FACTORIO_RCON_PORT=27016 \
         FACTORIO_RCON_PASSWORD=test_password \

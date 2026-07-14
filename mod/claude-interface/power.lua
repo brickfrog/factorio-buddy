@@ -205,62 +205,83 @@ local function checked_pipe_path(surface, force, positions)
     return pipes
 end
 
-local function cleanup_simulated_entities(created)
-    for i = #created, 1, -1 do
-        local entity = created[i]
-        if entity and entity.valid then
-            pcall(function() entity.destroy{raise_destroy = false} end)
-        end
+local function planned_collision_box(entry)
+    local prototype = prototypes.entity[entry.entity_name]
+    local box = prototype and prototype.collision_box or nil
+    if not box then return nil end
+    local direction = entry.direction or defines.direction.north
+    local function rotate(x, y)
+        if direction == defines.direction.east then return -y, x end
+        if direction == defines.direction.south then return -x, -y end
+        if direction == defines.direction.west then return y, -x end
+        return x, y
     end
+    local min_x, min_y, max_x, max_y = nil, nil, nil, nil
+    for _, corner in ipairs({
+        {box.left_top.x, box.left_top.y},
+        {box.left_top.x, box.right_bottom.y},
+        {box.right_bottom.x, box.left_top.y},
+        {box.right_bottom.x, box.right_bottom.y},
+    }) do
+        local x, y = rotate(corner[1], corner[2])
+        min_x = min_x and math.min(min_x, x) or x
+        min_y = min_y and math.min(min_y, y) or y
+        max_x = max_x and math.max(max_x, x) or x
+        max_y = max_y and math.max(max_y, y) or y
+    end
+    return {
+        left_top = {
+            x = entry.position.x + min_x,
+            y = entry.position.y + min_y,
+        },
+        right_bottom = {
+            x = entry.position.x + max_x,
+            y = entry.position.y + max_y,
+        },
+    }
+end
+
+local function collision_boxes_overlap(a, b)
+    return a and b
+        and a.left_top.x < b.right_bottom.x
+        and a.right_bottom.x > b.left_top.x
+        and a.left_top.y < b.right_bottom.y
+        and a.right_bottom.y > b.left_top.y
 end
 
 local function validate_cumulative_placement(surface, force, entries)
-    local created = {}
-    local ok, failure = pcall(function()
-        for _, entry in ipairs(entries) do
-            local allowed, error = can_place(surface, force, entry.entity_name, entry.position, entry.direction)
-            if not allowed then
-                return {
-                    entity_name = entry.entity_name,
-                    position = entry.position,
-                    direction = entry.direction,
-                    direction_name = entry.direction_name,
-                    reason = error or "Cannot place entity here",
-                }
-            end
-
-            local entity = surface.create_entity{
-                name = entry.entity_name,
-                position = {entry.position.x, entry.position.y},
+    local checked = {}
+    for _, entry in ipairs(entries) do
+        local allowed, error = can_place(surface, force, entry.entity_name, entry.position, entry.direction)
+        if not allowed then
+            return {
+                entity_name = entry.entity_name,
+                position = entry.position,
                 direction = entry.direction,
-                force = force,
+                direction_name = entry.direction_name,
+                reason = error or "Cannot place entity here",
             }
-            if not entity then
+        end
+
+        local box = planned_collision_box(entry)
+        for _, prior in ipairs(checked) do
+            if collision_boxes_overlap(box, prior.box) then
                 return {
                     entity_name = entry.entity_name,
                     position = entry.position,
                     direction = entry.direction,
                     direction_name = entry.direction_name,
-                    reason = "create_entity returned nil during cumulative validation",
+                    reason = "planned footprint overlaps " .. prior.entry.entity_name,
+                    conflicts_with = {
+                        entity_name = prior.entry.entity_name,
+                        position = prior.entry.position,
+                    },
                 }
             end
-            table.insert(created, entity)
         end
-        return nil
-    end)
-
-    cleanup_simulated_entities(created)
-
-    if not ok then
-        return {
-            entity_name = "layout",
-            position = nil,
-            direction = nil,
-            direction_name = nil,
-            reason = tostring(failure),
-        }
+        table.insert(checked, {entry = entry, box = box})
     end
-    return failure
+    return nil
 end
 
 local function find_pole_position(surface, force, ideal)

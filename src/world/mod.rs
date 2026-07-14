@@ -55,7 +55,7 @@ impl TilePos {
     }
 
     /// Convert to world position for a 1x1 entity (center of tile)
-    pub fn to_world_1x1(&self) -> Position {
+    pub fn to_world_1x1(self) -> Position {
         Position {
             x: self.x as f64 + 0.5,
             y: self.y as f64 + 0.5,
@@ -63,7 +63,7 @@ impl TilePos {
     }
 
     /// Convert to world position for a 2x2 entity (center of 4 tiles)
-    pub fn to_world_2x2(&self) -> Position {
+    pub fn to_world_2x2(self) -> Position {
         Position {
             x: self.x as f64 + 1.0,
             y: self.y as f64 + 1.0,
@@ -71,7 +71,7 @@ impl TilePos {
     }
 
     /// Convert to world position for a 3x3 entity
-    pub fn to_world_3x3(&self) -> Position {
+    pub fn to_world_3x3(self) -> Position {
         Position {
             x: self.x as f64 + 1.5,
             y: self.y as f64 + 1.5,
@@ -79,7 +79,7 @@ impl TilePos {
     }
 
     /// Convert to world position for entity of given size (width, height)
-    pub fn to_world(&self, width: u32, height: u32) -> Position {
+    pub fn to_world(self, width: u32, height: u32) -> Position {
         Position {
             x: self.x as f64 + width as f64 / 2.0,
             y: self.y as f64 + height as f64 / 2.0,
@@ -130,7 +130,7 @@ impl Position {
     }
 
     /// Convert to tile position (floor to get the tile this position is in)
-    pub fn to_tile(&self) -> TilePos {
+    pub fn to_tile(self) -> TilePos {
         TilePos {
             x: self.x.floor() as i32,
             y: self.y.floor() as i32,
@@ -215,7 +215,7 @@ impl TileArea {
 
     /// Convert to world area for Factorio queries
     /// The max position is exclusive in world coordinates (adds 1)
-    pub fn to_world(&self) -> Area {
+    pub fn to_world(self) -> Area {
         Area {
             left_top: Position::new(self.min.x as f64, self.min.y as f64),
             right_bottom: Position::new((self.max.x + 1) as f64, (self.max.y + 1) as f64),
@@ -291,8 +291,8 @@ pub enum Direction {
 
 impl Direction {
     /// Convert to Factorio's numeric direction
-    pub fn to_factorio(&self) -> u8 {
-        *self as u8
+    pub fn to_factorio(self) -> u8 {
+        self as u8
     }
 
     /// Create from Factorio 2.0's numeric direction
@@ -326,7 +326,7 @@ impl Direction {
     }
 
     /// Get the short name for this direction
-    pub fn to_name(&self) -> &'static str {
+    pub fn to_name(self) -> &'static str {
         match self {
             Direction::North => "north",
             Direction::NorthEast => "northeast",
@@ -379,7 +379,7 @@ pub struct Tick {
 
 impl Tick {
     /// Convert ticks to seconds (60 ticks per second)
-    pub fn to_seconds(&self) -> f64 {
+    pub fn to_seconds(self) -> f64 {
         self.tick as f64 / 60.0
     }
 }

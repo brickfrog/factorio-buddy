@@ -262,6 +262,7 @@ impl ControllerLease {
         }
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -289,7 +290,7 @@ impl ControllerLease {
         }
 
         file.set_len(0)?;
-        write!(file, "{}\n", std::process::id())?;
+        writeln!(file, "{}", std::process::id())?;
         file.sync_all()?;
         Ok(Self { file, path })
     }
@@ -338,6 +339,8 @@ fn atomic_write(path: &Path, contents: &[u8], private: bool) -> Result<()> {
         let _ = std::fs::remove_file(&staged);
         return Err(error).with_context(|| format!("failed to replace {}", path.display()));
     }
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -364,7 +367,10 @@ fn configure_rcon_password(args: &mut Args) -> Result<()> {
 
     if args.start_server {
         if !matches!(args.rcon_host.as_str(), "localhost" | "127.0.0.1" | "::1") {
-            bail!("an owned Factorio server must use loopback RCON, not {}", args.rcon_host);
+            bail!(
+                "an owned Factorio server must use loopback RCON, not {}",
+                args.rcon_host
+            );
         }
         args.rcon_host = "127.0.0.1".to_owned();
         let password = match args.rcon_password.take() {
@@ -380,7 +386,11 @@ fn configure_rcon_password(args: &mut Args) -> Result<()> {
         return Ok(());
     }
 
-    if args.rcon_password.as_deref().is_some_and(|value| value.trim().is_empty()) {
+    if args
+        .rcon_password
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
         bail!("RCON password cannot be empty");
     }
     if args.rcon_password.is_none() {
@@ -428,13 +438,21 @@ impl Inbox {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file_len = std::fs::metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
+        let file_len = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         let offset = match std::fs::read_to_string(&cursor_path) {
-            Ok(cursor) => cursor
-                .trim()
-                .parse::<u64>()
-                .with_context(|| format!("invalid inbox cursor {}", cursor_path.display()))?
-                .min(file_len),
+            Ok(cursor) => {
+                let stored = cursor
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid inbox cursor {}", cursor_path.display()))?;
+                if stored > file_len {
+                    0
+                } else {
+                    stored
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error.into()),
         };
@@ -573,16 +591,15 @@ fn trees_equal(left: &Path, right: &Path) -> Result<bool> {
         let right_path = right.join(&name);
         let left_type = std::fs::symlink_metadata(&left_path)?.file_type();
         let right_type = std::fs::symlink_metadata(&right_path)?.file_type();
-        if left_type.is_dir() != right_type.is_dir() || left_type.is_file() != right_type.is_file() {
+        if left_type.is_dir() != right_type.is_dir() || left_type.is_file() != right_type.is_file()
+        {
             return Ok(false);
         }
         if left_type.is_dir() {
             if !trees_equal(&left_path, &right_path)? {
                 return Ok(false);
             }
-        } else if left_type.is_file()
-            && std::fs::read(&left_path)? != std::fs::read(&right_path)?
-        {
+        } else if left_type.is_file() && std::fs::read(&left_path)? != std::fs::read(&right_path)? {
             return Ok(false);
         }
     }
@@ -591,7 +608,7 @@ fn trees_equal(left: &Path, right: &Path) -> Result<bool> {
 
 fn install_mod_source(source: &Path, mods_dir: &Path) -> Result<bool> {
     let destination = mods_dir.join("claude-interface");
-    if trees_equal(&source, &destination)? {
+    if trees_equal(source, &destination)? {
         return Ok(false);
     }
 
@@ -621,9 +638,8 @@ fn install_mod_source(source: &Path, mods_dir: &Path) -> Result<bool> {
             let _ = std::fs::rename(&backup, &destination);
         }
         let _ = std::fs::remove_dir_all(&staged);
-        return Err(error).with_context(|| {
-            format!("failed to activate Factorio mod {}", destination.display())
-        });
+        return Err(error)
+            .with_context(|| format!("failed to activate Factorio mod {}", destination.display()));
     }
     if backup.exists() {
         std::fs::remove_dir_all(&backup)?;
@@ -643,7 +659,11 @@ fn factorio_client_running() -> bool {
         return false;
     };
     processes.filter_map(Result::ok).any(|entry| {
-        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
             return false;
         };
         let Ok(command_line) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
@@ -674,19 +694,17 @@ fn install_mods(write_data: &Path) -> Result<()> {
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         let client_mods = home.join(".factorio/mods");
-        if client_mods.is_dir() {
-            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod/claude-interface");
-            let destination = client_mods.join("claude-interface");
-            if !trees_equal(&source, &destination)? {
-                if factorio_client_running() {
-                    bail!(
-                        "the Factorio client is running with a different Buddy mod; close it and rerun the same command so the synchronized mod can be installed"
-                    );
-                }
-                install_mod_source(&source, &client_mods)
-                    .context("failed to install Buddy mod for the Factorio client")?;
-                info!(path = %client_mods.display(), "installed Factorio client mod");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod/claude-interface");
+        let destination = client_mods.join("claude-interface");
+        if !trees_equal(&source, &destination)? {
+            if factorio_client_running() {
+                bail!(
+                    "the Factorio client is running with a different Buddy mod; close it and rerun the same command so the synchronized mod can be installed"
+                );
             }
+            install_mod_source(&source, &client_mods)
+                .context("failed to install Buddy mod for the Factorio client")?;
+            info!(path = %client_mods.display(), "installed Factorio client mod");
         }
     }
     Ok(())
@@ -736,19 +754,13 @@ fn normalized_path(path: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    let parent = absolute
-        .parent()
-        .context("path has no parent directory")?;
+    let parent = absolute.parent().context("path has no parent directory")?;
     let parent = if parent.exists() {
         parent.canonicalize()?
     } else {
         parent.to_owned()
     };
-    Ok(parent.join(
-        absolute
-            .file_name()
-            .context("path has no file name")?,
-    ))
+    Ok(parent.join(absolute.file_name().context("path has no file name")?))
 }
 
 fn unix_millis(time: SystemTime) -> Result<u64> {
@@ -985,6 +997,12 @@ fn mcp_config(args: &Args, mcp: &Path) -> String {
     .to_string()
 }
 
+fn write_mcp_config(args: &Args, mcp: &Path) -> Result<PathBuf> {
+    let path = args.write_data.join(format!("mcp-{}.json", args.agent));
+    atomic_write(&path, mcp_config(args, mcp).as_bytes(), true)?;
+    Ok(path)
+}
+
 fn validate_lifecycle_response(function: &str, response: &str) -> Result<()> {
     let trimmed = response.trim();
     if function == "ping" {
@@ -1017,7 +1035,7 @@ fn validate_lifecycle_response(function: &str, response: &str) -> Result<()> {
     }
     if function == "pre_place_character_result" {
         match value.get("status").and_then(Value::as_str) {
-            Some("created" | "already_placed" | "teleported") => {}
+            Some("created" | "already_placed") => {}
             Some(status) => bail!("pre_place_character_result failed with status {status}"),
             None => bail!("pre_place_character_result returned no status"),
         }
@@ -1045,32 +1063,42 @@ impl LifecycleClient {
     }
 
     async fn call(&self, function: &str, values: &[Value]) -> Result<String> {
-        let attempts = if lifecycle_is_read_only(function) { 2 } else { 1 };
+        let attempts = if lifecycle_is_read_only(function) {
+            2
+        } else {
+            1
+        };
         let mut last_error = None;
         for attempt in 0..attempts {
             let mut guard = self.client.lock().await;
-            if guard.is_none() {
-                let agent_id = AgentId::new(Some(&self.agent))?;
-                let client = FactorioClient::connect(&self.host, self.port, &self.password)
-                    .await
-                    .with_context(|| {
-                        format!("failed to connect lifecycle RCON for {function}")
-                    })?
-                    .with_agent_id(agent_id);
-                *guard = Some(client);
-            }
-            let response = guard
-                .as_mut()
-                .expect("lifecycle client initialized")
-                .call_remote(function, values)
-                .await;
+            let mut client = match guard.take() {
+                Some(client) => client,
+                None => {
+                    let agent_id = AgentId::new(Some(&self.agent))?;
+                    match FactorioClient::connect(&self.host, self.port, &self.password).await {
+                        Ok(client) => client.with_agent_id(agent_id),
+                        Err(error) => {
+                            last_error = Some(error);
+                            if attempt + 1 < attempts {
+                                warn!(function, "lifecycle RCON connection failed; retrying once");
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+            };
+            // Keep the slot empty while an RCON operation is in flight. If the
+            // task is cancelled, the local client is dropped instead of
+            // returning a potentially half-read protocol stream to the pool.
+            let response = client.call_remote(function, values).await;
             match response {
                 Ok(response) => {
+                    *guard = Some(client);
                     validate_lifecycle_response(function, &response)?;
                     return Ok(response);
                 }
                 Err(error) => {
-                    *guard = None;
                     last_error = Some(error);
                     if attempt + 1 < attempts {
                         warn!(function, "lifecycle RCON disconnected; reconnecting once");
@@ -1078,9 +1106,8 @@ impl LifecycleClient {
                 }
             }
         }
-        Err(last_error
-            .context("lifecycle call failed without a transport error")?)
-        .with_context(|| format!("lifecycle call {function} failed"))
+        let error = last_error.context("lifecycle call failed without a transport error")?;
+        Err(error).with_context(|| format!("lifecycle call {function} failed"))
     }
 }
 
@@ -1240,7 +1267,7 @@ async fn invoke_claude(
                                         .and_then(Value::as_str)
                                         .unwrap_or("unknown");
                                     let arguments =
-                                        block.get("input").cloned().unwrap_or_else(|| json!(null));
+                                        block.get("input").cloned().unwrap_or(Value::Null);
                                     tool_names.insert(id.to_owned(), tool.to_owned());
                                     info!(event = "tool_call", tool, tool_use_id = id, arguments = %arguments, "Tool call");
                                 }
@@ -1256,9 +1283,9 @@ async fn invoke_claude(
                                             .call(
                                                 "receive_response",
                                                 &[
-                                                json!(player_index),
-                                                json!(response_agent),
-                                                json!(text),
+                                                    json!(player_index),
+                                                    json!(response_agent),
+                                                    json!(text),
                                                 ],
                                             )
                                             .await
@@ -1295,8 +1322,7 @@ async fn invoke_claude(
                                     .get("is_error")
                                     .and_then(|value| value.as_bool())
                                     .unwrap_or(false);
-                                let result =
-                                    block.get("content").cloned().unwrap_or_else(|| json!(null));
+                                let result = block.get("content").cloned().unwrap_or(Value::Null);
                                 info!(event = "tool_result", tool = tool_names.get(id).map(String::as_str).unwrap_or("unknown"), tool_use_id = id, is_error, result = %result, "Tool result");
                             }
                         }
@@ -1322,6 +1348,7 @@ async fn invoke_claude(
             Ok(result) => result,
             Err(error) => {
                 stderr_task.abort();
+                let _ = stderr_task.await;
                 return Err(error).context("claude turn exceeded the wall-clock timeout");
             }
         }
@@ -1334,7 +1361,14 @@ async fn invoke_claude(
             }
         }
     }
-    let (status, parsed, delivered_text) = outcome?;
+    let (status, parsed, delivered_text) = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            return Err(error);
+        }
+    };
     let _ = stderr_task.await;
     info!(event = "turn_exit", exit_status = %status, duration_ms = started.elapsed().as_millis(), "Claude process exited");
 
@@ -1498,10 +1532,9 @@ async fn cancel_active_turn(active: &mut Option<ActiveTurn>, reason: &str) {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut terminate = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("install SIGTERM handler");
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}
@@ -1513,15 +1546,14 @@ async fn shutdown_signal() {
 
 async fn run_buddy(args: Arc<Args>, local_server: &mut Option<LocalServer>) -> Result<()> {
     let mcp = find_mcp(args.mcp_bin.clone())?;
-    let config: Arc<str> = mcp_config(&args, &mcp).into();
+    let config_path = write_mcp_config(&args, &mcp)?;
+    let config: Arc<str> = config_path.to_string_lossy().into_owned().into();
     let input = args
         .script_output
         .clone()
         .unwrap_or_else(default_script_output)
         .join("claude-chat/input.jsonl");
-    let cursor = args
-        .write_data
-        .join(format!("inbox-{}.cursor", args.agent));
+    let cursor = args.write_data.join(format!("inbox-{}.cursor", args.agent));
     let mut inbox = Inbox::new(input.clone(), cursor)?;
     let label = args.label.clone().unwrap_or_else(|| args.agent.clone());
     let lifecycle = Arc::new(LifecycleClient::new(&args)?);
@@ -1690,11 +1722,16 @@ async fn main() -> Result<()> {
     if args.start_server && args.script_output.is_none() {
         args.script_output = Some(args.write_data.join("script-output"));
     }
+    let _lease =
+        ControllerLease::acquire(args.write_data.join(format!("buddy-{}.lock", args.agent)))?;
+    let _server_lease = if args.start_server {
+        Some(ControllerLease::acquire(
+            args.write_data.join("buddy-server.lock"),
+        )?)
+    } else {
+        None
+    };
     configure_rcon_password(&mut args)?;
-    let _lease = ControllerLease::acquire(
-        args.write_data
-            .join(format!("buddy-{}.lock", args.agent)),
-    )?;
     let mut local_server = if args.start_server {
         Some(start_local_server(&args).await?)
     } else {
@@ -1771,6 +1808,39 @@ mod tests {
     }
 
     #[test]
+    fn normal_factorio_chat_wakes_buddy_and_responses_do_not_require_the_gui() {
+        let control = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/mod/claude-interface/control.lua"
+        ));
+        let chat_start = control
+            .find("script.on_event(defines.events.on_console_chat")
+            .expect("console chat handler");
+        let chat_end = control[chat_start..]
+            .find("-- Hotkey toggle")
+            .map(|offset| chat_start + offset)
+            .expect("end of console chat handler");
+        assert!(control[chat_start..chat_end].contains("write_bridge_message("));
+
+        let display_start = control
+            .find("local function add_chat_message")
+            .expect("chat display helper");
+        let display_end = control[display_start..]
+            .find("local function set_status")
+            .map(|offset| display_start + offset)
+            .expect("end of chat display helper");
+        let display = &control[display_start..display_end];
+        let print = display.find("player.print(").expect("console delivery");
+        let gui_guard = display
+            .find("player.gui.screen[GUI_FRAME]")
+            .expect("optional GUI delivery");
+        assert!(
+            print < gui_guard,
+            "console delivery must precede the GUI guard"
+        );
+    }
+
+    #[test]
     fn default_prompt_requires_complete_belt_routes() {
         assert!(DEFAULT_SYSTEM_PROMPT
             .contains("Build belts as complete source-to-destination routes with route_belt"));
@@ -1839,6 +1909,25 @@ mod tests {
     }
 
     #[test]
+    fn inbox_replays_a_recreated_shorter_file_instead_of_clamping_to_its_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.jsonl");
+        let cursor = directory.path().join("cursor");
+        append(
+            &path,
+            b"{\"message\":\"a deliberately long message in the original file\"}\n",
+        );
+        let mut first = Inbox::new(path.clone(), cursor.clone()).unwrap();
+        assert_eq!(first.poll().unwrap().len(), 1);
+        std::fs::write(&path, b"{\"message\":\"new\"}\n").unwrap();
+
+        let mut recreated = Inbox::new(path, cursor).unwrap();
+        let messages = recreated.poll().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message, "new");
+    }
+
+    #[test]
     fn claude_prompt_is_separated_from_options_and_settings_are_isolated() {
         let args = Args::try_parse_from(["buddy"]).unwrap();
         let arguments = claude_arguments(&args, "{}", "--help", Some("session-id"))
@@ -1874,11 +1963,13 @@ mod tests {
             r#"{"status":"creation_failed"}"#
         )
         .is_err());
-        validate_lifecycle_response(
+        assert!(validate_lifecycle_response(
             "pre_place_character_result",
-            r#"{"status":"created"}"#,
+            r#"{"status":"teleported"}"#
         )
-        .unwrap();
+        .is_err());
+        validate_lifecycle_response("pre_place_character_result", r#"{"status":"created"}"#)
+            .unwrap();
         validate_lifecycle_response("receive_response", "").unwrap();
     }
 
@@ -1890,6 +1981,34 @@ mod tests {
         assert!(ControllerLease::acquire(path.clone()).is_err());
         drop(first);
         ControllerLease::acquire(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_turn_cancellation_aborts_the_running_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_flag = Arc::clone(&dropped);
+        let handle = tokio::spawn(async move {
+            let _guard = Dropped(task_flag);
+            std::future::pending::<()>().await;
+            unreachable!()
+        });
+        tokio::task::yield_now().await;
+        let mut active = Some(ActiveTurn {
+            kind: TurnKind::Autonomy,
+            handle,
+        });
+        cancel_active_turn(&mut active, "test player message").await;
+        assert!(active.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1904,6 +2023,10 @@ mod tests {
         .unwrap();
         configure_rcon_password(&mut args).unwrap();
         let password = args.rcon_password.as_deref().unwrap();
+        let mut resumed = args.clone();
+        resumed.rcon_password = None;
+        configure_rcon_password(&mut resumed).unwrap();
+        assert_eq!(resumed.rcon_password.as_deref(), Some(password));
         assert_eq!(password.len(), 64);
         assert!(password.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(
@@ -1913,6 +2036,14 @@ mod tests {
             password
         );
         assert_eq!(args.rcon_host, "127.0.0.1");
+        let config_path = write_mcp_config(&args, Path::new("/tmp/factorio-mcp")).unwrap();
+        let arguments = claude_arguments(&args, &config_path.to_string_lossy(), "play", None);
+        assert!(arguments
+            .iter()
+            .all(|argument| !argument.to_string_lossy().contains(password)));
+        assert!(std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(password));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1922,6 +2053,10 @@ mod tests {
                     .permissions()
                     .mode()
                     & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
         }
@@ -1945,9 +2080,11 @@ mod tests {
             std::fs::read(mods.join("claude-interface/info.json")).unwrap(),
             b"v2"
         );
-        assert!(std::fs::read_dir(&mods)
+        assert!(std::fs::read_dir(&mods).unwrap().all(|entry| !entry
             .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with('.')));
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.')));
     }
 
     #[test]
@@ -1990,5 +2127,28 @@ mod tests {
         assert_eq!(promote_owned_autosave(&save, &owner).unwrap(), None);
         assert_eq!(std::fs::read(&save).unwrap(), b"current");
         assert!(!directory.path().join("buddy.previous.zip").exists());
+    }
+
+    #[test]
+    fn resume_refuses_autosaves_that_predate_the_owned_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let save = directory.path().join("buddy.zip");
+        let autosave = directory.path().join("_autosave1.zip");
+        let owner_path = directory.path().join("save-owner.json");
+        std::fs::write(&save, b"current").unwrap();
+        std::fs::write(&autosave, b"unrelated older run").unwrap();
+        let owner = SaveOwner {
+            version: 1,
+            primary_save: normalized_path(&save)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            run_started_unix_ms: u64::MAX,
+            clean_shutdown: false,
+        };
+        write_json_atomic(&owner_path, &owner, false).unwrap();
+
+        assert_eq!(promote_owned_autosave(&save, &owner_path).unwrap(), None);
+        assert_eq!(std::fs::read(&save).unwrap(), b"current");
     }
 }

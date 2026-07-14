@@ -261,6 +261,7 @@ impl FactorioClient {
                     json!(area.right_bottom.y),
                     entity_type.map_or(Value::Null, |value| json!(value)),
                     name.map_or(Value::Null, |value| json!(value)),
+                    json!(self.agent_id.as_str()),
                 ],
             )
             .await?;
@@ -295,6 +296,7 @@ impl FactorioClient {
                     json!(area.left_top.y),
                     json!(area.right_bottom.x),
                     json!(area.right_bottom.y),
+                    json!(self.agent_id.as_str()),
                 ],
             )
             .await?;
@@ -317,6 +319,7 @@ impl FactorioClient {
                     json!(area.right_bottom.x),
                     json!(area.right_bottom.y),
                     json!(limit),
+                    json!(self.agent_id.as_str()),
                 ],
             )
             .await?;
@@ -338,6 +341,7 @@ impl FactorioClient {
                     json!(area.right_bottom.x),
                     json!(area.right_bottom.y),
                     json!(limit),
+                    json!(self.agent_id.as_str()),
                 ],
             )
             .await?;
@@ -361,6 +365,7 @@ impl FactorioClient {
                     json!(area.right_bottom.x),
                     json!(area.right_bottom.y),
                     resource_type.map_or(Value::Null, |value| json!(value)),
+                    json!(self.agent_id.as_str()),
                 ],
             )
             .await?;
@@ -377,7 +382,12 @@ impl FactorioClient {
         let response = self
             .call_remote(
                 "find_nearest_resource",
-                &[json!(resource_name), json!(from.x), json!(from.y)],
+                &[
+                    json!(resource_name),
+                    json!(from.x),
+                    json!(from.y),
+                    json!(self.agent_id.as_str()),
+                ],
             )
             .await?;
         let resource: ResourcePatch = serde_json::from_str(&response)?;
@@ -396,6 +406,7 @@ impl FactorioClient {
                     json!(area.left_top.y),
                     json!(area.right_bottom.x),
                     json!(area.right_bottom.y),
+                    json!(self.agent_id.as_str()),
                 ],
             )
             .await?;
@@ -406,7 +417,14 @@ impl FactorioClient {
     /// Get a specific tile
     pub async fn get_tile(&mut self, position: Position) -> Result<Tile> {
         let response = self
-            .call_remote("get_tile", &[json!(position.x), json!(position.y)])
+            .call_remote(
+                "get_tile",
+                &[
+                    json!(position.x),
+                    json!(position.y),
+                    json!(self.agent_id.as_str()),
+                ],
+            )
             .await?;
         let tile: Tile = serde_json::from_str(&response)?;
         Ok(tile)
@@ -1139,7 +1157,11 @@ impl FactorioClient {
     }
 
     /// Rotate entity to a new direction
-    pub async fn rotate_entity(&mut self, unit_number: u32, direction: u8) -> Result<()> {
+    pub async fn rotate_entity(
+        &mut self,
+        unit_number: u32,
+        direction: u8,
+    ) -> Result<serde_json::Value> {
         let position = self.get_entity(unit_number).await?.position;
         self.approach_position(position, PROXIMITY_RANGE_INTERACT)
             .await?;
@@ -1153,10 +1175,8 @@ impl FactorioClient {
                 ],
             )
             .await?;
-        if response.contains("error") {
-            anyhow::bail!("Failed to rotate entity: {}", response);
-        }
-        Ok(())
+        ensure_lua_success(&response)?;
+        Ok(serde_json::from_str(&response)?)
     }
 
     /// Insert items into an entity
@@ -1271,7 +1291,10 @@ impl FactorioClient {
     /// Check if a technology has been researched
     pub async fn is_tech_researched(&mut self, tech_name: &str) -> Result<bool> {
         let response = self
-            .call_remote("is_tech_researched", &[json!(tech_name)])
+            .call_remote(
+                "is_tech_researched",
+                &[json!(tech_name), json!(self.agent_id.as_str())],
+            )
             .await?;
         #[derive(serde::Deserialize)]
         struct TechState {
@@ -1345,16 +1368,33 @@ impl FactorioClient {
     pub async fn wait_ticks(&mut self, ticks: u32) -> Result<()> {
         let start = self.get_tick().await?.tick;
         let target = start + ticks as u64;
+        let wall_limit =
+            tokio::time::Duration::from_secs(((ticks as u64 / 60).saturating_mul(4)).clamp(5, 120));
 
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            let current = self.get_tick().await?.tick;
-            if current >= target {
-                break;
+        tokio::time::timeout(wall_limit, async {
+            let mut last_tick = start;
+            let mut unchanged_samples = 0_u32;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                let current = self.get_tick().await?.tick;
+                if current >= target {
+                    return Ok(());
+                }
+                if current == last_tick {
+                    unchanged_samples += 1;
+                    if unchanged_samples >= 100 {
+                        anyhow::bail!(
+                            "Game ticks are not advancing (paused or stalled at tick {current})"
+                        );
+                    }
+                } else {
+                    last_tick = current;
+                    unchanged_samples = 0;
+                }
             }
-        }
-
-        Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for {ticks} game ticks"))?
     }
 
     // --- Proximity Checks ---
@@ -1372,7 +1412,8 @@ impl FactorioClient {
                 );
             }
         }
-        self.ensure_proximity_to_position(target, max_distance).await
+        self.ensure_proximity_to_position(target, max_distance)
+            .await
     }
 
     /// Check if player is within range of a position, return error if not
@@ -1730,6 +1771,7 @@ impl FactorioClient {
                     json!(area.left_top.y),
                     json!(area.right_bottom.x),
                     json!(area.right_bottom.y),
+                    json!(self.agent_id.as_str()),
                 ],
             )
             .await?;
@@ -1747,6 +1789,7 @@ impl FactorioClient {
                     json!(area.left_top.y),
                     json!(area.right_bottom.x),
                     json!(area.right_bottom.y),
+                    json!(self.agent_id.as_str()),
                 ],
             )
             .await?;

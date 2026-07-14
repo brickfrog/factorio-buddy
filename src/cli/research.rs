@@ -73,7 +73,10 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
 
     match cmd.command {
         ResearchSubcommand::Status => {
-            let response = client.call_remote("get_research_status", &[]).await?;
+            let agent_id = client.agent_id().as_str().to_string();
+            let response = client
+                .call_remote("get_research_status", &[serde_json::json!(agent_id)])
+                .await?;
 
             #[derive(serde::Deserialize)]
             struct Labs {
@@ -210,7 +213,10 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
         }
 
         ResearchSubcommand::Current => {
-            let response = client.call_remote("get_research_status", &[]).await?;
+            let agent_id = client.agent_id().as_str().to_string();
+            let response = client
+                .call_remote("get_research_status", &[serde_json::json!(agent_id)])
+                .await?;
 
             #[derive(serde::Deserialize)]
             struct CurrentResearch {
@@ -239,8 +245,12 @@ pub async fn execute(cmd: ResearchCommand, conn: &ResolvedConnectionArgs) -> Res
         }
 
         ResearchSubcommand::Start { tech } => {
+            let agent_id = client.agent_id().as_str().to_string();
             let response = client
-                .call_remote("start_research", &[serde_json::json!(tech)])
+                .call_remote(
+                    "start_research",
+                    &[serde_json::json!(tech), serde_json::json!(agent_id)],
+                )
                 .await?;
 
             #[derive(serde::Deserialize)]

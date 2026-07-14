@@ -42,10 +42,9 @@ pub fn find_belt_gaps(graph: &BeltGraph, all_entities: &[Entity]) -> BeltGapResu
                     gap_type: GapType::Blocked,
                     blocker: Some(blocker.name.clone()),
                 });
-            } else if graph.can_receive_from(
-                &output_pos.offset_in_direction(node.direction),
-                &output_pos,
-            ) {
+            } else if graph
+                .can_receive_from(&output_pos.offset_in_direction(node.direction), &output_pos)
+            {
                 // Only call an empty tile a gap when a compatible belt resumes
                 // immediately after it. An empty terminal is a legitimate belt
                 // endpoint, not evidence of a broken line.
