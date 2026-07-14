@@ -384,25 +384,53 @@ raw_lua "rcon.print(remote.call('claude_interface', 'place_entity', '$AGENT_ID',
 GROUND_ITEM="$(raw_lua "local s = game.surfaces['buddy-live-regression']; local count = 0; for _, e in pairs(s.find_entities_filtered{type = 'item-entity', position = {5.5, 0.5}, radius = 0.2}) do if e.stack and e.stack.valid_for_read and e.stack.name == 'copper-plate' then count = count + e.stack.count end end; rcon.print(helpers.table_to_json({count = count}))")"
 assert_json "placement never destroys blocked ground items" "$GROUND_ITEM" '.count == 1'
 
-# Coordinate removal must fail closed when more than one entity overlaps the
-# target. Exact unit-number removal remains available for deliberate changes.
-raw_lua "
+# Coordinate-only removal is discovery, never mutation. Even one candidate
+# must be returned for an exact-unit follow-up, and exact removal must remain
+# available for deliberate changes.
+SOLE_REMOVE_FIXTURE="$(raw_lua "
 game.tick_paused = true
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 c.teleport({8.5, 0.5})
+local inv = c.get_main_inventory()
+if inv then inv.clear() end
 local s = c.surface
 for _, e in pairs(s.find_entities_filtered{position = {10.5, 0.5}, radius = 0.2}) do
     if e.type ~= 'resource' and e.type ~= 'character' then e.destroy() end
 end
+local belt = s.create_entity{name = 'transport-belt', position = {10.5, 0.5}, direction = defines.direction.east, force = c.force}
+rcon.print(helpers.table_to_json({unit_number = belt and belt.unit_number or nil}))
+")"
+SOLE_REMOVE_UNIT="$(jq -r '.unit_number' <<<"$SOLE_REMOVE_FIXTURE")"
+COORDINATE_REMOVE="$(raw_lua "rcon.print(remote.call('claude_interface', 'remove_entity_at', '$AGENT_ID', 10.5, 0.5))")"
+assert_json "coordinate-only removal requires exact identity for one candidate" "$COORDINATE_REMOVE" \
+    --argjson unit "$SOLE_REMOVE_UNIT" \
+    '.success == false
+     and .error_kind == "exact_identity_required"
+     and .action_needed == "remove_entity_by_unit_number"
+     and (.candidates | length) == 1
+     and .candidates[0].unit_number == $unit'
+SOLE_BELT_REMAINS="$(raw_lua "local s = game.surfaces['buddy-live-regression']; rcon.print(helpers.table_to_json({count = s.count_entities_filtered{name = 'transport-belt', position = {10.5, 0.5}, radius = 0.2}}))")"
+assert_json "coordinate-only removal leaves the sole candidate unchanged" "$SOLE_BELT_REMAINS" '.count == 1'
+EXACT_REMOVE="$(raw_lua "rcon.print(remote.call('claude_interface', 'remove_entity', '$AGENT_ID', $SOLE_REMOVE_UNIT))")"
+assert_json "exact-unit removal still removes the selected entity" "$EXACT_REMOVE" \
+    --argjson unit "$SOLE_REMOVE_UNIT" \
+    '.success == true and .removed == true and .unit_number == $unit'
+SOLE_BELT_GONE="$(raw_lua "local s = game.surfaces['buddy-live-regression']; rcon.print(helpers.table_to_json({count = s.count_entities_filtered{name = 'transport-belt', position = {10.5, 0.5}, radius = 0.2}}))")"
+assert_json "exact-unit removal changes only the selected entity" "$SOLE_BELT_GONE" '.count == 0'
+
+# The same coordinate seam remains non-mutating when several entities overlap.
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
 s.create_entity{name = 'transport-belt', position = {10.5, 0.5}, direction = defines.direction.east, force = c.force}
 s.create_entity{name = 'entity-ghost', inner_name = 'small-electric-pole', position = {10.5, 0.5}, force = c.force}
 " >/dev/null
 AMBIGUOUS_REMOVE="$(raw_lua "rcon.print(remote.call('claude_interface', 'remove_entity_at', '$AGENT_ID', 10.5, 0.5))")"
 raw_lua "game.tick_paused = false" >/dev/null
 assert_json "coordinate removal fails closed on overlap" "$AMBIGUOUS_REMOVE" \
-    '.success == false and .error_kind == "ambiguous_entity" and (.candidates | length) >= 2'
+    '.success == false and .error_kind == "exact_identity_required" and (.candidates | length) >= 2'
 BELT_REMAINS="$(raw_lua "local s = game.surfaces['buddy-live-regression']; rcon.print(helpers.table_to_json({count = s.count_entities_filtered{name = 'transport-belt', position = {10.5, 0.5}, radius = 0.2}}))")"
-assert_json "ambiguous removal does not mine nearby infrastructure" "$BELT_REMAINS" '.count == 1'
+assert_json "coordinate removal does not mine nearby infrastructure" "$BELT_REMAINS" '.count == 1'
 
 # Surface-scoped snapshots and diagnostics must describe the same world.
 SURFACE_FIXTURE="$(raw_lua "
@@ -867,6 +895,11 @@ fi
 
 INVALID_PLACE="$(mcp_tool place_entity '{"entity_name":"not-a-real-entity","x":28,"y":10,"direction":"north"}')"
 assert_json "semantic MCP failures set isError" "$INVALID_PLACE" '.result.isError == true'
+INVALID_ROTATION="$(mcp_tool rotate_entity '{"unit_number":1,"direction":"sideways"}')"
+assert_json "invalid rotation validation sets isError" "$INVALID_ROTATION" \
+    '.result.isError == true
+     and (.result.content[0].text | fromjson
+          | .success == false and .error_kind == "invalid_direction")'
 
 DISCONNECTED_LAB="$(mcp_tool build_lab_feed "$(jq -cn \
     --argjson unit "$DISCONNECTED_LAB_UNIT" \

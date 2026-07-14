@@ -901,10 +901,10 @@ fn critical_mod_safety_contracts_are_explicit() {
         "placement must fail on blocking ground items rather than deleting them"
     );
     assert!(
-        control_lua.contains("error_kind = \"ambiguous_entity\"")
+        control_lua.contains("error_kind = \"exact_identity_required\"")
             && control_lua.contains("action_needed = \"remove_entity_by_unit_number\"")
-            && control_lua.contains("#candidates > 1"),
-        "coordinate removal must fail closed and require an exact unit number when ambiguous"
+            && control_lua.contains("candidate_count = #summaries"),
+        "coordinate removal must fail closed and require an exact unit number"
     );
 
     assert!(
@@ -1009,6 +1009,47 @@ fn corrected_inventory_readers_document_factorio_2_get_contents_shape() {
     let research_lua = include_str!("../mod/claude-interface/research.lua");
     assert_uses_factorio_2_get_contents_shape("research.lua get_available_research", research_lua);
     assert_uses_factorio_2_get_contents_shape("control.lua clear_area_impl", control_lua);
+}
+
+#[test]
+fn coordinate_removal_requires_exact_identity_without_mutating() {
+    let control_lua = include_str!("../mod/claude-interface/control.lua");
+    let coordinate_remove = control_lua
+        .split("local function remove_entity_at_impl(agent_id, x, y)")
+        .nth(1)
+        .and_then(|tail| tail.split("local function remove_entity_impl").next())
+        .expect("remove_entity_at_impl should precede remove_entity_impl");
+    let exact_remove = control_lua
+        .split("local function remove_entity_impl(agent_id, unit_number)")
+        .nth(1)
+        .and_then(|tail| tail.split("local function insert_items_impl").next())
+        .expect("remove_entity_impl should precede insert_items_impl");
+
+    for required in [
+        "success = false",
+        "removed = false",
+        "error_kind = \"exact_identity_required\"",
+        "action_needed = \"remove_entity_by_unit_number\"",
+        "candidate_count = #summaries",
+        "summary.exact_remove",
+        "args = entity.unit_number and {unit_number = entity.unit_number} or nil",
+    ] {
+        assert!(
+            coordinate_remove.contains(required),
+            "coordinate removal should retain fail-closed evidence {required:?}"
+        );
+    }
+    assert!(
+        !coordinate_remove.contains("mine_entity_for_agent")
+            && !coordinate_remove.contains("character.mine_entity")
+            && !coordinate_remove.contains("entity.destroy"),
+        "coordinate removal must remain non-mutating for zero, one, or many candidates"
+    );
+    assert!(
+        exact_remove.contains("entities.find_by_unit_number(unit_number)")
+            && exact_remove.contains("return mine_entity_for_agent(agent_id, entity)"),
+        "exact-unit remove_entity must remain the deliberate mutation path"
+    );
 }
 
 fn assert_uses_transport_line_contents_shape(case_name: &str, lua: &str) {

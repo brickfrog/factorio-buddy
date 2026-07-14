@@ -1665,7 +1665,6 @@ local function remove_entity_at_impl(agent_id, x, y)
     if not (character and character.valid) then
         return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
     end
-    storage.factorioctl_entities = storage.factorioctl_entities or {}
     local found = character.surface.find_entities_filtered{
         position = {x, y},
         radius = 0.5,
@@ -1681,21 +1680,35 @@ local function remove_entity_at_impl(agent_id, x, y)
     table.sort(candidates, function(a, b)
         return (a.unit_number or math.huge) < (b.unit_number or math.huge)
     end)
-    if #candidates == 0 then return {success = false, error = "No entity found"} end
-    if #candidates > 1 then
-        local summaries = {}
-        for _, entity in ipairs(candidates) do
-            table.insert(summaries, entities.summary(entity, false))
-        end
-        return {
-            success = false,
-            error = "Multiple entities overlap this position; use remove_entity with an exact unit_number",
-            error_kind = "ambiguous_entity",
-            action_needed = "remove_entity_by_unit_number",
-            candidates = summaries,
+    local summaries = {}
+    for _, entity in ipairs(candidates) do
+        local summary = entities.summary(entity, false)
+        summary.exact_remove = {
+            available = entity.unit_number ~= nil,
+            tool = entity.unit_number and "remove_entity" or nil,
+            args = entity.unit_number and {unit_number = entity.unit_number} or nil,
+            guidance = entity.unit_number
+                and ("Call remove_entity with unit_number=" .. tostring(entity.unit_number))
+                or "This entity has no unit_number and cannot be removed through the exact-unit API",
         }
+        table.insert(summaries, summary)
     end
-    return mine_entity_for_agent(agent_id, candidates[1])
+
+    return {
+        success = false,
+        removed = false,
+        error = #candidates == 0
+            and "No removable entity found at this position; coordinate removal is non-mutating"
+            or "Coordinate removal is non-mutating; choose a candidate and call remove_entity with its exact unit_number",
+        error_kind = "exact_identity_required",
+        action_needed = "remove_entity_by_unit_number",
+        position = {x = x, y = y},
+        candidate_count = #summaries,
+        candidates = summaries,
+        guidance = #candidates == 0
+            and "Inspect the exact target again and use remove_entity only after obtaining its unit_number"
+            or "Use candidates[].exact_remove.args with remove_entity; never retry this coordinate-only API as a mutation",
+    }
 end
 
 local function remove_entity_impl(agent_id, unit_number)

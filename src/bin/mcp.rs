@@ -676,6 +676,32 @@ fn tool_text_indicates_error(text: &str) -> bool {
             .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
 }
 
+fn semantic_failure(error_kind: &str, error: impl Into<String>) -> String {
+    serde_json::json!({
+        "success": false,
+        "error_kind": error_kind,
+        "error": error.into(),
+    })
+    .to_string()
+}
+
+fn invalid_direction_failure(field: &str, value: &str) -> String {
+    semantic_failure(
+        "invalid_direction",
+        format!("Invalid {field} '{value}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)"),
+    )
+}
+
+fn rollback_missing_identity_error(entity: &Entity) -> serde_json::Value {
+    serde_json::json!({
+        "unit_number": null,
+        "name": entity.name,
+        "position": entity.position,
+        "error_kind": "missing_unit_number",
+        "error": "Rollback skipped: the transaction-created entity had no unit_number, so exact identity removal was impossible; coordinate removal was not attempted.",
+    })
+}
+
 fn mark_semantic_tool_errors(result: &mut rmcp::model::CallToolResult) {
     if result.content.first().is_some_and(|content| {
         content
@@ -1203,14 +1229,16 @@ mod tests {
         attach_endpoint_preflight, automation_repair_hint, compound_route_preflight,
         execute_lua_refusal, existing_belt_compatibility, flow_lookup, flow_scan_area,
         fuel_topology_verification, incremental_infrastructure_verification,
-        inserter_machine_endpoint_verification, is_machine_output_source,
-        machine_output_build_args, machine_side_layout, model_safe_payload, parse_controller_steps,
+        inserter_machine_endpoint_verification, invalid_direction_failure,
+        is_machine_output_source, machine_output_build_args, machine_side_layout,
+        mark_semantic_tool_errors, model_safe_payload, parse_controller_steps,
         production_observation_json, production_unit_verified, production_verification_json,
         production_verification_summary, raw_lua_enabled, ready_fuel_supply_args,
-        recipe_restore_action, rollback_pending_after_pass, rollback_retry_order,
-        route_belt_failure_json, route_material_shortfall, route_segment_waypoint,
-        tool_text_indicates_error, BuildFuelSupplyParams, FactorioMcp, InserterMachineFlow,
-        RecipeRestoreAction, RouteBeltParams, MODEL_VISIBLE_TOOLS,
+        recipe_restore_action, rollback_missing_identity_error, rollback_pending_after_pass,
+        rollback_retry_order, route_belt_failure_json, route_material_shortfall,
+        route_segment_waypoint, semantic_failure, tool_text_indicates_error, BuildFuelSupplyParams,
+        FactorioMcp, InserterMachineFlow, RecipeRestoreAction, RouteBeltParams,
+        MODEL_VISIBLE_TOOLS,
     };
     use factorioctl::analyze::EntityLookup;
     use factorioctl::world::{
@@ -1669,6 +1697,50 @@ mod tests {
     }
 
     #[test]
+    fn semantic_validation_failures_are_structured_protocol_errors() {
+        for failure in [
+            invalid_direction_failure("direction", "sideways"),
+            semantic_failure(
+                "invalid_flow_reference",
+                "provide source_unit_number or source_x/source_y",
+            ),
+        ] {
+            let payload: serde_json::Value =
+                serde_json::from_str(&failure).expect("semantic failure should be JSON");
+            assert_eq!(payload["success"], false);
+            assert!(payload["error_kind"].as_str().is_some());
+            assert!(payload["error"].as_str().is_some());
+            assert!(tool_text_indicates_error(&failure));
+
+            let mut result =
+                rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(failure)]);
+            mark_semantic_tool_errors(&mut result);
+            assert_eq!(result.is_error, Some(true));
+        }
+    }
+
+    #[test]
+    fn missing_route_rollback_identity_is_reported_without_coordinate_guessing() {
+        let entity = Entity {
+            unit_number: None,
+            name: "transport-belt".to_string(),
+            entity_type: Some("transport-belt".to_string()),
+            position: Position::new(12.5, -4.5),
+            direction: 4,
+            health: None,
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+
+        let failure = rollback_missing_identity_error(&entity);
+        assert_eq!(failure["unit_number"], serde_json::Value::Null);
+        assert_eq!(failure["error_kind"], "missing_unit_number");
+        assert!(failure["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("coordinate removal was not attempted")));
+    }
+
+    #[test]
     fn model_tool_surface_is_the_exact_competent_gameplay_allowlist() {
         let server = FactorioMcp::new();
         let tools = server.tool_router.list_all();
@@ -2097,6 +2169,7 @@ mod tests {
             "partial_route_available",
             "buildable prefix",
             "places the buildable prefix",
+            "remove_entity_at(",
         ] {
             assert!(
                 !route_core.contains(forbidden),
@@ -2107,6 +2180,7 @@ mod tests {
             "check_entity_placement",
             "Complete route preflight failed; no belts were placed.",
             "client.remove_entity(unit_number).await",
+            "rollback_missing_identity_error(entity)",
             "\"complete_route\": true",
             "\"ready_to_call\"",
         ] {
@@ -2115,6 +2189,18 @@ mod tests {
                 "route_belt_core should retain atomic-route invariant {required:?}"
             );
         }
+    }
+
+    #[test]
+    fn fuel_supply_tool_boundaries_structure_core_errors() {
+        let source = include_str!("mcp.rs");
+        assert_eq!(
+            source
+                .matches(".with_player_messages(semantic_failure(\"fuel_supply_failed\", e))")
+                .count(),
+            2,
+            "both build and repair tool boundaries must convert core errors into protocol errors"
+        );
     }
 
     #[test]
@@ -2359,7 +2445,7 @@ async fn flow_reference_tile(
             .get_entity(unit)
             .await
             .map(|entity| entity.position.to_tile())
-            .map_err(|e| format!("Error reading entity {unit}: {e}")),
+            .map_err(|e| format!("Error: reading entity {unit}: {e}")),
     }
 }
 
@@ -4652,7 +4738,7 @@ impl FactorioMcp {
         let entities = client
             .find_entities(area, None, None)
             .await
-            .map_err(|e| format!("Error getting entities: {}", e))?;
+            .map_err(|e| format!("Error: getting entities: {}", e))?;
         let tiles = client.get_tiles(area).await.unwrap_or_default();
         let char_pos = client.get_character_position().await.ok();
         let detail_level = match detail {
@@ -4978,7 +5064,7 @@ impl FactorioMcp {
             Ok(e) => e,
             Err(e) => {
                 return self
-                    .with_player_messages(format!("Error getting entity: {}", e))
+                    .with_player_messages(format!("Error: getting entity: {}", e))
                     .await
             }
         };
@@ -4998,7 +5084,7 @@ impl FactorioMcp {
                 Ok(r) => r,
                 Err(e) => {
                     return self
-                        .with_player_messages(format!("Error querying drop position: {}", e))
+                        .with_player_messages(format!("Error: querying drop position: {}", e))
                         .await
                 }
             };
@@ -5215,7 +5301,7 @@ impl FactorioMcp {
                 Ok(pos) => pos,
                 Err(e) => {
                     return self
-                        .with_player_messages(format!("Error getting position: {}", e))
+                        .with_player_messages(format!("Error: getting position: {}", e))
                         .await
                 }
             }
@@ -5254,7 +5340,7 @@ impl FactorioMcp {
             Ok(pos) => pos,
             Err(e) => {
                 return self
-                    .with_player_messages(format!("Error getting position: {}", e))
+                    .with_player_messages(format!("Error: getting position: {}", e))
                     .await
             }
         };
@@ -5295,7 +5381,7 @@ impl FactorioMcp {
             .await
         {
             Ok(map) => map,
-            Err(e) => format!("Error rendering map: {}", e),
+            Err(e) => format!("Error: rendering map: {}", e),
         };
 
         let result = serde_json::json!({
@@ -5393,7 +5479,7 @@ impl FactorioMcp {
                 Ok(pos) => pos,
                 Err(e) => {
                     return self
-                        .with_player_messages(format!("Error getting position: {}", e))
+                        .with_player_messages(format!("Error: getting position: {}", e))
                         .await
                 }
             }
@@ -5897,7 +5983,11 @@ impl FactorioMcp {
             "source",
         ) {
             Ok(lookup) => lookup,
-            Err(e) => return self.with_player_messages(e).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(semantic_failure("invalid_flow_reference", e))
+                    .await;
+            }
         };
         let target = match flow_lookup(
             params.target_unit_number,
@@ -5906,15 +5996,27 @@ impl FactorioMcp {
             "target",
         ) {
             Ok(lookup) => lookup,
-            Err(e) => return self.with_player_messages(e).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(semantic_failure("invalid_flow_reference", e))
+                    .await;
+            }
         };
         let source_tile = match flow_reference_tile(&mut client, source).await {
             Ok(tile) => tile,
-            Err(e) => return self.with_player_messages(e).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(semantic_failure("flow_reference_unavailable", e))
+                    .await;
+            }
         };
         let target_tile = match flow_reference_tile(&mut client, target).await {
             Ok(tile) => tile,
-            Err(e) => return self.with_player_messages(e).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(semantic_failure("flow_reference_unavailable", e))
+                    .await;
+            }
         };
         let area = flow_scan_area(source_tile, target_tile, params.radius.clamp(1, 100));
 
@@ -5925,7 +6027,7 @@ impl FactorioMcp {
                     serde_json::to_string_pretty(&report)
                         .unwrap_or_else(|e| format!("Error: {}", e))
                 }
-                Err(e) => format!("Error reading belt contents: {}", e),
+                Err(e) => format!("Error: reading belt contents: {}", e),
             },
             Err(e) => format!("Error: {}", e),
         };
@@ -5985,10 +6087,13 @@ impl FactorioMcp {
                 Some(d) => d,
                 None => {
                     return self
-                        .with_player_messages(format!(
-                    "Invalid direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                    params.direction
-                ))
+                        .with_player_messages(semantic_failure(
+                            "invalid_direction",
+                            format!(
+                                "Invalid direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                                params.direction
+                            ),
+                        ))
                         .await
                 }
             }
@@ -6275,9 +6380,12 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid selected direction '{}'. Re-run execute_entity_placement_near with dry_run=true.",
-                        direction_name
+                    .with_player_messages(semantic_failure(
+                        "invalid_direction",
+                        format!(
+                            "Invalid selected direction '{}'. Re-run execute_entity_placement_near with dry_run=true.",
+                            direction_name
+                        ),
                     ))
                     .await;
             }
@@ -6627,9 +6735,12 @@ impl FactorioMcp {
                     Some(direction) => direction,
                     None => {
                         return self
-                            .with_player_messages(format!(
-                                "Invalid output_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                                direction_name
+                            .with_player_messages(semantic_failure(
+                                "invalid_direction",
+                                format!(
+                                    "Invalid output_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                                    direction_name
+                                ),
                             ))
                             .await
                     }
@@ -6685,9 +6796,12 @@ impl FactorioMcp {
                     Some(direction) => direction,
                     None => {
                         return self
-                            .with_player_messages(format!(
-                                "Invalid output_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                                direction_name
+                            .with_player_messages(semantic_failure(
+                                "invalid_direction",
+                                format!(
+                                    "Invalid output_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                                    direction_name
+                                ),
                             ))
                             .await;
                     }
@@ -7193,7 +7307,7 @@ impl FactorioMcp {
             .await
         {
             Ok(transfer) => serde_json::to_string_pretty(&transfer)
-                .unwrap_or_else(|e| format!("Error serializing transfer result: {}", e)),
+                .unwrap_or_else(|e| format!("Error: serializing transfer result: {}", e)),
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
@@ -7621,10 +7735,13 @@ impl FactorioMcp {
             Some(d) => d,
             None => {
                 return self
-                    .with_player_messages(format!(
-                    "Invalid direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                    params.direction
-                ))
+                    .with_player_messages(semantic_failure(
+                        "invalid_direction",
+                        format!(
+                            "Invalid direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
+                            params.direction
+                        ),
+                    ))
                     .await
             }
         };
@@ -7674,7 +7791,7 @@ impl FactorioMcp {
                         "success": false,
                         "dry_run": params.dry_run,
                         "error_kind": "route_area_too_large",
-                        "error": format!("Error building collision map: {}", error),
+                        "error": format!("Error: building collision map: {}", error),
                         "from": { "x": params.from_x, "y": params.from_y },
                         "to": { "x": params.to_x, "y": params.to_y },
                         "belt_type": params.belt_type,
@@ -7714,7 +7831,7 @@ impl FactorioMcp {
                 return Ok(route_belt_failure_json(
                     params,
                     "infrastructure_failure",
-                    format!("Error building collision map: {}", e),
+                    format!("Error: building collision map: {}", e),
                 ));
             }
         };
@@ -7727,7 +7844,7 @@ impl FactorioMcp {
                     return Ok(route_belt_failure_json(
                         params,
                         "infrastructure_failure",
-                        format!("Error checking existing route entities: {}", e),
+                        format!("Error: checking existing route entities: {}", e),
                     ));
                 }
             };
@@ -7878,7 +7995,7 @@ impl FactorioMcp {
                 return Ok(route_belt_failure_json(
                     params,
                     "infrastructure_failure",
-                    format!("Error checking inventory: {}", e),
+                    format!("Error: checking inventory: {}", e),
                 ));
             }
         };
@@ -8109,17 +8226,16 @@ impl FactorioMcp {
             let mut rolled_back = 0;
             let mut rollback_errors = Vec::new();
             for entity in placed_entities.iter().rev() {
-                let rollback = match entity.unit_number {
-                    Some(unit_number) => client.remove_entity(unit_number).await,
-                    None => client.remove_entity_at(entity.position).await,
-                };
-                match rollback {
-                    Ok(()) => rolled_back += 1,
-                    Err(rollback_error) => rollback_errors.push(serde_json::json!({
-                        "unit_number": entity.unit_number,
-                        "position": entity.position,
-                        "error": rollback_error.to_string(),
-                    })),
+                match entity.unit_number {
+                    Some(unit_number) => match client.remove_entity(unit_number).await {
+                        Ok(()) => rolled_back += 1,
+                        Err(rollback_error) => rollback_errors.push(serde_json::json!({
+                            "unit_number": unit_number,
+                            "position": entity.position,
+                            "error": rollback_error.to_string(),
+                        })),
+                    },
+                    None => rollback_errors.push(rollback_missing_identity_error(entity)),
                 }
             }
             return Ok(serde_json::json!({
@@ -8144,7 +8260,7 @@ impl FactorioMcp {
                 "guidance": if rollback_errors.is_empty() {
                     "The failed route was rolled back. Inspect the reported tile and retry the complete route."
                 } else {
-                    "Rollback was incomplete. Remove only the exact units listed in rollback_errors before retrying."
+                    "Rollback was incomplete. Inspect rollback_errors; entries missing unit identity were deliberately not removed by coordinates."
                 },
             }));
         }
@@ -8528,7 +8644,11 @@ impl FactorioMcp {
         };
         let result = match self.build_fuel_supply_core(&mut client, &params).await {
             Ok(result) => model_safe_payload(result),
-            Err(e) => return self.with_player_messages(e).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(semantic_failure("fuel_supply_failed", e))
+                    .await;
+            }
         };
         let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
         self.with_player_messages(msg).await
@@ -8607,7 +8727,11 @@ impl FactorioMcp {
             .await
         {
             Ok(result) => result,
-            Err(e) => return self.with_player_messages(e).await,
+            Err(e) => {
+                return self
+                    .with_player_messages(semantic_failure("fuel_supply_failed", e))
+                    .await;
+            }
         };
         let success = repair
             .get("success")
@@ -8656,9 +8780,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "inserter_direction",
+                        &params.inserter_direction,
                     ))
                     .await;
             }
@@ -8954,9 +9078,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "inserter_direction",
+                        &params.inserter_direction,
                     ))
                     .await;
             }
@@ -9392,9 +9516,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "inserter_direction",
+                        &params.inserter_direction,
                     ))
                     .await;
             }
@@ -9881,9 +10005,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid input_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.input_inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "input_inserter_direction",
+                        &params.input_inserter_direction,
                     ))
                     .await;
             }
@@ -9892,9 +10016,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid output_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.output_inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "output_inserter_direction",
+                        &params.output_inserter_direction,
                     ))
                     .await;
             }
@@ -10692,9 +10816,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid gear_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.gear_inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "gear_inserter_direction",
+                        &params.gear_inserter_direction,
                     ))
                     .await;
             }
@@ -10703,9 +10827,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid copper_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.copper_inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "copper_inserter_direction",
+                        &params.copper_inserter_direction,
                     ))
                     .await;
             }
@@ -10714,9 +10838,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid output_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.output_inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "output_inserter_direction",
+                        &params.output_inserter_direction,
                     ))
                     .await;
             }
@@ -10725,9 +10849,9 @@ impl FactorioMcp {
             Some(direction) => direction,
             None => {
                 return self
-                    .with_player_messages(format!(
-                        "Invalid lab_inserter_direction '{}'. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)",
-                        params.lab_inserter_direction
+                    .with_player_messages(invalid_direction_failure(
+                        "lab_inserter_direction",
+                        &params.lab_inserter_direction,
                     ))
                     .await;
             }
@@ -11471,7 +11595,7 @@ impl FactorioMcp {
             Ok(r) => r,
             Err(e) => {
                 return self
-                    .with_player_messages(format!("Error getting belt contents: {}", e))
+                    .with_player_messages(format!("Error: getting belt contents: {}", e))
                     .await
             }
         };
@@ -11481,7 +11605,7 @@ impl FactorioMcp {
             Ok(e) => e,
             Err(e) => {
                 return self
-                    .with_player_messages(format!("Error getting entities: {}", e))
+                    .with_player_messages(format!("Error: getting entities: {}", e))
                     .await
             }
         };
@@ -11924,7 +12048,7 @@ impl FactorioMcp {
         if broadcast_config.console || broadcast_config.flying_text {
             let mut client = match self.connect().await {
                 Ok(c) => c,
-                Err(e) => return format!("Error connecting: {}", e),
+                Err(e) => return format!("Error: connecting: {}", e),
             };
 
             if broadcast_config.console {
@@ -12065,7 +12189,7 @@ impl FactorioMcp {
 
         let result = match memory.save() {
             Ok(()) => format!("Zone '{}' created successfully", params.id),
-            Err(e) => format!("Error saving zone: {}", e),
+            Err(e) => format!("Error: saving zone: {}", e),
         };
         self.with_player_messages(result).await
     }
@@ -12156,7 +12280,7 @@ impl FactorioMcp {
 
                 match memory.save() {
                     Ok(()) => format!("Zone '{}' updated successfully", params.id),
-                    Err(e) => format!("Error saving: {}", e),
+                    Err(e) => format!("Error: saving: {}", e),
                 }
             }
             None => format!("Zone '{}' not found", params.id),
@@ -12172,7 +12296,7 @@ impl FactorioMcp {
         let result = match memory.remove_zone(&params.id) {
             Some(_) => match memory.save() {
                 Ok(()) => format!("Zone '{}' deleted", params.id),
-                Err(e) => format!("Error saving: {}", e),
+                Err(e) => format!("Error: saving: {}", e),
             },
             None => format!("Zone '{}' not found", params.id),
         };
@@ -12207,7 +12331,7 @@ impl FactorioMcp {
             Ok(r) => r,
             Err(e) => {
                 return self
-                    .with_player_messages(format!("Error scanning: {}", e))
+                    .with_player_messages(format!("Error: scanning: {}", e))
                     .await
             }
         };
@@ -12247,7 +12371,7 @@ impl FactorioMcp {
         if params.save_as_protected {
             if let Err(e) = memory.save() {
                 return self
-                    .with_player_messages(format!("Error saving memory: {}", e))
+                    .with_player_messages(format!("Error: saving memory: {}", e))
                     .await;
             }
         }
@@ -12400,7 +12524,7 @@ impl FactorioMcp {
             Ok(e) => e,
             Err(e) => {
                 return self
-                    .with_player_messages(format!("Error getting entities: {}", e))
+                    .with_player_messages(format!("Error: getting entities: {}", e))
                     .await
             }
         };
@@ -12512,7 +12636,7 @@ impl FactorioMcp {
             Ok(r) => r,
             Err(e) => {
                 return self
-                    .with_player_messages(format!("Error getting resources: {}", e))
+                    .with_player_messages(format!("Error: getting resources: {}", e))
                     .await
             }
         };
