@@ -21,13 +21,6 @@ use crate::world::{
 };
 use rcon::RconClient;
 
-/// Maximum distance for placing entities
-pub const PROXIMITY_RANGE_PLACE: f64 = 10.0;
-/// Maximum distance for inserting items
-pub const PROXIMITY_RANGE_INSERT: f64 = 5.0;
-/// Maximum distance for setting recipes
-pub const PROXIMITY_RANGE_INTERACT: f64 = 5.0;
-
 /// Default wall-clock budget for observing a character crafting queue.
 pub const DEFAULT_CRAFTING_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Default delay between character crafting queue observations.
@@ -35,6 +28,40 @@ pub const DEFAULT_CRAFTING_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 type CraftingQueueFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CraftingQueueSnapshot>> + Send + 'a>>;
+
+#[derive(Debug, serde::Deserialize)]
+struct WalkStatus {
+    success: bool,
+    #[serde(default)]
+    walk_id: Option<u64>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    arrived: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    final_position: Option<Position>,
+    #[serde(default)]
+    distance_walked: f64,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReachStatus {
+    success: bool,
+    #[serde(default)]
+    reachable: bool,
+    #[serde(default)]
+    target_position: Option<Position>,
+    #[serde(default)]
+    max_distance: Option<f64>,
+    #[serde(default)]
+    walk_arrival_distance: Option<f64>,
+    #[serde(default)]
+    error: Option<String>,
+}
 
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -857,6 +884,7 @@ impl FactorioClient {
                     json!(self.agent_id.as_str()),
                     json!(position.x),
                     json!(position.y),
+                    Value::Null,
                 ],
             )
             .await?;
@@ -929,12 +957,7 @@ impl FactorioClient {
     /// Mine a natural entity or pick up loose items at an exact position.
     /// Walks to the target first if needed.
     pub async fn mine_at(&mut self, position: Position, count: u32) -> Result<MineResult> {
-        // Walk to the target first
-        let char_pos = self.get_character_position().await?;
-        let dist = ((position.x - char_pos.x).powi(2) + (position.y - char_pos.y).powi(2)).sqrt();
-        if dist > 2.5 {
-            let _ = self.walk_to(position, false).await?;
-        }
+        self.approach_position(position, "resource").await?;
 
         let response = self
             .call_remote(
@@ -1511,8 +1534,7 @@ impl FactorioClient {
         position: Position,
         direction: Direction,
     ) -> Result<Entity> {
-        self.approach_position(position, PROXIMITY_RANGE_PLACE)
-            .await?;
+        self.approach_position(position, "build").await?;
         let response = self
             .call_remote(
                 "place_entity",
@@ -1741,8 +1763,7 @@ impl FactorioClient {
         position: Position,
         direction: Direction,
     ) -> Result<Entity> {
-        self.approach_position(position, PROXIMITY_RANGE_PLACE)
-            .await?;
+        self.approach_position(position, "build").await?;
         let response = self
             .call_remote(
                 "place_ghost",
@@ -1769,8 +1790,6 @@ impl FactorioClient {
 
     /// Remove entity at position
     pub async fn remove_entity_at(&mut self, position: Position) -> Result<()> {
-        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
-            .await?;
         let response = self
             .call_remote(
                 "remove_entity_at",
@@ -1787,9 +1806,7 @@ impl FactorioClient {
 
     /// Remove entity by unit number
     pub async fn remove_entity(&mut self, unit_number: u32) -> Result<()> {
-        let position = self.get_entity(unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
-            .await?;
+        self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
                 "remove_entity",
@@ -1806,9 +1823,7 @@ impl FactorioClient {
         unit_number: u32,
         direction: u8,
     ) -> Result<serde_json::Value> {
-        let position = self.get_entity(unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
-            .await?;
+        self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
                 "rotate_entity",
@@ -1830,9 +1845,7 @@ impl FactorioClient {
         unit_number: u32,
         allowed_items: &[String],
     ) -> Result<serde_json::Value> {
-        let position = self.get_entity(unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
-            .await?;
+        self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
                 "configure_inserter",
@@ -1857,9 +1870,7 @@ impl FactorioClient {
         count: u32,
         inventory_type: &str,
     ) -> Result<serde_json::Value> {
-        let position = self.get_entity(unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INSERT)
-            .await?;
+        self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
                 "insert_items",
@@ -1883,9 +1894,7 @@ impl FactorioClient {
         fuel_item: &str,
         count: u32,
     ) -> Result<serde_json::Value> {
-        let position = self.get_entity(unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INSERT)
-            .await?;
+        self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
                 "bootstrap_burner_once",
@@ -1907,9 +1916,7 @@ impl FactorioClient {
         item: &str,
         count: u32,
     ) -> Result<serde_json::Value> {
-        let position = self.get_entity(unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INSERT)
-            .await?;
+        self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
                 "collect_from_chest",
@@ -1932,9 +1939,7 @@ impl FactorioClient {
         count: u32,
         inventory_type: &str,
     ) -> Result<u32> {
-        let position = self.get_entity(unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INSERT)
-            .await?;
+        self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
                 "extract_items",
@@ -1966,9 +1971,7 @@ impl FactorioClient {
     }
 
     async fn set_recipe_value(&mut self, unit_number: u32, recipe: Option<&str>) -> Result<()> {
-        let position = self.get_entity(unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
-            .await?;
+        self.approach_entity(unit_number).await?;
         let recipe = recipe.map_or(Value::Null, |name| json!(name));
         let response = self
             .call_remote(
@@ -2027,9 +2030,7 @@ impl FactorioClient {
         count: u32,
         dry_run: bool,
     ) -> Result<serde_json::Value> {
-        let position = self.get_entity(lab_unit_number).await?.position;
-        self.approach_position(position, PROXIMITY_RANGE_INSERT)
-            .await?;
+        self.approach_entity(lab_unit_number).await?;
         let response = self
             .call_remote(
                 "feed_lab_from_inventory",
@@ -2070,8 +2071,7 @@ impl FactorioClient {
         direction: Direction,
         belt_type: &str, // "input" for entry, "output" for exit
     ) -> Result<Entity> {
-        self.approach_position(position, PROXIMITY_RANGE_PLACE)
-            .await?;
+        self.approach_position(position, "build").await?;
         let response = self
             .call_remote(
                 "place_underground_belt",
@@ -2156,25 +2156,129 @@ impl FactorioClient {
 
     // --- Proximity Checks ---
 
-    async fn approach_position(&mut self, target: Position, max_distance: f64) -> Result<()> {
-        let current = self.get_character_position().await?;
-        if current.distance(&target) > max_distance {
-            // Mutations remain character-bound, but a straight line can run
-            // through the very machine or factory row being repaired. Use the
-            // shared collision-map/A* walker; it still drives the character's
-            // ordinary walking state and never teleports.
-            let result = self.walk_to_pathfind(target, 16).await?;
-            if result.final_position.distance(&target) > max_distance {
-                anyhow::bail!(
-                    "Could not move within interaction range of ({:.1}, {:.1}): {}",
-                    target.x,
-                    target.y,
-                    result.reason.as_deref().unwrap_or("walk stopped early")
-                );
-            }
+    async fn get_entity_reach_status(&mut self, unit_number: u32) -> Result<ReachStatus> {
+        let response = self
+            .call_remote(
+                "get_entity_reach",
+                &[json!(self.agent_id.as_str()), json!(unit_number)],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    async fn get_position_reach_status(
+        &mut self,
+        target: Position,
+        reach_kind: &str,
+    ) -> Result<ReachStatus> {
+        let response = self
+            .call_remote(
+                "get_position_reach",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(target.x),
+                    json!(target.y),
+                    json!(reach_kind),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Move only when Factorio says an exact entity is out of reach, then
+    /// re-check the engine-owned reach predicate after the walk.
+    pub async fn approach_entity(&mut self, unit_number: u32) -> Result<()> {
+        let initial = self.get_entity_reach_status(unit_number).await?;
+        if !initial.success {
+            anyhow::bail!(
+                "{}",
+                initial
+                    .error
+                    .unwrap_or_else(|| "failed to inspect entity reach".to_string())
+            );
         }
-        self.ensure_proximity_to_position(target, max_distance)
-            .await
+        if initial.reachable {
+            return Ok(());
+        }
+
+        let target = initial
+            .target_position
+            .ok_or_else(|| anyhow::anyhow!("entity reach response omitted target_position"))?;
+        let max_distance = initial
+            .max_distance
+            .filter(|distance| distance.is_finite() && *distance > 0.0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("entity reach response omitted a usable max_distance")
+            })?;
+        let physical_arrival_distance = initial.walk_arrival_distance.unwrap_or(0.0).max(0.0);
+
+        let walk = self
+            .walk_to_pathfind_with_tolerance(target, 16, max_distance, physical_arrival_distance)
+            .await;
+        let final_status = self.get_entity_reach_status(unit_number).await?;
+        if final_status.success && final_status.reachable {
+            return Ok(());
+        }
+
+        let walk_reason = match walk {
+            Ok(result) => result
+                .reason
+                .unwrap_or_else(|| "walk completed outside native reach".to_string()),
+            Err(error) => error.to_string(),
+        };
+        anyhow::bail!(
+            "Could not move within Factorio reach of entity {}: {}; final reach check: {}",
+            unit_number,
+            walk_reason,
+            final_status
+                .error
+                .unwrap_or_else(|| "entity remains out of reach".to_string())
+        )
+    }
+
+    async fn approach_position(&mut self, target: Position, reach_kind: &str) -> Result<()> {
+        let initial = self.get_position_reach_status(target, reach_kind).await?;
+        if !initial.success {
+            anyhow::bail!(
+                "{}",
+                initial
+                    .error
+                    .unwrap_or_else(|| "failed to inspect position reach".to_string())
+            );
+        }
+        if initial.reachable {
+            return Ok(());
+        }
+        let max_distance = initial
+            .max_distance
+            .filter(|distance| distance.is_finite() && *distance > 0.0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("position reach response omitted a usable max_distance")
+            })?;
+        let physical_arrival_distance = initial.walk_arrival_distance.unwrap_or(0.0).max(0.0);
+        let walk = self
+            .walk_to_pathfind_with_tolerance(target, 16, max_distance, physical_arrival_distance)
+            .await;
+        let final_status = self.get_position_reach_status(target, reach_kind).await?;
+        if final_status.success && final_status.reachable {
+            return Ok(());
+        }
+        let walk_reason = match walk {
+            Ok(result) => result
+                .reason
+                .unwrap_or_else(|| "walk completed outside native reach".to_string()),
+            Err(error) => error.to_string(),
+        };
+        anyhow::bail!(
+            "Could not move within Factorio {} reach of ({:.1}, {:.1}): {}; final reach check: {}",
+            reach_kind,
+            target.x,
+            target.y,
+            walk_reason,
+            final_status
+                .error
+                .unwrap_or_else(|| "position remains out of reach".to_string())
+        )
     }
 
     /// Check if player is within range of a position, return error if not
@@ -2231,21 +2335,23 @@ impl FactorioClient {
         target: Position,
         search_radius: u32,
     ) -> Result<WalkResult> {
-        use crate::world::find_walk_path;
+        self.walk_to_pathfind_with_tolerance(target, search_radius, 0.0, 0.0)
+            .await
+    }
+
+    async fn walk_to_pathfind_with_tolerance(
+        &mut self,
+        target: Position,
+        search_radius: u32,
+        final_tolerance: f64,
+        physical_arrival_distance: f64,
+    ) -> Result<WalkResult> {
+        use crate::world::{find_walk_path, find_walk_path_to_any};
+        use std::collections::HashSet;
 
         let start_pos = self.get_character_position().await?;
         let start_grid = GridPos::from_position(&start_pos);
         let end_grid = GridPos::from_position(&target);
-
-        // If already at target, return immediately
-        if start_pos.distance(&target) < 1.5 {
-            return Ok(WalkResult {
-                arrived: true,
-                final_position: start_pos,
-                distance_walked: 0.0,
-                reason: None,
-            });
-        }
 
         // Build collision map for the area
         let padding = search_radius as f64;
@@ -2262,56 +2368,128 @@ impl FactorioClient {
 
         let collision_map = self.build_collision_map(area).await?;
 
-        // Find path using A*
-        let path_result = find_walk_path(start_grid, end_grid, &collision_map);
+        // Exact navigation has one exact goal. Interaction movement instead
+        // pathfinds to any walkable standing tile inside the authoritative
+        // Factorio reach radius, because an entity's center is normally
+        // collision-blocked by the entity itself.
+        let (path_result, path_goal) = if final_tolerance > 0.0 {
+            let candidate_radius = final_tolerance.min(padding).ceil().max(1.0) as i32;
+            let safe_goal_radius = (final_tolerance - physical_arrival_distance).max(0.0);
+            let mut goals = HashSet::new();
+            for x in end_grid.x - candidate_radius..=end_grid.x + candidate_radius {
+                for y in end_grid.y - candidate_radius..=end_grid.y + candidate_radius {
+                    let candidate = GridPos::new(x, y);
+                    if candidate.to_position().distance(&target) <= safe_goal_radius
+                        && collision_map.is_walkable(&candidate)
+                    {
+                        goals.insert(candidate);
+                    }
+                }
+            }
+            let result = find_walk_path_to_any(start_grid, &goals, &collision_map);
+            let goal = result.path.last().copied().unwrap_or(end_grid);
+            (result, goal)
+        } else {
+            (
+                find_walk_path(start_grid, end_grid, &collision_map),
+                end_grid,
+            )
+        };
 
         if !path_result.success {
-            // Fall back to direct walking
-            return self.walk_to(target, false).await;
+            // Preserve the ordinary walking fallback when the collision map
+            // cannot find any route. The terminal receipt still reports a
+            // truthful `stuck` result rather than fabricating arrival.
+            return self.walk_to_with_tolerance(target, final_tolerance).await;
         }
 
         // Walk through each waypoint
         let mut total_distance = 0.0;
+        let waypoints = path_result
+            .path
+            .iter()
+            .copied()
+            .filter(|waypoint| *waypoint != start_grid)
+            .collect::<Vec<_>>();
 
-        for waypoint in &path_result.path {
-            let waypoint_pos = waypoint.to_position();
+        for (index, waypoint) in waypoints.iter().enumerate() {
+            let last_waypoint = index + 1 == waypoints.len();
+            let raw_waypoint = if last_waypoint && final_tolerance == 0.0 {
+                target
+            } else if last_waypoint {
+                path_goal.to_position()
+            } else {
+                waypoint.to_position()
+            };
+            let distance_from_target = raw_waypoint.distance(&target);
+            let enters_final_radius = final_tolerance > 0.0
+                && distance_from_target + physical_arrival_distance <= final_tolerance;
+            let final_hop = last_waypoint || enters_final_radius;
+            let tolerance = if enters_final_radius {
+                // Stop along the collision-free A* segment as soon as the
+                // character enters the requested radius. Walking exactly to
+                // this near-target turn can put the character on a later
+                // placement tile.
+                final_tolerance - distance_from_target
+            } else if last_waypoint {
+                final_tolerance
+            } else {
+                0.0
+            };
 
-            // Walk to this waypoint using the direct method
-            let result = self.walk_to(waypoint_pos, false).await?;
+            let result = self.walk_to_with_tolerance(raw_waypoint, tolerance).await?;
             total_distance += result.distance_walked;
 
-            if !result.arrived && result.final_position.distance(&waypoint_pos) > 3.0 {
-                // Got stuck, return current result
+            if !result.arrived {
                 return Ok(WalkResult {
                     arrived: false,
                     final_position: result.final_position,
                     distance_walked: total_distance,
-                    reason: Some("Blocked on path".to_string()),
+                    reason: result.reason,
+                });
+            }
+            if final_hop {
+                let inside_target_radius = final_tolerance == 0.0
+                    || result.final_position.distance(&target) <= final_tolerance;
+                return Ok(WalkResult {
+                    arrived: result.arrived && inside_target_radius,
+                    final_position: result.final_position,
+                    distance_walked: total_distance,
+                    reason: if inside_target_radius {
+                        None
+                    } else {
+                        Some("Walk stopped outside requested arrival radius".to_string())
+                    },
                 });
             }
         }
 
-        // Check if we arrived
-        let final_pos = self.get_character_position().await?;
-        let arrived = final_pos.distance(&target) < 3.0;
+        // Same-tile paths contain no waypoint after filtering. The mod still
+        // owns the exact floating-point arrival decision for that final hop.
+        if waypoints.is_empty() {
+            return self.walk_to_with_tolerance(target, final_tolerance).await;
+        }
 
+        let final_pos = self.get_character_position().await?;
         Ok(WalkResult {
-            arrived,
+            arrived: true,
             final_position: final_pos,
             distance_walked: total_distance,
-            reason: if arrived {
-                None
-            } else {
-                Some("Did not reach target".to_string())
-            },
+            reason: None,
         })
     }
 
     /// Smooth walk to a target position (direct, no pathfinding)
     pub async fn walk_to(&mut self, target: Position, _run: bool) -> Result<WalkResult> {
-        let mut total_distance = 0.0;
+        self.walk_to_with_tolerance(target, 0.0).await
+    }
+
+    async fn walk_to_with_tolerance(
+        &mut self,
+        target: Position,
+        arrival_distance: f64,
+    ) -> Result<WalkResult> {
         let start_pos = self.get_character_position().await?;
-        let mut last_pos = start_pos;
 
         let target_response = self
             .call_remote(
@@ -2320,49 +2498,67 @@ impl FactorioClient {
                     json!(self.agent_id.as_str()),
                     json!(target.x),
                     json!(target.y),
+                    json!(arrival_distance.max(0.0)),
                 ],
             )
             .await?;
         ensure_lua_success(&target_response)?;
+        let started: WalkStatus = serde_json::from_str(&target_response)?;
+        if !started.success {
+            anyhow::bail!(
+                "{}",
+                started
+                    .error
+                    .unwrap_or_else(|| "failed to start walk".to_string())
+            );
+        }
+        let walk_id = started
+            .walk_id
+            .ok_or_else(|| anyhow::anyhow!("walk start response omitted walk_id"))?;
 
         for _ in 0..500 {
-            let pos = self.get_character_position().await?;
-            total_distance += pos.distance(&last_pos);
-
-            if pos.distance(&target) < 3.0 {
-                self.call_remote("clear_walk_target", &[json!(self.agent_id.as_str())])
-                    .await?;
-                return Ok(WalkResult {
-                    arrived: true,
-                    final_position: pos,
-                    distance_walked: total_distance,
-                    reason: None,
-                });
-            }
-
-            let target_active = self
-                .call_remote("has_walk_target", &[json!(self.agent_id.as_str())])
+            let response = self
+                .call_remote(
+                    "get_walk_status",
+                    &[json!(self.agent_id.as_str()), json!(walk_id)],
+                )
                 .await?;
-            if target_active.trim() != "true" {
+            let status: WalkStatus = serde_json::from_str(&response)?;
+            if !status.success {
+                anyhow::bail!(
+                    "{}",
+                    status
+                        .error
+                        .unwrap_or_else(|| "failed to read walk status".to_string())
+                );
+            }
+            if !status.active {
+                let final_position = match status.final_position {
+                    Some(position) => position,
+                    None => self.get_character_position().await.unwrap_or(start_pos),
+                };
                 return Ok(WalkResult {
-                    arrived: pos.distance(&target) < 3.0,
-                    final_position: pos,
-                    distance_walked: total_distance,
-                    reason: Some("Walk target cleared".to_string()),
+                    arrived: status.arrived,
+                    final_position,
+                    distance_walked: status.distance_walked,
+                    reason: if status.arrived { None } else { status.reason },
                 });
             }
 
-            last_pos = pos;
             tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
         }
 
-        self.call_remote("clear_walk_target", &[json!(self.agent_id.as_str())])
+        let _ = self
+            .call_remote(
+                "clear_walk_target",
+                &[json!(self.agent_id.as_str()), json!(walk_id)],
+            )
             .await?;
         let pos = self.get_character_position().await?;
         Ok(WalkResult {
             arrived: false,
             final_position: pos,
-            distance_walked: total_distance,
+            distance_walked: pos.distance(&start_pos),
             reason: Some("Timeout".to_string()),
         })
     }
@@ -2399,10 +2595,10 @@ impl FactorioClient {
                 break;
             };
 
-            let walk_result = self.walk_to(target_pos, false).await?;
-            total_distance += walk_result.distance_walked;
-
+            let before = self.get_character_position().await?;
             let mine_result = self.mine_at(target_pos, 1).await?;
+            let after = self.get_character_position().await?;
+            total_distance += before.distance(&after);
             if mine_result.success {
                 gathered += 1;
             } else {

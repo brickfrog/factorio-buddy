@@ -278,6 +278,7 @@ impl LuaCommand {
                 Self::lua_string_arg(agent_id.as_str()),
                 position.x.to_string(),
                 position.y.to_string(),
+                "nil".to_string(),
             ],
             "Run just sync/resume so the updated claude-interface mod is loaded before walking.",
         )
@@ -286,8 +287,43 @@ impl LuaCommand {
     pub fn clear_walk_target(agent_id: &AgentId) -> String {
         Self::claude_interface_json_call(
             "clear_walk_target",
-            &[Self::lua_string_arg(agent_id.as_str())],
+            &[Self::lua_string_arg(agent_id.as_str()), "nil".to_string()],
             "Run just sync/resume so the updated claude-interface mod is loaded before clearing walk targets.",
+        )
+    }
+
+    pub fn get_walk_status(agent_id: &AgentId, walk_id: u64) -> String {
+        Self::claude_interface_json_call(
+            "get_walk_status",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                walk_id.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before reading walk status.",
+        )
+    }
+
+    pub fn get_entity_reach(agent_id: &AgentId, unit_number: u32) -> String {
+        Self::claude_interface_json_call(
+            "get_entity_reach",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                unit_number.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before reading entity reach.",
+        )
+    }
+
+    pub fn get_position_reach(agent_id: &AgentId, position: Position, reach_kind: &str) -> String {
+        Self::claude_interface_json_call(
+            "get_position_reach",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                position.x.to_string(),
+                position.y.to_string(),
+                Self::lua_string_arg(reach_kind),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before reading position reach.",
         )
     }
 
@@ -1372,7 +1408,10 @@ mod tests {
         let lua = LuaCommand::set_walk_target(&agent, Position::new(12.0, 13.0));
 
         assert_remote_request(&lua, "set_walk_target");
-        assert_eq!(remote_args(&lua), vec![json!("doug"), json!(12), json!(13)]);
+        assert_eq!(
+            remote_args(&lua),
+            vec![json!("doug"), json!(12), json!(13), Value::Null]
+        );
         for forbidden in [
             "storage.factorioctl_walk_targets",
             "remote.call(\"claude_interface\", \"register_character\"",
@@ -1404,7 +1443,7 @@ mod tests {
         assert_remote_request(&lua, "set_walk_target");
         assert_eq!(
             remote_args(&lua),
-            vec![json!("__player__"), json!(12), json!(13)]
+            vec![json!("__player__"), json!(12), json!(13), Value::Null]
         );
         assert!(!lua.contains("walking_state"));
         assert!(!lua.contains("storage.factorioctl_walk_targets"));

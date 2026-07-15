@@ -32,11 +32,6 @@ pub async fn execute(cmd: PlaceCommand, conn: &ResolvedConnectionArgs) -> Result
     let (width, height) = entity_size(&cmd.entity_name);
     let world_pos = tile.to_world(width, height);
 
-    // Check proximity before placing
-    client
-        .ensure_proximity_to_position(world_pos, crate::client::PROXIMITY_RANGE_PLACE)
-        .await?;
-
     let entity = client
         .place_entity(&cmd.entity_name, world_pos, dir)
         .await?;

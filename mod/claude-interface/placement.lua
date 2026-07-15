@@ -403,11 +403,17 @@ local function add_resource_policy_details(target, policy)
     target.preserves_resource_patch = policy.preserves_resource_patch
     target.resource_footprint = policy.footprint
     target.overlapping_resources = policy.overlapping_resources
+    target.overlapping_resource_tiles = policy.overlapping_resource_tiles
+    target.overlapping_resource_amount = policy.overlapping_resource_amount
+    target.resource_overlap = policy.resource_overlap
+    target.resource_overlap_tile_count = policy.resource_overlap_tile_count
+    target.resource_advisory = policy.advisory
+    target.warning = policy.warning
+    target.guidance = policy.guidance
     target.extractor_exception = policy.extractor_exception
     if not policy.policy_allowed then
         target.error_kind = policy.error_kind
         target.resource_policy_error = policy.error
-        target.guidance = policy.guidance
     end
 end
 
@@ -528,7 +534,7 @@ local function placement_candidate(surface, force, entity_name, position, direct
         diagnostic.output_buildable = output.belt_can_place
         diagnostic.output_clear = output.output_clear
         diagnostic.output_blocked = output.belt_can_place ~= true
-        diagnostic.output_usable = output.output_clear == true
+        diagnostic.output_usable = output.belt_can_place == true
         if output.warning then diagnostic.output_warning = output.warning end
     else
         diagnostic.output_usable = true
@@ -710,7 +716,7 @@ function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius,
 
     local selected = nil
     for _, candidate in pairs(candidates) do
-        if candidate.output_buildable and candidate.output_clear then
+        if candidate.output_buildable then
             selected = candidate
             break
         end
@@ -718,10 +724,10 @@ function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius,
 
     if not selected then
         table.insert(result.blockers, {
-            type = "no_clear_output_tile",
-            message = "Drill placements exist, but none have a clear buildable output belt tile.",
+            type = "no_buildable_output_tile",
+            message = "Drill placements exist, but none have a buildable output belt tile.",
         })
-        result.next_action = "move_to_patch_edge_or_clear_output"
+        result.next_action = "clear_output_blocker_or_try_another_patch"
         return result
     end
 
@@ -735,7 +741,7 @@ function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius,
                 y = selected.position.y,
                 direction = direction_arg_name(selected.direction),
             },
-            description = "Place " .. drill_name .. " over " .. resource_name .. " with a clear edge output.",
+            description = "Place " .. drill_name .. " over " .. resource_name .. " with a buildable output; resource-free outputs are preferred.",
         },
         {
             tool = "place_entity",
@@ -1272,7 +1278,9 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
         storage.factorioctl_entities[entity.unit_number] = entity
     end
     inv.remove{name = entity_name, count = 1}
-    return placement_entity_result(entity)
+    local result = placement_entity_result(entity)
+    add_resource_policy_details(result, policy)
+    return result
 end
 
 function M.place_underground_belt(agent_id, entity_name, x, y, direction, belt_type)
@@ -1360,6 +1368,7 @@ function M.place_underground_belt(agent_id, entity_name, x, y, direction, belt_t
 
     local result = placement_entity_result(entity)
     result.belt_to_ground_type = entity.belt_to_ground_type
+    add_resource_policy_details(result, policy)
     return result
 end
 
@@ -1524,6 +1533,7 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
                             inventory_count = inventory_count,
                             item_in_inventory = inventory_count > 0,
                         }
+                        add_resource_policy_details(placement, policy)
                         local output = mining_drill_output_diagnostics(surface, character.force, entity_name, position, dir, character)
                         if output then
                             placement.output = output
@@ -1539,6 +1549,11 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
     end
 
     table.sort(placements, function(a, b)
+        local a_resource_overlap = a.resource_overlap == true
+        local b_resource_overlap = b.resource_overlap == true
+        if a_resource_overlap ~= b_resource_overlap then
+            return a_resource_overlap == false
+        end
         if a.output_clear ~= b.output_clear then
             return a.output_clear == true
         end
@@ -1639,6 +1654,11 @@ function M.plan_entity_placement_near(agent_id, entity_name, target_x, target_y,
     end
 
     table.sort(accepted, function(a, b)
+        local a_resource_overlap = a.resource_overlap == true
+        local b_resource_overlap = b.resource_overlap == true
+        if a_resource_overlap ~= b_resource_overlap then
+            return a_resource_overlap == false
+        end
         local a_stand = a.post_placement and a.post_placement.has_clear_standing_position == true or false
         local b_stand = b.post_placement and b.post_placement.has_clear_standing_position == true or false
         if a_stand ~= b_stand then
@@ -1775,8 +1795,8 @@ function M.rotate_entity(agent_id, unit_number, direction)
     if rotation_policy.policy_allowed ~= true then
         return {
             success = false,
-            error_kind = rotation_policy.error_kind or "resource_footprint_reserved",
-            error = rotation_policy.error or "Requested rotation violates the live resource-footprint policy",
+            error_kind = rotation_policy.error_kind or "resource_destructive_rotation",
+            error = rotation_policy.error or "Requested rotation could destructively revalidate live resource tiles",
             guidance = rotation_policy.guidance,
             unit_number = unit_number,
             name = entity.name,

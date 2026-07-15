@@ -26,11 +26,6 @@ pub struct ExtractCommand {
 pub async fn execute(cmd: ExtractCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = conn.connect_client().await?;
 
-    // Check proximity before extracting
-    client
-        .ensure_proximity_to_entity(cmd.from, crate::client::PROXIMITY_RANGE_INSERT)
-        .await?;
-
     let extracted = client
         .extract_items(cmd.from, &cmd.item, cmd.count, &cmd.inventory)
         .await?;

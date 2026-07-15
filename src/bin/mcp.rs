@@ -1758,7 +1758,7 @@ mod tests {
             .collect();
 
         assert_eq!(visible, expected, "model tool surface must not drift");
-        assert_eq!(visible.len(), 48);
+        assert_eq!(visible.len(), 49);
         let schema_bytes = serde_json::to_vec(&tools)
             .expect("serialize tool schemas")
             .len();
@@ -1790,6 +1790,7 @@ mod tests {
             "configure_inserter",
             "feed_lab_from_inventory",
             "file_issue",
+            "get_entity_inventory",
             "wait_for_crafting",
         ] {
             assert!(
@@ -2205,6 +2206,9 @@ mod tests {
             "buildable prefix",
             "places the buildable prefix",
             "remove_entity_at(",
+            "resource_endpoint_reserved",
+            "resource_tiles_reserved",
+            "preserves_resource_patches",
         ] {
             assert!(
                 !route_core.contains(forbidden),
@@ -2219,6 +2223,8 @@ mod tests {
             "\"missing_identity_errors\"",
             "\"complete_route\": true",
             "\"ready_to_call\"",
+            "\"resource_tiles_observed\"",
+            "\"planned_surface_resource_tiles_crossed\"",
         ] {
             assert!(
                 route_core.contains(required),
@@ -2228,6 +2234,15 @@ mod tests {
         assert!(
             !route_core.contains("client.remove_entity(unit_number).await"),
             "route_belt_core must use the retrying exact-unit rollback helper instead of a one-pass removal loop"
+        );
+        let resource_observation = route_core
+            .split("let mut resource_tiles = HashSet::new();")
+            .nth(1)
+            .and_then(|tail| tail.split("let mut existing_surface_belts").next())
+            .expect("route_belt_core should record live resource tiles");
+        assert!(
+            !resource_observation.contains("collision_map.block"),
+            "live resource observations must not become A* collision blockers"
         );
     }
 
@@ -2489,24 +2504,31 @@ async fn flow_reference_tile(
     }
 }
 
-/// Parameters for get_entities tool
+/// Entity-area query.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetEntitiesParams {
-    /// X coordinate of area center
+    /// Center X tile.
     pub x: i32,
-    /// Y coordinate of area center
+    /// Center Y tile.
     pub y: i32,
-    /// Radius around center
+    /// Search radius.
     #[serde(default = "default_radius")]
     pub radius: u32,
-    /// Optional: filter by entity name (e.g., 'transport-belt')
+    /// Optional prototype-name filter.
     pub name: Option<String>,
-    /// Optional: filter by entity type (e.g., 'container', 'resource', 'lab')
+    /// Optional prototype-type filter.
     #[serde(default)]
     pub entity_type: Option<String>,
-    /// Maximum entities to return before summarizing (default: 100)
+    /// Detailed result cap.
     #[serde(default = "default_entity_limit")]
     pub limit: usize,
+}
+
+/// Entity inventory query.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GetEntityInventoryParams {
+    /// Exact entity unit number.
+    pub unit_number: u32,
 }
 
 fn default_entity_limit() -> usize {
@@ -2928,14 +2950,14 @@ pub struct BootstrapBurnerOnceParams {
     pub count: u32,
 }
 
-/// Parameters for bounded, non-destructive chest collection.
+/// Chest collection request.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CollectFromChestParams {
-    /// Existing chest unit number.
+    /// Exact chest unit number.
     pub unit_number: u32,
-    /// Item to transfer into the agent inventory.
+    /// Exact item name.
     pub item: String,
-    /// Item count, from 1 through 1000.
+    /// Count from 1 through 1000.
     #[serde(default = "default_count")]
     pub count: u32,
 }
@@ -4106,10 +4128,10 @@ pub struct ConfigureInserterParams {
     pub allowed_items: Vec<String>,
 }
 
-/// Parameters for get_machine_belt_positions tool
+/// Machine connection query.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MachineBeltPositionsParams {
-    /// Unit number of the machine (furnace, assembler, etc.)
+    /// Exact machine unit number.
     pub unit_number: u32,
 }
 
@@ -4430,7 +4452,7 @@ pub struct ListZonesParams {
     pub zone_type: Option<String>,
 }
 
-// === Resource Protection Parameters ===
+// === Resource Observation Parameters ===
 
 /// Parameters for scan_resources tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -4442,7 +4464,7 @@ pub struct ScanResourcesParams {
     /// Radius around center to scan
     #[serde(default = "default_radius")]
     pub radius: u32,
-    /// If true, save discovered resources as protected (default: true)
+    /// If true, save discovered resources as advisory layout context (default: true)
     #[serde(default = "default_save_as_protected")]
     pub save_as_protected: bool,
 }
@@ -4608,6 +4630,7 @@ const MODEL_VISIBLE_TOOLS: &[&str] = &[
     "get_available_research",
     "get_belt_lane_contents",
     "get_entities",
+    "get_entity_inventory",
     "get_machine_belt_positions",
     "get_power_status",
     "get_recipe",
@@ -5079,7 +5102,7 @@ impl FactorioMcp {
 
     /// Get all entities in an area. Returns entity names, positions, and types.
     #[tool(
-        description = "Get entities in an area. Prefer name/type filters. Large results are capped and summarized; use a smaller radius or limit for details."
+        description = "Find entities near x,y. Prefer prototype name/type filters; narrow radius or limit when results are summarized."
     )]
     async fn get_entities(&self, Parameters(params): Parameters<GetEntitiesParams>) -> String {
         let mut client = match self.connect().await {
@@ -5163,12 +5186,30 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
+    /// Inspect supported item inventories on one exact entity.
+    #[tool(
+        description = "Read an entity's supported inventories. Before collect_from_chest, inspect inventories.chest; its absence or emptiness proves a container empty. An item-specific miss does not."
+    )]
+    async fn get_entity_inventory(
+        &self,
+        Parameters(params): Parameters<GetEntityInventoryParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(client) => client,
+            Err(error) => return self.with_player_messages(format!("Error: {error}")).await,
+        };
+
+        let result = match client.get_entity_inventory(params.unit_number).await {
+            Ok(inventory) => serde_json::to_string_pretty(&inventory)
+                .unwrap_or_else(|error| format!("Error: {error}")),
+            Err(error) => format!("Error: {error}"),
+        };
+        self.with_player_messages(result).await
+    }
+
     /// Get belt and inserter positions for a machine.
     #[tool(
-        description = "Get the correct belt and inserter positions for connecting to a machine. \
-        For DRILLS: Returns the exact drop position (where items come out) and the tile where a belt should be placed. \
-        For FURNACES/ASSEMBLERS: Returns input_belt, input_inserter, output_belt, output_inserter positions. \
-        ALWAYS use this tool before routing belts to/from machines!"
+        description = "Return exact belt/inserter tiles for a machine. Drills include drop/output tiles; furnaces and assemblers include input/output tiles. Use before routing."
     )]
     async fn get_machine_belt_positions(
         &self,
@@ -6176,7 +6217,7 @@ impl FactorioMcp {
 
     /// Place an entity from character inventory.
     #[tool(
-        description = "Place one non-belt inventory entity at an exact position. Use route_belt for belts. Inserter direction is its pickup side. Live footprint checks reserve resource patches for compatible extractors and failures return structured diagnostics."
+        description = "Place one non-belt entity at an exact position. Use route_belt for belts; inserters face their pickup side. Ordinary infrastructure may overlap resources. Live Factorio collision and extractor-category checks remain authoritative."
     )]
     async fn place_entity(&self, Parameters(params): Parameters<PlaceEntityParams>) -> String {
         if is_existing_belt_entity(&params.entity_name) {
@@ -6245,7 +6286,7 @@ impl FactorioMcp {
 
     /// Find nearby valid placements for an entity.
     #[tool(
-        description = "Find nearby Factorio-valid placements for an entity in all cardinal directions. Mining-drill results include output belt diagnostics and prefer clear patch-edge outlets. Use for fussy entities like drills, offshore-pump, boiler, and steam-engine instead of guessing coordinates."
+        description = "Find nearby Factorio-valid placements in all directions. Resource overlap is advisory for ordinary infrastructure; extractor-category compatibility is mandatory. Drill outlets prefer clear terrain but may use ore."
     )]
     async fn find_entity_placements(
         &self,
@@ -6299,6 +6340,10 @@ impl FactorioMcp {
                     obj.insert("allowed".to_string(), serde_json::json!(policy.allowed));
                     obj.insert("warnings".to_string(), serde_json::json!(policy.warnings));
                     obj.insert("errors".to_string(), serde_json::json!(policy.errors));
+                    obj.insert(
+                        "recorded_resource_overlaps".to_string(),
+                        serde_json::json!(policy.overlapping_resources),
+                    );
                 }
             }
             placements.sort_by(|a, b| {
@@ -6320,10 +6365,19 @@ impl FactorioMcp {
                     .get("output_buildable")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let a_resource_overlap = a
+                    .get("resource_overlap")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let b_resource_overlap = b
+                    .get("resource_overlap")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 b_allowed
                     .cmp(&a_allowed)
                     .then_with(|| b_output_clear.cmp(&a_output_clear))
                     .then_with(|| b_output_buildable.cmp(&a_output_buildable))
+                    .then_with(|| a_resource_overlap.cmp(&b_resource_overlap))
                     .then_with(|| {
                         let a_distance = a
                             .get("distance")
@@ -6402,7 +6456,7 @@ impl FactorioMcp {
 
     /// Execute a safe entity placement selected by plan_entity_placement_near.
     #[tool(
-        description = "Place one isolated non-belt entity near a target. Derives a clear, resource-safe position that does not trap the NPC. Use dry_run=true to preview it."
+        description = "Place one non-belt entity near a target so the NPC remains mobile. Ordinary infrastructure may overlap resources; live extractor-category checks still apply. Use dry_run=true to preview."
     )]
     async fn execute_entity_placement_near(
         &self,
@@ -6546,7 +6600,7 @@ impl FactorioMcp {
 
     /// Plan an edge mining drill and output belt without mutating the game.
     #[tool(
-        description = "Plan a patch-edge mining setup without mutating the game. Returns a resource-backed drill placement whose output belt tile is clear/buildable, plus ordered place_entity steps and missing_items. Use before placing burner/electric drills on large ore patches."
+        description = "Plan a resource-backed drill and Factorio-buildable output belt without mutation. Returns ordered steps and missing items. Clear output is preferred, but ore is valid."
     )]
     async fn build_edge_miner(
         &self,
@@ -6580,7 +6634,7 @@ impl FactorioMcp {
 
     /// Execute a checked edge mining drill and output belt plan.
     #[tool(
-        description = "Plan or atomically build a patch-edge mining setup: select a resource-backed drill position with a clear output, place the drill and output belt, bootstrap burner fuel, and verify that the new drill produces. Use dry_run=true to preview the complete transaction."
+        description = "Atomically plan/build a resource-backed drill plus Factorio-buildable output belt, bootstrap fuel, and verify production. Clear output is preferred, but ore is valid. dry_run previews the transaction."
     )]
     async fn execute_edge_miner(
         &self,
@@ -7422,7 +7476,7 @@ impl FactorioMcp {
 
     /// Collect a bounded item count from an existing chest.
     #[tool(
-        description = "Collect 1-1000 items from an existing chest without mining it. Reports identity, conservation, and partial transfer; not automated logistics."
+        description = "Collect 1-1000 of a known chest item without mining. Call get_entity_inventory first; item_not_found means that item is absent, not that the chest is empty. Reports conservation, not automation."
     )]
     async fn collect_from_chest(
         &self,
@@ -7611,10 +7665,10 @@ impl FactorioMcp {
 
         let mut actions = Vec::new();
         let mut success = true;
-        let walk = client.walk_to(target, false).await;
+        let walk = client.approach_entity(params.furnace_unit_number).await;
         success &= walk.is_ok();
         actions.push(serde_json::json!({
-            "tool": "walk_to",
+            "operation": "approach_entity",
             "success": walk.is_ok(),
             "error": walk.as_ref().err().map(|e| e.to_string()),
         }));
@@ -7647,7 +7701,8 @@ impl FactorioMcp {
                 "count": params.fuel_count,
                 "success": false,
                 "skipped": true,
-                "error": "walk_to failed",
+                "error": walk.as_ref().err().map(|error| error.to_string())
+                    .unwrap_or_else(|| "authoritative entity approach failed".to_string()),
             }));
         }
 
@@ -7748,7 +7803,7 @@ impl FactorioMcp {
                     "position": furnace.position,
                 },
                 "steps": [
-                    {"tool": "walk_to", "args": {"x": furnace.position.x, "y": furnace.position.y}},
+                    {"operation": "approach_entity", "internal": true, "args": {"unit_number": params.furnace_unit_number}, "semantics": "move only if Factorio reports the exact furnace out of reach"},
                     {"operation": "load_furnace_fuel", "internal": true, "args": {"unit_number": params.furnace_unit_number, "item": params.fuel_item, "count": params.fuel_count, "inventory_type": "fuel"}},
                     {"operation": "load_furnace_source", "internal": true, "args": {"unit_number": params.furnace_unit_number, "item": params.source_item, "count": params.source_count, "inventory_type": "furnace_source"}},
                     {"operation": "wait_for_bootstrap_output", "internal": true, "args": {"ticks": wait_ticks}},
@@ -7766,10 +7821,10 @@ impl FactorioMcp {
         let mut actions = Vec::new();
         let mut success = true;
 
-        let walk = client.walk_to(furnace.position, false).await;
+        let walk = client.approach_entity(params.furnace_unit_number).await;
         success &= walk.is_ok();
         actions.push(serde_json::json!({
-            "tool": "walk_to",
+            "operation": "approach_entity",
             "success": walk.is_ok(),
             "error": walk.as_ref().err().map(|e| e.to_string()),
         }));
@@ -7784,7 +7839,13 @@ impl FactorioMcp {
                 )
                 .await
         } else {
-            Err(anyhow::anyhow!("walk_to failed"))
+            Err(anyhow::anyhow!(
+                "authoritative entity approach failed: {}",
+                walk.as_ref()
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "unknown approach failure".to_string())
+            ))
         };
         success &= fuel.is_ok();
         actions.push(serde_json::json!({
@@ -8171,9 +8232,9 @@ impl FactorioMcp {
             }
         };
 
-        // Resource entities are walkable to the character, but new belt
-        // infrastructure must not consume extraction space. Reserve exact live
-        // resource tiles before A* so it can detour or use underground belts.
+        // Resource entities are valid terrain for ordinary logistics. Record
+        // their exact live tiles for route diagnostics without blocking A*;
+        // Factorio/Lua placement preflights below remain authoritative.
         let mut resource_tiles = HashSet::new();
         for entity in &route_entities {
             if entity.entity_type.as_deref() != Some("resource") {
@@ -8184,13 +8245,11 @@ impl FactorioMcp {
                     for y in bounds.left_top.y.floor() as i32..bounds.right_bottom.y.ceil() as i32 {
                         let tile = GridPos::new(x, y);
                         resource_tiles.insert(tile);
-                        collision_map.block(tile);
                     }
                 }
             } else {
                 let tile = GridPos::from_position(&entity.position);
                 resource_tiles.insert(tile);
-                collision_map.block(tile);
             }
         }
 
@@ -8210,30 +8269,6 @@ impl FactorioMcp {
 
         let start = GridPos::new(params.from_x, params.from_y);
         let goal = GridPos::new(params.to_x, params.to_y);
-        let reserved_endpoints: Vec<_> = [("from", start), ("to", goal)]
-            .into_iter()
-            .filter(|(_, tile)| {
-                resource_tiles.contains(tile) && !existing_surface_belts.contains_key(tile)
-            })
-            .map(|(endpoint, tile)| {
-                serde_json::json!({
-                    "endpoint": endpoint,
-                    "position": {"x": tile.x, "y": tile.y},
-                })
-            })
-            .collect();
-        if !reserved_endpoints.is_empty() {
-            return Ok(serde_json::json!({
-                "success": false,
-                "complete_route": false,
-                "dry_run": params.dry_run,
-                "error_kind": "resource_endpoint_reserved",
-                "error": "A new belt endpoint overlaps a live resource tile. No belts were placed.",
-                "reserved_endpoints": reserved_endpoints,
-                "resource_tiles_reserved": resource_tiles.len(),
-                "guidance": "Choose clear endpoint tiles outside the patch. Use execute_edge_miner to derive a resource-free drill output, then route around or underground.",
-            }));
-        }
 
         if params.respect_zones {
             let memory = AgentMemory::load();
@@ -8401,6 +8436,14 @@ impl FactorioMcp {
             .unwrap_or(0);
 
         let build_belts = result.belts.clone();
+        let mut planned_surface_resource_tiles_crossed: Vec<GridPos> = build_belts
+            .iter()
+            .filter(|belt| belt.kind == BeltKind::Surface)
+            .map(|belt| GridPos::from_position(&belt.position))
+            .filter(|tile| resource_tiles.contains(tile))
+            .collect();
+        planned_surface_resource_tiles_crossed.sort_by_key(|tile| (tile.x, tile.y));
+        planned_surface_resource_tiles_crossed.dedup();
         let materials_sufficient = surface_belts_have >= surface_belts_needed
             && underground_belts_have >= underground_belts_needed;
         let material_shortfall = route_material_shortfall(
@@ -8449,8 +8492,9 @@ impl FactorioMcp {
                 "new_belt_count": surface_belts_needed + underground_belts_needed,
                 "turn_count": result.turn_count,
                 "underground_count": result.underground_count,
-                "resource_tiles_reserved": resource_tiles.len(),
-                "preserves_resource_patches": true,
+                "resource_tiles_observed": resource_tiles.len(),
+                "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
+                "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
                 "materials": materials,
                 "materials_sufficient": materials_sufficient,
                 "ready_to_execute": materials_sufficient,
@@ -8478,6 +8522,18 @@ impl FactorioMcp {
                 object.insert(
                     "topology".to_string(),
                     compact_belt_topology(result.topology.as_ref()),
+                );
+                object.insert(
+                    "resource_tiles_observed".to_string(),
+                    serde_json::json!(resource_tiles.len()),
+                );
+                object.insert(
+                    "planned_surface_resource_tiles_crossed".to_string(),
+                    serde_json::json!(&planned_surface_resource_tiles_crossed),
+                );
+                object.insert(
+                    "planned_surface_resource_tiles_crossed_count".to_string(),
+                    serde_json::json!(planned_surface_resource_tiles_crossed.len()),
                 );
                 object.insert(
                     "guidance".to_string(),
@@ -8544,6 +8600,9 @@ impl FactorioMcp {
                 "materials": materials,
                 "materials_sufficient": true,
                 "topology": compact_belt_topology(result.topology.as_ref()),
+                "resource_tiles_observed": resource_tiles.len(),
+                "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
+                "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
                 "preflight_errors": preflight_errors,
                 "guidance": "Fix the reported blocker or choose different endpoints, then retry the complete route. Do not place around the failure one tile at a time.",
             }));
@@ -8670,6 +8729,9 @@ impl FactorioMcp {
                 "materials": materials,
                 "materials_sufficient": true,
                 "topology": compact_belt_topology(result.topology.as_ref()),
+                "resource_tiles_observed": resource_tiles.len(),
+                "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
+                "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
                 "rollback": rollback,
                 "rollback_errors": rollback_errors,
                 "guidance": if rollback_success {
@@ -8703,8 +8765,9 @@ impl FactorioMcp {
             "skipped_existing": skipped_existing,
             "turn_count": result.turn_count,
             "underground_count": result.underground_count,
-            "resource_tiles_reserved": resource_tiles.len(),
-            "preserves_resource_patches": true,
+            "resource_tiles_observed": resource_tiles.len(),
+            "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
+            "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
             "materials": materials,
             "materials_sufficient": materials_sufficient,
             "topology": compact_belt_topology(result.topology.as_ref()),
@@ -8714,7 +8777,7 @@ impl FactorioMcp {
 
     /// Route belts from point A to point B using A* pathfinding.
     #[tool(
-        description = "Plan or atomically build a complete A* belt route. New belts avoid live resource tiles by detouring or tunneling; exact existing belts may be reused. Use dry_run=true for one executable payload. Material/preflight failure places nothing and unexpected partial work is rolled back."
+        description = "Plan or atomically build a complete A* belt route. Surface belts may cross resources and use ore endpoints; reports include observed resources and exact surface crossings. dry_run returns executable args. Live placement preflight, all-or-nothing materials, reuse, and rollback still apply."
     )]
     async fn route_belt(&self, Parameters(params): Parameters<RouteBeltParams>) -> String {
         let mut client = match self.connect().await {
@@ -12700,12 +12763,11 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
-    // === Resource Protection Tools ===
+    // === Resource Observation Tools ===
 
-    /// Scan for resources and optionally protect them.
+    /// Scan for resources and optionally retain them as layout context.
     #[tool(
-        description = "Scan an area for resource patches (ore, oil) and save them as protected. \
-        Protected resources will generate warnings when you try to place non-mining buildings on them."
+        description = "Scan an area for resource patches (ore, oil) and optionally save them as advisory layout context. Saved overlap warns about future mining access but does not veto ordinary infrastructure placement."
     )]
     async fn scan_resources(&self, Parameters(params): Parameters<ScanResourcesParams>) -> String {
         let mut client = match self.connect().await {
@@ -12776,6 +12838,7 @@ impl FactorioMcp {
         let result = serde_json::json!({
             "resources_found": info.len(),
             "resources_saved": saved_count,
+            "saved_resource_policy": "advisory_layout_context",
             "resources": info
         });
 
@@ -12784,10 +12847,9 @@ impl FactorioMcp {
         self.with_player_messages(result_str).await
     }
 
-    /// Get all protected resources.
+    /// Get all recorded resource observations.
     #[tool(
-        description = "List all protected resource patches that have been saved. \
-        These are areas where only mining-related buildings should be placed."
+        description = "List saved resource-patch observations. These are advisory layout context, not placement reservations; ordinary infrastructure may overlap them."
     )]
     async fn get_protected_resources(&self) -> String {
         let memory = AgentMemory::load();
@@ -12798,6 +12860,7 @@ impl FactorioMcp {
             .map(|r| {
                 serde_json::json!({
                     "resource_type": r.resource_type,
+                    "advisory_only": true,
                     "center": { "x": r.center.x, "y": r.center.y },
                     "total_amount": r.total_amount,
                     "tile_count": r.tile_count,
@@ -12820,7 +12883,7 @@ impl FactorioMcp {
 
     /// Check if a placement is appropriate and possible.
     #[tool(
-        description = "Check if placing an entity at a position is both policy-appropriate and actually placeable by Factorio. Returns policy_allowed and factorio_allowed separately."
+        description = "Check an exact placement against advisory zones/resources and authoritative live Factorio/Lua placement rules. Resource overlap alone is nonfatal for ordinary infrastructure; incompatible extractors remain rejected. Returns policy_allowed and factorio_allowed separately."
     )]
     async fn check_placement(
         &self,
@@ -12846,7 +12909,8 @@ impl FactorioMcp {
                         "warnings": policy_check.warnings,
                         "errors": ["Invalid direction. Use: north/n, east/e, south/s, west/w (or 0/4/8/12)"],
                         "overlapping_zones": policy_check.overlapping_zones,
-                        "overlapping_resources": policy_check.overlapping_resources
+                        "overlapping_resources": policy_check.overlapping_resources,
+                        "resource_overlap_is_advisory": true
                     });
                     let result_str = serde_json::to_string_pretty(&result)
                         .unwrap_or_else(|e| format!("Error: {}", e));
@@ -12892,6 +12956,7 @@ impl FactorioMcp {
             "errors": policy_check.errors,
             "overlapping_zones": policy_check.overlapping_zones,
             "overlapping_resources": policy_check.overlapping_resources,
+            "resource_overlap_is_advisory": true,
             "factorio": factorio_check
         });
 
@@ -12901,8 +12966,9 @@ impl FactorioMcp {
     }
 
     /// Find a suitable empty area for building.
-    #[tool(description = "Find a suitable empty area for a specific zone type. \
-        Searches for space that doesn't overlap with protected resources or existing zones.")]
+    #[tool(
+        description = "Find an entity-clear area for a zone. Permanent non-mining sites prefer recorded-resource-free terrain, but if none exists in range the nearest clear resource-overlapping site is returned with an explicit advisory instead of failing. Reserved zones remain excluded."
+    )]
     async fn find_build_area(&self, Parameters(params): Parameters<FindBuildAreaParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
@@ -12938,6 +13004,32 @@ impl FactorioMcp {
         // Search in a spiral pattern from center
         let center_x = params.x;
         let center_y = params.y;
+        let prefer_off_resource = params.zone_type != "mining";
+        let mut resource_overlap_fallback: Option<(i32, i32, Vec<String>)> = None;
+
+        let found_result = |check_x: i32,
+                            check_y: i32,
+                            overlapping_resources: Vec<String>,
+                            selection: &str,
+                            advisory: Option<&str>| {
+            serde_json::json!({
+                "found": true,
+                "area": {
+                    "x1": check_x,
+                    "y1": check_y,
+                    "x2": check_x + width,
+                    "y2": check_y + height
+                },
+                "center": {
+                    "x": check_x + width / 2,
+                    "y": check_y + height / 2
+                },
+                "selection": selection,
+                "resource_overlap": !overlapping_resources.is_empty(),
+                "overlapping_resources": overlapping_resources,
+                "advisory": advisory,
+            })
+        };
 
         for dist in 0..params.radius as i32 {
             for dx in -dist..=dist {
@@ -12964,12 +13056,6 @@ impl FactorioMcp {
                         continue;
                     }
 
-                    // Check for protected resource overlap
-                    let has_resource = !memory.resources_overlapping(&candidate).is_empty();
-                    if has_resource && params.zone_type != "mining" {
-                        continue;
-                    }
-
                     // Check for existing zone overlap
                     let overlapping_zones = memory.zones_overlapping(&candidate);
                     let has_incompatible_zone = overlapping_zones
@@ -12979,20 +13065,29 @@ impl FactorioMcp {
                         continue;
                     }
 
-                    // Found a suitable area!
-                    let result = serde_json::json!({
-                        "found": true,
-                        "area": {
-                            "x1": check_x,
-                            "y1": check_y,
-                            "x2": check_x + width,
-                            "y2": check_y + height
-                        },
-                        "center": {
-                            "x": check_x + width / 2,
-                            "y": check_y + height / 2
+                    let mut overlapping_resources: Vec<String> = memory
+                        .resources_overlapping(&candidate)
+                        .into_iter()
+                        .map(|resource| resource.resource_type.clone())
+                        .collect();
+                    overlapping_resources.sort();
+                    overlapping_resources.dedup();
+
+                    if prefer_off_resource && !overlapping_resources.is_empty() {
+                        if resource_overlap_fallback.is_none() {
+                            resource_overlap_fallback =
+                                Some((check_x, check_y, overlapping_resources));
                         }
-                    });
+                        continue;
+                    }
+
+                    let selection = if prefer_off_resource {
+                        "off_resource_preferred"
+                    } else {
+                        "first_clear_site"
+                    };
+                    let result =
+                        found_result(check_x, check_y, overlapping_resources, selection, None);
                     return self
                         .with_player_messages(
                             serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -13000,6 +13095,21 @@ impl FactorioMcp {
                         .await;
                 }
             }
+        }
+
+        if let Some((check_x, check_y, overlapping_resources)) = resource_overlap_fallback {
+            let result = found_result(
+                check_x,
+                check_y,
+                overlapping_resources,
+                "resource_overlap_fallback",
+                Some(
+                    "No entity-clear off-resource site was found within the search radius. This fallback overlaps recorded resource terrain; ordinary infrastructure is legal here, but permanent construction may reduce future mining access. Check each entity with live placement rules before building.",
+                ),
+            );
+            return self
+                .with_player_messages(serde_json::to_string_pretty(&result).unwrap_or_default())
+                .await;
         }
 
         let result = serde_json::json!({
@@ -13012,8 +13122,7 @@ impl FactorioMcp {
 
     /// Get a blank slate view of constraints only.
     #[tool(
-        description = "Get only the immovable constraints in an area (terrain, resources, zones) without showing existing buildings. \
-        Useful for thinking fresh about layout without being distracted by existing messy layouts."
+        description = "Get terrain, resource context, and zones without existing buildings. Resources are advisory terrain that ordinary logistics may cross or occupy; reserved zones and live Factorio collision checks remain authoritative. Useful for fresh layout planning without the existing factory."
     )]
     async fn get_blank_slate(&self, Parameters(params): Parameters<GetBlankSlateParams>) -> String {
         let mut client = match self.connect().await {
@@ -13090,7 +13199,8 @@ impl FactorioMcp {
                 "resources": resource_info,
                 "zones": zones
             },
-            "tip": "This shows only immovable constraints. Plan your layout around these, then create zones before building."
+            "resource_overlap_policy": "advisory_for_ordinary_infrastructure",
+            "tip": "Resources are layout context, not immovable terrain: ordinary logistics may cross or occupy them. Prefer clear permanent sites when practical, but use live placement checks for actual collision and extractor compatibility. Reserved zones remain hard constraints."
         });
 
         let result_str =

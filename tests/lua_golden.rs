@@ -1562,7 +1562,10 @@ fn named_walk_routes_to_mod_target_without_host_driver_state() {
         ("walk_target", walk_target.as_str()),
     ] {
         assert_remote_request(name, lua, "set_walk_target");
-        assert_eq!(remote_args(lua), vec![json!("doug"), json!(12), json!(13)]);
+        assert_eq!(
+            remote_args(lua),
+            vec![json!("doug"), json!(12), json!(13), Value::Null]
+        );
         for forbidden in [
             "storage.factorioctl_walk_targets",
             "walking_state",
@@ -2519,20 +2522,21 @@ fn chat_fetch_uses_mod_remote_without_level_storage_fallback() {
 }
 
 #[test]
-fn named_walk_poll_loop_exits_when_driver_clears_target() {
+fn named_walk_poll_loop_uses_matching_terminal_receipt() {
     let client_mod = include_str!("../src/client/mod.rs");
-    let active_lua = LuaCommand::walk_target_active(&named_agent());
+    let status_lua = LuaCommand::get_walk_status(&named_agent(), 7);
 
     assert!(
-        client_mod.contains(r#"call_remote("has_walk_target""#)
-            && client_mod.contains(r#"call_remote("clear_walk_target""#)
-            && client_mod.contains("Walk target cleared"),
-        "named walk_to should poll the shared driver target and exit when it has been cleared"
+        client_mod.contains(r#""get_walk_status""#)
+            && client_mod.contains(r#""clear_walk_target""#)
+            && client_mod.contains("status.arrived")
+            && !client_mod.contains("Walk target cleared"),
+        "named walk_to should trust the matching mod-owned terminal receipt"
     );
-    assert_remote_request("walk_target_active", &active_lua, "has_walk_target");
-    assert_eq!(remote_args(&active_lua), vec![json!("doug")]);
+    assert_remote_request("get_walk_status", &status_lua, "get_walk_status");
+    assert_eq!(remote_args(&status_lua), vec![json!("doug"), json!(7)]);
     assert!(
-        !active_lua.contains("storage.factorioctl_walk_targets"),
+        !status_lua.contains("storage.factorioctl_walk_targets"),
         "Rust should not keep a fallback walk-target table after the mod backend is required"
     );
 }
@@ -2552,8 +2556,10 @@ fn mod_walk_target_uses_engine_walking_without_teleporting() {
             && walk_driver.contains("walking = true")
             && walk_driver.contains("direction = walk_direction_toward(dx, dy)")
             && walk_driver.contains("tgt.stuck_ticks >= 120")
-            && walk_driver.contains("stop_target_walk(agent_id, c)"),
-        "walk targets must use tick-driven Factorio walking with arrival, stuck, and stop handling"
+            && walk_driver.contains("stop_target_walk(agent_id, c, \"arrived\")")
+            && walk_driver.contains("stop_target_walk(agent_id, c, \"stuck\")")
+            && walk_driver.contains("characters.finish_walk(agent_id, character, reason)"),
+        "walk targets must use tick-driven Factorio walking with explicit terminal receipts"
     );
     assert!(
         !walk_driver.contains("teleport("),
@@ -2921,7 +2927,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("selected.post_placement.nearest_clear_standing_position")
             && placement_lua.contains("selected.can_place_and_keep_working")
             && placement_lua.contains("output_blocked = output.belt_can_place ~= true")
-            && placement_lua.contains("output_usable = output.output_clear == true")
+            && placement_lua.contains("output_usable = output.belt_can_place == true")
             && placement_lua.contains("expand_radius_or_use_edge_planner")
             && placement_lua.contains("execute_place_entity_step")
             && placement_lua.contains("recommended_action = \"rotate_entity\"")
@@ -2932,7 +2938,9 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("output_clear = output.output_clear")
             && placement_lua.contains("Drill output tile overlaps resource")
             && placement_lua.contains("function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius, drill_name, limit)")
-            && placement_lua.contains("no_clear_output_tile")
+            && placement_lua.contains("if candidate.output_buildable then")
+            && placement_lua.contains("no_buildable_output_tile")
+            && placement_lua.contains("resource-free outputs are preferred")
             && placement_lua.contains("execute_edge_miner_steps")
             && placement_lua.contains("count_matching_resources(surface, resource_name, drill_area)")
             && placement_lua.contains("selected.output.belt_tile")
@@ -2959,11 +2967,28 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && !placement_lua.contains("candidate_alternate_path"),
         "blocked belt diagnostics must not suggest disconnected one-tile detours"
     );
+    assert_eq!(
+        placement_lua
+            .matches("local a_resource_overlap = a.resource_overlap == true")
+            .count(),
+        2,
+        "both generic placement searches should rank clear ground before advisory resource overlap"
+    );
+    assert_eq!(
+        placement_lua
+            .matches("return a_resource_overlap == false")
+            .count(),
+        2,
+        "resource overlap should remain legal fallback ordering rather than a filter"
+    );
     for required in [
         r#"local resource_policy = require("resource_policy")"#,
         "resource_policy.inspect(surface, entity_name, position, direction)",
         "resource_policy.inspect_rotation(",
         "policy.policy_allowed",
+        "target.resource_advisory = policy.advisory",
+        "target.guidance = policy.guidance",
+        "add_resource_policy_details(result, policy)",
         "function M.configure_inserter(agent_id, unit_number, allowed_items)",
         "entity.filter_slot_count",
         "entity.set_filter(slot, nil)",
@@ -2988,7 +3013,14 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "prototype.resource_categories",
         "resource_category",
         "compatible_with_extractor",
-        "resource_footprint_reserved",
+        "if extractor then",
+        "result.resource_overlap = result.resource_overlap_tile_count > 0",
+        "overlapping_resource_tiles",
+        "overlapping_resource_amount",
+        "incompatible_resource_category",
+        "result.advisory = {",
+        "kind = \"resource_overlap\"",
+        "resource_destructive_rotation",
         "newly_overlapped_resources",
     ] {
         assert!(
@@ -2998,15 +3030,32 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
     }
     assert!(
         !resource_policy_lua.contains("allow_resource_overlap")
-            && !resource_policy_lua.contains("protected_resources"),
-        "live resource policy must not expose a bypass or depend on stale memory"
+            && !resource_policy_lua.contains("protected_resources")
+            && !resource_policy_lua.contains("resource_footprint_reserved")
+            && !resource_policy_lua.contains("reserved for compatible extraction")
+            && !resource_policy_lua.contains("route belts around or underground")
+            && !resource_policy_lua.contains("transport-belt")
+            && !resource_policy_lua.contains("electric-pole")
+            && !resource_policy_lua.contains("inserter"),
+        "live resource policy must be advisory for non-miners without a caller bypass or stale memory"
+    );
+    assert_eq!(
+        resource_policy_lua
+            .matches("result.policy_allowed = false")
+            .count(),
+        2,
+        "only an unavailable inspection and an incompatible mining drill may reject placement"
     );
     assert!(
         power_lua.contains(r#"local resource_policy = require("resource_policy")"#)
             && power_lua
                 .contains("resource_policy.inspect(surface, entity_name, position, direction)")
+            && power_lua.contains("resource_advisory = policy.advisory")
+            && power_lua.contains("resource_advisory = report.resource_advisory")
+            && power_lua.contains("warning = policy.warning")
+            && power_lua.contains("guidance = policy.guidance")
             && power_lua.contains("if entity.allowed then return entity end"),
-        "steam and pole planners should consume the same live resource policy"
+        "steam and pole planners should propagate the same live resource advisory"
     );
 }
 
@@ -4097,7 +4146,7 @@ fn static_builder_tests_cover_named_legacy_extract_and_registry_contracts() {
     assert_remote_request("named walk_character", &named_lua, "set_walk_target");
     assert_eq!(
         remote_args(&named_lua),
-        vec![json!("doug"), json!(12), json!(13)]
+        vec![json!("doug"), json!(12), json!(13), Value::Null]
     );
     assert!(!named_lua.contains("storage.factorioctl_characters"));
     assert!(!named_lua.contains("connected_players"));
@@ -4108,7 +4157,7 @@ fn static_builder_tests_cover_named_legacy_extract_and_registry_contracts() {
     assert_remote_request("legacy walk_character", &legacy_lua, "set_walk_target");
     assert_eq!(
         remote_args(&legacy_lua),
-        vec![json!("__player__"), json!(12), json!(13)]
+        vec![json!("__player__"), json!(12), json!(13), Value::Null]
     );
     assert!(!legacy_lua.contains("for _, p in pairs(game.connected_players) do"));
     assert!(!legacy_lua.contains("storage.factorioctl_characters"));

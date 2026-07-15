@@ -41,13 +41,16 @@ tool can inspect the current game state.
    relevant status tool. If verification reports a problem, fix that concrete
    problem before expanding the build.
 
-6. Preserve resource patches for extraction.
-   Treat authoritative live resource tiles as extraction reserves. Put only a
-   compatible mining drill or pumpjack on them. Keep assemblers, furnaces,
-   labs, chests, power, and ordinary logistics outside the patch. Use
-   `execute_edge_miner` to derive a miner with a clear output tile, and use
-   `route_belt` so new belts route around or underground. Existing overlap is
-   not permission to extend the occupied resource footprint.
+6. Preserve future extraction without treating ore as forbidden terrain.
+   Resource overlap is advisory, not a placement veto. Prefer nearby clear land
+   for large permanent processing, storage, and power blocks when practical,
+   but temporary bootstrap structures and compact transport, power, or fluid
+   connections may cross or occupy resource tiles. Do not reject useful
+   automation or build wasteful detours solely to keep every ore tile empty.
+   Extraction machinery is the exception: a mining drill or pumpjack must be
+   compatible with every resource category under its footprint. Use
+   `execute_edge_miner` to derive a workable drill output; a Factorio-buildable
+   output tile remains usable even when that tile also contains ore.
 
 7. Build durable automation instead of repeating manual cycles.
    Manual `insert_items`, `extract_items`, `craft`, `hand_feed_furnace`, and
@@ -56,7 +59,7 @@ tool can inspect the current game state.
    will be needed again, spend the next actionable turn building the durable
    route:
    - use `execute_direct_smelter` for drill-to-furnace cells
-   - use `execute_edge_miner` for patch-edge drill plus output-belt cells
+   - use `execute_edge_miner` for resource-backed drill plus output-belt cells
    - use `execute_entity_placement_near` for safe assembler, lab, pole, chest,
      or crowded-build placement
    - use `diagnose_fuel_sustainability` then `build_fuel_supply` for boilers,

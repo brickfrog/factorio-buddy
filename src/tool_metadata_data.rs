@@ -34,6 +34,7 @@ pub const FACTORIO_MCP_TOOLS: &[FactorioToolMetadata] = &[
     tool("connected_player_count", false, true, false),
     tool("production_statistics", false, true, false),
     tool("get_entities", false, true, false),
+    tool("get_entity_inventory", false, true, false),
     tool("get_machine_belt_positions", false, true, false),
     tool("render_map", false, true, false),
     tool("debug_wedged_state", false, true, false),

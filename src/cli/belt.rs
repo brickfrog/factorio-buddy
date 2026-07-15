@@ -221,24 +221,8 @@ async fn run_belt_line_astar(
     let mut failed = 0;
 
     for belt in belts_to_place {
-        // Check if we need to walk closer
-        let char_pos = client.get_character_position().await?;
-        let dist = char_pos.distance(&belt.position);
-
-        if dist > 8.0 {
-            // Walk to the target area
-            let walk_result = client.walk_to(belt.position, false).await?;
-            if !walk_result.arrived && walk_result.final_position.distance(&belt.position) > 10.0 {
-                println!(
-                    "  Couldn't reach ({:.0},{:.0})",
-                    belt.position.x, belt.position.y
-                );
-                failed += 1;
-                continue;
-            }
-        }
-
-        // Place belt with correct direction from A*
+        // Placement owns its range-aware approach. Exact navigation must not
+        // walk onto the tile that is about to receive the belt.
         match client
             .place_entity(belt_type, belt.position, belt.direction)
             .await

@@ -28,9 +28,14 @@ use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Build belts as complete source-to-destination routes with route_belt or a higher-level automation controller; do not improvise disconnected one-tile belt fragments. Treat live resource patches as extraction reserves: put only compatible mining drills or pumpjacks on them, place processing, storage, power, and ordinary logistics outside them, and route new belts around or underground. Use execute_edge_miner so new extraction begins with a clear output tile; existing overlap is not permission to extend it. Prefer dedicated item belts or deliberate lane separation; never assume a branch is pure because one sampled tile currently shows one item. Before tapping any belt that may carry multiple products, inspect its exact lanes; configure the receiving inserter's whitelist when one consumer must accept only specific items, but do not mistake a filtered inserter for a pure upstream belt. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Build belts as complete source-to-destination routes with route_belt or a higher-level automation controller; do not improvise disconnected one-tile belt fragments. Treat live resource patches as future extraction capacity, not forbidden terrain. Resource overlap is advisory, not a placement veto: prefer clear land for large permanent processing, storage, or power blocks when practical, but temporary bootstrap structures and compact transport, power, or fluid connections may cross or occupy resource tiles. Do not refuse useful automation or build a wasteful detour solely because an otherwise valid placement touches ore. Only extraction machinery is resource-category constrained; place mining drills or pumpjacks only where they are compatible. Use execute_edge_miner to derive a workable drill output, and accept a Factorio-buildable output tile even when it contains ore. Prefer dedicated item belts or deliberate lane separation; never assume a branch is pure because one sampled tile currently shows one item. Before tapping any belt that may carry multiple products, inspect its exact lanes; configure the receiving inserter's whitelist when one consumer must accept only specific items, but do not mistake a filtered inserter for a pure upstream belt. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
 
 const AUTONOMY_DIRECTIVE: &str = "Autonomy tick: re-evaluate the whole factory from the authoritative snapshot below before acting. The factory is a set of independent subsystems that keep running while you work elsewhere. Choose from the current evidence, not from conversational momentum or the previous turn's focus. If research or another subsystem is healthy and progressing, leave it running; do not wait for it, repeatedly poll it, or keep embellishing it. Select the highest-leverage stalled or underdeveloped subsystem shown by the current data, inspect the relevant location with tools, take concrete action toward durable automation, and verify the result. Do not merely describe a plan.";
+
+// The managed server is local and returning players replace stale peers. Keep
+// a temporarily starved background client connected instead of dropping it at
+// Factorio's 20-second default.
+const MANAGED_CLIENT_DROP_THRESHOLD_SECONDS: u64 = 86_400;
 
 #[derive(Clone, Debug, Parser)]
 #[command(about = "Run the autonomous Factorio buddy using the Rust MCP tool server")]
@@ -90,9 +95,6 @@ struct Args {
     /// Seconds between autonomous turns. Set to 0 for chat-only operation.
     #[arg(long, default_value_t = 30, env = "BUDDY_HEARTBEAT_SECONDS")]
     heartbeat_seconds: u64,
-
-    #[arg(long, default_value_t = true, env = "AUTONOMY_REQUIRES_PLAYER")]
-    autonomy_requires_player: bool,
 
     /// Optional whole-turn timeout. Zero leaves a progressing turn uncapped;
     /// player input and shutdown can still cancel it immediately.
@@ -922,6 +924,15 @@ fn promote_owned_autosave(
     Ok(Some(autosave))
 }
 
+fn managed_factorio_config(data_root: &Path, run_directory: &Path) -> String {
+    format!(
+        "[path]\nread-data={}\nwrite-data={}\n\n[other]\ncheck-updates=false\ndrop-detection-threshold-time={}\n",
+        data_root.join("data").display(),
+        run_directory.display(),
+        MANAGED_CLIENT_DROP_THRESHOLD_SECONDS,
+    )
+}
+
 async fn start_local_server(args: &mut Args) -> Result<LocalServer> {
     if tokio::net::TcpStream::connect((&*args.rcon_host, args.rcon_port))
         .await
@@ -971,12 +982,7 @@ async fn start_local_server(args: &mut Args) -> Result<LocalServer> {
     let config = run_directory.join("config.ini");
     atomic_write(
         &config,
-        format!(
-            "[path]\nread-data={}\nwrite-data={}\n\n[other]\ncheck-updates=false\n",
-            data_root.join("data").display(),
-            run_directory.display()
-        )
-        .as_bytes(),
+        managed_factorio_config(data_root, &run_directory).as_bytes(),
         true,
     )?;
     if !save.exists() {
@@ -1196,17 +1202,6 @@ impl LifecycleClient {
         let error = last_error.context("lifecycle call failed without a transport error")?;
         Err(error).with_context(|| format!("lifecycle call {function} failed"))
     }
-}
-
-fn connected_player_count(value: &str) -> u64 {
-    let Ok(value) = serde_json::from_str::<Value>(value) else {
-        return 0;
-    };
-    value
-        .as_u64()
-        .or_else(|| value.get("count").and_then(Value::as_u64))
-        .or_else(|| value.get("connected_players").and_then(Value::as_u64))
-        .unwrap_or(0)
 }
 
 fn stream_event_session_id(event: &Value) -> Option<&str> {
@@ -1667,7 +1662,6 @@ async fn run_buddy(args: Arc<Args>, local_server: &mut Option<LocalServer>) -> R
         effort = %args.effort,
         heartbeat_seconds = args.heartbeat_seconds,
         turn_timeout_seconds = args.turn_timeout_seconds,
-        autonomy_requires_player = args.autonomy_requires_player,
         "Factorio buddy online"
     );
     let mut timer = interval(Duration::from_millis(500));
@@ -1769,21 +1763,6 @@ async fn run_buddy(args: Arc<Args>, local_server: &mut Option<LocalServer>) -> R
                     || Instant::now() < next_autonomy
                 {
                     continue;
-                }
-                if args.autonomy_requires_player {
-                    let count = lifecycle
-                        .call("connected_player_count_result", &[])
-                        .await
-                        .map(|value| connected_player_count(&value))
-                        .unwrap_or_else(|error| {
-                            warn!(%error, "failed to check connected player count");
-                            0
-                        });
-                    if count == 0 {
-                        next_autonomy = Instant::now()
-                            + Duration::from_secs(args.heartbeat_seconds.max(1));
-                        continue;
-                    }
                 }
                 pending.push_back(TurnRequest {
                     kind: TurnKind::Autonomy,
@@ -1887,13 +1866,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_connected_player_shapes() {
-        assert_eq!(connected_player_count("2"), 2);
-        assert_eq!(connected_player_count(r#"{"count":3}"#), 3);
-        assert_eq!(connected_player_count("garbage"), 0);
-    }
-
-    #[test]
     fn reads_session_id_from_stream_events() {
         let event = json!({"type": "system", "subtype": "init", "session_id": "abc-123"});
         assert_eq!(stream_event_session_id(&event), Some("abc-123"));
@@ -1954,11 +1926,14 @@ mod tests {
     }
 
     #[test]
-    fn default_prompt_requires_resource_preservation_and_explicit_belt_contents() {
+    fn default_prompt_treats_resource_overlap_as_advisory_and_keeps_belt_contents_explicit() {
         for required in [
-            "Treat live resource patches as extraction reserves",
-            "route new belts around or underground",
-            "existing overlap is not permission to extend it",
+            "future extraction capacity, not forbidden terrain",
+            "Resource overlap is advisory, not a placement veto",
+            "temporary bootstrap structures and compact transport",
+            "Do not refuse useful automation or build a wasteful detour",
+            "Only extraction machinery is resource-category constrained",
+            "accept a Factorio-buildable output tile even when it contains ore",
             "Prefer dedicated item belts or deliberate lane separation",
             "never assume a branch is pure",
             "configure the receiving inserter's whitelist",
@@ -1985,6 +1960,16 @@ mod tests {
             Some(true),
             "just play must create peaceful default maps"
         );
+    }
+
+    #[test]
+    fn managed_server_tolerates_background_client_stalls() {
+        let config = managed_factorio_config(Path::new("/factorio"), Path::new("/buddy-run"));
+        assert!(config.contains("read-data=/factorio/data"));
+        assert!(config.contains("write-data=/buddy-run"));
+        assert!(config.contains(&format!(
+            "drop-detection-threshold-time={MANAGED_CLIENT_DROP_THRESHOLD_SECONDS}"
+        )));
     }
 
     #[test]
@@ -2082,10 +2067,11 @@ mod tests {
     }
 
     #[test]
-    fn companion_autonomy_requires_a_connected_player_by_default() {
+    fn companion_autonomy_has_no_player_presence_switch() {
         let args = Args::try_parse_from(["buddy"]).unwrap();
-        assert!(args.autonomy_requires_player);
+        assert_eq!(args.heartbeat_seconds, 30);
         assert_eq!(args.turn_timeout_seconds, 0);
+        assert!(Args::try_parse_from(["buddy", "--autonomy-requires-player"]).is_err());
     }
 
     #[test]

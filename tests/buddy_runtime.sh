@@ -168,7 +168,7 @@ cleanup() {
 
     local scenario
     local pid
-    for scenario in "$TEST_ROOT"/clean "$TEST_ROOT"/server-death; do
+    for scenario in "$TEST_ROOT"/clean "$TEST_ROOT"/no-player-autonomy "$TEST_ROOT"/server-death; do
         if pid="$(find_owned_server_pid "$scenario" "$RCON_PORT" 2>/dev/null)"; then
             kill -KILL "$pid" 2>/dev/null || true
         fi
@@ -189,7 +189,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for command in awk cmp cp find grep jq seq sleep ss stat timeout touch tr; do
+for command in awk chmod cmp cp find grep jq seq sleep ss stat timeout touch tr; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
 [[ -x "$FACTORIO_BIN" ]] || fail "Factorio binary is not executable: $FACTORIO_BIN"
@@ -205,6 +205,7 @@ assert_ports_unused
 start_buddy() {
     local scenario_name="$1"
     local mode="${2:-fresh}"
+    local heartbeat_seconds="${3:-0}"
     local scenario="$TEST_ROOT/$scenario_name"
     local log="$scenario/buddy-$mode.log"
     local fresh_args=()
@@ -213,8 +214,14 @@ start_buddy() {
     elif [[ "$mode" != "resume" ]]; then
         fail "unknown Buddy start mode: $mode"
     fi
-    mkdir -p "$scenario/home/.factorio/mods" "$scenario/write-data"
+    mkdir -p "$scenario/bin" "$scenario/home/.factorio/mods" "$scenario/write-data"
     printf 'isolated-home\n' > "$scenario/home/.factorio/mods/runtime-test-sentinel"
+    cp -a "$ROOT/mod/claude-interface" "$scenario/home/.factorio/mods/"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'printf '\''%s\n'\'' '\''{"type":"result","subtype":"success","is_error":false,"result":"runtime fake reply","session_id":"runtime-fake-session"}'\''' \
+        > "$scenario/bin/claude"
+    chmod +x "$scenario/bin/claude"
 
     env \
         -u FACTORIO_RCON_PASSWORD \
@@ -224,12 +231,13 @@ start_buddy() {
         -u FACTORIO_WRITE_DATA \
         -u FACTORIO_SCRIPT_OUTPUT \
         HOME="$scenario/home" \
-        BUDDY_HEARTBEAT_SECONDS=0 \
+        PATH="$scenario/bin:$PATH" \
+        BUDDY_HEARTBEAT_SECONDS="$heartbeat_seconds" \
         RUST_LOG=info \
         "$BUDDY_BIN" \
             --start-server \
             "${fresh_args[@]}" \
-            --heartbeat-seconds 0 \
+            --heartbeat-seconds "$heartbeat_seconds" \
             --agent runtime-live \
             --rcon-host localhost \
             --rcon-port "$RCON_PORT" \
@@ -271,6 +279,8 @@ PASSWORD="$(tr -d '\r\n' < "$PASSWORD_FILE")"
 while IFS= read -r config; do
     [[ "$(stat -c '%a' "$config")" == "600" ]] \
         || fail "managed Factorio config is not mode 0600: $config"
+    grep -Fxq 'drop-detection-threshold-time=86400' "$config" \
+        || fail "managed Factorio config does not tolerate background-client stalls: $config"
 done < <(find "$CLEAN_ROOT/write-data/managed-runs" -name config.ini -type f)
 if tr '\0' '\n' < "/proc/$CURRENT_BUDDY_PID/cmdline" | grep -Fq -- "$PASSWORD"; then
     fail "managed RCON password leaked into the Buddy process arguments"
@@ -295,7 +305,7 @@ done
     || fail "Factorio child was not launched with an explicit loopback RCON bind"
 [[ -f "$CLEAN_ROOT/home/.factorio/mods/runtime-test-sentinel" ]] \
     || fail "isolated HOME sentinel was disturbed"
-pass "managed credentials are generated, private, and absent from Buddy argv"
+pass "managed credentials stay private and background-client stalls are tolerated"
 
 FACTORIO_LOG="$(find "$CLEAN_ROOT/write-data/managed-runs" -name factorio-current.log -type f -print -quit)"
 [[ -f "$FACTORIO_LOG" ]] || fail "managed Factorio runtime log is missing"
@@ -351,6 +361,37 @@ jq -e '.version == 2 and .clean_shutdown == true' \
 grep -Fq "Factorio server stopped after final save" "$CLEAN_LOG" \
     || fail "clean shutdown did not complete Factorio's final-save path"
 pass "clean shutdown saves and reaps the owned Factorio server"
+
+# Autonomy belongs to the NPC runtime, not to the graphical client's
+# connection state. With no multiplayer peer ever joining, a due heartbeat
+# must still run a complete model turn.
+assert_ports_unused
+start_buddy no-player-autonomy fresh 1
+NO_PLAYER_ROOT="$TEST_ROOT/no-player-autonomy"
+NO_PLAYER_LOG="$NO_PLAYER_ROOT/buddy-fresh.log"
+wait_for_log "$CURRENT_BUDDY_PID" "$NO_PLAYER_LOG" \
+    "Claude turn finished kind=Autonomy succeeded=true" 20 \
+    || fail "Buddy did not complete autonomy with zero connected players"
+NO_PLAYER_FACTORIO_LOG="$(find "$NO_PLAYER_ROOT/write-data/managed-runs" -name factorio-current.log -type f -print -quit)"
+[[ -f "$NO_PLAYER_FACTORIO_LOG" ]] \
+    || fail "no-player autonomy Factorio log is missing"
+if grep -Fq "processed PlayerJoinGame" "$NO_PLAYER_FACTORIO_LOG"; then
+    fail "no-player autonomy fixture unexpectedly had a multiplayer client"
+fi
+kill -TERM "$CURRENT_BUDDY_PID"
+wait_for_process_stop "$CURRENT_BUDDY_PID" 75 \
+    || fail "no-player autonomy Buddy did not shut down cleanly"
+set +e
+wait "$CURRENT_BUDDY_PID"
+NO_PLAYER_STATUS=$?
+set -e
+CURRENT_BUDDY_PID=""
+CURRENT_SERVER_PID=""
+(( NO_PLAYER_STATUS == 0 )) \
+    || fail "no-player autonomy Buddy exited with status $NO_PLAYER_STATUS"
+assert_no_owned_server "$NO_PLAYER_ROOT" \
+    || fail "no-player autonomy left an owned Factorio process or listener"
+pass "autonomy continues with zero connected players"
 
 # Failure lifecycle: killing the owned child must terminate Buddy promptly and
 # non-zero instead of leaving a useless controller alive.

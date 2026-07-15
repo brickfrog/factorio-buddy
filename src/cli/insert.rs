@@ -26,11 +26,6 @@ pub struct InsertCommand {
 pub async fn execute(cmd: InsertCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = conn.connect_client().await?;
 
-    // Check proximity before inserting
-    client
-        .ensure_proximity_to_entity(cmd.into, crate::client::PROXIMITY_RANGE_INSERT)
-        .await?;
-
     client
         .insert_items(cmd.into, &cmd.item, cmd.count, &cmd.inventory)
         .await?;

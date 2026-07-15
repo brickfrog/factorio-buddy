@@ -42,6 +42,8 @@ local function init_storage()
     storage.characters = storage.characters or {}
     storage.walk_state = storage.walk_state or {}
     storage.walk_targets = storage.walk_targets or {}
+    storage.walk_results = storage.walk_results or {}
+    storage.walk_sequence = storage.walk_sequence or 0
     storage.blueprints = storage.blueprints or {}
     -- Map markers for agent characters (chart tag references)
     storage.agent_tags = storage.agent_tags or {}
@@ -528,12 +530,8 @@ local function walk_direction_toward(dx, dy)
     return dy >= 0 and defines.direction.southwest or defines.direction.northwest
 end
 
-local function stop_target_walk(agent_id, character)
-    storage.walk_targets[agent_id] = nil
-    if storage.walk_state then storage.walk_state[agent_id] = nil end
-    if character and character.valid then
-        character.walking_state = {walking = false}
-    end
+local function stop_target_walk(agent_id, character, reason)
+    return characters.finish_walk(agent_id, character, reason)
 end
 
 -- Drive queued targets through the character's ordinary Factorio walking state.
@@ -544,38 +542,49 @@ local function process_walk_targets()
     for agent_id, tgt in pairs(storage.walk_targets) do
         local c = find_factorioctl_character(agent_id)
         if not (c and c.valid) then
-            stop_target_walk(agent_id, nil)
+            stop_target_walk(agent_id, nil, "character_missing")
             goto continue
         end
         if tgt.expires_tick and game.tick >= tgt.expires_tick then
-            stop_target_walk(agent_id, c)
+            stop_target_walk(agent_id, c, "expired")
             goto continue
+        end
+
+        -- Migrate an active target from an older save before producing a
+        -- receipt for it.
+        if tgt.walk_id == nil then
+            storage.walk_sequence = (storage.walk_sequence or 0) + 1
+            tgt.walk_id = storage.walk_sequence
         end
 
         local dx = tgt.x - c.position.x
         local dy = tgt.y - c.position.y
         local dist = math.sqrt(dx * dx + dy * dy)
-        local sp = c.character_running_speed or 0.15
-        local arrival_distance = math.max(0.2, sp * 1.5)
+        local last_x = tgt.last_x or c.position.x
+        local last_y = tgt.last_y or c.position.y
+        local moved = math.sqrt(
+            (c.position.x - last_x) * (c.position.x - last_x)
+                + (c.position.y - last_y) * (c.position.y - last_y)
+        )
+        tgt.distance_walked = (tgt.distance_walked or 0) + moved
+        tgt.last_x = c.position.x
+        tgt.last_y = c.position.y
+        local arrival_distance = characters.walk_arrival_distance(
+            c,
+            tgt.requested_arrival_distance
+        )
+        tgt.arrival_distance = arrival_distance
 
         if dist <= arrival_distance then
-            stop_target_walk(agent_id, c)
+            stop_target_walk(agent_id, c, "arrived")
         else
-            local last_x = tgt.last_x or c.position.x
-            local last_y = tgt.last_y or c.position.y
-            local moved = math.sqrt(
-                (c.position.x - last_x) * (c.position.x - last_x)
-                    + (c.position.y - last_y) * (c.position.y - last_y)
-            )
             if moved < 0.001 then
                 tgt.stuck_ticks = (tgt.stuck_ticks or 0) + 1
             else
                 tgt.stuck_ticks = 0
             end
-            tgt.last_x = c.position.x
-            tgt.last_y = c.position.y
             if tgt.stuck_ticks >= 120 then
-                stop_target_walk(agent_id, c)
+                stop_target_walk(agent_id, c, "stuck")
             else
                 c.walking_state = {
                     walking = true,
@@ -1660,6 +1669,17 @@ local function remove_entity_impl(agent_id, unit_number)
     return mine_entity_for_agent(agent_id, entity)
 end
 
+local function get_entity_reach_impl(agent_id, unit_number)
+    local character = find_factorioctl_character(agent_id)
+    local entity = entities.find_by_unit_number(unit_number)
+    return characters.entity_reach_status(character, entity)
+end
+
+local function get_position_reach_impl(agent_id, x, y, reach_kind)
+    local character = find_factorioctl_character(agent_id)
+    return characters.position_reach_status(character, x, y, reach_kind)
+end
+
 local function insert_items_impl(agent_id, unit_number, item, count, inventory_type)
     local character = find_factorioctl_character(agent_id)
     if not (character and character.valid) then
@@ -2067,15 +2087,21 @@ local api = {
     end,
 
     -- Set a target for ordinary character walking (processed in on_tick)
-    set_walk_target = function(agent_id, x, y)
-        return json_remote_call("set_walk_target", characters.set_walk_target, agent_id, x, y)
+    set_walk_target = function(agent_id, x, y, arrival_distance)
+        return json_remote_call("set_walk_target", characters.set_walk_target, agent_id, x, y, arrival_distance)
     end,
 
     -- Clear target position AND any leftover walk state for an agent. Must reset
     -- walking_state too, or a stale {walking=true} keeps the orphan character
     -- engine-walking with no target (audit F2 trapdoor).
-    clear_walk_target = function(agent_id)
-        return json_remote_call("clear_walk_target", characters.clear_walk_target, agent_id)
+    clear_walk_target = function(agent_id, walk_id)
+        return json_remote_call("clear_walk_target", characters.clear_walk_target, agent_id, walk_id)
+    end,
+
+    -- Return the active walk or its terminal receipt. The matching walk_id
+    -- keeps one caller from observing or cancelling another caller's target.
+    get_walk_status = function(agent_id, walk_id)
+        return json_remote_call("get_walk_status", characters.get_walk_status, agent_id, walk_id)
     end,
 
     -- Report whether an agent has an active deterministic walk target
@@ -2194,6 +2220,14 @@ local api = {
 
     get_entity = function(unit_number)
         return json_remote_call("get_entity", entities.get_entity, unit_number)
+    end,
+
+    get_entity_reach = function(agent_id, unit_number)
+        return json_remote_call("get_entity_reach", get_entity_reach_impl, agent_id, unit_number)
+    end,
+
+    get_position_reach = function(agent_id, x, y, reach_kind)
+        return json_remote_call("get_position_reach", get_position_reach_impl, agent_id, x, y, reach_kind)
     end,
 
     get_entity_drop_position = function(unit_number)

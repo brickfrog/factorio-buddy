@@ -17,11 +17,6 @@ pub struct SetRecipeCommand {
 pub async fn execute(cmd: SetRecipeCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = conn.connect_client().await?;
 
-    // Check proximity before setting recipe
-    client
-        .ensure_proximity_to_entity(cmd.unit_number, crate::client::PROXIMITY_RANGE_INTERACT)
-        .await?;
-
     if cmd.recipe.is_empty() {
         client.clear_recipe(cmd.unit_number).await?;
         println!("Cleared recipe on entity #{}", cmd.unit_number);

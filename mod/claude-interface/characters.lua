@@ -60,23 +60,57 @@ end
 
 local function collision_box_for_entity(entity, margin)
     if not (entity and entity.valid) then return nil end
-    local proto = prototypes.entity[entity.name]
-    if not (proto and proto.collision_box) then return nil end
-    local cb = proto.collision_box
-    if cb.left_top.x == cb.right_bottom.x or cb.left_top.y == cb.right_bottom.y then
+    local box = entity.bounding_box
+    if not box then return nil end
+    if box.left_top.x == box.right_bottom.x or box.left_top.y == box.right_bottom.y then
         return nil
     end
     margin = margin or 0.02
     return {
         left_top = {
-            x = entity.position.x + cb.left_top.x - margin,
-            y = entity.position.y + cb.left_top.y - margin,
+            x = box.left_top.x - margin,
+            y = box.left_top.y - margin,
         },
         right_bottom = {
-            x = entity.position.x + cb.right_bottom.x + margin,
-            y = entity.position.y + cb.right_bottom.y + margin,
+            x = box.right_bottom.x + margin,
+            y = box.right_bottom.y + margin,
         },
     }
+end
+
+local function same_collision_layers(left, right)
+    local left_layers = (left and left.layers) or {}
+    local right_layers = (right and right.layers) or {}
+    for layer in pairs(left_layers) do
+        if not right_layers[layer] then return false end
+    end
+    for layer in pairs(right_layers) do
+        if not left_layers[layer] then return false end
+    end
+    return true
+end
+
+-- Mirror Factorio's entity-to-entity CollisionMask semantics. This keeps
+-- standing diagnostics correct for every prototype (including modded ones)
+-- instead of maintaining an entity-type exclusion list.
+local function entity_prototypes_collide(left, right)
+    local left_mask = left and left.collision_mask
+    local right_mask = right and right.collision_mask
+    if not (left_mask and right_mask) then return false end
+    if left_mask.colliding_with_tiles_only or right_mask.colliding_with_tiles_only then
+        return false
+    end
+    if left_mask.not_colliding_with_itself
+        and right_mask.not_colliding_with_itself
+        and same_collision_layers(left_mask, right_mask)
+    then
+        return false
+    end
+    local right_layers = right_mask.layers or {}
+    for layer in pairs(left_mask.layers or {}) do
+        if right_layers[layer] then return true end
+    end
+    return false
 end
 
 local function entity_blocker_summary(entity, box)
@@ -101,10 +135,7 @@ local function stand_blockers(character, position)
     for _, entity in pairs(character.surface.find_entities_filtered{area = area}) do
         if entity.valid
             and entity ~= character
-            and entity.type ~= "resource"
-            and entity.type ~= "item-entity"
-            and entity.type ~= "entity-ghost"
-            and entity.type ~= "tile-ghost"
+            and entity_prototypes_collide(character.prototype, entity.prototype)
         then
             local box = collision_box_for_entity(entity, 0.02)
             if box and boxes_overlap_area(area, box) then
@@ -293,6 +324,29 @@ function M.require_position_reach(character, x, y, reach_kind)
     return out_of_reach(character, {x = x, y = y}, distance, max_distance, nil)
 end
 
+function M.position_reach_status(character, x, y, reach_kind)
+    local reach_error = M.require_position_reach(character, x, y, reach_kind)
+    if reach_error then
+        reach_error.reachable = false
+        if character and character.valid then
+            reach_error.walk_arrival_distance = M.walk_arrival_distance(character, 0)
+        end
+        if reach_error.error_kind == "out_of_reach" then reach_error.success = true end
+        return reach_error
+    end
+    local distance = position_distance(character, x, y)
+    return {
+        success = true,
+        reachable = true,
+        character_position = pos_table(character.position),
+        target_position = {x = x, y = y},
+        distance = distance,
+        max_distance = reach_limit(character, reach_kind),
+        walk_arrival_distance = M.walk_arrival_distance(character, 0),
+        reach_kind = reach_kind or "interact",
+    }
+end
+
 function M.require_entity_reach(character, entity)
     if not (character and character.valid) then
         return {
@@ -331,6 +385,33 @@ function M.require_entity_reach(character, entity)
         character.reach_distance or 0,
         entity.unit_number
     )
+end
+
+function M.entity_reach_status(character, entity)
+    local reach_error = M.require_entity_reach(character, entity)
+    if reach_error then
+        reach_error.reachable = false
+        if character and character.valid then
+            reach_error.walk_arrival_distance = M.walk_arrival_distance(character, 0)
+        end
+        if reach_error.error_kind == "out_of_reach" then
+            -- The reach query itself succeeded; the entity is simply not yet
+            -- reachable. Preserve the structured movement guidance.
+            reach_error.success = true
+        end
+        return reach_error
+    end
+    local distance = position_distance(character, entity.position.x, entity.position.y)
+    return {
+        success = true,
+        reachable = true,
+        unit_number = entity.unit_number,
+        character_position = pos_table(character.position),
+        target_position = pos_table(entity.position),
+        distance = distance,
+        max_distance = character.reach_distance or 0,
+        walk_arrival_distance = M.walk_arrival_distance(character, 0),
+    }
 end
 
 function M.ensure_surface(planet_name)
@@ -440,7 +521,120 @@ function M.connected_player_count_result()
     })
 end
 
-function M.set_walk_target(agent_id, x, y)
+local function requested_walk_arrival_distance(value)
+    value = tonumber(value)
+    if not value or value < 0 or value ~= value or value == math.huge then return 0 end
+    return math.min(value, 64)
+end
+
+local function effective_walk_arrival_distance(character, requested)
+    local speed = character and character.valid and character.character_running_speed or 0.15
+    return math.max(0.2, speed * 1.5, requested_walk_arrival_distance(requested))
+end
+
+function M.walk_arrival_distance(character, requested)
+    return effective_walk_arrival_distance(character, requested)
+end
+
+function M.finish_walk(agent_id, character, reason)
+    storage.walk_targets = storage.walk_targets or {}
+    storage.walk_results = storage.walk_results or {}
+    local target = storage.walk_targets[agent_id]
+    if not target then
+        if storage.walk_state then storage.walk_state[agent_id] = nil end
+        if character and character.valid then character.walking_state = {walking = false} end
+        return nil
+    end
+
+    local final_position = character and character.valid and pos_table(character.position) or nil
+    local remaining_distance = nil
+    if final_position then
+        local dx = target.x - final_position.x
+        local dy = target.y - final_position.y
+        remaining_distance = math.sqrt(dx * dx + dy * dy)
+    end
+    local arrival_distance = effective_walk_arrival_distance(
+        character,
+        target.requested_arrival_distance
+    )
+    local result = {
+        success = true,
+        walk_id = target.walk_id,
+        active = false,
+        arrived = reason == "arrived",
+        reason = reason,
+        target = {x = target.x, y = target.y},
+        final_position = final_position,
+        remaining_distance = remaining_distance,
+        arrival_distance = arrival_distance,
+        distance_walked = target.distance_walked or 0,
+        started_position = target.started_position,
+        started_tick = target.started_tick,
+        finished_tick = game.tick,
+    }
+    storage.walk_results[agent_id] = result
+    storage.walk_targets[agent_id] = nil
+    if storage.walk_state then storage.walk_state[agent_id] = nil end
+    if character and character.valid then
+        M.remember(agent_id, character)
+        character.walking_state = {walking = false}
+    end
+    return result
+end
+
+function M.get_walk_status(agent_id, walk_id)
+    storage.walk_targets = storage.walk_targets or {}
+    storage.walk_results = storage.walk_results or {}
+    walk_id = tonumber(walk_id)
+    local target = storage.walk_targets[agent_id]
+    local result = storage.walk_results[agent_id]
+
+    if target and (walk_id == nil or target.walk_id == walk_id) then
+        local character = M.find(agent_id)
+        local final_position = character and character.valid and pos_table(character.position) or nil
+        local remaining_distance = nil
+        if final_position then
+            local dx = target.x - final_position.x
+            local dy = target.y - final_position.y
+            remaining_distance = math.sqrt(dx * dx + dy * dy)
+        end
+        local arrival_distance = effective_walk_arrival_distance(
+            character,
+            target.requested_arrival_distance
+        )
+        target.arrival_distance = arrival_distance
+        return {
+            success = true,
+            walk_id = target.walk_id,
+            active = true,
+            arrived = false,
+            reason = "walking",
+            target = {x = target.x, y = target.y},
+            final_position = final_position,
+            remaining_distance = remaining_distance,
+            arrival_distance = arrival_distance,
+            distance_walked = target.distance_walked or 0,
+            started_position = target.started_position,
+            started_tick = target.started_tick,
+        }
+    end
+
+    if result and (walk_id == nil or result.walk_id == walk_id) then return result end
+    return {
+        success = true,
+        walk_id = walk_id,
+        active = false,
+        arrived = false,
+        reason = (walk_id ~= nil and (target or result)) and "superseded" or "idle",
+        target = nil,
+        final_position = nil,
+        remaining_distance = nil,
+        arrival_distance = nil,
+        distance_walked = 0,
+    }
+end
+
+function M.set_walk_target(agent_id, x, y, arrival_distance)
     local character = M.find(agent_id)
     if not (character and character.valid) then
         return {
@@ -451,28 +645,44 @@ function M.set_walk_target(agent_id, x, y)
 
     M.remember(agent_id, character)
     storage.walk_targets = storage.walk_targets or {}
+    storage.walk_results = storage.walk_results or {}
+    storage.walk_sequence = storage.walk_sequence or 0
+    if storage.walk_targets[agent_id] then
+        M.finish_walk(agent_id, character, "superseded")
+    end
+    storage.walk_sequence = storage.walk_sequence + 1
     if storage.walk_state then storage.walk_state[agent_id] = nil end
     storage.walk_targets[agent_id] = {
+        walk_id = storage.walk_sequence,
         x = x,
         y = y,
+        requested_arrival_distance = requested_walk_arrival_distance(arrival_distance),
+        arrival_distance = effective_walk_arrival_distance(character, arrival_distance),
+        distance_walked = 0,
         stuck_ticks = 0,
         expires_tick = game.tick + 7200,
         last_x = character.position.x,
         last_y = character.position.y,
+        started_position = pos_table(character.position),
+        started_tick = game.tick,
     }
     character.walking_state = {walking = false}
-    return {success = true}
+    return M.get_walk_status(agent_id, storage.walk_sequence)
 end
 
-function M.clear_walk_target(agent_id)
-    if storage.walk_targets then storage.walk_targets[agent_id] = nil end
-    if storage.walk_state then storage.walk_state[agent_id] = nil end
+function M.clear_walk_target(agent_id, walk_id)
+    walk_id = tonumber(walk_id)
     local character = M.find(agent_id)
-    if character and character.valid then
-        M.remember(agent_id, character)
-        character.walking_state = {walking = false}
+    local target = storage.walk_targets and storage.walk_targets[agent_id] or nil
+    if target then
+        if walk_id ~= nil and target.walk_id ~= walk_id then
+            return M.get_walk_status(agent_id, walk_id)
+        end
+        return M.finish_walk(agent_id, character, "cancelled")
     end
-    return {success = true}
+    if storage.walk_state then storage.walk_state[agent_id] = nil end
+    if character and character.valid then character.walking_state = {walking = false} end
+    return M.get_walk_status(agent_id, walk_id)
 end
 
 function M.init(agent_id, x, y)

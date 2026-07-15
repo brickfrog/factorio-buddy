@@ -28,7 +28,7 @@ local function rotate(x, y, direction)
 end
 
 -- Return the complete rotated collision footprint used by the live resource
--- reservation rule. This is deliberately derived from prototypes rather than
+-- overlap report. This is deliberately derived from prototypes rather than
 -- entity names or center tiles, so rectangular and modded entities are covered.
 function M.footprint(entity_name, position, direction)
     local px, py = xy(position)
@@ -108,6 +108,9 @@ function M.inspect(surface, entity_name, position, direction)
     local result = {
         policy_allowed = true,
         preserves_resource_patch = true,
+        resource_overlap = false,
+        resource_overlap_tile_count = 0,
+        overlapping_resource_amount = 0,
         footprint = footprint and area_record(footprint) or nil,
         overlapping_resources = {},
         overlapping_resource_tiles = {},
@@ -148,6 +151,7 @@ function M.inspect(surface, entity_name, position, direction)
             summary.tile_count = summary.tile_count + 1
             summary.total_amount = summary.total_amount + (resource.amount or 0)
             summary.compatible_with_extractor = summary.compatible_with_extractor and compatible
+            result.overlapping_resource_amount = result.overlapping_resource_amount + (resource.amount or 0)
         end
     end
     table.sort(result.overlapping_resources, function(a, b) return a.name < b.name end)
@@ -157,7 +161,9 @@ function M.inspect(surface, entity_name, position, direction)
         return a.position.y < b.position.y
     end)
 
-    if #result.overlapping_resources == 0 then return result end
+    result.resource_overlap_tile_count = #result.overlapping_resource_tiles
+    result.resource_overlap = result.resource_overlap_tile_count > 0
+    if not result.resource_overlap then return result end
 
     local all_compatible = extractor
     for _, resource in ipairs(result.overlapping_resources) do
@@ -168,23 +174,36 @@ function M.inspect(surface, entity_name, position, direction)
     end
     if all_compatible then
         result.extractor_exception = true
+        result.compatible_extractor = true
         result.preserves_resource_patch = true
         return result
     end
 
-    result.policy_allowed = false
-    result.preserves_resource_patch = false
-    result.error_kind = "resource_footprint_reserved"
-    result.error = "Proposed placement overlaps a live resource patch reserved for compatible extraction"
-    result.guidance = "Move processing, storage, power, and ordinary logistics off the resource patch. Use execute_edge_miner for extraction and route belts around or underground."
+    if extractor then
+        result.policy_allowed = false
+        result.preserves_resource_patch = false
+        result.error_kind = "incompatible_resource_category"
+        result.error = "Mining drill is incompatible with one or more resource categories under its footprint"
+        result.guidance = "Choose a mining-drill prototype whose resource categories include every overlapped live resource."
+        return result
+    end
+
+    result.warning = "Placement overlaps live resource tiles; the resources remain present, but the footprint can reduce future extractor access."
+    result.guidance = "Keep permanent processing, storage, and power blocks off resource patches when practical. Compact logistics crossings are valid; keep them short and preserve room for compatible mining drills."
+    result.advisory = {
+        kind = "resource_overlap",
+        severity = "warning",
+        message = result.warning,
+        guidance = result.guidance,
+    }
     return result
 end
 
 -- Rotating a legacy entity already on resources is permitted only when the
 -- requested collision footprint is unchanged. Factorio may remove resources
 -- when a changed footprint is revalidated, even if every requested resource
--- also overlapped the old orientation. Harmless no-op/square rotations remain
--- available without allowing a rectangular footprint to consume the patch.
+-- also overlapped the old orientation. This is destructive-mutation safety,
+-- not a blanket ban on building useful infrastructure across resource tiles.
 function M.inspect_rotation(surface, entity_name, position, current_direction, requested_direction)
     local current = M.inspect(surface, entity_name, position, current_direction)
     local requested = M.inspect(surface, entity_name, position, requested_direction)
@@ -194,6 +213,18 @@ function M.inspect_rotation(surface, entity_name, position, current_direction, r
             preserves_resource_patch = false,
             error_kind = requested.error_kind,
             error = requested.error,
+            current = current,
+            requested = requested,
+            newly_overlapped_resources = {},
+        }
+    end
+    if requested.policy_allowed ~= true then
+        return {
+            policy_allowed = false,
+            preserves_resource_patch = false,
+            error_kind = requested.error_kind,
+            error = requested.error,
+            guidance = requested.guidance,
             current = current,
             requested = requested,
             newly_overlapped_resources = {},
@@ -234,11 +265,11 @@ function M.inspect_rotation(surface, entity_name, position, current_direction, r
     return {
         policy_allowed = false,
         preserves_resource_patch = false,
-        error_kind = "resource_footprint_reserved",
+        error_kind = "resource_destructive_rotation",
         error = #introduced > 0
-            and "Requested rotation would expand this entity onto a live resource patch"
-            or "Requested rotation would change the footprint of an entity already overlapping live resources",
-        guidance = "Move the entity off the resource patch before changing its footprint, or keep an orientation with the same collision footprint.",
+            and "Requested rotation would expand the collision footprint onto live resource tiles"
+            or "Requested rotation would revalidate a changed collision footprint over live resource tiles",
+        guidance = "Move the entity to clear ground before changing its footprint, or keep an orientation with the same collision footprint so Factorio cannot remove resources during revalidation.",
         current = current,
         requested = requested,
         newly_overlapped_resources = introduced,

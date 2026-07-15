@@ -253,7 +253,7 @@ impl Zone {
     }
 }
 
-/// A protected resource patch (ore) that shouldn't be built on
+/// A recorded resource patch (ore or oil) used for layout advisories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtectedResource {
     /// Resource type (e.g., "iron-ore", "copper-ore")
@@ -286,7 +286,7 @@ pub struct PlacementCheck {
     pub errors: Vec<String>,
     /// Zones that overlap with the placement
     pub overlapping_zones: Vec<String>,
-    /// Protected resources that overlap
+    /// Recorded resources that overlap
     pub overlapping_resources: Vec<String>,
 }
 
@@ -332,7 +332,7 @@ impl PlacementCheck {
 pub struct AgentMemory {
     /// Defined zones
     pub zones: HashMap<String, Zone>,
-    /// Protected resource patches
+    /// Recorded resource patches retained under the legacy persisted field name
     pub protected_resources: Vec<ProtectedResource>,
     /// General notes (key-value)
     pub notes: HashMap<String, String>,
@@ -406,9 +406,9 @@ impl AgentMemory {
             .collect()
     }
 
-    // === Resource Protection ===
+    // === Resource Observations ===
 
-    /// Add a protected resource
+    /// Record a resource patch for later layout advisories.
     pub fn add_protected_resource(&mut self, resource: ProtectedResource) {
         // Check if we already have this resource (same type and overlapping bounds)
         let exists = self.protected_resources.iter().any(|r| {
@@ -420,7 +420,7 @@ impl AgentMemory {
         }
     }
 
-    /// Find protected resources at a position
+    /// Find recorded resources at a position.
     pub fn resources_at(&self, pos: &Position) -> Vec<&ProtectedResource> {
         self.protected_resources
             .iter()
@@ -428,7 +428,7 @@ impl AgentMemory {
             .collect()
     }
 
-    /// Find protected resources overlapping an area
+    /// Find recorded resources overlapping an area.
     pub fn resources_overlapping(&self, area: &Area) -> Vec<&ProtectedResource> {
         self.protected_resources
             .iter()
@@ -436,7 +436,7 @@ impl AgentMemory {
             .collect()
     }
 
-    /// Clear all protected resources
+    /// Clear all recorded resources.
     pub fn clear_protected_resources(&mut self) {
         self.protected_resources.clear();
     }
@@ -465,26 +465,18 @@ impl AgentMemory {
             }
         }
 
-        // Check protected resources
+        // Resource overlap is useful layout context, but it is not a placement
+        // veto. Factorio's live placement policy remains authoritative for
+        // ordinary collision checks and extractor/resource compatibility.
         let resources = self.resources_at(pos);
         for resource in &resources {
             result
                 .overlapping_resources
                 .push(resource.resource_type.clone());
-
-            // Only miners and related infrastructure should be on resources
-            let is_mining_entity = entity_name.contains("mining-drill")
-                || entity_name.contains("pumpjack")
-                || entity_name.contains("belt")
-                || entity_name.contains("inserter")
-                || entity_name.contains("pole");
-
-            if !is_mining_entity {
-                result = result.with_error(format!(
-                    "Position overlaps {} resource - use this area for mining only!",
-                    resource.resource_type
-                ));
-            }
+            result = result.with_warning(format!(
+                "Position overlaps recorded {} resource terrain; this memory overlap is advisory, and permanent construction may reduce future mining access",
+                resource.resource_type
+            ));
         }
 
         result
@@ -588,10 +580,29 @@ mod tests {
         let check = memory.check_placement("electric-mining-drill", &Position::new(25.0, 25.0));
         assert!(check.allowed);
 
-        // Assembler on ore should be blocked
+        // Ordinary infrastructure on ore remains legal and reports the overlap.
         let check = memory.check_placement("assembling-machine-1", &Position::new(25.0, 25.0));
+        assert!(check.allowed);
+        assert!(check.errors.is_empty());
+        assert_eq!(check.overlapping_resources, ["iron-ore"]);
+        assert!(check
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("may reduce future mining access")));
+
+        // Explicit reserved zones remain fatal independently of resource advice.
+        memory.set_zone(Zone::new(
+            "reserved-1".into(),
+            ZoneType::Reserved,
+            Area::new(20.0, 20.0, 30.0, 30.0),
+        ));
+        let check = memory.check_placement("transport-belt", &Position::new(25.0, 25.0));
         assert!(!check.allowed);
-        assert!(!check.errors.is_empty());
+        assert!(check
+            .errors
+            .iter()
+            .any(|error| error.contains("reserved zone 'reserved-1'")));
+        assert_eq!(check.overlapping_resources, ["iron-ore"]);
     }
 
     #[test]

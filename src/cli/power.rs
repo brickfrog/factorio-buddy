@@ -178,18 +178,8 @@ pub async fn execute(cmd: PowerCommand, conn: &ResolvedConnectionArgs) -> Result
                 let y = from_pos.y + dy * t;
                 let target = Position { x, y };
 
-                // Walk to position
-                let walk_result = client.walk_to(target, false).await?;
-                if !walk_result.arrived && walk_result.final_position.distance(&target) > 10.0 {
-                    println!(
-                        "  Couldn't reach ({:.0},{:.0}) - blocked",
-                        target.x, target.y
-                    );
-                    failed += 1;
-                    continue;
-                }
-
-                // Try to place pole
+                // Placement owns its range-aware approach. Exact navigation
+                // must not occupy the future pole footprint.
                 match client
                     .place_entity(&pole, target, crate::world::Direction::North)
                     .await

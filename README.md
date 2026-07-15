@@ -22,7 +22,9 @@ just play
 ```
 
 Join `localhost:34197` from Factorio's multiplayer menu. Press `Ctrl+Shift+C`
-to open the Buddy panel.
+to open the Buddy panel. The managed server tolerates long background-client
+stalls instead of dropping the local graphical client after Factorio's default
+20-second timeout.
 
 `just play` builds the Rust binaries, installs the included Lua mod into an
 isolated `.factorio-buddy` write-data directory, replaces the Buddy save with a
@@ -36,8 +38,9 @@ if Factorio is already running with RCON and the mod installed.
 
 ## Autonomy
 
-Autonomy runs only while a human player is connected. The default autonomous
-interval is 30 seconds. Override the interval when launching if needed:
+Autonomy continues while Buddy is running, whether or not a human player is
+currently connected. The default autonomous interval is 30 seconds. Override
+the interval when launching if needed:
 
 ```bash
 BUDDY_HEARTBEAT_SECONDS=60 just play

@@ -863,6 +863,55 @@ pub fn find_walk_path(
         };
     }
 
+    find_walk_path_to_goals(start, &HashSet::from([goal]), collision_map)
+}
+
+/// Find the shortest walk path to any walkable goal in a set. Range-aware
+/// interaction movement uses this to route to a clear standing tile around a
+/// blocked entity instead of pathfinding to the entity's occupied center.
+pub fn find_walk_path_to_any(
+    start: GridPos,
+    goals: &HashSet<GridPos>,
+    collision_map: &CollisionMap,
+) -> WalkPathResult {
+    let walkable_goals = goals
+        .iter()
+        .copied()
+        .filter(|goal| collision_map.is_walkable(goal))
+        .collect::<HashSet<_>>();
+    if walkable_goals.is_empty() {
+        return WalkPathResult {
+            success: false,
+            path: vec![],
+            path_length: 0,
+            error: Some("No walkable goal positions".to_string()),
+        };
+    }
+    find_walk_path_to_goals(start, &walkable_goals, collision_map)
+}
+
+fn distance_to_nearest_goal(position: GridPos, goals: &HashSet<GridPos>) -> f64 {
+    goals
+        .iter()
+        .map(|goal| position.manhattan_distance(goal))
+        .min()
+        .unwrap_or(0) as f64
+}
+
+fn find_walk_path_to_goals(
+    start: GridPos,
+    goals: &HashSet<GridPos>,
+    collision_map: &CollisionMap,
+) -> WalkPathResult {
+    if !collision_map.is_walkable(&start) {
+        return WalkPathResult {
+            success: false,
+            path: vec![],
+            path_length: 0,
+            error: Some("Start position is blocked".to_string()),
+        };
+    }
+
     // A* data structures
     let mut open_set = BinaryHeap::new();
     let mut came_from: HashMap<GridPos, (GridPos, Direction)> = HashMap::new();
@@ -874,13 +923,13 @@ pub fn find_walk_path(
     open_set.push(PathNode {
         pos: start,
         g_cost: 0.0,
-        f_cost: start.manhattan_distance(&goal) as f64,
+        f_cost: distance_to_nearest_goal(start, goals),
     });
 
     while let Some(current) = open_set.pop() {
-        if current.pos == goal {
+        if goals.contains(&current.pos) {
             // Reconstruct and simplify path
-            let full_path = reconstruct_path(&came_from, goal, start);
+            let full_path = reconstruct_path(&came_from, current.pos, start);
             let simplified = simplify_walk_path(&full_path);
             return WalkPathResult {
                 success: true,
@@ -908,7 +957,7 @@ pub fn find_walk_path(
                 came_from.insert(neighbor, (current.pos, move_direction));
                 g_score.insert(neighbor, tentative_g);
 
-                let h = neighbor.manhattan_distance(&goal) as f64;
+                let h = distance_to_nearest_goal(neighbor, goals);
                 open_set.push(PathNode {
                     pos: neighbor,
                     g_cost: tentative_g,
@@ -1045,6 +1094,41 @@ mod tests {
         // Should go around: 0,0 -> 0,1 -> 1,1 -> 2,1 -> 2,0 or similar
         assert!(result.belt_count > 3);
         assert!(result.turn_count > 0);
+    }
+
+    #[test]
+    fn walk_path_to_any_reaches_clear_perimeter_when_center_is_blocked() {
+        let bounds = Area {
+            left_top: Position { x: -2.0, y: -2.0 },
+            right_bottom: Position { x: 8.0, y: 8.0 },
+        };
+        let mut collision_map = CollisionMap::new(bounds);
+        collision_map.block(GridPos::new(5, 0));
+        let goals = HashSet::from([GridPos::new(5, 0), GridPos::new(4, 0), GridPos::new(5, 1)]);
+
+        let result = find_walk_path_to_any(GridPos::new(0, 0), &goals, &collision_map);
+
+        assert!(result.success);
+        let reached = result.path.last().expect("successful path has a goal");
+        assert!(goals.contains(reached));
+        assert_ne!(*reached, GridPos::new(5, 0));
+        assert!(collision_map.is_walkable(reached));
+    }
+
+    #[test]
+    fn walk_path_to_any_fails_when_every_goal_is_blocked() {
+        let bounds = Area {
+            left_top: Position { x: -2.0, y: -2.0 },
+            right_bottom: Position { x: 8.0, y: 8.0 },
+        };
+        let mut collision_map = CollisionMap::new(bounds);
+        collision_map.block(GridPos::new(5, 0));
+        let goals = HashSet::from([GridPos::new(5, 0)]);
+
+        let result = find_walk_path_to_any(GridPos::new(0, 0), &goals, &collision_map);
+
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("No walkable goal positions"));
     }
 
     #[test]

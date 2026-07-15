@@ -891,16 +891,16 @@ EXPECTED_TOOLS="$(printf '%s\n' \
     diagnose_steam_power execute_direct_smelter execute_edge_miner \
     execute_entity_placement_near extend_power_to feed_lab_from_inventory file_issue \
     find_nearest_resource \
-    get_available_research get_belt_lane_contents get_entities \
+    get_available_research get_belt_lane_contents get_entities get_entity_inventory \
     get_machine_belt_positions get_power_status get_recipe get_recipes_for_item \
     get_research_status mine_at place_entity plan_automation_science \
     plan_machine_output plan_recipe_assembler_cell plan_steam_power \
     production_statistics remove_entity render_map repair_fuel_sustainability \
     rotate_entity route_belt set_recipe situation_report start_research unstuck \
     verify_production wait_for_crafting walk_to | jq -Rsc 'split("\n")[:-1] | sort')"
-assert_json "model receives the exact 48-tool gameplay surface" "$TOOLS" \
+assert_json "model receives the exact 49-tool gameplay surface" "$TOOLS" \
     --argjson expected "$EXPECTED_TOOLS" \
-    '([.result.tools[].name] | sort) == $expected and (.result.tools | length) == 48'
+    '([.result.tools[].name] | sort) == $expected and (.result.tools | length) == 49'
 TOOLS_SCHEMA_BYTES="$(jq -c '.result.tools' <<<"$TOOLS" | wc -c)"
 if (( TOOLS_SCHEMA_BYTES <= 61440 )); then
     pass "model tool schema stays below 60 KiB"
@@ -908,6 +908,319 @@ else
     fail "model tool schema stays below 60 KiB" \
         "observed $TOOLS_SCHEMA_BYTES bytes"
 fi
+
+# A two-tile walk is real movement, not an already-arrived near no-op. The
+# response and the authoritative character position must agree.
+SHORT_WALK_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+for _, entity in pairs(s.find_entities_filtered{area = {{-46, -26}, {-32, -14}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({-44.5, -20.5}, s)
+rcon.print(helpers.table_to_json({x = c.position.x, y = c.position.y}))
+")"
+require_json "short-walk fixture starts at the exact disposable position" "$SHORT_WALK_FIXTURE" \
+    '.x == -44.5 and .y == -20.5'
+
+SHORT_WALK="$(mcp_tool walk_to '{"x":-42.5,"y":-20.5}')"
+SHORT_WALK_PAYLOAD="$(tool_payload "$SHORT_WALK")"
+assert_json "two-tile MCP walk reports real movement and arrival near the target" "$SHORT_WALK_PAYLOAD" \
+    '.arrived == true
+     and .distance_walked > 1.5
+     and ((.final_position.x + 42.5) | fabs) < 0.5
+     and ((.final_position.y + 20.5) | fabs) < 0.5'
+SHORT_WALK_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local dx = c.position.x - (-44.5)
+local dy = c.position.y - (-20.5)
+rcon.print(helpers.table_to_json({
+    x = c.position.x,
+    y = c.position.y,
+    displacement = math.sqrt(dx * dx + dy * dy),
+    target_active = remote.call('claude_interface', 'has_walk_target', '$AGENT_ID')
+}))
+")"
+assert_json "two-tile MCP walk actually moves the NPC and clears its target" "$SHORT_WALK_WORLD" \
+    '.displacement > 1.5
+     and ((.x + 42.5) | fabs) < 0.5
+     and ((.y + 20.5) | fabs) < 0.5
+     and .target_active == false'
+
+# Walk IDs make completion receipts race-safe. Superseding A with B must leave
+# A's receipt readable, and cancelling A must never cancel active B.
+WALK_RECEIPT_LIFECYCLE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+c.teleport({-44.5, -20.5}, s)
+local first = helpers.json_to_table(remote.call(
+    'claude_interface', 'set_walk_target', '$AGENT_ID', -30.5, -20.5
+))
+local second = helpers.json_to_table(remote.call(
+    'claude_interface', 'set_walk_target', '$AGENT_ID', -44.5, -6.5
+))
+local first_status = helpers.json_to_table(remote.call(
+    'claude_interface', 'get_walk_status', '$AGENT_ID', first.walk_id
+))
+local stale_clear = helpers.json_to_table(remote.call(
+    'claude_interface', 'clear_walk_target', '$AGENT_ID', first.walk_id
+))
+local second_active = helpers.json_to_table(remote.call(
+    'claude_interface', 'get_walk_status', '$AGENT_ID', second.walk_id
+))
+local target_active = remote.call('claude_interface', 'has_walk_target', '$AGENT_ID')
+local second_cancelled = helpers.json_to_table(remote.call(
+    'claude_interface', 'clear_walk_target', '$AGENT_ID', second.walk_id
+))
+rcon.print(helpers.table_to_json({
+    first = first,
+    second = second,
+    first_status = first_status,
+    stale_clear = stale_clear,
+    second_active = second_active,
+    target_active_after_stale_clear = target_active,
+    second_cancelled = second_cancelled,
+}))
+")"
+assert_json "walk receipts preserve supersession and stale cancellation safety" "$WALK_RECEIPT_LIFECYCLE" \
+    '.first.active == true
+     and .second.active == true
+     and .first.walk_id != .second.walk_id
+     and .first_status.active == false
+     and .first_status.arrived == false
+     and .first_status.reason == "superseded"
+     and .stale_clear.walk_id == .first.walk_id
+     and .stale_clear.reason == "superseded"
+     and .second_active.walk_id == .second.walk_id
+     and .second_active.active == true
+     and .second_active.reason == "walking"
+     and .target_active_after_stale_clear == true
+     and .second_cancelled.walk_id == .second.walk_id
+     and .second_cancelled.active == false
+     and .second_cancelled.reason == "cancelled"'
+
+# Factorio's authoritative reach check owns whether an exact-unit mutation
+# needs movement. At the vanilla six-tile reach boundary, removal must not
+# displace an NPC that can already reach the pole.
+REACHABLE_POLE_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+for _, entity in pairs(s.find_entities_filtered{area = {{-46, -26}, {-32, -14}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({-44.5, -20.5}, s)
+c.get_main_inventory().clear()
+local pole = s.create_entity{
+    name = 'small-electric-pole',
+    position = {-38.5, -20.5},
+    force = c.force,
+}
+if not pole then error('failed to create reachable-pole fixture') end
+local dx = pole.position.x - c.position.x
+local dy = pole.position.y - c.position.y
+rcon.print(helpers.table_to_json({
+    unit_number = pole.unit_number,
+    character_position = {x = c.position.x, y = c.position.y},
+    pole_position = {x = pole.position.x, y = pole.position.y},
+    distance = math.sqrt(dx * dx + dy * dy),
+    can_reach = c.can_reach_entity(pole)
+}))
+")"
+require_json "six-tile pole is authoritatively reachable before MCP removal" "$REACHABLE_POLE_FIXTURE" \
+    '(.unit_number | type) == "number"
+     and .can_reach == true
+     and ((.distance - 6) | fabs) < 0.01'
+REACHABLE_POLE_UNIT="$(jq -r '.unit_number' <<<"$REACHABLE_POLE_FIXTURE")"
+REACHABLE_POLE_X="$(jq -r '.character_position.x' <<<"$REACHABLE_POLE_FIXTURE")"
+REACHABLE_POLE_Y="$(jq -r '.character_position.y' <<<"$REACHABLE_POLE_FIXTURE")"
+
+REACHABLE_POLE_REMOVE="$(mcp_tool remove_entity "$(jq -cn \
+    --argjson unit "$REACHABLE_POLE_UNIT" \
+    '{unit_number:$unit}')")"
+assert_json "MCP removes the already-reachable pole" "$REACHABLE_POLE_REMOVE" \
+    '(.result.isError // false) == false
+     and .result.content[0].text == "Entity removed successfully"'
+REACHABLE_POLE_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+rcon.print(helpers.table_to_json({
+    pole_count = s.count_entities_filtered{
+        name = 'small-electric-pole',
+        position = {-38.5, -20.5},
+        radius = 0.2,
+    },
+    character_position = {x = c.position.x, y = c.position.y},
+    target_active = remote.call('claude_interface', 'has_walk_target', '$AGENT_ID')
+}))
+")"
+assert_json "already-reachable pole removal does not displace the NPC" "$REACHABLE_POLE_WORLD" \
+    --argjson before_x "$REACHABLE_POLE_X" \
+    --argjson before_y "$REACHABLE_POLE_Y" \
+    '.pole_count == 0
+     and ((.character_position.x - $before_x) | fabs) < 0.01
+     and ((.character_position.y - $before_y) | fabs) < 0.01
+     and .target_active == false'
+
+# Build reach is also Factorio-owned. A temporary bonus creates a target that
+# is beyond the old Rust constant but natively reachable; placement must not
+# start a walk.
+BUILD_REACH_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+c.teleport({-44.5, -20.5}, s)
+c.character_build_distance_bonus = 6
+c.get_main_inventory().insert{name = 'iron-chest', count = 1}
+rcon.print(helpers.table_to_json({
+    x = c.position.x,
+    y = c.position.y,
+    build_distance = c.build_distance,
+    target_distance = 12,
+}))
+")"
+require_json "build-reach fixture exceeds the retired constant but is natively reachable" "$BUILD_REACH_FIXTURE" \
+    '.build_distance >= 16 and .target_distance > 10 and .target_distance < .build_distance'
+BUILD_REACH_PLACE="$(mcp_tool place_entity '{"entity_name":"iron-chest","x":-32.5,"y":-20.5,"direction":"north"}')"
+BUILD_REACH_PLACE_PAYLOAD="$(tool_payload "$BUILD_REACH_PLACE")"
+assert_json "MCP places at native build reach without a needless walk" "$BUILD_REACH_PLACE_PAYLOAD" \
+    '.name == "iron-chest" and (.unit_number | type) == "number"'
+BUILD_REACH_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local chests = s.count_entities_filtered{name = 'iron-chest', position = {-32.5, -20.5}, radius = 0.2}
+c.character_build_distance_bonus = 0
+rcon.print(helpers.table_to_json({
+    chests = chests,
+    x = c.position.x,
+    y = c.position.y,
+    target_active = remote.call('claude_interface', 'has_walk_target', '$AGENT_ID'),
+}))
+")"
+assert_json "native-reachable placement preserves the NPC position" "$BUILD_REACH_WORLD" \
+    '.chests == 1
+     and ((.x + 44.5) | fabs) < 0.01
+     and ((.y + 20.5) | fabs) < 0.01
+     and .target_active == false'
+
+# A genuinely out-of-reach entity behind a wall requires the range-aware A*
+# perimeter path; a straight walk toward its occupied center gets stuck.
+OBSTACLE_REACH_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+for _, entity in pairs(s.find_entities_filtered{area = {{-15, -45}, {9, -36}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({-12.5, -40.5}, s)
+c.get_main_inventory().clear()
+local pole = s.create_entity{name = 'small-electric-pole', position = {5.5, -40.5}, force = c.force}
+for y = -42, -38 do
+    if not s.create_entity{name = 'stone-wall', position = {-7.5, y + 0.5}, force = c.force} then
+        error('failed to create obstacle wall')
+    end
+end
+if not pole then error('failed to create out-of-reach pole') end
+rcon.print(helpers.table_to_json({
+    pole_unit = pole.unit_number,
+    can_reach = c.can_reach_entity(pole),
+    reach_distance = c.reach_distance,
+    start = {x = c.position.x, y = c.position.y},
+    wall_count = s.count_entities_filtered{name = 'stone-wall', area = {{-8, -43}, {-7, -37}}},
+}))
+")"
+require_json "out-of-reach fixture puts a real wall across the direct route" "$OBSTACLE_REACH_FIXTURE" \
+    '(.pole_unit | type) == "number"
+     and .can_reach == false
+     and .wall_count == 5
+     and .reach_distance > 0'
+OBSTACLE_REACH_UNIT="$(jq -r '.pole_unit' <<<"$OBSTACLE_REACH_FIXTURE")"
+OBSTACLE_REACH_REMOVE="$(mcp_tool remove_entity "$(jq -cn --argjson unit "$OBSTACLE_REACH_UNIT" '{unit_number:$unit}')")"
+assert_json "range-aware A* reaches and removes the pole behind the wall" "$OBSTACLE_REACH_REMOVE" \
+    '(.result.isError // false) == false
+     and .result.content[0].text == "Entity removed successfully"'
+OBSTACLE_REACH_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local dx = c.position.x - (-12.5)
+local dy = c.position.y - (-40.5)
+rcon.print(helpers.table_to_json({
+    pole_count = s.count_entities_filtered{name = 'small-electric-pole', position = {5.5, -40.5}, radius = 0.2},
+    displacement = math.sqrt(dx * dx + dy * dy),
+    wall_count = s.count_entities_filtered{name = 'stone-wall', area = {{-8, -43}, {-7, -37}}},
+    target_active = remote.call('claude_interface', 'has_walk_target', '$AGENT_ID'),
+}))
+")"
+assert_json "obstacle approach moves around intact walls and leaves no walk active" "$OBSTACLE_REACH_WORLD" \
+    '.pole_count == 0
+     and .displacement > 3
+     and .wall_count == 5
+     and .target_active == false'
+
+# Standing diagnostics must use Factorio collision masks. Surface belts are
+# walkable infrastructure, so neither diagnostic may report one as a blocker.
+BELT_STANDING_DIAGNOSTICS="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+for _, entity in pairs(s.find_entities_filtered{area = {{-46, -26}, {-32, -14}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local belt = s.create_entity{
+    name = 'transport-belt',
+    position = {-38.5, -20.5},
+    direction = defines.direction.east,
+    force = c.force,
+}
+if not belt then error('failed to create belt-standing fixture') end
+if not c.teleport(belt.position, s) then error('failed to stand character on fixture belt') end
+local can_stand = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'can_stand_at',
+    '$AGENT_ID',
+    c.position.x,
+    c.position.y,
+    4
+))
+local blocked = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'is_player_blocked',
+    '$AGENT_ID',
+    4
+))
+rcon.print(helpers.table_to_json({
+    belt_unit = belt.unit_number,
+    can_stand = can_stand,
+    blocked = blocked,
+}))
+")"
+assert_json "belt under the NPC remains a clear standing position" "$BELT_STANDING_DIAGNOSTICS" \
+    '(.belt_unit | type) == "number"
+     and .can_stand.success == true
+     and .can_stand.can_stand == true
+     and .can_stand.blocker_count == 0
+     and .blocked.success == true
+     and .blocked.blocked == false
+     and .blocked.can_stand_at_current_position == true
+     and .blocked.blocker_count == 0'
+
+COLLIDING_STANDING_CONTROL="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local chest = s.create_entity{name = 'iron-chest', position = {-35.5, -20.5}, force = c.force}
+if not chest then error('failed to create standing-blocker control') end
+local report = helpers.json_to_table(remote.call(
+    'claude_interface', 'can_stand_at', '$AGENT_ID', -35.5, -20.5, 4
+))
+rcon.print(helpers.table_to_json({chest_unit = chest.unit_number, report = report}))
+")"
+assert_json "generic collision diagnostics still identify a real chest blocker" "$COLLIDING_STANDING_CONTROL" \
+    --argjson chest_unit "$(jq '.chest_unit' <<<"$COLLIDING_STANDING_CONTROL")" \
+    '.report.success == true
+     and .report.can_stand == false
+     and .report.blocker_count > 0
+     and any(.report.blockers[]; .unit_number == $chest_unit)'
 
 INVALID_PLACE="$(mcp_tool place_entity '{"entity_name":"not-a-real-entity","x":28,"y":10,"direction":"north"}')"
 assert_json "semantic MCP failures set isError" "$INVALID_PLACE" '.result.isError == true'
@@ -1053,53 +1366,69 @@ assert_json "empty whitelist clears all slots and disables filtering" "$CLEAR_FI
      and .filtering_enabled == false
      and (.filters | length) == 0'
 
-# Factorio's engine permits ordinary buildings on ore. Buddy's placement seam
-# must reject the full rotated footprint even when the center tile is clear,
-# while still permitting a compatible extractor. Belt A* must reserve exact
-# resource tiles before planning rather than discovering the policy at execute.
+# Resource patches are extraction capacity, not forbidden terrain. Ordinary
+# Factorio-valid infrastructure may overlap them with an advisory, compact belt
+# routes may cross them, and the ore must remain intact. Mining drills retain
+# the one hard semantic rule: their prototype must support the resource below.
 RESOURCE_FIXTURE="$(raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local s = c.surface
 c.teleport({37.5, -7.5})
 local inv = c.get_main_inventory()
 inv.insert{name = 'assembling-machine-1', count = 2}
-inv.insert{name = 'burner-mining-drill', count = 2}
+inv.insert{name = 'burner-mining-drill', count = 3}
 inv.insert{name = 'transport-belt', count = 200}
-for _, entity in pairs(s.find_entities_filtered{area = {{37, -25}, {58, -3}}}) do
+for _, entity in pairs(s.find_entities_filtered{area = {{37, -25}, {63, -3}}}) do
     if entity.type ~= 'character' then entity.destroy() end
 end
 -- Only the eastern edge of this assembler footprint contains ore; its center
 -- tile is deliberately clear.
-s.create_entity{name = 'iron-ore', position = {41.5, -7.5}, amount = 1000}
+local assembler_ore = s.create_entity{name = 'iron-ore', position = {41.5, -7.5}, amount = 1000}
 for x = 46, 51 do
     for y = -23, -18 do
         s.create_entity{name = 'copper-ore', position = {x + 0.5, y + 0.5}, amount = 1000}
     end
 end
 s.create_entity{name = 'iron-ore', position = {55.5, -7.5}, amount = 1000}
+local incompatible_resource = s.create_entity{name = 'crude-oil', position = {60.5, -7.5}, amount = 100000}
 rcon.print(helpers.table_to_json({
     assembler_before = inv.get_item_count('assembling-machine-1'),
-    center_resources = s.count_entities_filtered{type = 'resource', position = {40.5, -7.5}, radius = 0.1}
+    drill_before = inv.get_item_count('burner-mining-drill'),
+    center_resources = s.count_entities_filtered{type = 'resource', position = {40.5, -7.5}, radius = 0.1},
+    assembler_ore_before = assembler_ore and assembler_ore.amount or 0,
+    incompatible_resource_before = incompatible_resource and incompatible_resource.amount or 0
 }))
 ")"
 require_json "resource fixture leaves assembler center clear" "$RESOURCE_FIXTURE" \
-    '.assembler_before >= 1 and .center_resources == 0'
+    '.assembler_before >= 1
+     and .drill_before >= 3
+     and .center_resources == 0
+     and .assembler_ore_before == 1000
+     and .incompatible_resource_before == 100000'
 
-RESOURCE_REJECT="$(mcp_tool place_entity '{"entity_name":"assembling-machine-1","x":40.5,"y":-7.5,"direction":"north"}')"
-assert_json "ordinary building footprint on ore is rejected" "$RESOURCE_REJECT" \
-    '.result.isError == true'
-RESOURCE_REJECT_WORLD="$(raw_lua "
+RESOURCE_OVERLAP_PLACE="$(mcp_tool place_entity '{"entity_name":"assembling-machine-1","x":40.5,"y":-7.5,"direction":"north"}')"
+RESOURCE_OVERLAP_PAYLOAD="$(tool_payload "$RESOURCE_OVERLAP_PLACE")"
+assert_json "ordinary building footprint on ore is allowed with exact advisory data" "$RESOURCE_OVERLAP_PAYLOAD" \
+    '.name == "assembling-machine-1"
+     and .policy_allowed == true
+     and .resource_overlap == true
+     and .resource_overlap_tile_count >= 1
+     and .resource_advisory.kind == "resource_overlap"'
+RESOURCE_OVERLAP_WORLD="$(raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local s = c.surface
 local inv = c.get_main_inventory()
+local ore = s.find_entity('iron-ore', {41.5, -7.5})
 rcon.print(helpers.table_to_json({
     assemblers = s.count_entities_filtered{name = 'assembling-machine-1', position = {40.5, -7.5}, radius = 0.2},
-    inventory = inv.get_item_count('assembling-machine-1')
+    inventory = inv.get_item_count('assembling-machine-1'),
+    ore_amount = ore and ore.amount or 0
 }))
 ")"
-assert_json "resource rejection preserves world and inventory" "$RESOURCE_REJECT_WORLD" \
+assert_json "ordinary overlap places the entity without consuming ore" "$RESOURCE_OVERLAP_WORLD" \
     --argjson before "$(jq '.assembler_before' <<<"$RESOURCE_FIXTURE")" \
-    '.assemblers == 0 and .inventory == $before'
+    --argjson ore_before "$(jq '.assembler_ore_before' <<<"$RESOURCE_FIXTURE")" \
+    '.assemblers == 1 and .inventory == ($before - 1) and .ore_amount == $ore_before'
 
 raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({52.5, -7.5})" >/dev/null
 EXTRACTOR_PLACE="$(mcp_tool place_entity '{"entity_name":"burner-mining-drill","x":55,"y":-8,"direction":"east"}')"
@@ -1107,7 +1436,29 @@ EXTRACTOR_PLACE_PAYLOAD="$(tool_payload "$EXTRACTOR_PLACE")"
 assert_json "compatible mining drill keeps the resource extractor exception" "$EXTRACTOR_PLACE" \
     '.result.isError != true'
 assert_json "extractor is placed with exact identity" "$EXTRACTOR_PLACE_PAYLOAD" \
-    '.name == "burner-mining-drill" and (.unit_number | type) == "number"'
+    '.name == "burner-mining-drill"
+     and (.unit_number | type) == "number"
+     and .extractor_exception == true
+     and .resource_overlap == true'
+
+raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({57.5, -7.5})" >/dev/null
+INCOMPATIBLE_EXTRACTOR="$(mcp_tool place_entity '{"entity_name":"burner-mining-drill","x":60,"y":-8,"direction":"east"}')"
+assert_json "incompatible mining drill remains a semantic placement error" "$INCOMPATIBLE_EXTRACTOR" \
+    '.result.isError == true'
+INCOMPATIBLE_EXTRACTOR_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local oil = s.find_entity('crude-oil', {60.5, -7.5})
+rcon.print(helpers.table_to_json({
+    drills = s.count_entities_filtered{name = 'burner-mining-drill', position = {60, -8}, radius = 0.2},
+    inventory = c.get_main_inventory().get_item_count('burner-mining-drill'),
+    oil_amount = oil and oil.amount or 0
+}))
+")"
+assert_json "incompatible extractor rejection preserves inventory and resource" "$INCOMPATIBLE_EXTRACTOR_WORLD" \
+    --argjson before "$(jq '.drill_before' <<<"$RESOURCE_FIXTURE")" \
+    --argjson oil_before "$(jq '.incompatible_resource_before' <<<"$RESOURCE_FIXTURE")" \
+    '.drills == 0 and .inventory == ($before - 1) and .oil_amount == $oil_before'
 
 RESOURCE_ROUTE="$(mcp_tool route_belt '{
     "from_x":42,
@@ -1122,15 +1473,131 @@ RESOURCE_ROUTE="$(mcp_tool route_belt '{
     "respect_zones":false
 }')"
 RESOURCE_ROUTE_PAYLOAD="$(tool_payload "$RESOURCE_ROUTE")"
-assert_json "belt planner reserves the live resource patch" "$RESOURCE_ROUTE_PAYLOAD" \
+assert_json "belt planner may take the compact route across live resources" "$RESOURCE_ROUTE_PAYLOAD" \
     '.success == true
-     and .preserves_resource_patches == true
-     and .resource_tiles_reserved >= 36
-     and all(.planned_new_belts[]?;
-         (((.position.x | floor) >= 46
-           and (.position.x | floor) <= 51
-           and (.position.y | floor) >= -23
-           and (.position.y | floor) <= -18) | not))'
+     and .resource_tiles_observed >= 36
+     and .planned_surface_resource_tiles_crossed_count >= 6
+     and any(.planned_new_belts[]?;
+         ((.position.x | floor) >= 46
+          and (.position.x | floor) <= 51
+          and (.position.y | floor) >= -23
+          and (.position.y | floor) <= -18))'
+
+raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({48.5, -15.5})" >/dev/null
+RESOURCE_ROUTE_EXECUTE="$(mcp_tool route_belt '{
+    "from_x":42,
+    "from_y":-20,
+    "to_x":55,
+    "to_y":-20,
+    "belt_type":"transport-belt",
+    "search_radius":7,
+    "dry_run":false,
+    "extend_existing":true,
+    "allow_underground":false,
+    "respect_zones":false
+}')"
+RESOURCE_ROUTE_EXECUTE_PAYLOAD="$(tool_payload "$RESOURCE_ROUTE_EXECUTE")"
+assert_json "complete belt route executes across ore" "$RESOURCE_ROUTE_EXECUTE_PAYLOAD" \
+    '.success == true
+     and .complete_route == true
+     and .planned_surface_resource_tiles_crossed_count >= 6
+     and .placed > 0'
+RESOURCE_ROUTE_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local amount = 0
+for _, resource in pairs(s.find_entities_filtered{name = 'copper-ore', area = {{46, -23}, {52, -17}}}) do
+    amount = amount + (resource.amount or 0)
+end
+rcon.print(helpers.table_to_json({
+    belts_on_ore = s.count_entities_filtered{name = 'transport-belt', area = {{46, -23}, {52, -17}}},
+    resource_tiles = s.count_entities_filtered{name = 'copper-ore', area = {{46, -23}, {52, -17}}},
+    resource_amount = amount
+}))
+")"
+assert_json "belt crossing leaves the live copper patch intact" "$RESOURCE_ROUTE_WORLD" \
+    '.belts_on_ore >= 6 and .resource_tiles == 36 and .resource_amount == 36000'
+
+# A drill embedded inside a dense patch has no resource-free output tile, but a
+# belt is still Factorio-valid there. The edge planner must prefer a clear edge
+# when one exists without turning that preference into another hard blocker.
+DENSE_OUTPUT_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{10, -42}, {24, -27}}}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({17.5, -29.5})
+local inv = c.get_main_inventory()
+inv.insert{name = 'burner-mining-drill', count = 1}
+inv.insert{name = 'transport-belt', count = 1}
+inv.insert{name = 'coal', count = 10}
+for x = 10, 23 do
+    for y = -42, -27 do
+        s.create_entity{name = 'iron-ore', position = {x + 0.5, y + 0.5}, amount = 1000}
+    end
+end
+rcon.print(helpers.table_to_json({
+    resource_tiles = s.count_entities_filtered{name = 'iron-ore', area = {{10, -42}, {24, -26}}},
+    drills = inv.get_item_count('burner-mining-drill'),
+    belts = inv.get_item_count('transport-belt'),
+    coal = inv.get_item_count('coal')
+}))
+")"
+require_json "dense-output fixture surrounds the bounded drill search with ore" "$DENSE_OUTPUT_FIXTURE" \
+    '.resource_tiles == 224 and .drills >= 1 and .belts >= 1 and .coal >= 10'
+DENSE_OUTPUT_PLAN="$(mcp_tool execute_edge_miner '{
+    "resource_type":"iron-ore",
+    "x":17,
+    "y":-34,
+    "radius":2,
+    "drill_name":"burner-mining-drill",
+    "limit":10,
+    "dry_run":true
+}')"
+DENSE_OUTPUT_PLAN_PAYLOAD="$(tool_payload "$DENSE_OUTPUT_PLAN")"
+assert_json "dense-patch drill plan accepts a buildable output belt on ore" "$DENSE_OUTPUT_PLAN_PAYLOAD" \
+    '.success == true
+     and .dry_run == true
+     and .preflight.ready == true
+     and .plan.selected.output_buildable == true
+     and .plan.selected.output_clear == false
+     and (.plan.selected.output.overlapping_resources | length) > 0'
+DENSE_OUTPUT_EXECUTE="$(mcp_tool execute_edge_miner '{
+    "resource_type":"iron-ore",
+    "x":17,
+    "y":-34,
+    "radius":2,
+    "drill_name":"burner-mining-drill",
+    "limit":10,
+    "dry_run":false
+}')"
+DENSE_OUTPUT_EXECUTE_PAYLOAD="$(tool_payload "$DENSE_OUTPUT_EXECUTE")"
+assert_json "dense-patch drill and its output belt execute without a clear-tile fiction" "$DENSE_OUTPUT_EXECUTE_PAYLOAD" \
+    '.success == true
+     and .automation_verified.success == true
+     and (.placed_drill_unit_number | type) == "number"
+     and (.placed_belt_unit_number | type) == "number"
+     and .selected.output_buildable == true
+     and .selected.output_clear == false'
+DENSE_OUTPUT_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local amount = 0
+for _, resource in pairs(s.find_entities_filtered{name = 'iron-ore', area = {{10, -42}, {24, -26}}}) do
+    amount = amount + (resource.amount or 0)
+end
+rcon.print(helpers.table_to_json({
+    drills = s.count_entities_filtered{name = 'burner-mining-drill', area = {{14, -37}, {21, -31}}},
+    belts = s.count_entities_filtered{name = 'transport-belt', area = {{10, -42}, {24, -26}}},
+    resource_tiles = s.count_entities_filtered{name = 'iron-ore', area = {{10, -42}, {24, -26}}},
+    resource_amount = amount
+}))
+")"
+assert_json "dense-patch output belt leaves the resource entities intact" "$DENSE_OUTPUT_WORLD" \
+    '.drills == 1
+     and .belts >= 1
+     and .resource_tiles == 224
+     and .resource_amount <= 224000
+     and .resource_amount > 223000'
 
 ROTATION_FIXTURE="$(raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
@@ -1186,7 +1653,7 @@ ROTATION_BELT_UNIT="$(jq -r '.belt_unit' <<<"$ROTATION_FIXTURE")"
 RESOURCE_ROTATION="$(mcp_tool rotate_entity "$(jq -cn \
     --argjson unit "$ROTATION_RECTANGULAR_UNIT" \
     '{unit_number:$unit,direction:"east"}')")"
-assert_json "rectangular rotation cannot expand an entity onto ore" "$RESOURCE_ROTATION" \
+assert_json "rectangular rotation that could destroy newly covered ore is rejected" "$RESOURCE_ROTATION" \
     '.result.isError == true'
 RESOURCE_ROTATION_WORLD="$(raw_lua "
 local s = game.surfaces['buddy-live-regression']
@@ -1206,7 +1673,7 @@ assert_json "rejected rectangular rotation preserves entity direction and resour
 LEGACY_RESOURCE_ROTATION="$(mcp_tool rotate_entity "$(jq -cn \
     --argjson unit "$ROTATION_LEGACY_RECTANGULAR_UNIT" \
     '{unit_number:$unit,direction:"east"}')")"
-assert_json "footprint-changing rotation cannot revalidate an existing resource overlap" "$LEGACY_RESOURCE_ROTATION" \
+assert_json "changed-footprint rotation cannot destructively revalidate existing ore" "$LEGACY_RESOURCE_ROTATION" \
     '.result.isError == true'
 LEGACY_RESOURCE_ROTATION_WORLD="$(raw_lua "
 local s = game.surfaces['buddy-live-regression']
@@ -1219,7 +1686,7 @@ rcon.print(helpers.table_to_json({
     ore = s.count_entities_filtered{name = 'iron-ore', position = {78.5, -7.5}, radius = 0.2}
 }))
 ")"
-assert_json "legacy rectangular rejection preserves existing resource overlap" "$LEGACY_RESOURCE_ROTATION_WORLD" \
+assert_json "destructive-rotation guard preserves the existing resource overlap" "$LEGACY_RESOURCE_ROTATION_WORLD" \
     --argjson before "$(jq '.legacy_rectangular_direction' <<<"$ROTATION_FIXTURE")" \
     '.direction == $before and .ore == 1'
 
@@ -1512,24 +1979,41 @@ local chest = s.create_entity{name = 'iron-chest', position = {3, -17}, force = 
 if not (drill and inserter and chest) then error('failed to construct bounded inventory fixtures') end
 drill.get_fuel_inventory().clear()
 inserter.get_fuel_inventory().clear()
-local seeded_plates = chest.get_inventory(defines.inventory.chest).insert{name = 'iron-plate', count = 37}
+local chest_inventory = chest.get_inventory(defines.inventory.chest)
+local seeded_plates = chest_inventory.insert{name = 'iron-plate', count = 37}
+local seeded_magazines = chest_inventory.insert{name = 'firearm-magazine', count = 8}
 rcon.print(helpers.table_to_json({
     drill_unit = drill.unit_number,
     inserter_unit = inserter.unit_number,
     chest_unit = chest.unit_number,
     seeded_coal = seeded_coal,
-    seeded_plates = seeded_plates
+    seeded_plates = seeded_plates,
+    seeded_magazines = seeded_magazines
 }))
 ")"
 require_json "bounded inventory fixtures use exact existing entities" "$INVENTORY_PRIMITIVES_FIXTURE" \
     '.seeded_coal == 7
      and .seeded_plates == 37
+     and .seeded_magazines == 8
      and (.drill_unit | type) == "number"
      and (.inserter_unit | type) == "number"
      and (.chest_unit | type) == "number"'
 BOOTSTRAP_DRILL_UNIT="$(jq -r '.drill_unit' <<<"$INVENTORY_PRIMITIVES_FIXTURE")"
 BOOTSTRAP_INSERTER_UNIT="$(jq -r '.inserter_unit' <<<"$INVENTORY_PRIMITIVES_FIXTURE")"
 COLLECTION_CHEST_UNIT="$(jq -r '.chest_unit' <<<"$INVENTORY_PRIMITIVES_FIXTURE")"
+
+CHEST_INVENTORY="$(mcp_tool get_entity_inventory "$(jq -cn \
+    --argjson unit "$COLLECTION_CHEST_UNIT" \
+    '{unit_number:$unit}')")"
+CHEST_INVENTORY_PAYLOAD="$(tool_payload "$CHEST_INVENTORY")"
+assert_json "entity inventory inspection succeeds through the model-visible seam" "$CHEST_INVENTORY" \
+    '(.result.isError // false) == false'
+assert_json "entity inventory inspection discovers mixed contents without guessed item names" "$CHEST_INVENTORY_PAYLOAD" \
+    --argjson unit "$COLLECTION_CHEST_UNIT" \
+    '.unit_number == $unit
+     and .name == "iron-chest"
+     and any(.inventories.chest[]; .name == "iron-plate" and .count == 37)
+     and any(.inventories.chest[]; .name == "firearm-magazine" and .count == 8)'
 
 OVER_CAP_FUEL="$(mcp_tool bootstrap_burner_once "$(jq -cn \
     --argjson unit "$BOOTSTRAP_DRILL_UNIT" \
@@ -1646,6 +2130,7 @@ rcon.print(helpers.table_to_json({
     drill_coal = drill and drill.get_fuel_inventory().get_item_count('coal') or -1,
     inserter_coal = inserter and inserter.get_fuel_inventory().get_item_count('coal') or -1,
     chest_plates = chest and chest.get_inventory(defines.inventory.chest).get_item_count('iron-plate') or -1,
+    chest_magazines = chest and chest.get_inventory(defines.inventory.chest).get_item_count('firearm-magazine') or -1,
     character_coal = c.get_main_inventory().get_item_count('coal'),
     character_plates = c.get_main_inventory().get_item_count('iron-plate')
 }))
@@ -1658,6 +2143,7 @@ assert_json "bounded inventory actions preserve all three entity identities and 
      and .inserter_coal == 2
      and .character_coal == 2
      and .chest_plates == 25
+     and .chest_magazines == 8
      and .character_plates == 12'
 
 # Character crafting is asynchronous admission. A dedicated disposable force
