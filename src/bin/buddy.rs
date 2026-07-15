@@ -1972,6 +1972,22 @@ mod tests {
     }
 
     #[test]
+    fn default_new_game_map_uses_peaceful_mode() {
+        let settings: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/configs/map-gen.json"
+        )))
+        .expect("default map generation settings should be valid JSON");
+        assert_eq!(
+            settings
+                .get("peaceful_mode")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "just play must create peaceful default maps"
+        );
+    }
+
+    #[test]
     fn autonomy_prompt_requires_global_reprioritization_and_includes_snapshot() {
         let prompt = autonomy_prompt(r#"{"research":{"research_progress":0.5}}"#);
         assert!(prompt.contains("re-evaluate the whole factory"));

@@ -28,7 +28,8 @@ to open the Buddy panel.
 isolated `.factorio-buddy` write-data directory, replaces the Buddy save with a
 new game, starts the headless server, waits for RCON, registers one NPC
 character, and starts the model/tool loop. Ctrl+C stops both the NPC and the
-server.
+server. New games use Factorio's peaceful mode, so enemy bases do not attack
+unless provoked.
 
 Use `just resume` to continue the existing isolated Buddy world. Use `just npc`
 if Factorio is already running with RCON and the mod installed.

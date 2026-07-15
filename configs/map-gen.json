@@ -3,7 +3,7 @@
   "width": 0,
   "height": 0,
   "starting_area": 1,
-  "peaceful_mode": false,
+  "peaceful_mode": true,
   "autoplace_controls": {
     "coal": {"frequency": 1, "size": 1, "richness": 1},
     "stone": {"frequency": 1, "size": 1, "richness": 1},
