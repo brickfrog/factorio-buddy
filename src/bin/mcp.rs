@@ -883,6 +883,13 @@ fn parse_controller_steps(
     Ok((placements, rotations))
 }
 
+/// Lua reports Factorio's engine decision and Buddy's live placement policy
+/// separately. Mutation preflight must require the combined decision; a stale
+/// mod that does not provide it fails closed.
+fn placement_report_allowed(report: &serde_json::Value) -> bool {
+    report.get("allowed").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 async fn controller_preflight(
     client: &mut FactorioClient,
     routes: &[(&str, &serde_json::Value)],
@@ -928,11 +935,7 @@ async fn controller_preflight(
                 placement.direction,
             )
             .await;
-        let allowed = report.as_ref().ok().and_then(|value| {
-            value
-                .get("factorio_allowed")
-                .and_then(|allowed| allowed.as_bool())
-        }) == Some(true);
+        let allowed = report.as_ref().ok().is_some_and(placement_report_allowed);
         placements_ready &= allowed;
         placement_reports.insert(
             placement.label.to_string(),
@@ -1235,13 +1238,13 @@ mod tests {
         inserter_machine_endpoint_verification, invalid_direction_failure,
         is_machine_output_source, machine_output_build_args, machine_side_layout,
         mark_semantic_tool_errors, model_safe_payload, parse_controller_steps,
-        production_observation_json, production_unit_verified, production_verification_json,
-        production_verification_summary, raw_lua_enabled, ready_fuel_supply_args,
-        recipe_restore_action, rollback_missing_identity_error, rollback_pending_after_pass,
-        rollback_retry_order, route_belt_failure_json, route_material_shortfall,
-        route_segment_waypoint, semantic_failure, tool_text_indicates_error, BuildFuelSupplyParams,
-        FactorioMcp, InserterMachineFlow, RecipeRestoreAction, RouteBeltParams,
-        MODEL_VISIBLE_TOOLS,
+        placement_report_allowed, production_observation_json, production_unit_verified,
+        production_verification_json, production_verification_summary, raw_lua_enabled,
+        ready_fuel_supply_args, recipe_restore_action, rollback_missing_identity_error,
+        rollback_pending_after_pass, rollback_retry_order, route_belt_failure_json,
+        route_material_shortfall, route_segment_waypoint, semantic_failure,
+        tool_text_indicates_error, BuildFuelSupplyParams, FactorioMcp, InserterMachineFlow,
+        RecipeRestoreAction, RouteBeltParams, MODEL_VISIBLE_TOOLS,
     };
     use factorioctl::analyze::EntityLookup;
     use factorioctl::world::{
@@ -1755,7 +1758,7 @@ mod tests {
             .collect();
 
         assert_eq!(visible, expected, "model tool surface must not drift");
-        assert_eq!(visible.len(), 47);
+        assert_eq!(visible.len(), 48);
         let schema_bytes = serde_json::to_vec(&tools)
             .expect("serialize tool schemas")
             .len();
@@ -1784,6 +1787,7 @@ mod tests {
         for required in [
             "bootstrap_burner_once",
             "collect_from_chest",
+            "configure_inserter",
             "feed_lab_from_inventory",
             "file_issue",
             "wait_for_crafting",
@@ -2107,6 +2111,23 @@ mod tests {
         assert_eq!(payload["from"]["x"], 73);
         assert_eq!(payload["to"]["y"], -6);
         assert_eq!(payload["belt_type"], "transport-belt");
+    }
+
+    #[test]
+    fn placement_preflight_uses_live_policy_not_factorio_permission_alone() {
+        assert!(!placement_report_allowed(&serde_json::json!({
+            "factorio_allowed": true,
+            "policy_allowed": false,
+            "allowed": false,
+        })));
+        assert!(placement_report_allowed(&serde_json::json!({
+            "factorio_allowed": true,
+            "policy_allowed": true,
+            "allowed": true,
+        })));
+        assert!(!placement_report_allowed(&serde_json::json!({
+            "factorio_allowed": true,
+        })));
     }
 
     #[test]
@@ -4076,6 +4097,15 @@ pub struct RotateEntityParams {
     pub direction: String,
 }
 
+/// Parameters for configuring an existing inserter's complete whitelist.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ConfigureInserterParams {
+    /// Exact existing inserter unit number.
+    pub unit_number: u32,
+    /// Complete whitelist; [] clears and disables filtering.
+    pub allowed_items: Vec<String>,
+}
+
 /// Parameters for get_machine_belt_positions tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MachineBeltPositionsParams {
@@ -4564,6 +4594,7 @@ const MODEL_VISIBLE_TOOLS: &[&str] = &[
     "build_lab_feed",
     "build_recipe_assembler_cell",
     "collect_from_chest",
+    "configure_inserter",
     "craft",
     "diagnose_factory_blockers",
     "diagnose_steam_power",
@@ -6145,7 +6176,7 @@ impl FactorioMcp {
 
     /// Place an entity from character inventory.
     #[tool(
-        description = "Place one non-belt entity from character inventory at an exact position. Transport belts, underground belts, and splitters are rejected; use route_belt or a higher-level automation controller so the complete route is validated and placed atomically. For inserters, direction is the PICKUP side and the result reports Factorio's exact pickup_position and drop_position. On failure, returns structured diagnostics including can_place, inventory_count, direction, and position."
+        description = "Place one non-belt inventory entity at an exact position. Use route_belt for belts. Inserter direction is its pickup side. Live footprint checks reserve resource patches for compatible extractors and failures return structured diagnostics."
     )]
     async fn place_entity(&self, Parameters(params): Parameters<PlaceEntityParams>) -> String {
         if is_existing_belt_entity(&params.entity_name) {
@@ -6371,7 +6402,7 @@ impl FactorioMcp {
 
     /// Execute a safe entity placement selected by plan_entity_placement_near.
     #[tool(
-        description = "Safely place one isolated non-belt entity near a requested coordinate. The tool derives a collision-free position that does not trap the NPC and may adjust the requested coordinate. Use dry_run=true to preview the exact selected position."
+        description = "Place one isolated non-belt entity near a target. Derives a clear, resource-safe position that does not trap the NPC. Use dry_run=true to preview it."
     )]
     async fn execute_entity_placement_near(
         &self,
@@ -8030,6 +8061,35 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
+    /// Replace an existing inserter's complete item whitelist.
+    #[tool(
+        description = "Atomically replace an exact inserter's complete item whitelist. Pass allowed_items such as [\"copper-plate\"]; [] clears and disables filtering. Validates capacity, reads back, and rolls back on mismatch. Filters affect future pickups, not upstream belt purity or an already-held item."
+    )]
+    async fn configure_inserter(
+        &self,
+        Parameters(params): Parameters<ConfigureInserterParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(client) => client,
+            Err(error) => {
+                return self
+                    .with_player_messages(semantic_failure("connection_failed", error))
+                    .await
+            }
+        };
+
+        let result = match client
+            .configure_inserter(params.unit_number, &params.allowed_items)
+            .await
+        {
+            Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|error| {
+                semantic_failure("serialization_failed", error.to_string())
+            }),
+            Err(error) => semantic_failure("configure_inserter_failed", error.to_string()),
+        };
+        self.with_player_messages(result).await
+    }
+
     async fn route_belt_core(
         &self,
         client: &mut FactorioClient,
@@ -8047,8 +8107,11 @@ impl FactorioMcp {
             ),
         };
 
-        let mut collision_map = match client.build_collision_map(area).await {
-            Ok(map) => map,
+        let (mut collision_map, route_entities) = match client
+            .build_collision_map_with_entities(area)
+            .await
+        {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 let error = e.to_string();
                 if error.contains("Packet too large") {
@@ -8108,19 +8171,32 @@ impl FactorioMcp {
             }
         };
 
+        // Resource entities are walkable to the character, but new belt
+        // infrastructure must not consume extraction space. Reserve exact live
+        // resource tiles before A* so it can detour or use underground belts.
+        let mut resource_tiles = HashSet::new();
+        for entity in &route_entities {
+            if entity.entity_type.as_deref() != Some("resource") {
+                continue;
+            }
+            if let Some(bounds) = &entity.bounding_box {
+                for x in bounds.left_top.x.floor() as i32..bounds.right_bottom.x.ceil() as i32 {
+                    for y in bounds.left_top.y.floor() as i32..bounds.right_bottom.y.ceil() as i32 {
+                        let tile = GridPos::new(x, y);
+                        resource_tiles.insert(tile);
+                        collision_map.block(tile);
+                    }
+                }
+            } else {
+                let tile = GridPos::from_position(&entity.position);
+                resource_tiles.insert(tile);
+                collision_map.block(tile);
+            }
+        }
+
         let mut existing_surface_belts: HashMap<GridPos, Entity> = HashMap::new();
         if params.extend_existing {
-            let entities = match client.find_entities(area, None, None).await {
-                Ok(entities) => entities,
-                Err(e) => {
-                    return Ok(route_belt_failure_json(
-                        params,
-                        "infrastructure_failure",
-                        format!("Error: checking existing route entities: {}", e),
-                    ));
-                }
-            };
-            for entity in entities {
+            for entity in route_entities {
                 if !is_existing_belt_entity(&entity.name)
                     || entity.entity_type.as_deref() != Some("transport-belt")
                 {
@@ -8130,6 +8206,33 @@ impl FactorioMcp {
                 collision_map.unblock(tile);
                 existing_surface_belts.insert(tile, entity);
             }
+        }
+
+        let start = GridPos::new(params.from_x, params.from_y);
+        let goal = GridPos::new(params.to_x, params.to_y);
+        let reserved_endpoints: Vec<_> = [("from", start), ("to", goal)]
+            .into_iter()
+            .filter(|(_, tile)| {
+                resource_tiles.contains(tile) && !existing_surface_belts.contains_key(tile)
+            })
+            .map(|(endpoint, tile)| {
+                serde_json::json!({
+                    "endpoint": endpoint,
+                    "position": {"x": tile.x, "y": tile.y},
+                })
+            })
+            .collect();
+        if !reserved_endpoints.is_empty() {
+            return Ok(serde_json::json!({
+                "success": false,
+                "complete_route": false,
+                "dry_run": params.dry_run,
+                "error_kind": "resource_endpoint_reserved",
+                "error": "A new belt endpoint overlaps a live resource tile. No belts were placed.",
+                "reserved_endpoints": reserved_endpoints,
+                "resource_tiles_reserved": resource_tiles.len(),
+                "guidance": "Choose clear endpoint tiles outside the patch. Use execute_edge_miner to derive a resource-free drill output, then route around or underground.",
+            }));
         }
 
         if params.respect_zones {
@@ -8162,8 +8265,6 @@ impl FactorioMcp {
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
         };
-        let start = GridPos::new(params.from_x, params.from_y);
-        let goal = GridPos::new(params.to_x, params.to_y);
         let mut rejected_existing = Vec::new();
         let result = loop {
             let candidate =
@@ -8348,6 +8449,8 @@ impl FactorioMcp {
                 "new_belt_count": surface_belts_needed + underground_belts_needed,
                 "turn_count": result.turn_count,
                 "underground_count": result.underground_count,
+                "resource_tiles_reserved": resource_tiles.len(),
+                "preserves_resource_patches": true,
                 "materials": materials,
                 "materials_sufficient": materials_sufficient,
                 "ready_to_execute": materials_sufficient,
@@ -8407,11 +8510,7 @@ impl FactorioMcp {
                 .check_entity_placement(entity_name, belt.position, belt.direction)
                 .await
             {
-                Ok(report)
-                    if report
-                        .get("factorio_allowed")
-                        .and_then(|value| value.as_bool())
-                        == Some(true) => {}
+                Ok(report) if placement_report_allowed(&report) => {}
                 Ok(report) => preflight_errors.push(serde_json::json!({
                     "position": belt.position,
                     "entity": entity_name,
@@ -8604,6 +8703,8 @@ impl FactorioMcp {
             "skipped_existing": skipped_existing,
             "turn_count": result.turn_count,
             "underground_count": result.underground_count,
+            "resource_tiles_reserved": resource_tiles.len(),
+            "preserves_resource_patches": true,
             "materials": materials,
             "materials_sufficient": materials_sufficient,
             "topology": compact_belt_topology(result.topology.as_ref()),
@@ -8613,9 +8714,7 @@ impl FactorioMcp {
 
     /// Route belts from point A to point B using A* pathfinding.
     #[tool(
-        description = "Route belts from one position to another using A* pathfinding to avoid obstacles. \
-        This is the recommended way to create belt connections. Use dry_run=true to preview the route and receive one ready_to_call execution payload. \
-        Execution is all-or-nothing: insufficient materials or failed preflight place no belts, and an unexpected mid-route failure rolls back newly placed belts. Never execute a dry-run route one belt at a time."
+        description = "Plan or atomically build a complete A* belt route. New belts avoid live resource tiles by detouring or tunneling; exact existing belts may be reused. Use dry_run=true for one executable payload. Material/preflight failure places nothing and unexpected partial work is rolled back."
     )]
     async fn route_belt(&self, Parameters(params): Parameters<RouteBeltParams>) -> String {
         let mut client = match self.connect().await {
@@ -10245,14 +10344,9 @@ impl FactorioMcp {
                 Direction::parse(output.output_direction).unwrap_or(Direction::North),
             ).await.ok(),
         });
-        let placements_ready = placement_preflight.as_object().is_some_and(|checks| {
-            checks.values().all(|check| {
-                check
-                    .get("factorio_allowed")
-                    .and_then(|value| value.as_bool())
-                    == Some(true)
-            })
-        });
+        let placements_ready = placement_preflight
+            .as_object()
+            .is_some_and(|checks| checks.values().all(placement_report_allowed));
         let route_ready = compound_preflight["ready"].as_bool() == Some(true)
             && placements_ready
             && inventory.is_some();
@@ -10428,11 +10522,7 @@ impl FactorioMcp {
             )
             .await;
         let placement_allowed = |check: &anyhow::Result<serde_json::Value>| {
-            check.as_ref().ok().and_then(|value| {
-                value
-                    .get("factorio_allowed")
-                    .and_then(|allowed| allowed.as_bool())
-            }) == Some(true)
+            check.as_ref().ok().is_some_and(placement_report_allowed)
         };
         let placement_preflight = serde_json::json!({
             "input_inserter": input_placement.as_ref().map_err(|error| error.to_string()),
@@ -11037,14 +11127,9 @@ impl FactorioMcp {
                 Direction::parse(lab_feed.input_direction).unwrap_or(Direction::North),
             ).await.ok(),
         });
-        let placements_ready = placement_preflight.as_object().is_some_and(|checks| {
-            checks.values().all(|check| {
-                check
-                    .get("factorio_allowed")
-                    .and_then(|value| value.as_bool())
-                    == Some(true)
-            })
-        });
+        let placements_ready = placement_preflight
+            .as_object()
+            .is_some_and(|checks| checks.values().all(placement_report_allowed));
         let route_success = compound_preflight["ready"].as_bool() == Some(true)
             && placements_ready
             && inventory.is_some();
@@ -11334,11 +11419,7 @@ impl FactorioMcp {
             )
             .await;
         let placement_allowed = |check: &anyhow::Result<serde_json::Value>| {
-            check.as_ref().ok().and_then(|value| {
-                value
-                    .get("factorio_allowed")
-                    .and_then(|allowed| allowed.as_bool())
-            }) == Some(true)
+            check.as_ref().ok().is_some_and(placement_report_allowed)
         };
         let placement_preflight = serde_json::json!({
             "gear_inserter": gear_placement.as_ref().map_err(|error| error.to_string()),
@@ -12794,10 +12875,15 @@ impl FactorioMcp {
             .get("factorio_allowed")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let live_policy_allowed = factorio_check
+            .get("policy_allowed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let live_allowed = placement_report_allowed(&factorio_check);
 
         let result = serde_json::json!({
-            "allowed": policy_check.allowed && factorio_allowed,
-            "policy_allowed": policy_check.allowed,
+            "allowed": policy_check.allowed && live_allowed,
+            "policy_allowed": policy_check.allowed && live_policy_allowed,
             "factorio_allowed": factorio_allowed,
             "entity": params.entity_name,
             "position": { "x": params.x, "y": params.y },

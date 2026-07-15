@@ -1,3 +1,5 @@
+local resource_policy = require("resource_policy")
+
 local M = {}
 local inventory_contents = require("inventory").contents
 
@@ -145,19 +147,45 @@ local function can_place(surface, force, entity_name, position, direction)
         return false, tostring(allowed_or_error)
     end
     if allowed_or_error ~= true then
-        return false, "Factorio cannot place entity here"
+        return false, "Factorio cannot place entity here", {
+            factorio_allowed = false,
+            policy_allowed = true,
+            allowed = false,
+        }
     end
-    return true, nil
+    local policy = resource_policy.inspect(surface, entity_name, position, direction)
+    return policy.policy_allowed == true, policy.error, {
+        factorio_allowed = true,
+        policy_allowed = policy.policy_allowed,
+        allowed = policy.policy_allowed == true,
+        preserves_resource_patch = policy.preserves_resource_patch,
+        resource_footprint = policy.footprint,
+        overlapping_resources = policy.overlapping_resources,
+        error_kind = policy.error_kind,
+        guidance = policy.guidance,
+    }
 end
 
 local function checked_entity(surface, force, entity_name, position, direction)
-    local allowed, error = can_place(surface, force, entity_name, position, direction)
+    local allowed, error, report = can_place(surface, force, entity_name, position, direction)
+    report = report or {
+        factorio_allowed = false,
+        policy_allowed = false,
+        allowed = false,
+    }
     return {
         entity_name = entity_name,
         position = pos(position.x, position.y),
         direction = direction,
         direction_name = direction_name(direction),
-        factorio_allowed = allowed,
+        factorio_allowed = report.factorio_allowed,
+        policy_allowed = report.policy_allowed,
+        allowed = allowed,
+        preserves_resource_patch = report.preserves_resource_patch,
+        resource_footprint = report.resource_footprint,
+        overlapping_resources = report.overlapping_resources,
+        error_kind = report.error_kind,
+        guidance = report.guidance,
         error = error,
         place_args = {
             entity_name = entity_name,
@@ -169,7 +197,7 @@ local function checked_entity(surface, force, entity_name, position, direction)
 end
 
 local function append_blocker(blockers, entity)
-    if entity.factorio_allowed then return end
+    if entity.allowed then return end
     table.insert(blockers, {
         entity_name = entity.entity_name,
         position = entity.position,
@@ -299,7 +327,7 @@ local function find_pole_position(surface, force, ideal)
     for _, offset in ipairs(offsets) do
         local candidate = pos(ideal.x + offset[1], ideal.y + offset[2])
         local entity = checked_entity(surface, force, "small-electric-pole", candidate, 0)
-        if entity.factorio_allowed then return entity end
+        if entity.allowed then return entity end
     end
     return checked_entity(surface, force, "small-electric-pole", ideal, 0)
 end
@@ -326,7 +354,7 @@ local function find_machine_connection_pole(surface, force, machine_pos)
     for _, offset in ipairs(offsets) do
         local candidate = pos(machine_pos.x + offset[1], machine_pos.y + offset[2])
         local entity = checked_entity(surface, force, "small-electric-pole", candidate, 0)
-        if entity.factorio_allowed then return entity end
+        if entity.allowed then return entity end
     end
     return find_pole_position(surface, force, machine_pos)
 end
@@ -978,7 +1006,7 @@ function M.extend_power_to(character, x, y, radius, target_x, target_y)
 
     local pole_plan = pole_repair_path(surface, force, nearest.position, target)
     for _, pole in ipairs(pole_plan) do
-        if pole.factorio_allowed then
+        if pole.allowed then
             append_place_pole_step(
                 result,
                 pole,
@@ -1095,7 +1123,7 @@ function M.repair_steam_power(character, x, y, radius, target_x, target_y)
                 pole_plan = {find_machine_connection_pole(surface, force, entity.position)}
             end
             for _, pole in ipairs(pole_plan) do
-                if pole.factorio_allowed then
+                if pole.allowed then
                     needed["small-electric-pole"] = needed["small-electric-pole"] + 1
                     append_repair_step(
                         result,

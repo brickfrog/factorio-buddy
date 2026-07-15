@@ -775,6 +775,24 @@ impl LuaCommand {
         )
     }
 
+    /// Replace an existing inserter's complete whitelist.
+    pub fn configure_inserter(
+        agent_id: &AgentId,
+        unit_number: u32,
+        allowed_items: &[String],
+    ) -> String {
+        Self::claude_interface_json_call(
+            "configure_inserter",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                unit_number.to_string(),
+                serde_json::to_string(allowed_items)
+                    .expect("inserter whitelist JSON serialization cannot fail"),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before configuring inserter filters.",
+        )
+    }
+
     /// Insert items into an entity
     pub fn insert_items(
         agent_id: &AgentId,

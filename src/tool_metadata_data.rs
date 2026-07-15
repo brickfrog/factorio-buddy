@@ -75,6 +75,7 @@ pub const FACTORIO_MCP_TOOLS: &[FactorioToolMetadata] = &[
     tool("set_recipe", true, false, false),
     tool("remove_entity", true, false, false),
     tool("rotate_entity", true, false, false),
+    tool("configure_inserter", true, false, false),
     tool("route_belt", true, false, true),
     tool("build_fuel_supply", true, false, true),
     tool("repair_fuel_sustainability", true, false, true),

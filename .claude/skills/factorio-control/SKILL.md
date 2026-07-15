@@ -41,7 +41,15 @@ tool can inspect the current game state.
    relevant status tool. If verification reports a problem, fix that concrete
    problem before expanding the build.
 
-6. Build durable automation instead of repeating manual cycles.
+6. Preserve resource patches for extraction.
+   Treat authoritative live resource tiles as extraction reserves. Put only a
+   compatible mining drill or pumpjack on them. Keep assemblers, furnaces,
+   labs, chests, power, and ordinary logistics outside the patch. Use
+   `execute_edge_miner` to derive a miner with a clear output tile, and use
+   `route_belt` so new belts route around or underground. Existing overlap is
+   not permission to extend the occupied resource footprint.
+
+7. Build durable automation instead of repeating manual cycles.
    Manual `insert_items`, `extract_items`, `craft`, `hand_feed_furnace`, and
    `feed_lab_from_inventory` are bootstrap or recovery actions, not finished
    factory work. If the same ingredient, fuel, plate, or science-pack transfer
@@ -68,7 +76,7 @@ tool can inspect the current game state.
    assemblers exist. In that state, diagnose the consumer and build the coal
    delivery path with `build_fuel_supply` instead of refilling it by hand.
 
-7. Automate science production as a complete cell.
+8. Automate science production as a complete cell.
    For `automation-science-pack`, do not stop at crafting packs in inventory.
    Place missing assemblers or labs with `execute_entity_placement_near`
    first, then use the returned `placed_unit_number`. Prefer
@@ -87,11 +95,21 @@ tool can inspect the current game state.
    for repair or custom layouts that the composite planner cannot cover. Verify
    the assembler and lab before starting another research objective.
 
-8. Treat research and recipes as runtime data.
+9. Keep belt contents explicit at every branch.
+   Prefer dedicated item belts or deliberate lane separation; never infer that
+   a branch is pure because one sampled tile currently shows one item. Before
+   tapping an existing belt, inspect the exact source tile's lanes. If a
+   consumer must accept only selected items, call `configure_inserter` on that
+   exact inserter unit with the complete item whitelist and verify its readback.
+   An empty whitelist clears the configuration. A filter constrains future
+   pickups; it does not purify a mixed upstream belt or undo an item already in
+   the inserter's hand.
+
+10. Treat research and recipes as runtime data.
    If a craft fails or a recipe seems unavailable, query the recipe/technology
    state and follow the reported blockers. Avoid guessing alternate recipe
    names.
 
-9. Keep replies short.
+11. Keep replies short.
    The player sees in-game text. Report the operational result and any real
    blocker, not an internal chain of thought.

@@ -482,6 +482,14 @@ fn all_lua_cases() -> Vec<LuaCase> {
         ),
         LuaCase::new("rotate_entity", LuaCommand::rotate_entity(44, 4)),
         LuaCase::new(
+            "configure_inserter",
+            LuaCommand::configure_inserter(
+                &legacy_agent(),
+                44,
+                &["copper-plate".to_string(), "iron-gear-wheel".to_string()],
+            ),
+        ),
+        LuaCase::new(
             "insert_items",
             LuaCommand::insert_items(&legacy_agent(), 45, "coal", 5, "fuel"),
         ),
@@ -2838,6 +2846,8 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
 
     let control_lua = include_str!("../mod/claude-interface/control.lua");
     let placement_lua = include_str!("../mod/claude-interface/placement.lua");
+    let resource_policy_lua = include_str!("../mod/claude-interface/resource_policy.lua");
+    let power_lua = include_str!("../mod/claude-interface/power.lua");
     for required in [
         "local placement = require(\"placement\")",
         "placement.place_entity",
@@ -2849,6 +2859,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "placement.build_direct_smelter",
         "placement.place_ghost",
         "placement.rotate_entity",
+        "placement.configure_inserter",
         "place_entity = function(agent_id, entity_name, x, y, direction)",
         "place_underground_belt = function(agent_id, entity_name, x, y, direction, belt_type)",
         "check_entity_placement = function(agent_id, entity_name, x, y, direction)",
@@ -2858,6 +2869,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "build_direct_smelter = function(agent_id, drill_unit_number, output_x, output_y, output_direction, furnace_name, inserter_name, belt_name, radius)",
         "place_ghost = function(agent_id, entity_name, x, y, direction)",
         "rotate_entity = function(agent_id, unit_number, direction)",
+        "configure_inserter = function(agent_id, unit_number, allowed_items)",
     ] {
         assert!(
             control_lua.contains(required),
@@ -2946,6 +2958,55 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && !placement_lua.contains("alternate_belt_placements")
             && !placement_lua.contains("candidate_alternate_path"),
         "blocked belt diagnostics must not suggest disconnected one-tile detours"
+    );
+    for required in [
+        r#"local resource_policy = require("resource_policy")"#,
+        "resource_policy.inspect(surface, entity_name, position, direction)",
+        "resource_policy.inspect_rotation(",
+        "policy.policy_allowed",
+        "function M.configure_inserter(agent_id, unit_number, allowed_items)",
+        "entity.filter_slot_count",
+        "entity.set_filter(slot, nil)",
+        "read_inserter_filter_state",
+        "restore_inserter_filter_state",
+        "readback_verified = true",
+        "entity_identity_preserved",
+        "rollback_readback_verified",
+    ] {
+        assert!(
+            placement_lua.contains(required),
+            "placement.lua should retain filter/resource contract {required:?}"
+        );
+    }
+    for required in [
+        "function M.footprint(entity_name, position, direction)",
+        "function M.inspect_rotation(surface, entity_name, position, current_direction, requested_direction)",
+        "#(requested.overlapping_resource_tiles or {}) == 0",
+        "footprints_equal(current.footprint, requested.footprint)",
+        "type = \"resource\"",
+        "prototype.type == \"mining-drill\"",
+        "prototype.resource_categories",
+        "resource_category",
+        "compatible_with_extractor",
+        "resource_footprint_reserved",
+        "newly_overlapped_resources",
+    ] {
+        assert!(
+            resource_policy_lua.contains(required),
+            "resource_policy.lua should retain live semantic rule {required:?}"
+        );
+    }
+    assert!(
+        !resource_policy_lua.contains("allow_resource_overlap")
+            && !resource_policy_lua.contains("protected_resources"),
+        "live resource policy must not expose a bypass or depend on stale memory"
+    );
+    assert!(
+        power_lua.contains(r#"local resource_policy = require("resource_policy")"#)
+            && power_lua
+                .contains("resource_policy.inspect(surface, entity_name, position, direction)")
+            && power_lua.contains("if entity.allowed then return entity end"),
+        "steam and pole planners should consume the same live resource policy"
     );
 }
 

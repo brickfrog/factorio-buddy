@@ -28,7 +28,7 @@ use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Build belts as complete source-to-destination routes with route_belt or a higher-level automation controller; do not improvise disconnected one-tile belt fragments. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery, then replace them with automated production; never treat repeated hand-feeding as progress or completion. Build belts as complete source-to-destination routes with route_belt or a higher-level automation controller; do not improvise disconnected one-tile belt fragments. Treat live resource patches as extraction reserves: put only compatible mining drills or pumpjacks on them, place processing, storage, power, and ordinary logistics outside them, and route new belts around or underground. Use execute_edge_miner so new extraction begins with a clear output tile; existing overlap is not permission to extend it. Prefer dedicated item belts or deliberate lane separation; never assume a branch is pure because one sampled tile currently shows one item. Before tapping any belt that may carry multiple products, inspect its exact lanes; configure the receiving inserter's whitelist when one consumer must accept only specific items, but do not mistake a filtered inserter for a pure upstream belt. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel.";
 
 const AUTONOMY_DIRECTIVE: &str = "Autonomy tick: re-evaluate the whole factory from the authoritative snapshot below before acting. The factory is a set of independent subsystems that keep running while you work elsewhere. Choose from the current evidence, not from conversational momentum or the previous turn's focus. If research or another subsystem is healthy and progressing, leave it running; do not wait for it, repeatedly poll it, or keep embellishing it. Select the highest-leverage stalled or underdeveloped subsystem shown by the current data, inspect the relevant location with tools, take concrete action toward durable automation, and verify the result. Do not merely describe a plan.";
 
@@ -1951,6 +1951,24 @@ mod tests {
         assert!(
             DEFAULT_SYSTEM_PROMPT.contains("do not improvise disconnected one-tile belt fragments")
         );
+    }
+
+    #[test]
+    fn default_prompt_requires_resource_preservation_and_explicit_belt_contents() {
+        for required in [
+            "Treat live resource patches as extraction reserves",
+            "route new belts around or underground",
+            "existing overlap is not permission to extend it",
+            "Prefer dedicated item belts or deliberate lane separation",
+            "never assume a branch is pure",
+            "configure the receiving inserter's whitelist",
+            "do not mistake a filtered inserter for a pure upstream belt",
+        ] {
+            assert!(
+                DEFAULT_SYSTEM_PROMPT.contains(required),
+                "default gameplay prompt should include {required:?}"
+            );
+        }
     }
 
     #[test]

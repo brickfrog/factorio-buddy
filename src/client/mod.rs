@@ -593,8 +593,13 @@ impl FactorioClient {
 
     // --- Pathfinding Support ---
 
-    /// Build a collision map for pathfinding in an area
-    pub async fn build_collision_map(&mut self, area: Area) -> Result<CollisionMap> {
+    /// Build a collision map and return the same authoritative entity snapshot
+    /// used to construct it. Route planners use the snapshot to reserve live
+    /// resource tiles without paying for a second large RCON query.
+    pub async fn build_collision_map_with_entities(
+        &mut self,
+        area: Area,
+    ) -> Result<(CollisionMap, Vec<Entity>)> {
         let mut collision_map = CollisionMap::new(area);
 
         // Query tiles for terrain obstacles (water, cliffs)
@@ -608,8 +613,8 @@ impl FactorioClient {
 
         // Query entities for structure obstacles
         let entities = self.find_entities(area, None, None).await?;
-        for entity in entities {
-            if !entity_blocks_character_path(&entity) {
+        for entity in &entities {
+            if !entity_blocks_character_path(entity) {
                 continue;
             }
 
@@ -637,6 +642,12 @@ impl FactorioClient {
             }
         }
 
+        Ok((collision_map, entities))
+    }
+
+    /// Build a collision map for pathfinding in an area.
+    pub async fn build_collision_map(&mut self, area: Area) -> Result<CollisionMap> {
+        let (collision_map, _) = self.build_collision_map_with_entities(area).await?;
         Ok(collision_map)
     }
 
@@ -1809,6 +1820,32 @@ impl FactorioClient {
             )
             .await?;
         ensure_lua_success(&response)?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Replace an existing inserter's complete item whitelist. An empty list
+    /// clears all slots and disables filtering.
+    pub async fn configure_inserter(
+        &mut self,
+        unit_number: u32,
+        allowed_items: &[String],
+    ) -> Result<serde_json::Value> {
+        let position = self.get_entity(unit_number).await?.position;
+        self.approach_position(position, PROXIMITY_RANGE_INTERACT)
+            .await?;
+        let response = self
+            .call_remote(
+                "configure_inserter",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    json!(allowed_items),
+                ],
+            )
+            .await?;
+        // Preserve semantic failure kinds and rollback/readback evidence for
+        // the MCP caller. The server's common semantic-error marker turns a
+        // returned `{success:false}` payload into an MCP tool error.
         Ok(serde_json::from_str(&response)?)
     }
 

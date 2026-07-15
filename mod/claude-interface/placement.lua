@@ -1,5 +1,6 @@
 local characters = require("characters")
 local entities = require("entities")
+local resource_policy = require("resource_policy")
 
 local M = {}
 
@@ -397,6 +398,19 @@ local function placement_failure(entity_name, position, direction, inventory_cou
     return result
 end
 
+local function add_resource_policy_details(target, policy)
+    target.policy_allowed = policy.policy_allowed
+    target.preserves_resource_patch = policy.preserves_resource_patch
+    target.resource_footprint = policy.footprint
+    target.overlapping_resources = policy.overlapping_resources
+    target.extractor_exception = policy.extractor_exception
+    if not policy.policy_allowed then
+        target.error_kind = policy.error_kind
+        target.resource_policy_error = policy.error
+        target.guidance = policy.guidance
+    end
+end
+
 local function placement_candidate(surface, force, entity_name, position, direction, character, target)
     local character_blocker = character_placement_blocker(character, entity_name, position)
     local footprint = placement_area(entity_name, position, 0.0)
@@ -412,6 +426,8 @@ local function placement_candidate(surface, force, entity_name, position, direct
         character_overlap = character_blocker ~= nil,
         avoids_character = character_blocker == nil,
     }
+    local policy = resource_policy.inspect(surface, entity_name, position, direction)
+    add_resource_policy_details(diagnostic, policy)
     if target then
         diagnostic.distance = math.sqrt(
             (position[1] - target[1]) * (position[1] - target[1])
@@ -522,7 +538,8 @@ local function placement_candidate(surface, force, entity_name, position, direct
     if diagnostic.post_placement then
         has_clear_stand = diagnostic.post_placement.has_clear_standing_position == true
     end
-    diagnostic.can_place_and_keep_working = diagnostic.factorio_allowed == true
+    diagnostic.allowed = diagnostic.factorio_allowed == true and diagnostic.policy_allowed == true
+    diagnostic.can_place_and_keep_working = diagnostic.allowed == true
         and diagnostic.avoids_character == true
         and has_clear_stand
         and diagnostic.output_usable == true
@@ -803,7 +820,11 @@ local function can_place(surface, force, entity_name, position, direction, chara
     end)
     if not ok then return false, tostring(value), nil end
     if value ~= true then return false, tostring(value), nil end
-    return true, nil
+    local policy = resource_policy.inspect(surface, entity_name, position, direction)
+    if not policy.policy_allowed then
+        return false, policy.error, policy
+    end
+    return true, nil, policy
 end
 
 function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y, output_direction, furnace_name, inserter_name, belt_name, radius)
@@ -1193,6 +1214,23 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
         )
     end
 
+    local policy = resource_policy.inspect(surface, entity_name, position, direction)
+    if not policy.policy_allowed then
+        local details = {}
+        add_resource_policy_details(details, policy)
+        details.factorio_allowed = true
+        details.allowed = false
+        return placement_failure(
+            entity_name,
+            position,
+            direction,
+            inventory_count,
+            false,
+            policy.error,
+            details
+        )
+    end
+
     local create_ok, created_or_error = pcall(function()
         return surface.create_entity{
             name = entity_name,
@@ -1284,6 +1322,22 @@ function M.place_underground_belt(agent_id, entity_name, x, y, direction, belt_t
 
     if not can_place then
         return {error = "Cannot place underground belt here"}
+    end
+
+    local policy = resource_policy.inspect(surface, entity_name, position, direction)
+    if not policy.policy_allowed then
+        local result = {
+            success = false,
+            error = policy.error,
+            entity = entity_name,
+            position = {x = x, y = y},
+            direction = direction,
+            inventory_count = inventory_count,
+            factorio_allowed = true,
+            allowed = false,
+        }
+        add_resource_policy_details(result, policy)
+        return result
     end
 
     local entity = surface.create_entity{
@@ -1380,14 +1434,21 @@ function M.check_entity_placement(agent_id, entity_name, x, y, direction)
         }
     end
 
+    local policy = resource_policy.inspect(character.surface, entity_name, position, direction)
     local result = {
         factorio_allowed = can_place_or_error == true,
+        policy_allowed = policy.policy_allowed,
+        allowed = can_place_or_error == true and policy.policy_allowed == true,
         entity = entity_name,
         position = {x = x, y = y},
         direction = direction,
         inventory_count = inventory_count,
         item_in_inventory = inventory_count > 0,
     }
+    add_resource_policy_details(result, policy)
+    if can_place_or_error == true and not policy.policy_allowed then
+        result.error = policy.error
+    end
     if can_place_or_error ~= true then
         result.error = "Factorio cannot place entity here"
         local blocker_details = placement_diagnostics(character.surface, character.force, entity_name, position, direction, character)
@@ -1449,24 +1510,29 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
                     }
                 end)
                 if not character_blocker and ok and can_place == true then
-                    local distance = math.sqrt(dx * dx + dy * dy)
-                    local placement = {
-                        entity = entity_name,
-                        factorio_allowed = true,
-                        position = {x = position[1], y = position[2]},
-                        direction = dir,
-                        distance = distance,
-                        inventory_count = inventory_count,
-                        item_in_inventory = inventory_count > 0,
-                    }
-                    local output = mining_drill_output_diagnostics(surface, character.force, entity_name, position, dir, character)
-                    if output then
-                        placement.output = output
-                        placement.output_buildable = output.belt_can_place
-                        placement.output_clear = output.output_clear
-                        if output.warning then placement.output_warning = output.warning end
+                    local policy = resource_policy.inspect(surface, entity_name, position, dir)
+                    if policy.policy_allowed then
+                        local distance = math.sqrt(dx * dx + dy * dy)
+                        local placement = {
+                            entity = entity_name,
+                            factorio_allowed = true,
+                            policy_allowed = true,
+                            allowed = true,
+                            position = {x = position[1], y = position[2]},
+                            direction = dir,
+                            distance = distance,
+                            inventory_count = inventory_count,
+                            item_in_inventory = inventory_count > 0,
+                        }
+                        local output = mining_drill_output_diagnostics(surface, character.force, entity_name, position, dir, character)
+                        if output then
+                            placement.output = output
+                            placement.output_buildable = output.belt_can_place
+                            placement.output_clear = output.output_clear
+                            if output.warning then placement.output_warning = output.warning end
+                        end
+                        table.insert(placements, placement)
                     end
-                    table.insert(placements, placement)
                 end
             end
         end
@@ -1682,7 +1748,6 @@ function M.rotate_entity(agent_id, unit_number, direction)
         }
     end
 
-
     local reach_error = characters.require_entity_reach(character, entity)
     if reach_error then return reach_error end
 
@@ -1700,6 +1765,29 @@ function M.rotate_entity(agent_id, unit_number, direction)
     end
 
     local previous_direction = entity.direction
+    local rotation_policy = resource_policy.inspect_rotation(
+        entity.surface,
+        entity.name,
+        entity.position,
+        previous_direction,
+        direction
+    )
+    if rotation_policy.policy_allowed ~= true then
+        return {
+            success = false,
+            error_kind = rotation_policy.error_kind or "resource_footprint_reserved",
+            error = rotation_policy.error or "Requested rotation violates the live resource-footprint policy",
+            guidance = rotation_policy.guidance,
+            unit_number = unit_number,
+            name = entity.name,
+            entity_type = entity.type,
+            position = pos_table(entity.position),
+            direction = previous_direction,
+            requested_direction = direction,
+            resource_policy = rotation_policy,
+        }
+    end
+
     local ok, err = pcall(function()
         entity.direction = direction
     end)
@@ -1721,6 +1809,353 @@ function M.rotate_entity(agent_id, unit_number, direction)
     result.previous_direction = previous_direction
     result.requested_direction = direction
     return result
+end
+
+local function clone_filter_value(value)
+    if type(value) ~= "table" then return value end
+    local copy = {}
+    for key, nested in pairs(value) do
+        copy[key] = clone_filter_value(nested)
+    end
+    return copy
+end
+
+local function filter_name(filter)
+    if type(filter) == "string" then return filter end
+    if type(filter) == "table" then
+        if type(filter.name) == "string" then return filter.name end
+        if type(filter.name) == "table" and type(filter.name.name) == "string" then
+            return filter.name.name
+        end
+    end
+    return nil
+end
+
+local function filter_record(slot, filter)
+    if filter == nil then return nil end
+    local record = {
+        slot = slot,
+        name = filter_name(filter),
+    }
+    if type(filter) == "table" then
+        local quality = filter.quality
+        if quality == nil and type(filter.name) == "table" then quality = filter.name.quality end
+        if quality ~= nil then
+            record.quality = type(quality) == "table" and quality.name or quality
+        end
+        if filter.comparator ~= nil then record.comparator = filter.comparator end
+    end
+    return record
+end
+
+local function read_inserter_filter_state(entity, slot_count)
+    local state = {
+        filters = {},
+        raw_filters = {},
+    }
+    local enabled_ok, enabled_or_error = pcall(function() return entity.use_filters end)
+    if not enabled_ok then return nil, tostring(enabled_or_error) end
+    state.filtering_enabled = enabled_or_error == true
+
+    local mode_ok, mode_or_error = pcall(function() return entity.inserter_filter_mode end)
+    if not mode_ok then return nil, tostring(mode_or_error) end
+    state.mode = mode_or_error
+
+    for slot = 1, slot_count do
+        local filter_ok, filter_or_error = pcall(function() return entity.get_filter(slot) end)
+        if not filter_ok then return nil, tostring(filter_or_error) end
+        if filter_or_error ~= nil then
+            state.raw_filters[slot] = clone_filter_value(filter_or_error)
+            table.insert(state.filters, filter_record(slot, filter_or_error))
+        end
+    end
+    return state, nil
+end
+
+local function inserter_filter_states_match(expected, actual)
+    if not (expected and actual) then return false, "filter state was unavailable" end
+    if expected.filtering_enabled ~= actual.filtering_enabled then
+        return false, "filtering enabled-state was not restored"
+    end
+    if expected.mode ~= actual.mode then return false, "filter mode was not restored" end
+    if #expected.filters ~= #actual.filters then
+        return false, "filter count was not restored"
+    end
+    for index, wanted in ipairs(expected.filters) do
+        local observed = actual.filters[index]
+        if not observed
+            or wanted.slot ~= observed.slot
+            or wanted.name ~= observed.name
+            or wanted.quality ~= observed.quality
+            or wanted.comparator ~= observed.comparator
+        then
+            return false, "filter slot " .. tostring(wanted.slot) .. " was not restored"
+        end
+    end
+    return true, nil
+end
+
+local function restore_inserter_filter_state(entity, slot_count, state)
+    local write_ok, write_error = pcall(function()
+        for slot = 1, slot_count do entity.set_filter(slot, nil) end
+        if state.mode ~= nil then entity.inserter_filter_mode = state.mode end
+        for slot, filter in pairs(state.raw_filters) do
+            entity.set_filter(slot, clone_filter_value(filter))
+        end
+        entity.use_filters = state.filtering_enabled == true
+    end)
+    if not write_ok then return false, tostring(write_error), nil end
+
+    local restored, read_error = read_inserter_filter_state(entity, slot_count)
+    if not restored then
+        return false, "rollback readback failed: " .. tostring(read_error), nil
+    end
+    local matches, mismatch = inserter_filter_states_match(state, restored)
+    if not matches then return false, "rollback readback mismatch: " .. mismatch, restored end
+    return true, nil, restored
+end
+
+local function held_stack_record(entity)
+    local ok, stack = pcall(function() return entity.held_stack end)
+    if not ok or not (stack and stack.valid_for_read) then return nil end
+    local quality = nil
+    local quality_ok, quality_value = pcall(function() return stack.quality end)
+    if quality_ok and quality_value ~= nil then
+        quality = type(quality_value) == "table" and quality_value.name or quality_value
+    end
+    return {
+        name = stack.name,
+        count = stack.count,
+        quality = quality,
+    }
+end
+
+local function validate_allowed_items(allowed_items)
+    if type(allowed_items) ~= "table" then
+        return nil, "allowed_items must be a dense array"
+    end
+    local length = #allowed_items
+    local key_count = 0
+    local normalized = {}
+    local seen = {}
+    for key, item in pairs(allowed_items) do
+        key_count = key_count + 1
+        if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or key > length then
+            return nil, "allowed_items must be a dense array"
+        end
+        if type(item) ~= "string" or item == "" or item:match("^%s*(.-)%s*$") ~= item then
+            return nil, "allowed_items entries must be non-empty item prototype names without surrounding whitespace"
+        end
+        if seen[item] then
+            return nil, "allowed_items contains duplicate item: " .. item
+        end
+        if not prototypes.item[item] then
+            return nil, "unknown item prototype: " .. item
+        end
+        seen[item] = true
+        normalized[key] = item
+    end
+    if key_count ~= length then return nil, "allowed_items must be a dense array" end
+    return normalized, nil
+end
+
+-- Replace an existing inserter's complete whitelist atomically. Filters affect
+-- future pickups; an item already held by the arm may still finish its drop.
+function M.configure_inserter(agent_id, unit_number, allowed_items)
+    unit_number = tonumber(unit_number)
+    if not unit_number or unit_number <= 0 or unit_number % 1 ~= 0 then
+        return {
+            success = false,
+            error_kind = "invalid_unit_number",
+            error = "unit_number must be a positive integer",
+        }
+    end
+
+    local character = characters.find(agent_id)
+    if not (character and character.valid) then
+        return {
+            success = false,
+            error_kind = "no_character",
+            error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+        }
+    end
+
+    local entity = entities.find_by_unit_number(unit_number)
+    if not (entity and entity.valid) then
+        return {
+            success = false,
+            error_kind = "entity_not_found",
+            error = "Entity not found",
+            unit_number = unit_number,
+        }
+    end
+    if entity.type ~= "inserter" then
+        return {
+            success = false,
+            error_kind = "not_an_inserter",
+            error = "Entity is not an inserter",
+            unit_number = unit_number,
+            name = entity.name,
+            entity_type = entity.type,
+            position = pos_table(entity.position),
+        }
+    end
+    if entity.force ~= character.force then
+        return {
+            success = false,
+            error_kind = "wrong_force",
+            error = "Inserter belongs to a different force",
+            unit_number = unit_number,
+            force = character.force and character.force.name or nil,
+            entity_force = entity.force and entity.force.name or nil,
+        }
+    end
+
+    local reach_error = characters.require_entity_reach(character, entity)
+    if reach_error then return reach_error end
+
+    local normalized, validation_error = validate_allowed_items(allowed_items)
+    if not normalized then
+        return {
+            success = false,
+            error_kind = "invalid_allowed_items",
+            error = validation_error,
+            unit_number = unit_number,
+        }
+    end
+
+    local slots_ok, slots_or_error = pcall(function() return entity.filter_slot_count end)
+    if not slots_ok then
+        return {
+            success = false,
+            error_kind = "filters_unsupported",
+            error = tostring(slots_or_error),
+            unit_number = unit_number,
+        }
+    end
+    local slot_count = tonumber(slots_or_error) or 0
+    if slot_count < 1 then
+        return {
+            success = false,
+            error_kind = "filters_unsupported",
+            error = "Inserter prototype has no filter slots",
+            unit_number = unit_number,
+            name = entity.name,
+            filter_slot_count = slot_count,
+        }
+    end
+    if #normalized > slot_count then
+        return {
+            success = false,
+            error_kind = "too_many_filters",
+            error = "Requested whitelist exceeds inserter filter-slot capacity",
+            unit_number = unit_number,
+            requested_filter_count = #normalized,
+            filter_slot_count = slot_count,
+        }
+    end
+
+    local before, read_error = read_inserter_filter_state(entity, slot_count)
+    if not before then
+        return {
+            success = false,
+            error_kind = "filter_read_failed",
+            error = read_error,
+            unit_number = unit_number,
+        }
+    end
+    local held_before = held_stack_record(entity)
+
+    local apply_ok, apply_error = pcall(function()
+        for slot = 1, slot_count do entity.set_filter(slot, nil) end
+        if #normalized > 0 then
+            entity.inserter_filter_mode = "whitelist"
+            for slot, item in ipairs(normalized) do entity.set_filter(slot, item) end
+            entity.use_filters = true
+        else
+            entity.use_filters = false
+        end
+    end)
+    if not apply_ok then
+        local rollback_ok, rollback_error, rollback_observed = restore_inserter_filter_state(entity, slot_count, before)
+        return {
+            success = false,
+            error_kind = "filter_write_failed",
+            error = tostring(apply_error),
+            unit_number = unit_number,
+            rollback_succeeded = rollback_ok,
+            rollback_readback_verified = rollback_ok,
+            rollback_error = rollback_ok and nil or tostring(rollback_error),
+            rollback_observed = rollback_observed,
+        }
+    end
+
+    local after, after_error = read_inserter_filter_state(entity, slot_count)
+    local mismatch = nil
+    if not after then
+        mismatch = after_error
+    elseif after.filtering_enabled ~= (#normalized > 0) then
+        mismatch = "filtering enabled-state readback did not match request"
+    elseif #normalized > 0 and after.mode ~= "whitelist" then
+        mismatch = "filter mode readback was not whitelist"
+    elseif #after.filters ~= #normalized then
+        mismatch = "filter-slot readback count did not match request"
+    else
+        for slot, item in ipairs(normalized) do
+            local actual = after.filters[slot]
+            if not actual or actual.slot ~= slot or actual.name ~= item then
+                mismatch = "filter-slot readback did not match request at slot " .. tostring(slot)
+                break
+            end
+        end
+    end
+
+    if mismatch then
+        local rollback_ok, rollback_error, rollback_observed = restore_inserter_filter_state(entity, slot_count, before)
+        return {
+            success = false,
+            error_kind = "filter_readback_mismatch",
+            error = mismatch,
+            unit_number = unit_number,
+            requested_allowed_items = normalized,
+            observed = after,
+            rollback_succeeded = rollback_ok,
+            rollback_readback_verified = rollback_ok,
+            rollback_error = rollback_ok and nil or tostring(rollback_error),
+            rollback_observed = rollback_observed,
+        }
+    end
+
+    return {
+        success = true,
+        unit_number = unit_number,
+        name = entity.name,
+        entity_type = entity.type,
+        position = pos_table(entity.position),
+        force = entity.force and entity.force.name or nil,
+        filter_slot_count = slot_count,
+        requested_allowed_items = normalized,
+        before = {
+            filtering_enabled = before.filtering_enabled,
+            mode = before.mode,
+            filters = before.filters,
+        },
+        after = {
+            filtering_enabled = after.filtering_enabled,
+            mode = after.mode,
+            filters = after.filters,
+        },
+        filtering_enabled = after.filtering_enabled,
+        mode = after.mode,
+        filters = after.filters,
+        held_stack_before = held_before,
+        held_stack_after = held_stack_record(entity),
+        readback_verified = true,
+        entity_identity_preserved = entity.valid and entity.unit_number == unit_number,
+        guidance = #normalized > 0
+            and "The whitelist applies to future pickups only. Inspect the upstream belt separately; this does not make a mixed belt pure."
+            or "Filtering is disabled and all filter slots are clear.",
+    }
 end
 
 return M

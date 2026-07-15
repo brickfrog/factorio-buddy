@@ -21,6 +21,7 @@
     "connected_player_count": {"args": [], "returns": "number"},
     "connected_player_count_result": {"args": [], "returns": "json"},
     "collect_from_chest": {"args": ["agent_id", "unit_number", "item", "count"], "returns": "json"},
+    "configure_inserter": {"args": ["agent_id", "unit_number", "allowed_items"], "returns": "json"},
     "craft": {"args": ["agent_id", "recipe_name", "count"], "returns": "json"},
     "create_native_blueprint": {"args": ["agent_id", "x1", "y1", "x2", "y2"], "returns": "json"},
     "delete_blueprint": {"args": ["name"], "returns": "json"},

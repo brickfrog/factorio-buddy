@@ -2376,6 +2376,10 @@ local api = {
         return json_remote_call("rotate_entity", placement.rotate_entity, agent_id, unit_number, direction)
     end,
 
+    configure_inserter = function(agent_id, unit_number, allowed_items)
+        return json_remote_call("configure_inserter", placement.configure_inserter, agent_id, unit_number, allowed_items)
+    end,
+
     insert_items = function(agent_id, unit_number, item, count, inventory_type)
         return json_remote_call("insert_items", insert_items_impl, agent_id, unit_number, item, count, inventory_type)
     end,

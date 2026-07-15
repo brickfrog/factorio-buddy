@@ -887,7 +887,7 @@ TOOLS="$(mcp_send tools/list '{}')"
 EXPECTED_TOOLS="$(printf '%s\n' \
     analyze_inserters analyze_item_flow bootstrap_burner_once bootstrap_smelting_once \
     build_assembler_feed build_assembler_output build_automation_science \
-    build_lab_feed build_recipe_assembler_cell collect_from_chest craft diagnose_factory_blockers \
+    build_lab_feed build_recipe_assembler_cell collect_from_chest configure_inserter craft diagnose_factory_blockers \
     diagnose_steam_power execute_direct_smelter execute_edge_miner \
     execute_entity_placement_near extend_power_to feed_lab_from_inventory file_issue \
     find_nearest_resource \
@@ -898,9 +898,9 @@ EXPECTED_TOOLS="$(printf '%s\n' \
     production_statistics remove_entity render_map repair_fuel_sustainability \
     rotate_entity route_belt set_recipe situation_report start_research unstuck \
     verify_production wait_for_crafting walk_to | jq -Rsc 'split("\n")[:-1] | sort')"
-assert_json "model receives the exact 47-tool gameplay surface" "$TOOLS" \
+assert_json "model receives the exact 48-tool gameplay surface" "$TOOLS" \
     --argjson expected "$EXPECTED_TOOLS" \
-    '([.result.tools[].name] | sort) == $expected and (.result.tools | length) == 47'
+    '([.result.tools[].name] | sort) == $expected and (.result.tools | length) == 48'
 TOOLS_SCHEMA_BYTES="$(jq -c '.result.tools' <<<"$TOOLS" | wc -c)"
 if (( TOOLS_SCHEMA_BYTES <= 61440 )); then
     pass "model tool schema stays below 60 KiB"
@@ -916,6 +916,331 @@ assert_json "invalid rotation validation sets isError" "$INVALID_ROTATION" \
     '.result.isError == true
      and (.result.content[0].text | fromjson
           | .success == false and .error_kind == "invalid_direction")'
+
+# Inserter filtering is an exact-unit, identity-preserving mutation. Exercise
+# both electric and burner prototypes, then prove a burner inserter takes only
+# copper from a mixed source chest.
+FILTER_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+c.teleport({19.5, -5.5})
+local inv = c.get_main_inventory()
+inv.insert{name = 'assembling-machine-1', count = 2}
+inv.insert{name = 'burner-mining-drill', count = 2}
+inv.insert{name = 'transport-belt', count = 200}
+for _, entity in pairs(s.find_entities_filtered{area = {{17, -11}, {29, -2}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local electric = s.create_entity{
+    name = 'inserter',
+    position = {20.5, -5.5},
+    direction = defines.direction.north,
+    force = c.force,
+}
+electric.active = false
+local burner = s.create_entity{
+    name = 'burner-inserter',
+    position = {25.5, -6.5},
+    direction = defines.direction.north,
+    force = c.force,
+}
+burner.active = false
+local source = s.create_entity{name = 'iron-chest', position = burner.pickup_position, force = c.force}
+local destination = s.create_entity{name = 'iron-chest', position = burner.drop_position, force = c.force}
+source.insert{name = 'iron-plate', count = 20}
+source.insert{name = 'copper-plate', count = 20}
+local fuel = burner.get_fuel_inventory()
+if fuel then fuel.insert{name = 'coal', count = 5} end
+rcon.print(helpers.table_to_json({
+    electric_unit = electric.unit_number,
+    burner_unit = burner.unit_number,
+    source_unit = source.unit_number,
+    destination_unit = destination.unit_number
+}))
+")"
+require_json "filter fixture creates exact standard and burner inserters" "$FILTER_FIXTURE" \
+    '(.electric_unit | type) == "number"
+     and (.burner_unit | type) == "number"
+     and (.destination_unit | type) == "number"'
+ELECTRIC_FILTER_UNIT="$(jq -r '.electric_unit' <<<"$FILTER_FIXTURE")"
+BURNER_FILTER_UNIT="$(jq -r '.burner_unit' <<<"$FILTER_FIXTURE")"
+FILTER_DESTINATION_UNIT="$(jq -r '.destination_unit' <<<"$FILTER_FIXTURE")"
+
+ELECTRIC_FILTER="$(mcp_tool configure_inserter "$(jq -cn \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '{unit_number:$unit,allowed_items:["iron-plate","copper-plate"]}')")"
+ELECTRIC_FILTER_PAYLOAD="$(tool_payload "$ELECTRIC_FILTER")"
+assert_json "standard inserter whitelist is exact and read back" "$ELECTRIC_FILTER" \
+    '.result.isError != true'
+assert_json "standard inserter keeps identity and complete ordered filters" "$ELECTRIC_FILTER_PAYLOAD" \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '.readback_verified == true
+     and .entity_identity_preserved == true
+     and .unit_number == $unit
+     and .filter_slot_count >= 2
+     and .filtering_enabled == true
+     and [.filters[].name] == ["iron-plate","copper-plate"]'
+
+FILTER_BEFORE_INVALID="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local e = s.find_entities_filtered{type = 'inserter'}
+local target = nil
+for _, candidate in pairs(e) do if candidate.unit_number == $ELECTRIC_FILTER_UNIT then target = candidate end end
+rcon.print(helpers.table_to_json({
+    enabled = target and target.use_filters or false,
+    first = target and target.get_filter(1) or nil,
+    second = target and target.get_filter(2) or nil
+}))
+")"
+INVALID_FILTER="$(mcp_tool configure_inserter "$(jq -cn \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '{unit_number:$unit,allowed_items:["copper-plate","copper-plate"]}')")"
+assert_json "duplicate whitelist is rejected as a semantic tool error" "$INVALID_FILTER" \
+    '.result.isError == true'
+INVALID_FILTER_PAYLOAD="$(tool_payload "$INVALID_FILTER")"
+assert_json "filter failure preserves the precise Lua semantic payload" "$INVALID_FILTER_PAYLOAD" \
+    '.success == false
+     and .error_kind == "invalid_allowed_items"
+     and (.error | contains("duplicate item"))'
+FILTER_AFTER_INVALID="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local target = nil
+for _, candidate in pairs(s.find_entities_filtered{type = 'inserter'}) do
+    if candidate.unit_number == $ELECTRIC_FILTER_UNIT then target = candidate end
+end
+rcon.print(helpers.table_to_json({
+    enabled = target and target.use_filters or false,
+    first = target and target.get_filter(1) or nil,
+    second = target and target.get_filter(2) or nil
+}))
+")"
+assert_json "rejected whitelist leaves every prior filter unchanged" "$FILTER_AFTER_INVALID" \
+    --argjson before "$FILTER_BEFORE_INVALID" \
+    '. == $before'
+
+BURNER_FILTER="$(mcp_tool configure_inserter "$(jq -cn \
+    --argjson unit "$BURNER_FILTER_UNIT" \
+    '{unit_number:$unit,allowed_items:["copper-plate"]}')")"
+BURNER_FILTER_PAYLOAD="$(tool_payload "$BURNER_FILTER")"
+assert_json "burner inserter accepts the same exact filter contract" "$BURNER_FILTER_PAYLOAD" \
+    --argjson unit "$BURNER_FILTER_UNIT" \
+    '.readback_verified == true
+     and .entity_identity_preserved == true
+     and .unit_number == $unit
+     and [.filters[].name] == ["copper-plate"]'
+raw_lua "local s = game.surfaces['buddy-live-regression']; for _, e in pairs(s.find_entities_filtered{type = 'inserter'}) do if e.unit_number == $BURNER_FILTER_UNIT then e.active = true end end" >/dev/null
+sleep 4
+FILTERED_TRANSFER="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local destination = nil
+for _, e in pairs(s.find_entities_filtered{name = 'iron-chest'}) do
+    if e.unit_number == $FILTER_DESTINATION_UNIT then destination = e end
+end
+rcon.print(helpers.table_to_json({
+    copper = destination and destination.get_item_count('copper-plate') or 0,
+    iron = destination and destination.get_item_count('iron-plate') or 0
+}))
+")"
+assert_json "filtered burner inserter takes only copper from mixed input" "$FILTERED_TRANSFER" \
+    '.copper > 0 and .iron == 0'
+
+CLEAR_FILTER="$(mcp_tool configure_inserter "$(jq -cn \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '{unit_number:$unit,allowed_items:[]}')")"
+CLEAR_FILTER_PAYLOAD="$(tool_payload "$CLEAR_FILTER")"
+assert_json "empty whitelist clears all slots and disables filtering" "$CLEAR_FILTER_PAYLOAD" \
+    '.readback_verified == true
+     and .filtering_enabled == false
+     and (.filters | length) == 0'
+
+# Factorio's engine permits ordinary buildings on ore. Buddy's placement seam
+# must reject the full rotated footprint even when the center tile is clear,
+# while still permitting a compatible extractor. Belt A* must reserve exact
+# resource tiles before planning rather than discovering the policy at execute.
+RESOURCE_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+c.teleport({37.5, -7.5})
+local inv = c.get_main_inventory()
+inv.insert{name = 'assembling-machine-1', count = 2}
+inv.insert{name = 'burner-mining-drill', count = 2}
+inv.insert{name = 'transport-belt', count = 200}
+for _, entity in pairs(s.find_entities_filtered{area = {{37, -25}, {58, -3}}}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+-- Only the eastern edge of this assembler footprint contains ore; its center
+-- tile is deliberately clear.
+s.create_entity{name = 'iron-ore', position = {41.5, -7.5}, amount = 1000}
+for x = 46, 51 do
+    for y = -23, -18 do
+        s.create_entity{name = 'copper-ore', position = {x + 0.5, y + 0.5}, amount = 1000}
+    end
+end
+s.create_entity{name = 'iron-ore', position = {55.5, -7.5}, amount = 1000}
+rcon.print(helpers.table_to_json({
+    assembler_before = inv.get_item_count('assembling-machine-1'),
+    center_resources = s.count_entities_filtered{type = 'resource', position = {40.5, -7.5}, radius = 0.1}
+}))
+")"
+require_json "resource fixture leaves assembler center clear" "$RESOURCE_FIXTURE" \
+    '.assembler_before >= 1 and .center_resources == 0'
+
+RESOURCE_REJECT="$(mcp_tool place_entity '{"entity_name":"assembling-machine-1","x":40.5,"y":-7.5,"direction":"north"}')"
+assert_json "ordinary building footprint on ore is rejected" "$RESOURCE_REJECT" \
+    '.result.isError == true'
+RESOURCE_REJECT_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local inv = c.get_main_inventory()
+rcon.print(helpers.table_to_json({
+    assemblers = s.count_entities_filtered{name = 'assembling-machine-1', position = {40.5, -7.5}, radius = 0.2},
+    inventory = inv.get_item_count('assembling-machine-1')
+}))
+")"
+assert_json "resource rejection preserves world and inventory" "$RESOURCE_REJECT_WORLD" \
+    --argjson before "$(jq '.assembler_before' <<<"$RESOURCE_FIXTURE")" \
+    '.assemblers == 0 and .inventory == $before'
+
+raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({52.5, -7.5})" >/dev/null
+EXTRACTOR_PLACE="$(mcp_tool place_entity '{"entity_name":"burner-mining-drill","x":55,"y":-8,"direction":"east"}')"
+EXTRACTOR_PLACE_PAYLOAD="$(tool_payload "$EXTRACTOR_PLACE")"
+assert_json "compatible mining drill keeps the resource extractor exception" "$EXTRACTOR_PLACE" \
+    '.result.isError != true'
+assert_json "extractor is placed with exact identity" "$EXTRACTOR_PLACE_PAYLOAD" \
+    '.name == "burner-mining-drill" and (.unit_number | type) == "number"'
+
+RESOURCE_ROUTE="$(mcp_tool route_belt '{
+    "from_x":42,
+    "from_y":-20,
+    "to_x":55,
+    "to_y":-20,
+    "belt_type":"transport-belt",
+    "search_radius":7,
+    "dry_run":true,
+    "extend_existing":true,
+    "allow_underground":false,
+    "respect_zones":false
+}')"
+RESOURCE_ROUTE_PAYLOAD="$(tool_payload "$RESOURCE_ROUTE")"
+assert_json "belt planner reserves the live resource patch" "$RESOURCE_ROUTE_PAYLOAD" \
+    '.success == true
+     and .preserves_resource_patches == true
+     and .resource_tiles_reserved >= 36
+     and all(.planned_new_belts[]?;
+         (((.position.x | floor) >= 46
+           and (.position.x | floor) <= 51
+           and (.position.y | floor) >= -23
+           and (.position.y | floor) <= -18) | not))'
+
+ROTATION_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+c.teleport({66.5, -7.5})
+local rectangular = s.create_entity{
+    name = 'steam-engine',
+    position = {70.5, -7.5},
+    direction = defines.direction.north,
+    force = c.force,
+    create_build_effect_smoke = false
+}
+local rectangular_ore = s.create_entity{name = 'iron-ore', position = {72.5, -7.5}, amount = 1000}
+local legacy_rectangular = s.create_entity{
+    name = 'steam-engine',
+    position = {78.5, -7.5},
+    direction = defines.direction.north,
+    force = c.force,
+    create_build_effect_smoke = false
+}
+local legacy_rectangular_ore = s.create_entity{name = 'iron-ore', position = {78.5, -7.5}, amount = 1000}
+local belt_ore = s.create_entity{name = 'iron-ore', position = {70.5, -10.5}, amount = 1000}
+local belt = s.create_entity{
+    name = 'transport-belt',
+    position = {70.5, -10.5},
+    direction = defines.direction.north,
+    force = c.force,
+    create_build_effect_smoke = false
+}
+c.teleport({74.5, -7.5})
+rcon.print(helpers.table_to_json({
+    rectangular_unit = rectangular and rectangular.unit_number or nil,
+    rectangular_direction = rectangular and rectangular.direction or nil,
+    rectangular_ore_created = rectangular_ore ~= nil,
+    legacy_rectangular_unit = legacy_rectangular and legacy_rectangular.unit_number or nil,
+    legacy_rectangular_direction = legacy_rectangular and legacy_rectangular.direction or nil,
+    legacy_rectangular_ore_created = legacy_rectangular_ore ~= nil,
+    belt_unit = belt and belt.unit_number or nil,
+    belt_ore_created = belt_ore ~= nil
+}))
+")"
+require_json "rotation fixture creates rectangular and square legacy overlaps" "$ROTATION_FIXTURE" \
+    '.rectangular_ore_created == true
+     and .legacy_rectangular_ore_created == true
+     and .belt_ore_created == true
+     and (.rectangular_unit | type) == "number"
+     and (.legacy_rectangular_unit | type) == "number"
+     and (.belt_unit | type) == "number"'
+ROTATION_RECTANGULAR_UNIT="$(jq -r '.rectangular_unit' <<<"$ROTATION_FIXTURE")"
+ROTATION_LEGACY_RECTANGULAR_UNIT="$(jq -r '.legacy_rectangular_unit' <<<"$ROTATION_FIXTURE")"
+ROTATION_BELT_UNIT="$(jq -r '.belt_unit' <<<"$ROTATION_FIXTURE")"
+
+RESOURCE_ROTATION="$(mcp_tool rotate_entity "$(jq -cn \
+    --argjson unit "$ROTATION_RECTANGULAR_UNIT" \
+    '{unit_number:$unit,direction:"east"}')")"
+assert_json "rectangular rotation cannot expand an entity onto ore" "$RESOURCE_ROTATION" \
+    '.result.isError == true'
+RESOURCE_ROTATION_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local rectangular = nil
+for _, candidate in pairs(s.find_entities_filtered{name = 'steam-engine'}) do
+    if candidate.unit_number == $ROTATION_RECTANGULAR_UNIT then rectangular = candidate end
+end
+rcon.print(helpers.table_to_json({
+    direction = rectangular and rectangular.direction or nil,
+    ore = s.count_entities_filtered{name = 'iron-ore', position = {72.5, -7.5}, radius = 0.2}
+}))
+")"
+assert_json "rejected rectangular rotation preserves entity direction and resource" "$RESOURCE_ROTATION_WORLD" \
+    --argjson before "$(jq '.rectangular_direction' <<<"$ROTATION_FIXTURE")" \
+    '.direction == $before and .ore == 1'
+
+LEGACY_RESOURCE_ROTATION="$(mcp_tool rotate_entity "$(jq -cn \
+    --argjson unit "$ROTATION_LEGACY_RECTANGULAR_UNIT" \
+    '{unit_number:$unit,direction:"east"}')")"
+assert_json "footprint-changing rotation cannot revalidate an existing resource overlap" "$LEGACY_RESOURCE_ROTATION" \
+    '.result.isError == true'
+LEGACY_RESOURCE_ROTATION_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local rectangular = nil
+for _, candidate in pairs(s.find_entities_filtered{name = 'steam-engine'}) do
+    if candidate.unit_number == $ROTATION_LEGACY_RECTANGULAR_UNIT then rectangular = candidate end
+end
+rcon.print(helpers.table_to_json({
+    direction = rectangular and rectangular.direction or nil,
+    ore = s.count_entities_filtered{name = 'iron-ore', position = {78.5, -7.5}, radius = 0.2}
+}))
+")"
+assert_json "legacy rectangular rejection preserves existing resource overlap" "$LEGACY_RESOURCE_ROTATION_WORLD" \
+    --argjson before "$(jq '.legacy_rectangular_direction' <<<"$ROTATION_FIXTURE")" \
+    '.direction == $before and .ore == 1'
+
+SQUARE_ROTATION="$(mcp_tool rotate_entity "$(jq -cn \
+    --argjson unit "$ROTATION_BELT_UNIT" \
+    '{unit_number:$unit,direction:"east"}')")"
+assert_json "square legacy overlap may rotate without expanding its resource footprint" "$SQUARE_ROTATION" \
+    '.result.isError != true'
+SQUARE_ROTATION_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local belt = nil
+for _, candidate in pairs(s.find_entities_filtered{name = 'transport-belt'}) do
+    if candidate.unit_number == $ROTATION_BELT_UNIT then belt = candidate end
+end
+rcon.print(helpers.table_to_json({
+    direction = belt and belt.direction or nil,
+    ore = s.count_entities_filtered{name = 'iron-ore', position = {70.5, -10.5}, radius = 0.2}
+}))
+")"
+assert_json "allowed square rotation preserves the exact belt and resource" "$SQUARE_ROTATION_WORLD" \
+    '.direction == 4 and .ore == 1'
 
 DISCONNECTED_LAB="$(mcp_tool build_lab_feed "$(jq -cn \
     --argjson unit "$DISCONNECTED_LAB_UNIT" \
