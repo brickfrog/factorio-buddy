@@ -255,6 +255,23 @@ local function point_in_bounding_box(point, box)
         and point.y <= box.right_bottom.y
 end
 
+-- Factorio resolves an inserter or drill's actual recipient using the tile
+-- under its drop position, which can extend slightly beyond a small target's
+-- collision box (notably another inserter). Prefer that engine-owned target
+-- over reconstructing interaction geometry from collision bounds.
+local function entity_drops_to(source, target)
+    if not (source and source.valid and target) then return false end
+    local ok, drop_target = pcall(function() return source.drop_target end)
+    if ok and drop_target and drop_target.valid then
+        if source == target then return false end
+        if drop_target.unit_number and target.unit_number then
+            return drop_target.unit_number == target.unit_number
+        end
+        return drop_target == target
+    end
+    return point_in_bounding_box(source.drop_position, target.bounding_box)
+end
+
 local function inserter_can_operate(status)
     return status ~= nil
         and status ~= "no_power"
@@ -345,6 +362,7 @@ local function electric_coal_drill_power_proof(entity)
         energy = energy_ok and energy or nil,
         electric_network_id = network_ok and network_id or nil,
         producer_unit_number = entity.unit_number,
+        producer_operational = operational,
         hops = 0,
     }
 end
@@ -353,6 +371,7 @@ local function burner_coal_drill_fuel_proof(surface, force, drill, state)
     state.producer_frames = state.producer_frames or {}
     local frame = {
         producer_unit_number = drill.unit_number,
+        producer_operational = operational_coal_drill(drill),
         targets = {},
     }
     -- Only a return to the path that already proved this drill's coal output
@@ -376,7 +395,7 @@ local function burner_coal_drill_fuel_proof(surface, force, drill, state)
         force = force,
         area = expanded_box(drill.bounding_box, 4),
     }) do
-        if source ~= drill and point_in_bounding_box(source.drop_position, drill.bounding_box) then
+        if source ~= drill and entity_drops_to(source, drill) then
             local proof = coal_upstream_proof(surface, force, source, state)
             if proof.certified then
                 consider({
@@ -384,6 +403,7 @@ local function burner_coal_drill_fuel_proof(surface, force, drill, state)
                     live = proof.live == true,
                     reason = "direct_durable_coal_drill_fuel",
                     producer_unit_number = proof.producer_unit_number,
+                    producer_operational = proof.producer_operational == true,
                     via_unit_number = source.unit_number,
                     hops = (proof.hops or 0) + 1,
                     upstream_proof = proof,
@@ -398,7 +418,7 @@ local function burner_coal_drill_fuel_proof(surface, force, drill, state)
         area = expanded_box(drill.bounding_box, 3),
     }) do
         local feeder_status = entity_status_string(feeder)
-        if point_in_bounding_box(feeder.drop_position, drill.bounding_box)
+        if entity_drops_to(feeder, drill)
             and inserter_can_operate(feeder_status)
         then
             local pickup = feeder.pickup_position
@@ -415,6 +435,7 @@ local function burner_coal_drill_fuel_proof(surface, force, drill, state)
                             live = proof.live == true,
                             reason = "operational_inserter_durable_fuel",
                             producer_unit_number = proof.producer_unit_number,
+                            producer_operational = proof.producer_operational == true,
                             via_unit_number = feeder.unit_number,
                             inserter_status = feeder_status,
                             hops = (proof.hops or 0) + 1,
@@ -466,6 +487,7 @@ coal_upstream_proof = function(surface, force, entity, state)
                     live = true,
                     reason = "closed_self_sustaining_coal_cycle",
                     producer_unit_number = frame.producer_unit_number,
+                    producer_operational = frame.producer_operational == true,
                     cycle_unit_number = entity.unit_number,
                     hops = 0,
                 }
@@ -514,6 +536,7 @@ coal_upstream_proof = function(surface, force, entity, state)
                 energy_source = "burner",
                 operational = operational,
                 producer_unit_number = entity.unit_number,
+                producer_operational = operational,
                 fuel_proof = fuel_proof,
                 hops = (fuel_proof.hops or 0) + 1,
             })
@@ -551,14 +574,18 @@ coal_upstream_proof = function(surface, force, entity, state)
         force = force,
         area = expanded_box(entity.bounding_box, 4),
     }) do
-        if point_in_bounding_box(drill.drop_position, entity.bounding_box) then
+        if entity_drops_to(drill, entity) then
             local proof = coal_upstream_proof(surface, force, drill, state)
             if proof.certified then
                 return finish({
                     certified = true,
-                    live = coal_count > 0 and proof.live,
+                    -- A certified connected path from an operating producer is
+                    -- live even when this intermediate tile is between items
+                    -- in the sampled tick.
+                    live = proof.live == true,
                     reason = coal_count > 0 and "direct_durable_coal_drill" or "upstream_ready_but_source_empty",
                     producer_unit_number = drill.unit_number,
+                    producer_operational = proof.producer_operational == true,
                     via_unit_number = entity.unit_number,
                     hops = (proof.hops or 0) + 1,
                     upstream_proof = proof,
@@ -583,11 +610,13 @@ coal_upstream_proof = function(surface, force, entity, state)
                     if proof.certified then
                         return finish({
                             certified = true,
-                            live = coal_count > 0 and proof.live,
+                            live = proof.live == true,
                             reason = coal_count > 0 and "connected_surface_belt" or "upstream_ready_but_source_empty",
                             producer_unit_number = proof.producer_unit_number,
+                            producer_operational = proof.producer_operational == true,
                             via_unit_number = upstream.unit_number,
                             hops = (proof.hops or 0) + 1,
+                            upstream_proof = proof,
                         })
                     end
                 end
@@ -600,7 +629,7 @@ coal_upstream_proof = function(surface, force, entity, state)
         force = force,
         area = expanded_box(entity.bounding_box, 3),
     }) do
-        if point_in_bounding_box(feeder.drop_position, entity.bounding_box)
+        if entity_drops_to(feeder, entity)
             and inserter_can_operate(entity_status_string(feeder))
         then
             local pickup = feeder.pickup_position
@@ -611,11 +640,13 @@ coal_upstream_proof = function(surface, force, entity, state)
                     if proof.certified then
                         return finish({
                             certified = true,
-                            live = coal_count > 0 and proof.live,
+                            live = proof.live == true,
                             reason = coal_count > 0 and "operational_inserter_feed" or "upstream_ready_but_source_empty",
                             producer_unit_number = proof.producer_unit_number,
+                            producer_operational = proof.producer_operational == true,
                             via_unit_number = feeder.unit_number,
                             hops = (proof.hops or 0) + 1,
+                            upstream_proof = proof,
                         })
                     end
                 end
@@ -654,6 +685,7 @@ local function coal_source_record(surface, force, entity, proof_cache)
             coal_count = count,
             durable = proof.certified,
             operational = proof.live,
+            producer_operational = proof.producer_operational == true,
             upstream_proof = proof,
         }
     end
@@ -667,11 +699,17 @@ local function coal_source_record(surface, force, entity, proof_cache)
             coal_count = count,
             durable = proof.certified,
             operational = proof.live,
+            producer_operational = proof.producer_operational == true,
             upstream_proof = proof,
         }
     end
     if entity.type == "mining-drill" and entity.mining_target and entity.mining_target.name == "coal" then
         local status = entity_status_string(entity)
+        local energy_source = mining_drill_energy_source(entity)
+        local self_bootstrap_capable = energy_source == "burner"
+            and proof.live ~= true
+            and status ~= "disabled"
+            and status ~= "marked_for_deconstruction"
         return {
             kind = "coal_drill",
             unit_number = entity.unit_number,
@@ -682,6 +720,8 @@ local function coal_source_record(surface, force, entity, proof_cache)
             status = status,
             durable = proof.certified,
             operational = proof.live,
+            producer_operational = proof.producer_operational == true,
+            self_bootstrap_capable = self_bootstrap_capable,
             upstream_proof = proof,
         }
     end
@@ -697,8 +737,42 @@ local function fuel_connections(surface, force, consumer)
     }
     local result = {}
     local proof_cache = {}
+
+    -- A burner inserter moving coal fuels itself from that same pickup. Model
+    -- this as its durable connection so it does not recursively request a
+    -- second inserter to fuel the first one.
+    if consumer.type == "inserter" and consumer.burner_powered == true and consumer.pickup_position then
+        local pickup = consumer.pickup_position
+        local pickup_area = {{pickup.x - 0.25, pickup.y - 0.25}, {pickup.x + 0.25, pickup.y + 0.25}}
+        for _, source in pairs(surface.find_entities_filtered{area = pickup_area, force = force}) do
+            if source.unit_number ~= consumer.unit_number
+                and point_in_bounding_box(pickup, source.bounding_box)
+            then
+                local source_record = coal_source_record(surface, force, source, proof_cache)
+                if source_record then
+                    local status = consumer.status
+                    local operational = inserter_can_operate(status)
+                    table.insert(result, {
+                        connection_kind = "self_fueling_coal_pickup",
+                        inserter_unit_number = consumer.unit_number,
+                        inserter_name = consumer.name,
+                        inserter_status = status,
+                        inserter_operational = operational,
+                        pickup_position = pos_table(pickup),
+                        drop_position = pos_table(consumer.drop_position),
+                        source = source_record,
+                        source_durable = source_record.durable == true,
+                        source_operational = source_record.operational == true,
+                        durable = source_record.durable == true,
+                        live = operational and source_record.operational == true,
+                    })
+                end
+            end
+        end
+    end
+
     for _, inserter in pairs(surface.find_entities_filtered{type = "inserter", area = search_area, force = force}) do
-        if point_in_bounding_box(inserter.drop_position, box) then
+        if entity_drops_to(inserter, consumer) then
             local pickup = inserter.pickup_position
             local pickup_area = {{pickup.x - 0.25, pickup.y - 0.25}, {pickup.x + 0.25, pickup.y + 0.25}}
             for _, source in pairs(surface.find_entities_filtered{area = pickup_area, force = force}) do
@@ -763,29 +837,35 @@ local function inserter_fuel_candidates(surface, force, entity)
     local bb = entity.bounding_box
     if not bb then return {} end
     local center = entity.position
+    local lane_x = math.floor(center.x) + 0.5
+    local lane_y = math.floor(center.y) + 0.5
+    local north_edge = math.floor(bb.left_top.y)
+    local east_edge = math.ceil(bb.right_bottom.x)
+    local south_edge = math.ceil(bb.right_bottom.y)
+    local west_edge = math.floor(bb.left_top.x)
     local candidates = {
         {
             side = "north",
-            inserter = {x = center.x, y = bb.left_top.y - 0.5},
-            pickup = {x = center.x, y = bb.left_top.y - 1.5},
+            inserter = {x = lane_x, y = north_edge - 0.5},
+            pickup = {x = lane_x, y = north_edge - 1.5},
             direction = defines.direction.north,
         },
         {
             side = "east",
-            inserter = {x = bb.right_bottom.x + 0.5, y = center.y},
-            pickup = {x = bb.right_bottom.x + 1.5, y = center.y},
+            inserter = {x = east_edge + 0.5, y = lane_y},
+            pickup = {x = east_edge + 1.5, y = lane_y},
             direction = defines.direction.east,
         },
         {
             side = "south",
-            inserter = {x = center.x, y = bb.right_bottom.y + 0.5},
-            pickup = {x = center.x, y = bb.right_bottom.y + 1.5},
+            inserter = {x = lane_x, y = south_edge + 0.5},
+            pickup = {x = lane_x, y = south_edge + 1.5},
             direction = defines.direction.south,
         },
         {
             side = "west",
-            inserter = {x = bb.left_top.x - 0.5, y = center.y},
-            pickup = {x = bb.left_top.x - 1.5, y = center.y},
+            inserter = {x = west_edge - 0.5, y = lane_y},
+            pickup = {x = west_edge - 1.5, y = lane_y},
             direction = defines.direction.west,
         },
     }
@@ -798,11 +878,13 @@ local function inserter_fuel_candidates(surface, force, entity)
             position = candidate.inserter,
             direction = candidate.direction,
             force = force,
+            build_check_type = defines.build_check_type.script,
         }
         local pickup_belt_can_place = surface.can_place_entity{
             name = "transport-belt",
             position = candidate.pickup,
             force = force,
+            build_check_type = defines.build_check_type.script,
         }
         table.insert(viable, {
             side = candidate.side,
@@ -1043,11 +1125,22 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
             if entity.burner then
                 local fuel_inv = safe_fuel_inventory(entity)
                 local fuel_count = inventory_total(fuel_inv) or 0
+                local remaining_ok, remaining_burning_fuel = pcall(function()
+                    return entity.burner.remaining_burning_fuel
+                end)
+                remaining_burning_fuel = remaining_ok
+                    and (tonumber(remaining_burning_fuel) or 0)
+                    or 0
+                local heat_ok, burner_heat = pcall(function() return entity.burner.heat end)
+                burner_heat = heat_ok and (tonumber(burner_heat) or 0) or 0
+                local has_fuel = fuel_count > 0
+                    or remaining_burning_fuel > 0
+                    or burner_heat > 0
                 local status = entity_status_string(entity)
                 local priority = 40
-                if fuel_count == 0 then priority = 10
+                if not has_fuel then priority = 10
                 elseif fuel_count < 5 then priority = 20
-                elseif status == "no_fuel" then priority = 10
+                elseif status == "no_fuel" and remaining_burning_fuel <= 0 then priority = 10
                 end
                 table.insert(consumers, {
                     priority = priority,
@@ -1057,7 +1150,12 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
                     position = pos_table(entity.position),
                     bounding_box = bounding_box_table(entity.bounding_box),
                     status = status,
+                    burner_powered = true,
                     fuel_count = fuel_count,
+                    remaining_burning_fuel = remaining_burning_fuel,
+                    burner_heat = burner_heat,
+                    pickup_position = entity.type == "inserter" and pos_table(entity.pickup_position) or nil,
+                    drop_position = entity.type == "inserter" and pos_table(entity.drop_position) or nil,
                     fuel_inserter_candidates = inserter_fuel_candidates(surface, entity.force, entity),
                     durable_actions = {{
                         type = "route_coal_supply",
@@ -1103,14 +1201,17 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
         end
         consumer.fuel_topology_present = #consumer.fuel_connections > 0
         consumer.automated = #consumer.proven_fuel_connections > 0
+        local has_fuel = consumer.fuel_count > 0
+            or (consumer.remaining_burning_fuel or 0) > 0
+            or (consumer.burner_heat or 0) > 0
         if consumer.automated then
-            consumer.issue = (not has_live_connection or consumer.fuel_count == 0)
+            consumer.issue = (not has_live_connection or not has_fuel)
                 and "automated_supply_starved"
                 or nil
         elseif consumer.fuel_topology_present then
             consumer.issue = "fuel_topology_not_operational"
         else
-            consumer.issue = consumer.fuel_count == 0 and "empty_fuel"
+            consumer.issue = not has_fuel and "empty_fuel"
                 or (consumer.fuel_count < 5 and "low_fuel" or "manual_or_unknown_fuel_supply")
         end
 
@@ -1129,19 +1230,54 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
                 status = source.status,
                 durable = source.durable == true,
                 operational = source.operational,
+                self_bootstrap_capable = source.self_bootstrap_capable == true,
                 upstream_proof = source.upstream_proof,
                 distance = math.sqrt(source.distance_sq),
             })
         end
 
-        local source = ranked_sources[1]
-        if source and source.operational and not consumer.automated and consumer.fuel_inserter_candidates then
+        local source = nil
+        for _, candidate_source in ipairs(ranked_sources) do
+            if candidate_source.operational == true then
+                source = candidate_source
+                break
+            end
+        end
+
+        -- A cold burner coal drill cannot become a strictly durable source until
+        -- its own output is routed back into its fuel inventory. When no already
+        -- operational durable source exists, allow only that exact drill to
+        -- propose the provisional closed-loop transaction. It is never accepted
+        -- as a source for another consumer, and durability still requires the
+        -- normal post-build proof.
+        local provisional_self_source = false
+        if not source and consumer.type == "mining-drill" then
+            for _, candidate_source in ipairs(ranked_sources) do
+                if candidate_source.unit_number == consumer.unit_number
+                    and candidate_source.self_bootstrap_capable == true
+                then
+                    source = candidate_source
+                    provisional_self_source = true
+                    break
+                end
+            end
+        end
+
+        if source and not consumer.automated and consumer.fuel_inserter_candidates then
             for _, candidate in ipairs(consumer.fuel_inserter_candidates) do
                 if candidate.can_place_inserter then
                     local source_position = source.route_position or source.position
                     local source_tile = source.route_tile or {x = tile_coord(source_position.x), y = tile_coord(source_position.y)}
                     local pickup_x = tile_coord(candidate.pickup_tile.x)
                     local pickup_y = tile_coord(candidate.pickup_tile.y)
+                    local consumer_bootstrap_count = 0
+                    if provisional_self_source
+                        and consumer.fuel_count == 0
+                        and (consumer.remaining_burning_fuel or 0) <= 0
+                        and (consumer.burner_heat or 0) <= 0
+                    then
+                        consumer_bootstrap_count = 5
+                    end
                     candidate.route_coal_to_pickup_args = {
                         from_x = source_tile.x,
                         from_y = source_tile.y,
@@ -1150,6 +1286,7 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
                     }
                     candidate.fuel_transaction_args = {
                         consumer_unit_number = consumer.unit_number,
+                        source_unit_number = source.unit_number,
                         from_x = source_tile.x,
                         from_y = source_tile.y,
                         pickup_x = pickup_x,
@@ -1158,6 +1295,12 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
                         inserter_y = candidate.inserter_position.y,
                         inserter_direction = candidate.inserter_direction_name,
                         inserter_name = candidate.inserter_name,
+                        provisional_source_unit_number = provisional_self_source
+                            and source.unit_number
+                            or nil,
+                        bootstrap_consumer_fuel_count = provisional_self_source
+                            and consumer_bootstrap_count
+                            or nil,
                     }
                     candidate.automation_steps = {{
                         tool = "repair_fuel_sustainability",
@@ -1181,7 +1324,7 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
                         },
                         transaction_args = candidate.fuel_transaction_args,
                         source_kind = source.kind,
-                        source_is_proposed = true,
+                        source_is_proposed = provisional_self_source,
                         follow_up = {
                             tool = "verify_production",
                             args = {x = consumer.position.x, y = consumer.position.y, radius = 8},
@@ -1196,11 +1339,42 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
     local suggested_actions = {}
     if #consumers > 0 then
         local target = consumers[1]
+        local cold_self_source = nil
+        if target.type == "mining-drill"
+            and target.fuel_count == 0
+            and (target.remaining_burning_fuel or 0) <= 0
+            and (target.burner_heat or 0) <= 0
+        then
+            for _, source in ipairs(target.candidate_sources or {}) do
+                if source.unit_number == target.unit_number
+                    and source.self_bootstrap_capable == true
+                then
+                    cold_self_source = source
+                    break
+                end
+            end
+        end
         if target.automated and not target.issue then
             table.insert(suggested_actions, {
                 type = "fuel_supply_verified",
                 target_unit_number = target.unit_number,
                 description = "An adjacent inserter with an operational coal source is feeding this consumer; no manual fuel action is needed.",
+            })
+        elseif cold_self_source and target.automated then
+            table.insert(suggested_actions, {
+                type = "bootstrap_burner_once",
+                tool = "bootstrap_burner_once",
+                target_unit_number = target.unit_number,
+                args = {
+                    unit_number = target.unit_number,
+                    fuel_item = "coal",
+                    count = 5,
+                },
+                follow_up = {
+                    tool = "repair_fuel_sustainability",
+                    args = {x = target.position.x, y = target.position.y, radius = 16, dry_run = true},
+                },
+                description = "This already-built closed coal loop is cold. Seed only its exact burner drill once, then recheck the existing durable connection instead of building duplicate belts.",
             })
         elseif target.automated or target.fuel_topology_present then
             table.insert(suggested_actions, {
@@ -1210,6 +1384,10 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
                 description = "The adjacent fuel inserter topology exists, but either the inserter or its coal source is not operational. Repair that exact connection instead of hand-feeding or building a duplicate route.",
             })
         elseif target.ready_to_call then
+            local description = "Build the route from the nearest operational source, then verify the actual adjacent inserter and coal flow. The source is not considered durable until proven_fuel_connections reports it."
+            if target.ready_to_call.source_is_proposed then
+                description = "Bootstrap this burner coal drill with a bounded fuel seed, close its own output-to-fuel loop, then verify the closed self-sustaining coal cycle. The provisional source is not considered durable until proven_fuel_connections reports it."
+            end
             table.insert(suggested_actions, {
                 type = "repair_fuel_sustainability",
                 target_unit_number = target.unit_number,
@@ -1218,7 +1396,8 @@ function M.diagnose_fuel_sustainability(surface, force, x1, y1, x2, y2, limit)
                 transaction_args = target.ready_to_call.transaction_args,
                 follow_up = target.ready_to_call.follow_up,
                 source_kind = target.ready_to_call.source_kind,
-                description = "Build the proposed route from the nearest operational source, then verify the actual adjacent inserter and coal flow. The source is not considered durable until proven_fuel_connections reports it.",
+                source_is_proposed = target.ready_to_call.source_is_proposed,
+                description = description,
             })
         elseif #coal_resources > 0 then
             table.insert(suggested_actions, {

@@ -977,7 +977,20 @@ fn critical_mod_safety_contracts_are_explicit() {
             && entities_lua.contains("operational_coal_drill")
             && entities_lua.contains("if connection.durable then")
             && entities_lua.contains("consumer.fuel_topology_present")
-            && entities_lua.contains("source_is_proposed = true")
+            && entities_lua.contains("self_bootstrap_capable = self_bootstrap_capable")
+            && entities_lua.contains("candidate_source.unit_number == consumer.unit_number")
+            && entities_lua.contains("provisional_source_unit_number = provisional_self_source")
+            && entities_lua.contains("bootstrap_consumer_fuel_count = provisional_self_source")
+            && entities_lua.contains("consumer_bootstrap_count = 5")
+            && entities_lua.contains("source_is_proposed = provisional_self_source")
+            && entities_lua.contains("source_unit_number = source.unit_number")
+            && entities_lua.contains("connection_kind = \"self_fueling_coal_pickup\"")
+            && entities_lua.contains("remaining_burning_fuel > 0")
+            && entities_lua.contains("proof.producer_operational == true")
+            && entities_lua.matches("live = proof.live == true").count() >= 3
+            && !entities_lua.contains("live = proof.producer_operational == true")
+            && !entities_lua
+                .contains("live = coal_count > 0 and proof.producer_operational == true")
             && entities_lua.contains("if a.operational ~= b.operational then")
             && entities_lua.contains("if a.distance_sq ~= b.distance_sq then"),
         "fuel diagnosis must prove adjacent inserter/source operation and rank unproven sources explicitly"
@@ -1103,6 +1116,18 @@ fn bounded_inventory_actions_preserve_entities_and_conserve_items() {
                 "json_remote_call(\"bootstrap_burner_once\", inventory_actions.bootstrap_burner_once, agent_id, unit_number, fuel_item, count)",
             )
             && control_lua.contains(
+                "snapshot_burner_state = function(unit_number)",
+            )
+            && control_lua.contains(
+                "json_remote_call(\"snapshot_burner_state\", inventory_actions.snapshot_burner_state, unit_number)",
+            )
+            && control_lua.contains(
+                "rollback_burner_bootstrap = function(agent_id, snapshot, feeder_unit_number)",
+            )
+            && control_lua.contains(
+                "json_remote_call(\"rollback_burner_bootstrap\", inventory_actions.rollback_burner_bootstrap, agent_id, snapshot, feeder_unit_number)",
+            )
+            && control_lua.contains(
                 "collect_from_chest = function(agent_id, unit_number, item, count)",
             )
             && control_lua.contains(
@@ -1117,6 +1142,18 @@ fn bounded_inventory_actions_preserve_entities_and_conserve_items() {
             "unit_number".to_string(),
             "fuel_item".to_string(),
             "count".to_string(),
+        ])
+    );
+    assert_eq!(
+        manifest.get("snapshot_burner_state"),
+        Some(&vec!["unit_number".to_string()])
+    );
+    assert_eq!(
+        manifest.get("rollback_burner_bootstrap"),
+        Some(&vec![
+            "agent_id".to_string(),
+            "snapshot".to_string(),
+            "feeder_unit_number".to_string(),
         ])
     );
     assert_eq!(
@@ -1157,6 +1194,50 @@ fn bounded_inventory_actions_preserve_entities_and_conserve_items() {
         assert!(
             fuel.contains(required),
             "bootstrap_burner_once should retain contract evidence {required:?}"
+        );
+    }
+
+    let snapshot = inventory_actions_lua
+        .split("function M.snapshot_burner_state(unit_number)")
+        .nth(1)
+        .and_then(|tail| tail.split("function M.rollback_burner_bootstrap").next())
+        .expect("snapshot_burner_state should precede rollback_burner_bootstrap");
+    for required in [
+        "local snapshot = burner_state(entity)",
+        "missing_burner_state",
+        "snapshot.success = true",
+    ] {
+        assert!(
+            snapshot.contains(required),
+            "snapshot_burner_state should capture exact normalized state with evidence {required:?}"
+        );
+    }
+
+    let rollback = inventory_actions_lua
+        .split("function M.rollback_burner_bootstrap(agent_id, snapshot, feeder_unit_number)")
+        .nth(1)
+        .and_then(|tail| tail.split("function M.collect_from_chest").next())
+        .expect("rollback_burner_bootstrap should precede collect_from_chest");
+    for required in [
+        "feeder.active = false",
+        "local before = burner_state(consumer)",
+        "fuel_inventory.clear()",
+        "consumer.burner.currently_burning = nil",
+        "consumer.burner.heat = 0",
+        "consumer.burner.currently_burning = {",
+        "consumer.burner.remaining_burning_fuel = snapshot.remaining_burning_fuel or 0",
+        "consumer.burner.heat = snapshot.heat or 0",
+        "consumer.surface.spill_item_stack{",
+        "spilled_excess = spilled_excess",
+        "unrecovered_excess = unrecovered_excess + (remainder - spilled_count)",
+        "local consumer_state_restored = #restore_errors == 0 and same_burner_state(after, snapshot)",
+        "feeder_quiesced = feeder_quiesced",
+        "transaction_fuel_cleared = consumer_state_restored",
+        "classification = \"failed_fuel_transaction_rollback\"",
+    ] {
+        assert!(
+            rollback.contains(required),
+            "rollback_burner_bootstrap should atomically quiesce and restore with evidence {required:?}"
         );
     }
 
@@ -2011,6 +2092,27 @@ fn fuel_inserter_candidates_use_the_belt_as_factorio_pickup_side() {
             "{side} fuel candidate must pick up from the {direction} belt side"
         );
     }
+    for required in [
+        "local lane_x = math.floor(center.x) + 0.5",
+        "local lane_y = math.floor(center.y) + 0.5",
+        "local north_edge = math.floor(bb.left_top.y)",
+        "local east_edge = math.ceil(bb.right_bottom.x)",
+        "local south_edge = math.ceil(bb.right_bottom.y)",
+        "local west_edge = math.floor(bb.left_top.x)",
+        "build_check_type = defines.build_check_type.script",
+    ] {
+        assert!(
+            function.contains(required),
+            "fuel candidates must use executable tile-centered geometry: missing {required:?}"
+        );
+    }
+
+    assert!(
+        entities_lua.contains("local function entity_drops_to(source, target)")
+            && entities_lua.contains("return source.drop_target")
+            && entities_lua.contains("if entity_drops_to(inserter, consumer) then"),
+        "fuel topology must use Factorio's exact drop target for small consumers such as burner inserters"
+    );
 }
 
 #[test]
@@ -2960,6 +3062,20 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             && placement_lua.contains("table.sort(placements")
             && !control_lua.contains("and nil or"),
         "placement.lua should own placement diagnostics, scans, and create_entity contracts"
+    );
+    assert_eq!(
+        placement_lua
+            .matches("build_check_type = defines.build_check_type.manual")
+            .count(),
+        1,
+        "manual build checks are only valid for character standing-space probes; scripted placement must not advertise implicit fast replacement"
+    );
+    assert!(
+        placement_lua
+            .matches("build_check_type = defines.build_check_type.script")
+            .count()
+            >= 8,
+        "all non-fast-replacing placement planners and executors must use script build semantics"
     );
     assert!(
         !placement_lua.contains("belt_alternate_candidates")
@@ -3946,6 +4062,7 @@ fn lua_plans_only_recommend_model_visible_tools() {
     let allowed = BTreeSet::from([
         "build_automation_science",
         "build_lab_feed",
+        "bootstrap_burner_once",
         "execute_edge_miner",
         "execute_entity_placement_near",
         "feed_lab_from_inventory",

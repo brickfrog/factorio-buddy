@@ -1909,6 +1909,35 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
+    /// Snapshot exact burner state before a compound controller transaction.
+    pub async fn snapshot_burner_state(&mut self, unit_number: u32) -> Result<serde_json::Value> {
+        let response = self
+            .call_remote("snapshot_burner_state", &[json!(unit_number)])
+            .await?;
+        ensure_lua_success(&response)?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Quiesce the new feeder and restore exact pre-transaction burner state.
+    pub async fn rollback_burner_bootstrap(
+        &mut self,
+        snapshot: &serde_json::Value,
+        feeder_unit_number: Option<u32>,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .call_remote(
+                "rollback_burner_bootstrap",
+                &[
+                    json!(self.agent_id.as_str()),
+                    snapshot.clone(),
+                    feeder_unit_number.map_or(serde_json::Value::Null, |unit| json!(unit)),
+                ],
+            )
+            .await?;
+        ensure_lua_success(&response)?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     /// Collect bounded construction or recovery stock from an existing chest.
     pub async fn collect_from_chest(
         &mut self,

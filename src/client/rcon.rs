@@ -17,6 +17,22 @@ const SERVERDATA_RESPONSE_VALUE: i32 = 0;
 /// Default timeout for RCON operations
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_COMMAND_RESPONSE_PACKETS: usize = 32;
+// Real Factorio remotes can return multi-megabyte JSON snapshots. Keep a
+// bounded packet allocation, but do not reject ordinary production-sized
+// world queries (the old 1 MB cap desynchronized the persistent connection).
+const MAX_RCON_PACKET_SIZE: usize = 16 * 1024 * 1024;
+const MIN_RCON_PACKET_SIZE: usize = 10;
+
+fn validated_packet_size(raw_size: i32) -> Result<usize> {
+    let size = usize::try_from(raw_size).context("RCON packet size was negative")?;
+    if size < MIN_RCON_PACKET_SIZE {
+        bail!("Packet too small: {size} bytes");
+    }
+    if size > MAX_RCON_PACKET_SIZE {
+        bail!("Packet too large: {size} bytes");
+    }
+    Ok(size)
+}
 
 /// An RCON packet
 #[derive(Debug, Clone)]
@@ -62,7 +78,10 @@ impl RconPacket {
     /// Decode packet from bytes (excluding size prefix)
     pub fn decode(data: &[u8]) -> Result<Self> {
         if data.len() < 10 {
-            bail!("Packet too small: {} bytes", data.len());
+            bail!("Packet too small: {} bytes ({data:02x?})", data.len());
+        }
+        if data[data.len() - 2..] != [0, 0] {
+            bail!("RCON packet is missing its two null terminators");
         }
 
         let request_id = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -153,40 +172,60 @@ impl RconClient {
     }
 
     async fn send(&mut self, packet: &RconPacket) -> Result<()> {
-        let stream = self.stream.as_mut().context("Not connected")?;
         let data = packet.encode();
-        timeout(DEFAULT_TIMEOUT, stream.write_all(&data))
-            .await
-            .context("Send timed out")?
-            .context("Failed to send")?;
-        Ok(())
+        let result = async {
+            let stream = self.stream.as_mut().context("Not connected")?;
+            timeout(DEFAULT_TIMEOUT, stream.write_all(&data))
+                .await
+                .context("Send timed out")?
+                .context("Failed to send")?;
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            // A failed write may have sent only a prefix of the command. Never
+            // return that byte stream to the persistent connection pool.
+            self.stream.take();
+        }
+        result
     }
 
     async fn receive(&mut self) -> Result<RconPacket> {
-        let stream = self.stream.as_mut().context("Not connected")?;
+        self.receive_with_timeout(DEFAULT_TIMEOUT).await
+    }
 
-        // Read size (4 bytes, little-endian)
-        let mut size_buf = [0u8; 4];
-        timeout(DEFAULT_TIMEOUT, stream.read_exact(&mut size_buf))
-            .await
-            .context("Receive timed out")?
-            .context("Failed to read size")?;
+    async fn receive_with_timeout(&mut self, read_timeout: Duration) -> Result<RconPacket> {
+        let result = async {
+            // Read size (4 bytes, little-endian)
+            let mut size_buf = [0u8; 4];
+            let stream = self.stream.as_mut().context("Not connected")?;
+            timeout(read_timeout, stream.read_exact(&mut size_buf))
+                .await
+                .context("Receive timed out")?
+                .context("Failed to read size")?;
 
-        let size = i32::from_le_bytes(size_buf) as usize;
-        // Factorio can return large responses (especially for entity queries)
-        // The Source RCON protocol max is 4096, but Factorio extends this
-        if size > 1_000_000 {
-            bail!("Packet too large: {} bytes", size);
+            let size = validated_packet_size(i32::from_le_bytes(size_buf))?;
+
+            // Read rest of packet
+            let mut data = vec![0u8; size];
+            timeout(read_timeout, stream.read_exact(&mut data))
+                .await
+                .context("Receive timed out")?
+                .context("Failed to read packet")?;
+
+            RconPacket::decode(&data)
         }
+        .await;
 
-        // Read rest of packet
-        let mut data = vec![0u8; size];
-        timeout(DEFAULT_TIMEOUT, stream.read_exact(&mut data))
-            .await
-            .context("Receive timed out")?
-            .context("Failed to read packet")?;
-
-        RconPacket::decode(&data)
+        if result.is_err() {
+            // read_exact may consume an arbitrary prefix before a timeout or
+            // EOF. A malformed complete frame is also a protocol violation.
+            // In every case, reconnect instead of parsing leftover bytes as a
+            // future packet boundary.
+            self.stream.take();
+        }
+        result
     }
 }
 
@@ -241,6 +280,22 @@ impl Drop for RconClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+
+    async fn test_connection() -> (RconClient, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+        (
+            RconClient {
+                stream: Some(client),
+                request_id: AtomicI32::new(0),
+            },
+            server,
+        )
+    }
 
     #[test]
     fn test_packet_encode_decode() {
@@ -271,6 +326,84 @@ mod tests {
         // Null terminators
         assert_eq!(encoded[14], 0);
         assert_eq!(encoded[15], 0);
+    }
+
+    #[test]
+    fn production_sized_packets_fit_the_bounded_rcon_frame() {
+        // Captured from the production get_tiles query that first exposed the
+        // old 1 MB cap and persistent-stream desynchronization.
+        assert_eq!(validated_packet_size(1_326_720).unwrap(), 1_326_720);
+        assert!(validated_packet_size(-1).is_err());
+        assert!(validated_packet_size(9).is_err());
+        assert!(validated_packet_size((MAX_RCON_PACKET_SIZE + 1) as i32).is_err());
+    }
+
+    #[tokio::test]
+    async fn receive_drops_stream_after_partial_size_prefix_eof() {
+        let (mut client, mut server) = test_connection().await;
+        server.write_all(&12_i32.to_le_bytes()[..2]).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        assert!(client.receive().await.is_err());
+        assert!(client.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_drops_stream_after_partial_packet_body_eof() {
+        let (mut client, mut server) = test_connection().await;
+        server.write_all(&12_i32.to_le_bytes()).await.unwrap();
+        server.write_all(&[0; 5]).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        assert!(client.receive().await.is_err());
+        assert!(client.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_drops_stream_after_invalid_size_prefix() {
+        let (mut client, mut server) = test_connection().await;
+        server.write_all(&9_i32.to_le_bytes()).await.unwrap();
+
+        assert!(client.receive().await.is_err());
+        assert!(client.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_drops_stream_after_malformed_complete_frame() {
+        let (mut client, mut server) = test_connection().await;
+        server.write_all(&10_i32.to_le_bytes()).await.unwrap();
+        server
+            .write_all(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 2])
+            .await
+            .unwrap();
+
+        assert!(client.receive().await.is_err());
+        assert!(client.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_drops_stream_after_partial_prefix_timeout() {
+        let (mut client, mut server) = test_connection().await;
+        server.write_all(&12_i32.to_le_bytes()[..2]).await.unwrap();
+
+        assert!(client
+            .receive_with_timeout(Duration::from_millis(20))
+            .await
+            .is_err());
+        assert!(client.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_drops_stream_after_partial_body_timeout() {
+        let (mut client, mut server) = test_connection().await;
+        server.write_all(&12_i32.to_le_bytes()).await.unwrap();
+        server.write_all(&[0; 5]).await.unwrap();
+
+        assert!(client
+            .receive_with_timeout(Duration::from_millis(20))
+            .await
+            .is_err());
+        assert!(client.stream.is_none());
     }
 
     #[test]

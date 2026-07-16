@@ -2426,6 +2426,14 @@ local api = {
         return json_remote_call("bootstrap_burner_once", inventory_actions.bootstrap_burner_once, agent_id, unit_number, fuel_item, count)
     end,
 
+    snapshot_burner_state = function(unit_number)
+        return json_remote_call("snapshot_burner_state", inventory_actions.snapshot_burner_state, unit_number)
+    end,
+
+    rollback_burner_bootstrap = function(agent_id, snapshot, feeder_unit_number)
+        return json_remote_call("rollback_burner_bootstrap", inventory_actions.rollback_burner_bootstrap, agent_id, snapshot, feeder_unit_number)
+    end,
+
     collect_from_chest = function(agent_id, unit_number, item, count)
         return json_remote_call("collect_from_chest", inventory_actions.collect_from_chest, agent_id, unit_number, item, count)
     end,

@@ -659,6 +659,13 @@ require_json "manual-buffer burner drill is not a durable downstream coal source
            and .source.upstream_proof.reason == "coal_drill_upstream_not_durable"
            and .source.upstream_proof.upstream_proof.reason == "burner_coal_drill_fuel_not_durable"
            and .source.upstream_proof.upstream_proof.fuel_proof.reason == "manual_burner_fuel_buffer")'
+require_json "fuel repair reuses an existing drill seed instead of demanding five more coal" "$BUFFERED_DRILL_REPORT" \
+    --argjson drill "$BUFFERED_DRILL_UNIT" \
+    '.report.consumers[]
+     | select(.unit_number == $drill)
+     | .remaining_burning_fuel > 0
+       and .ready_to_call.transaction_args.provisional_source_unit_number == $drill
+       and .ready_to_call.transaction_args.bootstrap_consumer_fuel_count == 0'
 
 # Shorten only the already-burning test buffer after observing real output, then
 # let the game advance into no_fuel. This keeps the regression fast without
@@ -730,6 +737,602 @@ require_json "exhausted manual burner drill remains non-durable downstream" "$EX
            and .durable == false
            and .source.upstream_proof.reason == "coal_drill_upstream_not_durable"
            and .source.upstream_proof.upstream_proof.reason == "burner_coal_drill_fuel_not_durable")'
+
+# A cold burner coal drill is the one safe provisional-source case: the same
+# drill may seed itself briefly while one transaction closes its output back
+# into its fuel inventory. Reuse the isolated negative-fixture area, but remove
+# every old entity/resource first so no stocked belt or second producer can
+# satisfy the proof accidentally.
+COLD_COAL_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local area = {{-64, 12}, {-46, 31}}
+for _, entity in pairs(s.find_entities_filtered{area = area}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({-60, 18}, s)
+local inv = c.get_main_inventory()
+inv.clear()
+local seeded_coal = inv.insert{name = 'coal', count = 12}
+local seeded_belts = inv.insert{name = 'transport-belt', count = 16}
+local seeded_inserters = inv.insert{name = 'burner-inserter', count = 1}
+for x = -58, -55 do
+    for y = 21, 24 do
+        s.create_entity{name = 'coal', position = {x + 0.5, y + 0.5}, amount = 100000}
+    end
+end
+local drill = s.create_entity{
+    name = 'burner-mining-drill',
+    position = {-56, 23},
+    direction = defines.direction.east,
+    force = c.force
+}
+if not drill then
+    rcon.print(helpers.table_to_json({error = 'cold burner coal drill creation failed'}))
+    return
+end
+drill.get_fuel_inventory().clear()
+local status = nil
+for name, value in pairs(defines.entity_status) do
+    if value == drill.status then status = name break end
+end
+rcon.print(helpers.table_to_json({
+    drill_unit = drill.unit_number,
+    drill_position = drill.position,
+    drill_drop_position = drill.drop_position,
+    mining_target = drill.mining_target and drill.mining_target.name or nil,
+    status = status,
+    drill_fuel = drill.get_fuel_inventory().get_item_count(),
+    seeded_coal = seeded_coal,
+    seeded_belts = seeded_belts,
+    seeded_inserters = seeded_inserters,
+    resource_tiles = s.count_entities_filtered{name = 'coal', area = area}
+}))
+")"
+require_json "cold burner coal fixture has exactly one empty provisional producer" "$COLD_COAL_FIXTURE" \
+    '.error == null
+     and (.drill_unit | type) == "number"
+     and .drill_position == {x:-56.0, y:23.0}
+     and .status == "no_fuel"
+     and .drill_fuel == 0
+     and .seeded_coal == 12
+     and .seeded_belts == 16
+     and .seeded_inserters == 1
+     and .resource_tiles == 16'
+COLD_COAL_DRILL_UNIT="$(jq -r '.drill_unit' <<<"$COLD_COAL_FIXTURE")"
+COLD_COAL_ARGS="$(jq -cn \
+    --argjson x -56 \
+    --argjson y 23 \
+    '{x:$x, y:$y, radius:8, limit:10, search_radius:8, dry_run:true,
+      respect_zones:false, allow_underground:false, extend_existing:true,
+      verify_radius:8}')"
+
+start_mcp
+
+COLD_COAL_DRY="$(mcp_tool repair_fuel_sustainability "$COLD_COAL_ARGS")"
+COLD_COAL_DRY_PAYLOAD="$(tool_payload "$COLD_COAL_DRY")"
+assert_json "cold coal repair dry-run succeeds through the model-visible seam" "$COLD_COAL_DRY" \
+    '(.result.isError // false) == false'
+require_json "cold coal dry-run selects only the exact provisional producer" "$COLD_COAL_DRY_PAYLOAD" \
+    --argjson unit "$COLD_COAL_DRILL_UNIT" \
+    '.success == true
+     and .dry_run == true
+     and .selected_transaction.consumer_unit_number == $unit
+     and .selected_transaction.provisional_source_unit_number == $unit
+     and .selected_transaction.bootstrap_consumer_fuel_count == 5
+     and .selected_transaction.inserter_fuel_count == 5
+     and .repair.success == true
+     and .repair.dry_run == true
+     and .repair.preflight.ready == true
+     and .repair.preflight.bootstrap_fuel == {
+         item:"coal",
+         available:12,
+         required:10,
+         inserter_required:5,
+         source_tap_required:0,
+         consumer_required:5,
+         ready:true
+     }
+     and any(.diagnosis.consumers[]?;
+         .unit_number == $unit
+         and .ready_to_call.transaction_args.consumer_unit_number == $unit
+         and .ready_to_call.transaction_args.provisional_source_unit_number == $unit
+         and .ready_to_call.transaction_args.bootstrap_consumer_fuel_count == 5)'
+COLD_COAL_DRY_BYTES="$(printf '%s' "$COLD_COAL_DRY_PAYLOAD" | wc -c)"
+if (( COLD_COAL_DRY_BYTES <= 65536 )); then
+    pass "cold coal repair dry-run stays below the 64 KiB model payload bound"
+else
+    fail "cold coal repair dry-run stays below the 64 KiB model payload bound" \
+        "observed $COLD_COAL_DRY_BYTES bytes"
+fi
+
+COLD_COAL_DRY_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local drill
+for _, entity in pairs(s.find_entities_filtered{area = {{-64, 12}, {-46, 31}}}) do
+    if entity.unit_number == $COLD_COAL_DRILL_UNIT then drill = entity break end
+end
+rcon.print(helpers.table_to_json({
+    same_drill = drill and drill.valid and drill.unit_number == $COLD_COAL_DRILL_UNIT or false,
+    drill_fuel = drill and drill.get_fuel_inventory().get_item_count() or -1,
+    belts = s.count_entities_filtered{type = 'transport-belt', area = {{-64, 12}, {-46, 31}}},
+    inserters = s.count_entities_filtered{type = 'inserter', area = {{-64, 12}, {-46, 31}}},
+    character_coal = c.get_main_inventory().get_item_count('coal'),
+    character_belts = c.get_main_inventory().get_item_count('transport-belt'),
+    character_inserters = c.get_main_inventory().get_item_count('burner-inserter')
+}))
+")"
+require_json "cold coal dry-run leaves the disposable world untouched" "$COLD_COAL_DRY_WORLD" \
+    '.same_drill == true
+     and .drill_fuel == 0
+     and .belts == 0
+     and .inserters == 0
+     and .character_coal == 12
+     and .character_belts == 16
+     and .character_inserters == 1'
+
+COLD_COAL_EXEC_ARGS="$(jq -c '.dry_run = false' <<<"$COLD_COAL_ARGS")"
+COLD_COAL_EXEC="$(mcp_tool repair_fuel_sustainability "$COLD_COAL_EXEC_ARGS")"
+COLD_COAL_EXEC_PAYLOAD="$(tool_payload "$COLD_COAL_EXEC")"
+assert_json "cold coal repair executes through one high-level controller call" "$COLD_COAL_EXEC" \
+    '(.result.isError // false) == false'
+require_json "cold coal repair bootstraps and verifies the exact closed loop" "$COLD_COAL_EXEC_PAYLOAD" \
+    --argjson unit "$COLD_COAL_DRILL_UNIT" \
+    '.success == true
+     and .dry_run == false
+     and .selected_transaction.consumer_unit_number == $unit
+     and .selected_transaction.provisional_source_unit_number == $unit
+     and .selected_transaction.bootstrap_consumer_fuel_count == 5
+     and .repair.success == true
+     and .repair.consumer.unit_number == $unit
+     and .repair.route.success == true
+     and .repair.inserter.success == true
+     and .repair.bootstrap_fuel.success == true
+     and .repair.bootstrap_fuel.count == 5
+     and .repair.bootstrap_consumer_fuel.success == true
+     and .repair.bootstrap_consumer_fuel.unit_number == $unit
+     and .repair.bootstrap_consumer_fuel.count == 5
+     and .repair.infrastructure_verified.success == true
+     and .repair.infrastructure_verified.durable_fuel_topology.consumer_unit_number == $unit
+     and .repair.infrastructure_verified.durable_fuel_topology.exact_connection_present == true
+     and .repair.infrastructure_verified.durable_fuel_topology.durable_connection_verified == true
+     and .repair.infrastructure_verified.durable_fuel_topology.live_supply_verified == true
+     and (.repair.infrastructure_verified.durable_fuel_topology.proof_reasons
+         | index("closed_self_sustaining_coal_cycle")) != null
+     and .repair.automation_verified.infrastructure_success == true
+     and .repair.automation_verified.fuel_supply_live == true'
+COLD_COAL_EXEC_BYTES="$(printf '%s' "$COLD_COAL_EXEC_PAYLOAD" | wc -c)"
+if (( COLD_COAL_EXEC_BYTES <= 65536 )); then
+    pass "cold coal repair execution stays below the 64 KiB model payload bound"
+else
+    fail "cold coal repair execution stays below the 64 KiB model payload bound" \
+        "observed $COLD_COAL_EXEC_BYTES bytes"
+fi
+COLD_COAL_INSERTER_UNIT="$(jq -r '.repair.inserter.unit_number' <<<"$COLD_COAL_EXEC_PAYLOAD")"
+
+COLD_COAL_WORLD='{}'
+for _ in $(seq 1 100); do
+    COLD_COAL_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local area = {{-64, 12}, {-46, 31}}
+local drill, feeder
+local belt_coal = 0
+for _, entity in pairs(s.find_entities_filtered{area = area}) do
+    if entity.unit_number == $COLD_COAL_DRILL_UNIT then drill = entity end
+    if entity.unit_number == $COLD_COAL_INSERTER_UNIT then feeder = entity end
+    if entity.type == 'transport-belt' then
+        for line_index = 1, 2 do
+            belt_coal = belt_coal + entity.get_transport_line(line_index).get_item_count('coal')
+        end
+    end
+end
+local resource_amount = 0
+for _, resource in pairs(s.find_entities_filtered{name = 'coal', area = area}) do
+    resource_amount = resource_amount + resource.amount
+end
+local report = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'diagnose_fuel_sustainability',
+    -64,
+    12,
+    -46,
+    31,
+    20,
+    '$AGENT_ID'
+))
+local consumer, exact_connection, feeder_consumer, feeder_self_connection
+for _, candidate in ipairs(report.consumers or {}) do
+    if candidate.unit_number == $COLD_COAL_DRILL_UNIT then
+        consumer = candidate
+        for _, connection in ipairs(candidate.proven_fuel_connections or {}) do
+            if connection.inserter_unit_number == $COLD_COAL_INSERTER_UNIT then
+                exact_connection = connection
+                break
+            end
+        end
+    end
+    if candidate.unit_number == $COLD_COAL_INSERTER_UNIT then
+        feeder_consumer = candidate
+        for _, connection in ipairs(candidate.proven_fuel_connections or {}) do
+            if connection.connection_kind == 'self_fueling_coal_pickup'
+                and connection.inserter_unit_number == $COLD_COAL_INSERTER_UNIT
+            then
+                feeder_self_connection = connection
+                break
+            end
+        end
+    end
+end
+local function contains_reason(value, wanted, seen)
+    if type(value) ~= 'table' then return false end
+    seen = seen or {}
+    if seen[value] then return false end
+    seen[value] = true
+    if value.reason == wanted then return true end
+    for _, child in pairs(value) do
+        if contains_reason(child, wanted, seen) then return true end
+    end
+    return false
+end
+local drill_status = nil
+if drill then
+    for name, value in pairs(defines.entity_status) do
+        if value == drill.status then drill_status = name break end
+    end
+end
+rcon.print(helpers.table_to_json({
+    same_drill = drill and drill.valid and drill.unit_number == $COLD_COAL_DRILL_UNIT or false,
+    same_feeder = feeder and feeder.valid and feeder.unit_number == $COLD_COAL_INSERTER_UNIT or false,
+    drill_status = drill_status,
+    drill_fuel = drill and drill.get_fuel_inventory().get_item_count('coal') or -1,
+    drill_remaining = drill and drill.burner and drill.burner.remaining_burning_fuel or 0,
+    feeder_fuel = feeder and feeder.get_fuel_inventory().get_item_count('coal') or -1,
+    feeder_remaining = feeder and feeder.burner and feeder.burner.remaining_burning_fuel or 0,
+    belts = s.count_entities_filtered{type = 'transport-belt', area = area},
+    belt_coal = belt_coal,
+    resource_tiles = s.count_entities_filtered{name = 'coal', area = area},
+    resource_amount = resource_amount,
+    character_coal = c.get_main_inventory().get_item_count('coal'),
+    character_inserters = c.get_main_inventory().get_item_count('burner-inserter'),
+    automated = consumer and consumer.automated == true or false,
+    exact_connection_durable = exact_connection and exact_connection.durable == true or false,
+    exact_connection_live = exact_connection and exact_connection.live == true or false,
+    closed_cycle = contains_reason(exact_connection, 'closed_self_sustaining_coal_cycle'),
+    feeder_automated = feeder_consumer and feeder_consumer.automated == true or false,
+    feeder_self_connection_present = feeder_self_connection ~= nil,
+    feeder_self_connection_durable = feeder_self_connection and feeder_self_connection.durable == true or false,
+    feeder_self_connection_live = feeder_self_connection and feeder_self_connection.live == true or false,
+    feeder_self_source_operational = feeder_self_connection and feeder_self_connection.source_operational == true or false
+}))
+")"
+    if jq -e '.same_drill == true
+        and .same_feeder == true
+        and .belts >= 3
+        and .belt_coal > 0
+        and .resource_amount < 1600000
+        and .automated == true
+        and .exact_connection_durable == true
+        and .exact_connection_live == true
+        and .closed_cycle == true
+        and .feeder_automated == true
+        and .feeder_self_connection_present == true
+        and .feeder_self_connection_durable == true
+        and .feeder_self_connection_live == true
+        and .feeder_self_source_operational == true' >/dev/null 2>&1 <<<"$COLD_COAL_WORLD"; then
+        break
+    fi
+    sleep 0.1
+done
+require_json "cold coal repair persists a live self-sustaining factory loop" "$COLD_COAL_WORLD" \
+    '.same_drill == true
+     and .same_feeder == true
+     and (.drill_status == "working" or .drill_status == "waiting_for_space_in_destination")
+     and (.drill_fuel > 0 or .drill_remaining > 0)
+     and (.feeder_fuel > 0 or .feeder_remaining > 0)
+     and .belts >= 3
+     and .belt_coal > 0
+     and .resource_tiles == 16
+     and .resource_amount < 1600000
+     and .character_coal == 2
+     and .character_inserters == 0
+     and .automated == true
+     and .exact_connection_durable == true
+     and .exact_connection_live == true
+     and .closed_cycle == true
+     and .feeder_automated == true
+     and .feeder_self_connection_present == true
+     and .feeder_self_connection_durable == true
+     and .feeder_self_connection_live == true
+     and .feeder_self_source_operational == true'
+
+# If Factorio stalls after startup fuel is transferred, the controller must
+# clear that transaction fuel before removing its new loop. This prevents a
+# failed retry from leaving the pre-existing drill manually powered.
+ROLLBACK_COAL_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local area = {{-64, 12}, {-46, 31}}
+for _, entity in pairs(s.find_entities_filtered{area = area}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({-58, 23}, s)
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'coal', count = 12}
+inv.insert{name = 'transport-belt', count = 16}
+inv.insert{name = 'burner-inserter', count = 1}
+for x = -58, -55 do
+    for y = 21, 24 do
+        s.create_entity{name = 'coal', position = {x + 0.5, y + 0.5}, amount = 100000}
+    end
+end
+local drill = s.create_entity{
+    name = 'burner-mining-drill',
+    position = {-56, 23},
+    direction = defines.direction.east,
+    force = c.force
+}
+drill.get_fuel_inventory().clear()
+drill.burner.currently_burning = nil
+drill.burner.heat = 0
+rcon.print(helpers.table_to_json({drill_unit = drill and drill.unit_number or nil}))
+")"
+require_json "failed-bootstrap fixture creates one exact empty burner drill" "$ROLLBACK_COAL_FIXTURE" \
+    '(.drill_unit | type) == "number"'
+ROLLBACK_COAL_DRILL_UNIT="$(jq -r '.drill_unit' <<<"$ROLLBACK_COAL_FIXTURE")"
+
+rollback_coal_state() {
+    raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local area = {{-64, 12}, {-46, 31}}
+local drill
+for _, entity in pairs(s.find_entities_filtered{area = area}) do
+    if entity.unit_number == $ROLLBACK_COAL_DRILL_UNIT then drill = entity break end
+end
+local burning = drill and drill.burner and drill.burner.currently_burning or nil
+local burning_name = burning and burning.name and burning.name.name or nil
+local resource_amount = 0
+for _, resource in pairs(s.find_entities_filtered{name = 'coal', area = area}) do
+    resource_amount = resource_amount + resource.amount
+end
+rcon.print(helpers.table_to_json({
+    tick = game.tick,
+    same_drill = drill and drill.valid and drill.unit_number == $ROLLBACK_COAL_DRILL_UNIT or false,
+    drill_fuel = drill and drill.get_fuel_inventory().get_item_count('coal') or -1,
+    drill_remaining = drill and drill.burner and drill.burner.remaining_burning_fuel or -1,
+    drill_heat = drill and drill.burner and drill.burner.heat or -1,
+    drill_burning = burning_name,
+    belts = s.count_entities_filtered{type = 'transport-belt', area = area},
+    inserters = s.count_entities_filtered{type = 'inserter', area = area},
+    character_coal = c.get_main_inventory().get_item_count('coal'),
+    character_belts = c.get_main_inventory().get_item_count('transport-belt'),
+    character_inserters = c.get_main_inventory().get_item_count('burner-inserter'),
+    resource_amount = resource_amount
+}))
+"
+}
+
+# Send the controller request without blocking on its response. The independent
+# raw-RCON seam can then observe a genuinely running loop and pause it while the
+# controller is inside its bounded 600-tick observation.
+ROLLBACK_COAL_REQUEST_ID="$MCP_NEXT_ID"
+MCP_NEXT_ID=$((MCP_NEXT_ID + 1))
+jq -cn \
+    --argjson id "$ROLLBACK_COAL_REQUEST_ID" \
+    --argjson arguments "$COLD_COAL_EXEC_ARGS" \
+    '{jsonrpc:"2.0", id:$id, method:"tools/call",
+      params:{name:"repair_fuel_sustainability", arguments:$arguments}}' \
+    >&"$MCP_IN_FD"
+
+ROLLBACK_COAL_RUNNING='{}'
+ROLLBACK_COAL_PAUSED=false
+for _ in $(seq 1 150); do
+    ROLLBACK_COAL_RUNNING="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local area = {{-64, 12}, {-46, 31}}
+local drill, feeder
+for _, entity in pairs(s.find_entities_filtered{area = area}) do
+    if entity.unit_number == $ROLLBACK_COAL_DRILL_UNIT then
+        drill = entity
+    elseif entity.type == 'inserter' then
+        feeder = entity
+    end
+end
+local resource_amount = 0
+for _, resource in pairs(s.find_entities_filtered{name = 'coal', area = area}) do
+    resource_amount = resource_amount + resource.amount
+end
+local burning = drill and drill.burner and drill.burner.currently_burning or nil
+local burning_name = burning and burning.name and burning.name.name or nil
+rcon.print(helpers.table_to_json({
+    same_drill = drill and drill.valid and drill.unit_number == $ROLLBACK_COAL_DRILL_UNIT or false,
+    same_feeder = feeder and feeder.valid or false,
+    drill_burning = burning_name,
+    drill_remaining = drill and drill.burner and drill.burner.remaining_burning_fuel or 0,
+    drill_fuel = drill and drill.get_fuel_inventory().get_item_count('coal') or -1,
+    feeder_fuel = feeder and feeder.get_fuel_inventory().get_item_count('coal') or -1,
+    belts = s.count_entities_filtered{type = 'transport-belt', area = area},
+    inserters = s.count_entities_filtered{type = 'inserter', area = area},
+    resource_amount = resource_amount
+}))
+")"
+    if jq -e '
+        .same_drill == true
+        and .same_feeder == true
+        and .belts >= 3
+        and .inserters == 1
+        and .resource_amount < 1600000
+        and (.drill_burning == "coal" or .drill_remaining > 0)
+        and .drill_fuel >= 5
+        and .feeder_fuel > 0
+    ' >/dev/null 2>&1 <<<"$ROLLBACK_COAL_RUNNING"; then
+        raw_lua "game.tick_paused = true" >/dev/null
+        ROLLBACK_COAL_PAUSED=true
+        break
+    fi
+    sleep 0.05
+done
+
+if [[ "$ROLLBACK_COAL_PAUSED" != true ]]; then
+    ROLLBACK_COAL_EXEC="$(mcp_read_id "$ROLLBACK_COAL_REQUEST_ID" || true)"
+    fail "cold-coal rollback fixture reaches a live returned-fuel loop" \
+        "$ROLLBACK_COAL_RUNNING"
+    exit 1
+fi
+pass "cold-coal rollback fixture reaches a live returned-fuel loop"
+
+ROLLBACK_COAL_CALL_STATUS=0
+ROLLBACK_COAL_EXEC="$(mcp_read_id "$ROLLBACK_COAL_REQUEST_ID")" || ROLLBACK_COAL_CALL_STATUS=$?
+raw_lua "game.tick_paused = false" >/dev/null
+if (( ROLLBACK_COAL_CALL_STATUS != 0 )); then
+    fail "interrupted cold-coal controller returns an MCP response" \
+        "mcp_read_id exited $ROLLBACK_COAL_CALL_STATUS"
+    exit 1
+fi
+pass "interrupted cold-coal controller returns an MCP response"
+
+ROLLBACK_COAL_PAYLOAD="$(tool_payload "$ROLLBACK_COAL_EXEC")"
+assert_json "stalled cold-coal repair is a semantic controller failure" "$ROLLBACK_COAL_EXEC" \
+    '(.result.isError // false) == true'
+require_json "failed cold-coal transaction clears bootstrap fuel before rollback" "$ROLLBACK_COAL_PAYLOAD" \
+    --argjson unit "$ROLLBACK_COAL_DRILL_UNIT" \
+    '.success == false
+     and .selected_transaction.consumer_unit_number == $unit
+     and .repair.error_kind == "self_bootstrap_observation_failed"
+     and .repair.rollback.success == true
+     and .repair.rollback.transaction_fuel_cleared == true
+     and .repair.rollback.consumer_state.success == true
+     and .repair.rollback.consumer_state.identity_valid == true
+     and .repair.rollback.consumer_state.feeder_quiesced == true
+     and .repair.rollback.consumer_state.consumer_state_restored == true
+     and .repair.rollback.consumer_state.transaction_fuel_cleared == true
+     and .repair.rollback.consumer_state.before.cold == false
+     and .repair.rollback.consumer_state.expected.cold == true
+     and .repair.rollback.consumer_state.expected.fuel_total == 0
+     and .repair.rollback.consumer_state.expected.currently_burning == null
+     and .repair.rollback.consumer_state.expected.remaining_burning_fuel == 0
+     and .repair.rollback.consumer_state.expected.heat == 0
+     and .repair.rollback.consumer_state.after.cold == true
+     and .repair.rollback.consumer_state.after.fuel_total == 0
+     and .repair.rollback.consumer_state.after.currently_burning == null
+     and .repair.rollback.consumer_state.after.remaining_burning_fuel == 0
+     and .repair.rollback.consumer_state.after.heat == 0
+     and .repair.rollback.infrastructure.success == true'
+
+ROLLBACK_COAL_WORLD="$(rollback_coal_state)"
+require_json "failed cold-coal transaction leaves no powered drill or pointless infrastructure" "$ROLLBACK_COAL_WORLD" \
+    '.same_drill == true
+     and .drill_fuel == 0
+     and .drill_remaining == 0
+     and .drill_heat == 0
+     and .drill_burning == null
+     and .belts == 0
+     and .inserters == 0
+     and .character_belts == 16
+     and .character_inserters == 1
+     and .resource_amount < 1600000'
+
+ROLLBACK_COAL_TARGET_TICK="$(jq -r '.tick + 120' <<<"$ROLLBACK_COAL_WORLD")"
+ROLLBACK_COAL_RESOURCE_AFTER="$(jq -r '.resource_amount' <<<"$ROLLBACK_COAL_WORLD")"
+ROLLBACK_COAL_DELAYED_WORLD='{}'
+for _ in $(seq 1 100); do
+    ROLLBACK_COAL_DELAYED_WORLD="$(rollback_coal_state)"
+    if jq -e --argjson target "$ROLLBACK_COAL_TARGET_TICK" \
+        '.tick >= $target' >/dev/null 2>&1 <<<"$ROLLBACK_COAL_DELAYED_WORLD"; then
+        break
+    fi
+    sleep 0.05
+done
+require_json "failed cold-coal rollback remains cold after 120 running ticks" \
+    "$ROLLBACK_COAL_DELAYED_WORLD" \
+    --argjson target "$ROLLBACK_COAL_TARGET_TICK" \
+    --argjson resource_after "$ROLLBACK_COAL_RESOURCE_AFTER" \
+    '.tick >= $target
+     and .same_drill == true
+     and .drill_fuel == 0
+     and .drill_remaining == 0
+     and .drill_heat == 0
+     and .drill_burning == null
+     and .belts == 0
+     and .inserters == 0
+     and .resource_amount == $resource_after'
+
+# A rollback must conserve queued transaction fuel even when the character has
+# no inventory capacity. The exact burner snapshot is restored and the excess
+# is spilled at that consumer rather than silently deleted.
+FULL_INVENTORY_ROLLBACK="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local drill
+for _, entity in pairs(s.find_entities_filtered{area = {{-64, 12}, {-46, 31}}}) do
+    if entity.unit_number == $ROLLBACK_COAL_DRILL_UNIT then drill = entity break end
+end
+local snapshot = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'snapshot_burner_state',
+    $ROLLBACK_COAL_DRILL_UNIT
+))
+local inv = c.get_main_inventory()
+inv.clear()
+for i = 1, #inv do
+    inv[i].set_stack{name = 'iron-plate', count = 100}
+end
+drill.get_fuel_inventory().insert{name = 'coal', count = 5}
+drill.burner.currently_burning = {name = 'coal', quality = 'normal'}
+drill.burner.remaining_burning_fuel = 1000
+local report = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'rollback_burner_bootstrap',
+    '$AGENT_ID',
+    snapshot,
+    nil
+))
+local ground_coal = 0
+for _, entity in pairs(s.find_entities_filtered{
+    type = 'item-entity',
+    area = {{drill.position.x - 4, drill.position.y - 4},
+            {drill.position.x + 4, drill.position.y + 4}}
+}) do
+    if entity.stack and entity.stack.valid_for_read and entity.stack.name == 'coal' then
+        ground_coal = ground_coal + entity.stack.count
+    end
+end
+local burning = drill.burner.currently_burning
+rcon.print(helpers.table_to_json({
+    report = report,
+    drill_fuel = drill.get_fuel_inventory().get_item_count('coal'),
+    drill_remaining = drill.burner.remaining_burning_fuel,
+    drill_heat = drill.burner.heat,
+    drill_burning = burning and burning.name and burning.name.name or nil,
+    ground_coal = ground_coal,
+    character_full = inv.is_full()
+}))
+")"
+require_json "full-inventory burner rollback spills rather than deletes excess fuel" \
+    "$FULL_INVENTORY_ROLLBACK" \
+    '.report.success == true
+     and .report.consumer_state_restored == true
+     and .report.transaction_fuel_cleared == true
+     and .report.returned_excess == 0
+     and .report.spilled_excess == 5
+     and .report.unrecovered_excess == 0
+     and .drill_fuel == 0
+     and .drill_remaining == 0
+     and .drill_heat == 0
+     and .drill_burning == null
+     and .ground_coal == 5
+     and .character_full == true'
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+c.get_main_inventory().clear()
+for _, entity in pairs(s.find_entities_filtered{type = 'item-entity', area = {{-64, 12}, {-46, 31}}}) do
+    entity.destroy()
+end
+" >/dev/null
 
 # The fail-closed producer proof must still recognize genuine automated coal
 # production. Exercise a powered electric drill and its real output belt so the
@@ -845,6 +1448,602 @@ require_json "powered electric coal production is certified durable and live" "$
          and .operational == true
          and .upstream_proof.reason == "direct_durable_coal_drill")'
 
+# An operational through-belt is a source to tap, never an endpoint to rotate.
+# Build one mixed-item coal trunk, fail one complete fuel transaction on an idle
+# furnace to prove exact rollback, then reuse the same preserved trunk for a
+# successful filtered branch.
+SOURCE_TAP_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+c.teleport({-30, -26}, s)
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'transport-belt', count = 64}
+inv.insert{name = 'burner-inserter', count = 2}
+inv.insert{name = 'coal', count = 10}
+local belts = {}
+for index, y in ipairs({-25.5, -26.5, -27.5, -28.5}) do
+    belts[index] = s.create_entity{
+        name = 'transport-belt',
+        position = {-22.5, y},
+        direction = defines.direction.north,
+        force = c.force
+    }
+end
+local sink = s.create_entity{
+    name = 'inserter',
+    position = {-22.5, -29.5},
+    direction = defines.direction.south,
+    force = c.force
+}
+local chest = s.create_entity{name = 'iron-chest', position = {-22.5, -30.5}, force = c.force}
+local furnace = s.create_entity{name = 'stone-furnace', position = {-30, -26}, force = c.force}
+local north_position = {
+    x = furnace.position.x,
+    y = furnace.bounding_box.left_top.y - 0.5
+}
+local east_position = {
+    x = furnace.bounding_box.right_bottom.x + 0.5,
+    y = furnace.position.y
+}
+local wall = s.create_entity{name = 'stone-wall', position = north_position, force = c.force}
+local source = belts[1]
+for _, belt in ipairs(belts) do
+    for _ = 1, 3 do belt.get_transport_line(1).insert_at_back({name = 'coal', count = 1}) end
+    belt.get_transport_line(2).insert_at_back({name = 'copper-plate', count = 1})
+end
+furnace.get_fuel_inventory().clear()
+furnace.get_inventory(defines.inventory.furnace_source).clear()
+furnace.burner.currently_burning = nil
+furnace.burner.remaining_burning_fuel = 0
+furnace.burner.heat = 0
+local neighbours = source.belt_neighbours
+rcon.print(helpers.table_to_json({
+    source_unit = source and source.unit_number or nil,
+    source_direction = source and source.direction or nil,
+    source_inputs = source and #(neighbours.inputs or {}) or 0,
+    source_outputs = source and #(neighbours.outputs or {}) or 0,
+    consumer_unit = furnace and furnace.unit_number or nil,
+    sink_unit = sink and sink.unit_number or nil,
+    chest_unit = chest and chest.unit_number or nil,
+    wall_unit = wall and wall.unit_number or nil,
+    north_blocked = not s.can_place_entity{
+        name = 'burner-inserter', position = north_position, direction = defines.direction.north,
+        force = c.force, build_check_type = defines.build_check_type.manual
+    },
+    east_placeable = s.can_place_entity{
+        name = 'burner-inserter', position = east_position, direction = defines.direction.east,
+        force = c.force, build_check_type = defines.build_check_type.manual
+    },
+    baseline_belts = s.count_entities_filtered{type = 'transport-belt', area = {{-33, -33}, {-19, -20}}},
+    baseline_inserters = s.count_entities_filtered{type = 'inserter', area = {{-33, -33}, {-19, -20}}},
+    source_tile = {x = math.floor(source.position.x), y = math.floor(source.position.y)},
+    source_coal = source.get_transport_line(1).get_item_count('coal')
+        + source.get_transport_line(2).get_item_count('coal'),
+    source_copper = source.get_transport_line(1).get_item_count('copper-plate')
+        + source.get_transport_line(2).get_item_count('copper-plate')
+}))
+")"
+require_json "source-tap fixture is a live mixed through-belt and one cold consumer" \
+    "$SOURCE_TAP_FIXTURE" \
+    '.source_unit > 0
+     and .consumer_unit > 0
+     and .sink_unit > 0
+     and .chest_unit > 0
+     and .wall_unit > 0
+     and .source_direction == 0
+     and .source_inputs > 0
+     and .source_outputs > 0
+     and .north_blocked == true
+     and .east_placeable == true
+     and .source_tile == {x:-23,y:-26}
+     and .source_coal > 0
+     and .source_copper > 0'
+SOURCE_TAP_SOURCE_UNIT="$(jq -r '.source_unit' <<<"$SOURCE_TAP_FIXTURE")"
+SOURCE_TAP_SOURCE_DIRECTION="$(jq -r '.source_direction' <<<"$SOURCE_TAP_FIXTURE")"
+SOURCE_TAP_CONSUMER_UNIT="$(jq -r '.consumer_unit' <<<"$SOURCE_TAP_FIXTURE")"
+SOURCE_TAP_CHEST_UNIT="$(jq -r '.chest_unit' <<<"$SOURCE_TAP_FIXTURE")"
+SOURCE_TAP_BASELINE_BELTS="$(jq -r '.baseline_belts' <<<"$SOURCE_TAP_FIXTURE")"
+SOURCE_TAP_BASELINE_INSERTERS="$(jq -r '.baseline_inserters' <<<"$SOURCE_TAP_FIXTURE")"
+
+restock_source_tap_fixture() {
+    raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'transport-belt', count = 64}
+inv.insert{name = 'burner-inserter', count = 2}
+inv.insert{name = 'coal', count = 10}
+local source
+for _, entity in pairs(s.find_entities_filtered{type = 'transport-belt', area = {{-24, -27}, {-22, -25}}}) do
+    if entity.unit_number == $SOURCE_TAP_SOURCE_UNIT then source = entity break end
+end
+if source then
+    for _ = 1, 4 do source.get_transport_line(1).insert_at_back({name = 'coal', count = 1}) end
+    for _ = 1, 2 do source.get_transport_line(2).insert_at_back({name = 'copper-plate', count = 1}) end
+end
+rcon.print(helpers.table_to_json({
+    source_present = source ~= nil,
+    character_belts = inv.get_item_count('transport-belt'),
+    character_inserters = inv.get_item_count('burner-inserter'),
+    character_coal = inv.get_item_count('coal')
+}))
+"
+}
+
+SOURCE_TAP_ARGS="$(jq -cn \
+    --argjson x -30 \
+    --argjson y -26 \
+    '{x:$x,y:$y,radius:18,limit:10,search_radius:12,dry_run:true,
+      respect_zones:false,allow_underground:false,extend_existing:true,
+      verify_radius:18}')"
+restock_source_tap_fixture >/dev/null
+SOURCE_TAP_DRY="$(mcp_tool repair_fuel_sustainability "$SOURCE_TAP_ARGS")"
+SOURCE_TAP_DRY_PAYLOAD="$(tool_payload "$SOURCE_TAP_DRY")"
+assert_json "through-belt source-tap dry-run is a normal successful tool result" \
+    "$SOURCE_TAP_DRY" '.result.isError != true'
+require_json "through-belt source-tap plan preserves the source and creates an independent branch" \
+    "$SOURCE_TAP_DRY_PAYLOAD" \
+    --argjson source "$SOURCE_TAP_SOURCE_UNIT" \
+    --argjson consumer "$SOURCE_TAP_CONSUMER_UNIT" \
+    '.success == true
+     and .selected_transaction.consumer_unit_number == $consumer
+     and .selected_transaction.source_unit_number == $source
+     and .repair.success == true
+     and .repair.dry_run == true
+     and .repair.source_tap.source_unit_number == $source
+     and .repair.source_tap.source_direction_preserved == true
+     and .repair.source_tap.layout.source_tile == {x:-23,y:-26}
+     and .repair.source_tap.layout.pickup_tile == {x:-23,y:-26}
+     and .repair.source_tap.layout.inserter_tile == {x:-24,y:-26}
+     and .repair.source_tap.layout.drop_tile == {x:-25,y:-26}
+     and .repair.source_tap.layout.outward == "west"
+     and .repair.source_tap.layout.inserter_direction == "east"
+     and .repair.source_tap.route_start_matches_drop == true
+     and .repair.source_tap.branch_extend_existing == false
+     and .repair.route.from == {x:-25,y:-26}
+     and .repair.route.topology.connected == true
+     and .repair.preflight.ready == true
+     and .repair.preflight.routes.materials["transport-belt"].needed == 9
+     and .repair.preflight.routes.materials["transport-belt"].needed == .repair.route.new_belt_count
+     and .repair.preflight.routes.materials["burner-inserter"].needed == 2
+     and .repair.preflight.bootstrap_fuel.required == 10
+     and .repair.preflight.bootstrap_fuel.inserter_required == 5
+     and .repair.preflight.bootstrap_fuel.source_tap_required == 5
+     and .repair.preflight.bootstrap_fuel.consumer_required == 0
+     and (.repair.route.next_action.tool // null) != "rotate_entity"'
+
+SOURCE_TAP_DRY_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = game.surfaces['buddy-live-regression']
+local source, furnace
+for _, entity in pairs(s.find_entities_filtered{area = {{-33, -33}, {-19, -20}}}) do
+    if entity.unit_number == $SOURCE_TAP_SOURCE_UNIT then source = entity end
+    if entity.unit_number == $SOURCE_TAP_CONSUMER_UNIT then furnace = entity end
+end
+rcon.print(helpers.table_to_json({
+    same_source = source and source.valid and source.unit_number == $SOURCE_TAP_SOURCE_UNIT or false,
+    source_direction = source and source.direction or nil,
+    belts = s.count_entities_filtered{type = 'transport-belt', area = {{-33, -33}, {-19, -20}}},
+    inserters = s.count_entities_filtered{type = 'inserter', area = {{-33, -33}, {-19, -20}}},
+    burner_inserters = s.count_entities_filtered{name = 'burner-inserter', area = {{-33, -33}, {-19, -20}}},
+    consumer_fuel = furnace and furnace.get_fuel_inventory().get_item_count() or -1,
+    character_belts = c.get_main_inventory().get_item_count('transport-belt'),
+    character_inserters = c.get_main_inventory().get_item_count('burner-inserter'),
+    character_coal = c.get_main_inventory().get_item_count('coal')
+}))
+")"
+require_json "source-tap dry-run mutates no world or inventory state" "$SOURCE_TAP_DRY_WORLD" \
+    --argjson direction "$SOURCE_TAP_SOURCE_DIRECTION" \
+    --argjson belts "$SOURCE_TAP_BASELINE_BELTS" \
+    --argjson inserters "$SOURCE_TAP_BASELINE_INSERTERS" \
+    '.same_source == true
+     and .source_direction == $direction
+     and .belts == $belts
+     and .inserters == $inserters
+     and .burner_inserters == 0
+     and .consumer_fuel == 0
+     and .character_belts == 64
+     and .character_inserters == 2
+     and .character_coal == 10'
+
+SOURCE_TAP_FAIL_ARGS="$(jq -c '.dry_run = false' <<<"$SOURCE_TAP_ARGS")"
+restock_source_tap_fixture >/dev/null
+SOURCE_TAP_FAIL="$(mcp_tool repair_fuel_sustainability "$SOURCE_TAP_FAIL_ARGS")"
+SOURCE_TAP_FAIL_PAYLOAD="$(tool_payload "$SOURCE_TAP_FAIL")"
+require_json "idle source-tap target fails honestly and rolls back the complete new branch" \
+    "$SOURCE_TAP_FAIL_PAYLOAD" \
+    --argjson source "$SOURCE_TAP_SOURCE_UNIT" \
+    --argjson consumer "$SOURCE_TAP_CONSUMER_UNIT" \
+    '.success == false
+     and .selected_transaction.consumer_unit_number == $consumer
+     and .selected_transaction.source_unit_number == $source
+     and .repair.error_kind == "target_production_not_verified"
+     and .repair.automation_verified.production_success == false
+     and .repair.source_tap.source_unit_number == $source
+     and .repair.rollback.success == true
+     and .repair.rollback.consumer_state.success == true
+     and .repair.rollback.consumer_state.identity_valid == true
+     and .repair.rollback.consumer_state.consumer_state_restored == true
+     and .repair.rollback.consumer_state.expected.cold == true
+     and .repair.rollback.consumer_state.after.cold == true
+     and .repair.rollback.consumer_state.after.fuel_total == 0
+     and .repair.rollback.infrastructure.success == true'
+
+SOURCE_TAP_ROLLBACK_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local source, furnace, chest
+for _, entity in pairs(s.find_entities_filtered{area = {{-33, -33}, {-19, -20}}}) do
+    if entity.unit_number == $SOURCE_TAP_SOURCE_UNIT then source = entity end
+    if entity.unit_number == $SOURCE_TAP_CONSUMER_UNIT then furnace = entity end
+    if entity.unit_number == $SOURCE_TAP_CHEST_UNIT then chest = entity end
+end
+local burning = furnace and furnace.burner.currently_burning or nil
+local neighbours = source and source.belt_neighbours or nil
+rcon.print(helpers.table_to_json({
+    same_source = source and source.valid and source.unit_number == $SOURCE_TAP_SOURCE_UNIT or false,
+    source_direction = source and source.direction or nil,
+    source_inputs = neighbours and #(neighbours.inputs or {}) or 0,
+    source_outputs = neighbours and #(neighbours.outputs or {}) or 0,
+    belts = s.count_entities_filtered{type = 'transport-belt', area = {{-33, -33}, {-19, -20}}},
+    inserters = s.count_entities_filtered{type = 'inserter', area = {{-33, -33}, {-19, -20}}},
+    burner_inserters = s.count_entities_filtered{name = 'burner-inserter', area = {{-33, -33}, {-19, -20}}},
+    branch_belts = s.count_entities_filtered{type = 'transport-belt', area = {{-29, -27}, {-24, -25}}},
+    consumer_fuel = furnace and furnace.get_fuel_inventory().get_item_count() or -1,
+    consumer_remaining = furnace and furnace.burner.remaining_burning_fuel or -1,
+    consumer_heat = furnace and furnace.burner.heat or -1,
+    consumer_burning = burning and burning.name and burning.name.name or nil,
+    downstream_chest_coal = chest and chest.get_item_count('coal') or 0
+}))
+")"
+require_json "source-tap rollback preserves the exact live trunk and restores the cold consumer" \
+    "$SOURCE_TAP_ROLLBACK_WORLD" \
+    --argjson direction "$SOURCE_TAP_SOURCE_DIRECTION" \
+    --argjson belts "$SOURCE_TAP_BASELINE_BELTS" \
+    --argjson inserters "$SOURCE_TAP_BASELINE_INSERTERS" \
+    '.same_source == true
+     and .source_direction == $direction
+     and .source_inputs > 0
+     and .source_outputs > 0
+     and .belts == $belts
+     and .inserters == $inserters
+     and .burner_inserters == 0
+     and .branch_belts == 0
+     and .consumer_fuel == 0
+     and .consumer_remaining == 0
+     and .consumer_heat == 0
+     and .consumer_burning == null
+     and .downstream_chest_coal > 0'
+sleep 3
+SOURCE_TAP_ROLLBACK_LATE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local furnace
+for _, entity in pairs(s.find_entities_filtered{type = 'furnace', area = {{-33, -33}, {-19, -20}}}) do
+    if entity.unit_number == $SOURCE_TAP_CONSUMER_UNIT then furnace = entity break end
+end
+local burning = furnace and furnace.burner.currently_burning or nil
+rcon.print(helpers.table_to_json({
+    consumer_fuel = furnace and furnace.get_fuel_inventory().get_item_count() or -1,
+    consumer_remaining = furnace and furnace.burner.remaining_burning_fuel or -1,
+    consumer_heat = furnace and furnace.burner.heat or -1,
+    consumer_burning = burning and burning.name and burning.name.name or nil,
+    burner_inserters = s.count_entities_filtered{name = 'burner-inserter', area = {{-33, -33}, {-19, -20}}},
+    branch_belts = s.count_entities_filtered{type = 'transport-belt', area = {{-29, -27}, {-24, -25}}}
+}))
+")"
+require_json "rolled-back source tap cannot race another delivery after teardown" \
+    "$SOURCE_TAP_ROLLBACK_LATE" \
+    '.consumer_fuel == 0
+     and .consumer_remaining == 0
+     and .consumer_heat == 0
+     and .consumer_burning == null
+     and .burner_inserters == 0
+     and .branch_belts == 0'
+
+restock_source_tap_fixture >/dev/null
+SOURCE_TAP_SUCCESS_PREP="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local furnace
+for _, entity in pairs(s.find_entities_filtered{type = 'furnace', area = {{-33, -33}, {-19, -20}}}) do
+    if entity.unit_number == $SOURCE_TAP_CONSUMER_UNIT then furnace = entity break end
+end
+local inserted = furnace and furnace.get_inventory(defines.inventory.furnace_source).insert{
+    name = 'iron-ore', count = 20
+} or 0
+rcon.print(helpers.table_to_json({inserted = inserted}))
+")"
+require_json "source-tap success retry has real furnace input" "$SOURCE_TAP_SUCCESS_PREP" \
+    '.inserted == 20'
+SOURCE_TAP_SUCCESS="$(mcp_tool repair_fuel_sustainability "$SOURCE_TAP_FAIL_ARGS")"
+SOURCE_TAP_SUCCESS_PAYLOAD="$(tool_payload "$SOURCE_TAP_SUCCESS")"
+assert_json "source-tap success is a normal successful tool result" "$SOURCE_TAP_SUCCESS" \
+    '.result.isError != true'
+require_json "source-tap retry proves preserved source, filtered self-fueling tap, and target production" \
+    "$SOURCE_TAP_SUCCESS_PAYLOAD" \
+    --argjson source "$SOURCE_TAP_SOURCE_UNIT" \
+    --argjson consumer "$SOURCE_TAP_CONSUMER_UNIT" \
+    '.success == true
+     and .selected_transaction.consumer_unit_number == $consumer
+     and .selected_transaction.source_unit_number == $source
+     and .repair.success == true
+     and .repair.route.success == true
+     and .repair.route.complete_route == true
+     and .repair.source_tap.success == true
+     and .repair.source_tap.source_unit_number == $source
+     and .repair.source_tap.source_direction_preserved == true
+     and .repair.source_tap.route_start_matches_drop == true
+     and .repair.source_tap.branch_extend_existing == false
+     and .repair.source_tap.filter_readback_verified == true
+     and .repair.source_tap.allowed_items == ["coal"]
+     and .repair.source_tap.self_fueling_live == true
+     and .repair.source_tap.source_preservation.unit_matches == true
+     and .repair.source_tap.source_preservation.tile_matches == true
+     and .repair.source_tap.source_preservation.direction_matches == true
+     and .repair.bootstrap_source_tap_fuel.success == true
+     and .repair.inserter.filter.readback_verified == true
+     and [.repair.inserter.filter.filters[].name] == ["coal"]
+     and .repair.infrastructure_verified.success == true
+     and .repair.infrastructure_verified.durable_fuel_topology.exact_connection_present == true
+     and .repair.infrastructure_verified.durable_fuel_topology.durable_connection_verified == true
+     and .repair.infrastructure_verified.durable_fuel_topology.live_supply_verified == true
+     and .repair.production_verified.target_unit_number == $consumer
+     and .repair.production_verified.target_working_or_progressed == true
+     and .repair.automation_verified.success == true
+     and .repair.automation_verified.infrastructure_success == true
+     and .repair.automation_verified.production_success == true
+     and .repair.automation_verified.fuel_supply_live == true
+     and .repair.automation_verified.source_tap_success == true'
+SOURCE_TAP_UNIT="$(jq -r '.repair.source_tap.unit_number' <<<"$SOURCE_TAP_SUCCESS_PAYLOAD")"
+SOURCE_TAP_TERMINAL_UNIT="$(jq -r '.repair.inserter.unit_number' <<<"$SOURCE_TAP_SUCCESS_PAYLOAD")"
+
+SOURCE_TAP_SUCCESS_WORLD='{}'
+for _ in $(seq 1 100); do
+    SOURCE_TAP_SUCCESS_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local source, tap, terminal, furnace, chest
+for _, entity in pairs(s.find_entities_filtered{area = {{-33, -33}, {-19, -20}}}) do
+    if entity.unit_number == $SOURCE_TAP_SOURCE_UNIT then source = entity end
+    if entity.unit_number == $SOURCE_TAP_UNIT then tap = entity end
+    if entity.unit_number == $SOURCE_TAP_TERMINAL_UNIT then terminal = entity end
+    if entity.unit_number == $SOURCE_TAP_CONSUMER_UNIT then furnace = entity end
+    if entity.unit_number == $SOURCE_TAP_CHEST_UNIT then chest = entity end
+end
+local branch_coal, branch_copper = 0, 0
+for _, belt in pairs(s.find_entities_filtered{type = 'transport-belt', area = {{-29, -27}, {-24, -25}}}) do
+    for line_index = 1, 2 do
+        local line = belt.get_transport_line(line_index)
+        branch_coal = branch_coal + line.get_item_count('coal')
+        branch_copper = branch_copper + line.get_item_count('copper-plate')
+    end
+end
+local report = helpers.json_to_table(remote.call(
+    'claude_interface', 'diagnose_fuel_sustainability', -33, -33, -19, -20, 100, '$AGENT_ID'
+))
+local tap_connection, terminal_connection
+for _, candidate in ipairs(report.consumers or {}) do
+    if candidate.unit_number == $SOURCE_TAP_UNIT then
+        for _, connection in ipairs(candidate.proven_fuel_connections or {}) do
+            if connection.connection_kind == 'self_fueling_coal_pickup'
+                and connection.inserter_unit_number == $SOURCE_TAP_UNIT
+                and connection.source and connection.source.unit_number == $SOURCE_TAP_SOURCE_UNIT
+            then tap_connection = connection break end
+        end
+    end
+    if candidate.unit_number == $SOURCE_TAP_CONSUMER_UNIT then
+        for _, connection in ipairs(candidate.proven_fuel_connections or {}) do
+            if connection.inserter_unit_number == $SOURCE_TAP_TERMINAL_UNIT then
+                terminal_connection = connection break
+            end
+        end
+    end
+end
+local result_inv = furnace and furnace.get_inventory(defines.inventory.furnace_result) or nil
+local source_neighbours = source and source.belt_neighbours or nil
+local tap_filter = tap and tap.get_filter(1) or nil
+local terminal_filter = terminal and terminal.get_filter(1) or nil
+rcon.print(helpers.table_to_json({
+    same_source = source and source.valid and source.unit_number == $SOURCE_TAP_SOURCE_UNIT or false,
+    source_direction = source and source.direction or nil,
+    source_inputs = source_neighbours and #(source_neighbours.inputs or {}) or 0,
+    source_outputs = source_neighbours and #(source_neighbours.outputs or {}) or 0,
+    tap_pickup_tile = tap and {x = math.floor(tap.pickup_position.x), y = math.floor(tap.pickup_position.y)} or nil,
+    tap_drop_tile = tap and {x = math.floor(tap.drop_position.x), y = math.floor(tap.drop_position.y)} or nil,
+    tap_filter = tap_filter and tap_filter.name or nil,
+    terminal_filter = terminal_filter and terminal_filter.name or nil,
+    branch_coal = branch_coal,
+    branch_copper = branch_copper,
+    iron_plates = result_inv and result_inv.get_item_count('iron-plate') or 0,
+    downstream_chest_coal = chest and chest.get_item_count('coal') or 0,
+    tap_connection_durable = tap_connection and tap_connection.durable == true or false,
+    tap_connection_live = tap_connection and tap_connection.live == true or false,
+    terminal_connection_durable = terminal_connection and terminal_connection.durable == true or false,
+    terminal_connection_live = terminal_connection and terminal_connection.live == true or false
+}))
+")"
+    if jq -e '.same_source == true
+        and .source_inputs > 0
+        and .source_outputs > 0
+        and .tap_filter == "coal"
+        and .terminal_filter == "coal"
+        and .branch_copper == 0
+        and .iron_plates > 0
+        and .tap_connection_durable == true
+        and .tap_connection_live == true
+        and .terminal_connection_durable == true
+        and .terminal_connection_live == true' >/dev/null 2>&1 <<<"$SOURCE_TAP_SUCCESS_WORLD"; then
+        break
+    fi
+    sleep 0.1
+done
+require_json "source-tap world has one pure independent coal branch and the original through-line still works" \
+    "$SOURCE_TAP_SUCCESS_WORLD" \
+    --argjson direction "$SOURCE_TAP_SOURCE_DIRECTION" \
+    '.same_source == true
+     and .source_direction == $direction
+     and .source_inputs > 0
+     and .source_outputs > 0
+     and .tap_pickup_tile == {x:-23,y:-26}
+     and .tap_drop_tile == {x:-25,y:-26}
+     and .tap_filter == "coal"
+     and .terminal_filter == "coal"
+     and .branch_coal > 0
+     and .branch_copper == 0
+     and .iron_plates > 0
+     and .downstream_chest_coal > 0
+     and .tap_connection_durable == true
+     and .tap_connection_live == true
+     and .terminal_connection_durable == true
+     and .terminal_connection_live == true'
+
+# Burner inserters have a much narrower collision box than their engine-owned
+# interaction tile. A real adjacent feeder's drop point sits just outside that
+# collision box, so topology must trust Factorio's exact drop_target identity.
+SMALL_FUEL_TARGET_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local source = s.find_entity('transport-belt', {-22.5, -27.5})
+local consumer = s.create_entity{
+    name = 'burner-inserter',
+    position = {-20.5, -27.5},
+    direction = defines.direction.north,
+    force = game.forces.player
+}
+if not (source and consumer) then
+    rcon.print(helpers.table_to_json({error = 'small fuel target fixture creation failed'}))
+    return
+end
+consumer.get_fuel_inventory().clear()
+local pre = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'diagnose_fuel_sustainability',
+    -25,
+    -31,
+    -17,
+    -24,
+    30,
+    '$AGENT_ID'
+))
+local planned = nil
+for _, record in ipairs(pre.consumers or {}) do
+    if record.unit_number == consumer.unit_number then
+        for _, candidate in ipairs(record.fuel_inserter_candidates or {}) do
+            if candidate.side == 'west' then planned = candidate break end
+        end
+    end
+end
+local feeder = s.create_entity{
+    name = 'burner-inserter',
+    position = {-21.5, -27.5},
+    direction = defines.direction.west,
+    force = game.forces.player
+}
+if not feeder then
+    rcon.print(helpers.table_to_json({error = 'small fuel feeder creation failed'}))
+    return
+end
+feeder.inserter_filter_mode = 'whitelist'
+feeder.set_filter(1, 'coal')
+feeder.use_filters = true
+feeder.get_fuel_inventory().insert{name = 'coal', count = 5}
+source.get_transport_line(1).insert_at_back({name = 'coal', count = 3})
+local drop = feeder.drop_position
+local box = consumer.bounding_box
+local drop_outside_collision_box = not (
+    drop.x >= box.left_top.x and drop.x <= box.right_bottom.x
+    and drop.y >= box.left_top.y and drop.y <= box.right_bottom.y
+)
+rcon.print(helpers.table_to_json({
+    consumer_unit = consumer.unit_number,
+    feeder_unit = feeder.unit_number,
+    source_unit = source.unit_number,
+    planned_inserter_position = planned and planned.inserter_position or nil,
+    planned_pickup_tile = planned and planned.pickup_tile or nil,
+    actual_inserter_position = feeder.position,
+    actual_pickup_position = feeder.pickup_position,
+    actual_drop_position = drop,
+    drop_target_unit = feeder.drop_target and feeder.drop_target.unit_number or nil,
+    drop_outside_collision_box = drop_outside_collision_box
+}))
+")"
+require_json "small burner target fixture exercises exact engine interaction geometry" \
+    "$SMALL_FUEL_TARGET_FIXTURE" \
+    '.error == null
+     and (.consumer_unit | type) == "number"
+     and (.feeder_unit | type) == "number"
+     and .drop_outside_collision_box == true
+     and .planned_inserter_position == {x:-21.5,y:-27.5}
+     and .planned_pickup_tile == {x:-22.5,y:-27.5}
+     and .actual_inserter_position == .planned_inserter_position
+     and ((.actual_pickup_position.x | floor) == (.planned_pickup_tile.x | floor))
+     and ((.actual_pickup_position.y | floor) == (.planned_pickup_tile.y | floor))'
+SMALL_FUEL_CONSUMER_UNIT="$(jq -r '.consumer_unit' <<<"$SMALL_FUEL_TARGET_FIXTURE")"
+SMALL_FUEL_FEEDER_UNIT="$(jq -r '.feeder_unit' <<<"$SMALL_FUEL_TARGET_FIXTURE")"
+
+SMALL_FUEL_TARGET_PROOF='{}'
+for _ in $(seq 1 100); do
+    SMALL_FUEL_TARGET_PROOF="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local feeder = nil
+for _, entity in pairs(s.find_entities_filtered{type = 'inserter', area = {{-23, -29}, {-19, -26}}}) do
+    if entity.unit_number == $SMALL_FUEL_FEEDER_UNIT then
+        feeder = entity
+        break
+    end
+end
+local report = helpers.json_to_table(remote.call(
+    'claude_interface',
+    'diagnose_fuel_sustainability',
+    -25,
+    -31,
+    -17,
+    -24,
+    30,
+    '$AGENT_ID'
+))
+local result = {
+    consumer_found = false,
+    connection = nil,
+    engine_drop_target_unit = feeder and feeder.drop_target and feeder.drop_target.unit_number or nil
+}
+for _, consumer in ipairs(report.consumers or {}) do
+    if consumer.unit_number == $SMALL_FUEL_CONSUMER_UNIT then
+        result.consumer_found = true
+        result.automated = consumer.automated == true
+        result.fuel_count = consumer.fuel_count or 0
+        result.remaining_burning_fuel = consumer.remaining_burning_fuel or 0
+        for _, connection in ipairs(consumer.proven_fuel_connections or {}) do
+            if connection.inserter_unit_number == $SMALL_FUEL_FEEDER_UNIT then
+                result.connection = connection
+                break
+            end
+        end
+    end
+end
+rcon.print(helpers.table_to_json(result))
+")"
+    if jq -e --argjson consumer "$SMALL_FUEL_CONSUMER_UNIT" '.consumer_found == true
+        and .engine_drop_target_unit == $consumer
+        and .automated == true
+        and .connection.durable == true
+        and .connection.live == true' >/dev/null 2>&1 <<<"$SMALL_FUEL_TARGET_PROOF"; then
+        break
+    fi
+    sleep 0.1
+done
+require_json "small burner target receives exact durable live fuel topology proof" \
+    "$SMALL_FUEL_TARGET_PROOF" \
+    --argjson consumer "$SMALL_FUEL_CONSUMER_UNIT" \
+    --argjson feeder "$SMALL_FUEL_FEEDER_UNIT" \
+    '.consumer_found == true
+     and .engine_drop_target_unit == $consumer
+     and .automated == true
+     and ((.fuel_count > 0) or (.remaining_burning_fuel > 0))
+     and .connection.inserter_unit_number == $feeder
+     and .connection.durable == true
+     and .connection.live == true
+     and .connection.source.durable == true
+     and .connection.source.operational == true'
+
 # Install a wrong-facing belt in an otherwise eastbound three-tile corridor.
 # The MCP router may reject it or route around it, but may not count it as a
 # connected, reusable segment.
@@ -880,8 +2079,6 @@ rcon.print(helpers.table_to_json({lab_unit = lab and lab.unit_number or nil}))
 require_json "disconnected controller fixture has a real target lab" "$DISCONNECTED_LAB_FIXTURE" \
     '(.lab_unit | type) == "number"'
 DISCONNECTED_LAB_UNIT="$(jq -r '.lab_unit' <<<"$DISCONNECTED_LAB_FIXTURE")"
-
-start_mcp
 
 TOOLS="$(mcp_send tools/list '{}')"
 EXPECTED_TOOLS="$(printf '%s\n' \
@@ -1773,6 +2970,81 @@ assert_json "wrong-facing existing belt is never reused as a connected segment" 
      else
          .error_kind == "incompatible_existing_belt"
      end'
+
+# An independent route uses a character-walking collision map, where belts are
+# intentionally walkable. It must still treat every existing belt as occupied
+# build space rather than silently planning a fast replacement through it.
+INDEPENDENT_ROUTE_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local existing = s.find_entity('transport-belt', {31.5, 10.5})
+c.teleport({28.5, 10.5})
+c.get_main_inventory().insert{name = 'transport-belt', count = 32}
+rcon.print(helpers.table_to_json({
+    unit_number = existing and existing.unit_number or nil,
+    direction = existing and existing.direction or nil
+}))
+")"
+require_json "independent-route fixture retains the perpendicular live belt" \
+    "$INDEPENDENT_ROUTE_FIXTURE" \
+    '(.unit_number | type) == "number" and .direction == 0'
+INDEPENDENT_ROUTE_UNIT="$(jq -r '.unit_number' <<<"$INDEPENDENT_ROUTE_FIXTURE")"
+
+INDEPENDENT_ROUTE_PLAN="$(mcp_tool route_belt '{
+    "from_x":30,
+    "from_y":10,
+    "to_x":32,
+    "to_y":10,
+    "belt_type":"transport-belt",
+    "search_radius":3,
+    "dry_run":true,
+    "extend_existing":false,
+    "allow_underground":false,
+    "respect_zones":false
+}')"
+INDEPENDENT_ROUTE_PLAN_PAYLOAD="$(tool_payload "$INDEPENDENT_ROUTE_PLAN")"
+assert_json "independent route dry-run detours around occupied belt tiles" \
+    "$INDEPENDENT_ROUTE_PLAN_PAYLOAD" \
+    '.success == true
+     and .complete_route != false
+     and .ready_to_execute == true
+     and all(.planned_belts[]?; ((.position.x == 31.5 and .position.y == 10.5) | not))
+     and all(.planned_new_belts[]?; ((.position.x == 31.5 and .position.y == 10.5) | not))'
+
+INDEPENDENT_ROUTE_EXECUTE="$(mcp_tool route_belt '{
+    "from_x":30,
+    "from_y":10,
+    "to_x":32,
+    "to_y":10,
+    "belt_type":"transport-belt",
+    "search_radius":3,
+    "dry_run":false,
+    "extend_existing":false,
+    "allow_underground":false,
+    "respect_zones":false
+}')"
+INDEPENDENT_ROUTE_EXECUTE_PAYLOAD="$(tool_payload "$INDEPENDENT_ROUTE_EXECUTE")"
+assert_json "independent route executes atomically without replacing the crossing belt" \
+    "$INDEPENDENT_ROUTE_EXECUTE_PAYLOAD" \
+    '.success == true
+     and .complete_route == true
+     and .placed >= 5
+     and (.rollback // null) == null'
+INDEPENDENT_ROUTE_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local existing = nil
+for _, candidate in pairs(s.find_entities_filtered{name = 'transport-belt', area = {{29, 8}, {34, 13}}}) do
+    if candidate.unit_number == $INDEPENDENT_ROUTE_UNIT then existing = candidate end
+end
+rcon.print(helpers.table_to_json({
+    same_unit = existing and existing.valid and existing.unit_number == $INDEPENDENT_ROUTE_UNIT or false,
+    direction = existing and existing.direction or nil,
+    belt_count = s.count_entities_filtered{name = 'transport-belt', area = {{29, 8}, {34, 13}}}
+}))
+")"
+assert_json "independent route preserves the exact crossing belt and its direction" \
+    "$INDEPENDENT_ROUTE_WORLD" \
+    '.same_unit == true and .direction == 0 and .belt_count >= 6'
 
 # Build a separate clean route, put a real item on its first transport line,
 # and require both Factorio delivery and the static analyzer to agree. This is

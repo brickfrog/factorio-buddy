@@ -1,5 +1,6 @@
 local characters = require("characters")
 local entities = require("entities")
+local inventory = require("inventory")
 
 local M = {}
 
@@ -137,6 +138,101 @@ local function conservation_record(removed, inserted, returned)
         returned = returned,
         balanced = removed == inserted + returned,
     }
+end
+
+local function prototype_name(value)
+    if value == nil then return nil end
+    if type(value) == "string" then return value end
+    local ok, name = pcall(function() return value.name end)
+    if not ok or name == nil or name == value then return nil end
+    if type(name) == "string" then return name end
+    return prototype_name(name)
+end
+
+local function current_burning_record(burner)
+    local ok, burning = pcall(function() return burner.currently_burning end)
+    if not ok or burning == nil then return nil end
+    local name = prototype_name(burning.name)
+    if not name then return nil end
+    return {
+        name = name,
+        quality = prototype_name(burning.quality) or "normal",
+    }
+end
+
+local function burner_state(entity)
+    local fuel_inventory = entity and entity.valid
+        and entity.get_inventory(defines.inventory.fuel)
+        or nil
+    local burner = entity and entity.valid and entity.burner or nil
+    if not (fuel_inventory and burner) then return nil end
+
+    local contents = inventory.contents(fuel_inventory)
+    local fuel_total = 0
+    for _, item in ipairs(contents) do fuel_total = fuel_total + item.count end
+    local currently_burning = current_burning_record(burner)
+    local remaining_burning_fuel = tonumber(burner.remaining_burning_fuel) or 0
+    local heat = tonumber(burner.heat) or 0
+    return {
+        unit_number = entity.unit_number,
+        name = entity.name,
+        type = entity.type,
+        surface_index = entity.surface.index,
+        fuel_inventory = contents,
+        fuel_total = fuel_total,
+        currently_burning = currently_burning,
+        remaining_burning_fuel = remaining_burning_fuel,
+        heat = heat,
+        cold = fuel_total == 0
+            and currently_burning == nil
+            and remaining_burning_fuel <= 0
+            and heat <= 0,
+    }
+end
+
+local function item_key(item)
+    return tostring(item.name) .. "\0" .. tostring(item.quality or "normal")
+end
+
+local function contents_map(contents)
+    local result = {}
+    for _, item in ipairs(contents or {}) do
+        result[item_key(item)] = {
+            name = item.name,
+            quality = item.quality or "normal",
+            count = item.count,
+        }
+    end
+    return result
+end
+
+local function same_item_record(left, right)
+    if left == nil or right == nil then return left == right end
+    return left.name == right.name
+        and (left.quality or "normal") == (right.quality or "normal")
+end
+
+local function same_burner_state(left, right)
+    if not (left and right) then return false end
+    if left.unit_number ~= right.unit_number
+        or left.name ~= right.name
+        or left.type ~= right.type
+        or left.surface_index ~= right.surface_index
+        or not same_item_record(left.currently_burning, right.currently_burning)
+        or math.abs((left.remaining_burning_fuel or 0) - (right.remaining_burning_fuel or 0)) > 0.000001
+        or math.abs((left.heat or 0) - (right.heat or 0)) > 0.000001
+    then
+        return false
+    end
+    local left_items = contents_map(left.fuel_inventory)
+    local right_items = contents_map(right.fuel_inventory)
+    for key, item in pairs(left_items) do
+        if not right_items[key] or right_items[key].count ~= item.count then return false end
+    end
+    for key, item in pairs(right_items) do
+        if not left_items[key] or left_items[key].count ~= item.count then return false end
+    end
+    return true
 end
 
 function M.bootstrap_burner_once(agent_id, unit_number, fuel_item, count)
@@ -296,6 +392,185 @@ function M.bootstrap_burner_once(agent_id, unit_number, fuel_item, count)
         partial = inserted < count,
         conservation = conservation,
         guidance = "Temporary bootstrap fuel only. Repair durable fuel delivery with repair_fuel_sustainability next.",
+    }
+end
+
+-- Capture the exact pre-transaction burner state. The controller keeps this
+-- ordinary JSON value only until its compound fuel build commits or rolls back.
+function M.snapshot_burner_state(unit_number)
+    local entity = entities.find_by_unit_number(unit_number)
+    local snapshot = burner_state(entity)
+    if not snapshot then
+        return fail(
+            "missing_burner_state",
+            "fuel transaction target is missing or has no burner state",
+            "refresh_fuel_diagnosis",
+            {unit_number = unit_number}
+        )
+    end
+    snapshot.success = true
+    return snapshot
+end
+
+-- Atomically stop the transaction-created feeder and restore the pre-existing
+-- consumer to its exact snapshot. This is an internal failure path, so it must
+-- not depend on avatar reach and it must verify state equality before claiming
+-- that transaction fuel was cleared.
+function M.rollback_burner_bootstrap(agent_id, snapshot, feeder_unit_number)
+    if type(snapshot) ~= "table" or type(snapshot.unit_number) ~= "number" then
+        return fail(
+            "invalid_burner_snapshot",
+            "fuel rollback requires the exact pre-transaction burner snapshot",
+            "stop_and_inspect_transaction"
+        )
+    end
+
+    local character = characters.find(agent_id)
+    if not (character and character.valid and character.get_main_inventory()) then
+        return fail("no_character", "no character inventory for fuel rollback", "spawn_character")
+    end
+
+    local consumer = entities.find_by_unit_number(snapshot.unit_number)
+    local identity_valid = consumer
+        and consumer.valid
+        and consumer.unit_number == snapshot.unit_number
+        and consumer.name == snapshot.name
+        and consumer.type == snapshot.type
+        and consumer.surface.index == snapshot.surface_index
+    if not identity_valid then
+        return fail(
+            "consumer_identity_changed",
+            "fuel rollback refuses to restore a different entity",
+            "stop_and_inspect_transaction",
+            {snapshot = snapshot, current = consumer and target_summary(consumer) or nil}
+        )
+    end
+
+    local feeder = nil
+    local feeder_quiesced = feeder_unit_number == nil
+    local feeder_error = nil
+    if feeder_unit_number ~= nil then
+        feeder = entities.find_by_unit_number(feeder_unit_number)
+        if feeder and feeder.valid and feeder.type == "inserter" then
+            local ok, error_message = pcall(function() feeder.active = false end)
+            feeder_quiesced = ok and feeder.active == false
+            if not ok then feeder_error = tostring(error_message) end
+        else
+            feeder_error = "transaction feeder is missing or no longer an inserter"
+        end
+    end
+
+    local before = burner_state(consumer)
+    local fuel_inventory = consumer.get_inventory(defines.inventory.fuel)
+    local character_inventory = character.get_main_inventory()
+    local current_items = contents_map(before and before.fuel_inventory or {})
+    local snapshot_items = contents_map(snapshot.fuel_inventory or {})
+    local excess = {}
+    for key, item in pairs(current_items) do
+        local baseline = snapshot_items[key] and snapshot_items[key].count or 0
+        if item.count > baseline then
+            table.insert(excess, {
+                name = item.name,
+                quality = item.quality,
+                count = item.count - baseline,
+            })
+        end
+    end
+
+    fuel_inventory.clear()
+    consumer.burner.currently_burning = nil
+    consumer.burner.heat = 0
+
+    local restore_errors = {}
+    for _, item in ipairs(snapshot.fuel_inventory or {}) do
+        local inserted = fuel_inventory.insert{
+            name = item.name,
+            quality = item.quality or "normal",
+            count = item.count,
+        }
+        if inserted ~= item.count then
+            table.insert(restore_errors, {
+                stage = "fuel_inventory",
+                name = item.name,
+                quality = item.quality,
+                expected = item.count,
+                inserted = inserted,
+            })
+        end
+    end
+    if snapshot.currently_burning then
+        consumer.burner.currently_burning = {
+            name = snapshot.currently_burning.name,
+            quality = snapshot.currently_burning.quality or "normal",
+        }
+        consumer.burner.remaining_burning_fuel = snapshot.remaining_burning_fuel or 0
+    else
+        consumer.burner.currently_burning = nil
+    end
+    consumer.burner.heat = snapshot.heat or 0
+
+    local returned_excess = 0
+    local spilled_excess = 0
+    local unrecovered_excess = 0
+    for _, item in ipairs(excess) do
+        local returned = character_inventory.insert{
+            name = item.name,
+            quality = item.quality or "normal",
+            count = item.count,
+        }
+        returned_excess = returned_excess + returned
+        local remainder = item.count - returned
+        if remainder > 0 then
+            local spilled = consumer.surface.spill_item_stack{
+                position = consumer.position,
+                stack = {
+                    name = item.name,
+                    quality = item.quality or "normal",
+                    count = remainder,
+                },
+                enable_looted = false,
+                force = consumer.force,
+                allow_belts = false,
+                use_start_position_on_failure = true,
+                drop_full_stack = true,
+            }
+            local spilled_count = 0
+            for _, entity in pairs(spilled or {}) do
+                local stack = entity and entity.valid and entity.stack or nil
+                if stack and stack.valid_for_read
+                    and stack.name == item.name
+                    and (inventory.quality_name(stack) or "normal") == (item.quality or "normal")
+                then
+                    spilled_count = spilled_count + stack.count
+                end
+            end
+            spilled_excess = spilled_excess + spilled_count
+            unrecovered_excess = unrecovered_excess + (remainder - spilled_count)
+        end
+    end
+
+    local after = burner_state(consumer)
+    local consumer_state_restored = #restore_errors == 0 and same_burner_state(after, snapshot)
+    local success = feeder_quiesced and consumer_state_restored and unrecovered_excess == 0
+    return {
+        success = success,
+        classification = "failed_fuel_transaction_rollback",
+        consumer_unit_number = snapshot.unit_number,
+        feeder_unit_number = feeder_unit_number,
+        feeder_quiesced = feeder_quiesced,
+        feeder_error = feeder_error,
+        consumer_state_restored = consumer_state_restored,
+        transaction_fuel_cleared = consumer_state_restored,
+        identity_valid = identity_valid,
+        restore_errors = restore_errors,
+        returned_excess = returned_excess,
+        spilled_excess = spilled_excess,
+        unrecovered_excess = unrecovered_excess,
+        active_fuel_voided = before and before.currently_burning ~= nil
+            and snapshot.currently_burning == nil,
+        before = before,
+        expected = snapshot,
+        after = after,
     }
 end
 

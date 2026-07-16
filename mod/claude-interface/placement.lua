@@ -286,7 +286,7 @@ local function mining_drill_output_diagnostics(surface, force, entity_name, posi
             position = belt_position,
             direction = direction,
             force = force,
-            build_check_type = defines.build_check_type.manual,
+            build_check_type = defines.build_check_type.script,
         }
     end)
     local resources = resources_on_tile(surface, tile.x, tile.y)
@@ -512,7 +512,7 @@ local function placement_candidate(surface, force, entity_name, position, direct
             position = position,
             direction = direction,
             force = force,
-            build_check_type = defines.build_check_type.manual,
+            build_check_type = defines.build_check_type.script,
         }
     end)
     diagnostic.factorio_allowed = ok and can_place_or_error == true
@@ -653,7 +653,7 @@ function M.build_edge_miner(agent_id, resource_name, center_x, center_y, radius,
                         position = position,
                         direction = dir,
                         force = force,
-                        build_check_type = defines.build_check_type.manual,
+                        build_check_type = defines.build_check_type.script,
                     }
                 end)
                 if not character_blocker and can_place_ok and can_place_or_error == true then
@@ -821,7 +821,7 @@ local function can_place(surface, force, entity_name, position, direction, chara
             position = position,
             direction = direction,
             force = force,
-            build_check_type = defines.build_check_type.manual,
+            build_check_type = defines.build_check_type.script,
         }
     end)
     if not ok then return false, tostring(value), nil end
@@ -1203,7 +1203,7 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
             position = position,
             direction = direction,
             force = character.force,
-            build_check_type = defines.build_check_type.manual,
+            build_check_type = defines.build_check_type.script,
         }
     end)
 
@@ -1325,7 +1325,7 @@ function M.place_underground_belt(agent_id, entity_name, x, y, direction, belt_t
         position = position,
         direction = direction,
         force = character.force,
-        build_check_type = defines.build_check_type.manual,
+        build_check_type = defines.build_check_type.script,
     }
 
     if not can_place then
@@ -1410,7 +1410,7 @@ function M.check_entity_placement(agent_id, entity_name, x, y, direction)
             position = position,
             direction = direction,
             force = character.force,
-            build_check_type = defines.build_check_type.manual,
+            build_check_type = defines.build_check_type.script,
         }
     end)
 
@@ -1515,7 +1515,7 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
                         position = position,
                         direction = dir,
                         force = character.force,
-                        build_check_type = defines.build_check_type.manual,
+                        build_check_type = defines.build_check_type.script,
                     }
                 end)
                 if not character_blocker and ok and can_place == true then

@@ -5,6 +5,8 @@
     "broadcast_console": {"args": ["message"], "returns": "json"},
     "broadcast_flying_text": {"args": ["message"], "returns": "json"},
     "bootstrap_burner_once": {"args": ["agent_id", "unit_number", "fuel_item", "count"], "returns": "json"},
+    "rollback_burner_bootstrap": {"args": ["agent_id", "snapshot", "feeder_unit_number"], "returns": "json"},
+    "snapshot_burner_state": {"args": ["unit_number"], "returns": "json"},
     "build_direct_smelter": {"args": ["agent_id", "drill_unit_number", "output_x", "output_y", "output_direction", "furnace_name", "inserter_name", "belt_name", "radius"], "returns": "json"},
     "build_drill_array": {"args": ["agent_id", "count", "resource", "near_x", "near_y", "drill_type", "direction_name"], "returns": "json"},
     "build_edge_miner": {"args": ["agent_id", "resource_name", "center_x", "center_y", "radius", "drill_name", "limit"], "returns": "json"},

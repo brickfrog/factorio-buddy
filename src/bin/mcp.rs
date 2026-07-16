@@ -133,6 +133,23 @@ fn production_unit_verified(verification: &serde_json::Value, unit_number: Optio
             })
 }
 
+fn production_unit_observed(verification: &serde_json::Value, unit_number: Option<u32>) -> bool {
+    let Some(unit_number) = unit_number else {
+        return false;
+    };
+    verification
+        .get("entities")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entities| {
+            entities.iter().any(|entity| {
+                entity
+                    .get("unit_number")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(unit_number as u64)
+            })
+        })
+}
+
 fn is_production_entity_name(name: &str) -> bool {
     name.starts_with("assembling-machine")
         || name.contains("furnace")
@@ -579,15 +596,48 @@ fn production_verification_summary(
     target_unit_number: Option<u32>,
 ) -> serde_json::Value {
     let observation_call_ok = observation.get("error").is_none();
+    let production_applicable = production_unit_observed(observation, target_unit_number);
     let target_working_or_progressed = production_unit_verified(observation, target_unit_number);
     serde_json::json!({
         "success": observation_call_ok && target_working_or_progressed,
         "scope": "live_production_observation",
         "observation_call_ok": observation_call_ok,
         "target_unit_number": target_unit_number,
+        "production_applicable": production_applicable,
         "target_working_or_progressed": target_working_or_progressed,
         "proof": observation.get("proof"),
     })
+}
+
+fn fuel_consumer_activity_verification_summary(
+    observation: &serde_json::Value,
+    target_unit_number: Option<u32>,
+) -> serde_json::Value {
+    let mut summary = production_verification_summary(observation, target_unit_number);
+    let observation_call_ok = summary
+        .get("observation_call_ok")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let production_applicable = summary
+        .get("production_applicable")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+
+    if observation_call_ok && !production_applicable {
+        if let Some(report) = summary.as_object_mut() {
+            report.insert("success".to_string(), serde_json::json!(true));
+            report.insert(
+                "scope".to_string(),
+                serde_json::json!("live_fuel_consumer_observation"),
+            );
+            report.insert(
+                "proof".to_string(),
+                serde_json::json!("target_has_no_machine_production_counter"),
+            );
+        }
+    }
+
+    summary
 }
 
 fn fuel_topology_verification(
@@ -638,12 +688,14 @@ fn fuel_topology_verification(
         .and_then(|connection| connection.get("live"))
         .and_then(|value| value.as_bool())
         == Some(true);
+    let structural_success = diagnostic_available
+        && consumer.is_some()
+        && topology_present
+        && durable_connection_verified;
 
     serde_json::json!({
-        "success": diagnostic_available
-            && consumer.is_some()
-            && topology_present
-            && durable_connection_verified,
+        "success": structural_success && live_supply_verified,
+        "structural_success": structural_success,
         "scope": "durable_fuel_topology",
         "diagnostic_available": diagnostic_available,
         "consumer_found": consumer.is_some(),
@@ -809,6 +861,173 @@ struct ControllerPlacement<'a> {
     entity_name: &'a str,
     position: Position,
     direction: Direction,
+}
+
+const FUEL_SOURCE_TAP_INSERTER: &str = "burner-inserter";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct BeltSourceTapLayout {
+    source_tile: GridPos,
+    outward: Direction,
+    inserter_tile: GridPos,
+    pickup_tile: GridPos,
+    drop_tile: GridPos,
+    inserter_direction: Direction,
+}
+
+impl BeltSourceTapLayout {
+    fn inserter_position(self) -> Position {
+        self.inserter_tile.to_position()
+    }
+}
+
+fn belt_source_tap_layouts(source_tile: GridPos) -> [BeltSourceTapLayout; 4] {
+    [
+        Direction::North,
+        Direction::East,
+        Direction::South,
+        Direction::West,
+    ]
+    .map(|outward| BeltSourceTapLayout {
+        source_tile,
+        outward,
+        inserter_tile: source_tile.offset(outward, 1),
+        pickup_tile: source_tile,
+        drop_tile: source_tile.offset(outward, 2),
+        // Buddy and Factorio describe an inserter direction by its pickup side.
+        inserter_direction: outward.opposite(),
+    })
+}
+
+fn fuel_route_protects_existing_source(mut route: serde_json::Value) -> serde_json::Value {
+    let start_is_incompatible = route
+        .get("endpoint_incompatibility")
+        .and_then(|value| value.get("endpoint_kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("start");
+    if !start_is_incompatible {
+        return route;
+    }
+
+    if let Some(report) = route.as_object_mut() {
+        report.remove("next_action");
+        report.insert(
+            "error_kind".to_string(),
+            serde_json::json!("protected_fuel_source_endpoint"),
+        );
+        report.insert(
+            "error".to_string(),
+            serde_json::json!(
+                "The diagnosed fuel source is existing infrastructure and cannot be rotated or rebuilt by this transaction."
+            ),
+        );
+        report.insert(
+            "guidance".to_string(),
+            serde_json::json!(
+                "Refresh diagnose_fuel_sustainability so the exact source can be tapped without mutating it. No entity was changed."
+            ),
+        );
+    }
+    route
+}
+
+fn source_tap_filter_verified(report: &serde_json::Value) -> bool {
+    report_success(report)
+        && report
+            .get("readback_verified")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report.get("mode").and_then(serde_json::Value::as_str) == Some("whitelist")
+        && report
+            .get("filtering_enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .get("filters")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|filters| {
+                filters.len() == 1
+                    && filters[0].get("slot").and_then(serde_json::Value::as_u64) == Some(1)
+                    && filters[0].get("name").and_then(serde_json::Value::as_str) == Some("coal")
+            })
+}
+
+fn source_entity_preservation(
+    before: &Entity,
+    after: Option<&Entity>,
+    expected_tile: GridPos,
+) -> serde_json::Value {
+    let unit_matches = before.unit_number.is_some()
+        && after.and_then(|entity| entity.unit_number) == before.unit_number;
+    let name_matches = after.is_some_and(|entity| entity.name == before.name);
+    let tile_matches =
+        after.map(|entity| GridPos::from_position(&entity.position)) == Some(expected_tile);
+    let direction_matches = after.is_some_and(|entity| entity.direction == before.direction);
+    serde_json::json!({
+        "success": unit_matches && name_matches && tile_matches && direction_matches,
+        "unit_number": before.unit_number,
+        "unit_matches": unit_matches,
+        "name": before.name,
+        "name_matches": name_matches,
+        "tile": expected_tile,
+        "tile_matches": tile_matches,
+        "direction_before": Direction::from_factorio(before.direction),
+        "direction_after": after.map(Entity::direction_enum),
+        "direction_matches": direction_matches,
+    })
+}
+
+fn source_tap_plan_rank(
+    route: &serde_json::Value,
+    preflight: &serde_json::Value,
+    layout_index: usize,
+) -> (u8, u8, u64, usize) {
+    let ready = preflight.get("ready").and_then(serde_json::Value::as_bool) == Some(true);
+    let route_connected = report_success(route)
+        && route
+            .get("topology")
+            .and_then(|value| value.get("connected"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let placements_allowed = ["source_tap_inserter", "fuel_inserter"]
+        .into_iter()
+        .all(|label| {
+            preflight
+                .get("placements")
+                .and_then(|value| value.get(label))
+                .and_then(|value| value.get("allowed"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        });
+    let geometry_valid = preflight
+        .get("routes")
+        .and_then(|value| value.get("errors"))
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|errors| {
+            errors.iter().all(|error| {
+                error.get("kind").and_then(serde_json::Value::as_str)
+                    == Some("insufficient_materials")
+            })
+        });
+    let belt_count = route
+        .get("new_belt_count")
+        .or_else(|| route.get("belt_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    (
+        u8::from(!ready),
+        u8::from(!(route_connected && placements_allowed && geometry_valid)),
+        belt_count,
+        layout_index,
+    )
+}
+
+#[derive(Clone)]
+struct FuelSourceTapPlan {
+    layout: BeltSourceTapLayout,
+    route_params: RouteBeltParams,
+    route: serde_json::Value,
+    preflight: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -1067,6 +1286,42 @@ async fn rollback_controller_transaction(
     })
 }
 
+async fn rollback_failed_fuel_transaction(
+    client: &mut FactorioClient,
+    consumer_snapshot: &serde_json::Value,
+    feeder_unit_number: Option<u32>,
+    transaction_units: &[u32],
+) -> serde_json::Value {
+    // One Lua call first disables the exact transaction feeder and restores the
+    // pre-existing consumer. Only then may slower, reach-aware entity mining
+    // remove the new inserter and route without racing another delivery.
+    let consumer_state = match client
+        .rollback_burner_bootstrap(consumer_snapshot, feeder_unit_number)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => serde_json::json!({
+            "success": false,
+            "consumer_state_restored": false,
+            "transaction_fuel_cleared": false,
+            "feeder_unit_number": feeder_unit_number,
+            "error": error.to_string(),
+        }),
+    };
+    let infrastructure =
+        rollback_controller_transaction(client, transaction_units, &[], None).await;
+    let state_success = report_success(&consumer_state);
+    let infrastructure_success = report_success(&infrastructure);
+    serde_json::json!({
+        "success": state_success && infrastructure_success,
+        "transaction_fuel_cleared": consumer_state
+            .get("transaction_fuel_cleared")
+            .and_then(|value| value.as_bool()) == Some(true),
+        "consumer_state": consumer_state,
+        "infrastructure": infrastructure,
+    })
+}
+
 fn compact_belt_topology(topology: Option<&BeltRouteTopology>) -> serde_json::Value {
     match topology {
         Some(topology) => serde_json::json!({
@@ -1232,17 +1487,20 @@ struct ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_endpoint_preflight, automation_repair_hint, compound_route_preflight,
-        execute_lua_refusal, existing_belt_compatibility, flow_lookup, flow_scan_area,
-        fuel_topology_verification, incremental_infrastructure_verification,
-        inserter_machine_endpoint_verification, invalid_direction_failure,
-        is_machine_output_source, machine_output_build_args, machine_side_layout,
-        mark_semantic_tool_errors, model_safe_payload, parse_controller_steps,
+        attach_endpoint_preflight, automation_repair_hint, belt_source_tap_layouts,
+        compact_fuel_diagnosis, compact_fuel_repair, compound_route_preflight,
+        endpoint_belt_incompatibility, execute_lua_refusal, existing_belt_compatibility,
+        flow_lookup, flow_scan_area, fuel_consumer_activity_verification_summary,
+        fuel_route_protects_existing_source, fuel_topology_verification,
+        incremental_infrastructure_verification, inserter_machine_endpoint_verification,
+        invalid_direction_failure, is_machine_output_source, machine_output_build_args,
+        machine_side_layout, mark_semantic_tool_errors, model_safe_payload, parse_controller_steps,
         placement_report_allowed, production_observation_json, production_unit_verified,
         production_verification_json, production_verification_summary, raw_lua_enabled,
         ready_fuel_supply_args, recipe_restore_action, rollback_missing_identity_error,
         rollback_pending_after_pass, rollback_retry_order, route_belt_failure_json,
         route_material_shortfall, route_segment_waypoint, semantic_failure,
+        source_entity_preservation, source_tap_filter_verified, source_tap_plan_rank,
         tool_text_indicates_error, BuildFuelSupplyParams, FactorioMcp, InserterMachineFlow,
         RecipeRestoreAction, RouteBeltParams, MODEL_VISIBLE_TOOLS,
     };
@@ -1440,13 +1698,37 @@ mod tests {
                 "proof": "no_active_production",
                 "working_units": [],
                 "progressed_units": [],
+                "entities": [{"unit_number": 900, "name": "stone-furnace"}],
             }),
             Some(900),
         );
 
         assert_eq!(infrastructure["success"], true);
         assert_eq!(production["success"], false);
+        assert_eq!(production["production_applicable"], true);
         assert_eq!(production["target_working_or_progressed"], false);
+    }
+
+    #[test]
+    fn production_verification_does_not_demand_machine_output_from_transport_consumer() {
+        let observation = serde_json::json!({
+            "success": false,
+            "proof": "no_active_production",
+            "working_units": [],
+            "progressed_units": [],
+            "entities": [],
+        });
+        let strict_production = production_verification_summary(&observation, Some(490));
+        let production = fuel_consumer_activity_verification_summary(&observation, Some(490));
+
+        assert_eq!(strict_production["success"], false);
+        assert_eq!(production["success"], true);
+        assert_eq!(production["production_applicable"], false);
+        assert_eq!(production["target_working_or_progressed"], false);
+        assert_eq!(
+            production["proof"],
+            "target_has_no_machine_production_counter"
+        );
     }
 
     #[test]
@@ -1647,7 +1929,8 @@ mod tests {
             }],
         });
         let exact = fuel_topology_verification(&durable, 100, Some(42));
-        assert_eq!(exact["success"], true);
+        assert_eq!(exact["success"], false);
+        assert_eq!(exact["structural_success"], true);
         assert_eq!(exact["durable_connection_verified"], true);
         assert_eq!(exact["durable_connection_reported"], true);
         assert_eq!(exact["live_supply_verified"], false);
@@ -2191,6 +2474,172 @@ mod tests {
     }
 
     #[test]
+    fn source_tap_layouts_pick_from_exact_source_and_start_independent_branch() {
+        let source = GridPos::new(-45, 44);
+        let layouts = belt_source_tap_layouts(source);
+        assert_eq!(layouts.len(), 4);
+        for layout in layouts {
+            assert_eq!(layout.source_tile, source);
+            assert_eq!(layout.pickup_tile, source);
+            assert_eq!(layout.inserter_tile, source.offset(layout.outward, 1));
+            assert_eq!(layout.drop_tile, source.offset(layout.outward, 2));
+            assert_eq!(layout.inserter_direction, layout.outward.opposite());
+            assert_eq!(
+                GridPos::from_position(&layout.inserter_position()),
+                layout.inserter_tile
+            );
+        }
+
+        let west = layouts
+            .into_iter()
+            .find(|layout| layout.outward == Direction::West)
+            .expect("west tap");
+        assert_eq!(west.inserter_tile, GridPos::new(-46, 44));
+        assert_eq!(west.drop_tile, GridPos::new(-47, 44));
+        assert_eq!(west.inserter_direction, Direction::East);
+    }
+
+    #[test]
+    fn fuel_controller_never_surfaces_rotation_for_existing_source_endpoint() {
+        let route = serde_json::json!({
+            "success": false,
+            "error_kind": "incompatible_existing_belt",
+            "endpoint_incompatibility": {
+                "endpoint_kind": "start",
+                "unit_number": 252,
+                "actual_direction": "south",
+                "required_direction": "north",
+            },
+            "next_action": {
+                "tool": "rotate_entity",
+                "args": {"unit_number": 252, "direction": "north"},
+            },
+        });
+
+        let protected = fuel_route_protects_existing_source(route);
+        assert_eq!(protected["success"], false);
+        assert_eq!(protected["error_kind"], "protected_fuel_source_endpoint");
+        assert!(protected.get("next_action").is_none());
+        assert_eq!(protected["endpoint_incompatibility"]["unit_number"], 252);
+    }
+
+    #[test]
+    fn source_tap_filter_requires_exact_verified_coal_whitelist() {
+        let exact = serde_json::json!({
+            "success": true,
+            "readback_verified": true,
+            "filtering_enabled": true,
+            "mode": "whitelist",
+            "filters": [{"slot": 1, "name": "coal"}],
+        });
+        assert!(source_tap_filter_verified(&exact));
+
+        for invalid in [
+            serde_json::json!({
+                "success": true,
+                "readback_verified": true,
+                "filtering_enabled": true,
+                "mode": "whitelist",
+                "filters": [],
+            }),
+            serde_json::json!({
+                "success": true,
+                "readback_verified": true,
+                "filtering_enabled": true,
+                "mode": "whitelist",
+                "filters": [{"slot": 1, "name": "copper-plate"}],
+            }),
+            serde_json::json!({
+                "success": true,
+                "readback_verified": false,
+                "filtering_enabled": true,
+                "mode": "whitelist",
+                "filters": [{"slot": 1, "name": "coal"}],
+            }),
+        ] {
+            assert!(!source_tap_filter_verified(&invalid));
+        }
+    }
+
+    #[test]
+    fn source_tap_requires_exact_source_unit_tile_and_direction_to_survive() {
+        let before = Entity {
+            unit_number: Some(252),
+            name: "transport-belt".to_string(),
+            entity_type: Some("transport-belt".to_string()),
+            position: Position::new(-44.5, 44.5),
+            direction: Direction::South.to_factorio(),
+            health: Some(150.0),
+            force: Some("player".to_string()),
+            bounding_box: None,
+        };
+        let preserved = source_entity_preservation(&before, Some(&before), GridPos::new(-45, 44));
+        assert_eq!(preserved["success"], true);
+
+        let mut rotated = before.clone();
+        rotated.direction = Direction::North.to_factorio();
+        let changed = source_entity_preservation(&before, Some(&rotated), GridPos::new(-45, 44));
+        assert_eq!(changed["success"], false);
+        assert_eq!(changed["unit_matches"], true);
+        assert_eq!(changed["direction_matches"], false);
+    }
+
+    #[test]
+    fn source_tap_plan_prefers_complete_compound_preflight_then_shortest_route() {
+        let route = |belts| {
+            serde_json::json!({
+                "success": true,
+                "new_belt_count": belts,
+                "topology": {"connected": true},
+            })
+        };
+        let preflight = |ready| {
+            serde_json::json!({
+                "ready": ready,
+                "placements": {
+                    "source_tap_inserter": {"allowed": true},
+                    "fuel_inserter": {"allowed": true},
+                },
+            })
+        };
+        assert!(
+            source_tap_plan_rank(&route(8), &preflight(true), 1)
+                < source_tap_plan_rank(&route(3), &preflight(false), 0)
+        );
+        assert!(
+            source_tap_plan_rank(&route(3), &preflight(true), 1)
+                < source_tap_plan_rank(&route(8), &preflight(true), 0)
+        );
+
+        let material_shortfall = serde_json::json!({
+            "ready": false,
+            "placements": {
+                "source_tap_inserter": {"allowed": true},
+                "fuel_inserter": {"allowed": true},
+            },
+            "routes": {"errors": [
+                {"kind": "insufficient_materials", "item": "transport-belt"}
+            ]},
+        });
+        let self_crossing = serde_json::json!({
+            "ready": false,
+            "placements": {
+                "source_tap_inserter": {"allowed": true},
+                "fuel_inserter": {"allowed": true},
+            },
+            "routes": {"errors": [
+                {"kind": "insufficient_materials", "item": "transport-belt"},
+                {"kind": "route_entity_overlap", "entity": "source_tap_inserter"}
+            ]},
+        });
+        assert!(
+            source_tap_plan_rank(&route(8), &material_shortfall, 1)
+                < source_tap_plan_rank(&route(3), &self_crossing, 0),
+            "temporary material shortages must not make an impossible self-crossing tap rank first"
+        );
+    }
+
+    #[test]
     fn route_belt_core_has_no_partial_prefix_path() {
         let source = include_str!("mcp.rs");
         let route_core = source
@@ -2243,6 +2692,33 @@ mod tests {
         assert!(
             !resource_observation.contains("collision_map.block"),
             "live resource observations must not become A* collision blockers"
+        );
+
+        let existing_belt_policy = route_core
+            .split("let mut existing_surface_belts")
+            .nth(1)
+            .and_then(|tail| tail.split("let start = GridPos").next())
+            .expect("route_belt_core should classify existing surface belts before A*");
+        for required in [
+            "if params.extend_existing",
+            "collision_map.unblock(tile)",
+            "existing_surface_belts.insert(tile, entity)",
+            "collision_map.block(tile)",
+        ] {
+            assert!(
+                existing_belt_policy.contains(required),
+                "independent routes must reserve existing belt build space: missing {required:?}"
+            );
+        }
+        let dry_run = route_core
+            .find("if params.dry_run")
+            .expect("route_belt_core should retain dry-run response");
+        let placement_preflight = route_core
+            .find("check_entity_placement")
+            .expect("route_belt_core should preflight every planned placement");
+        assert!(
+            placement_preflight < dry_run,
+            "dry-run must execute the same placement preflight before claiming readiness"
         );
     }
 
@@ -2306,6 +2782,7 @@ mod tests {
                     "args": {"x": 46.5, "y": 10.5, "radius": 64},
                     "transaction_args": {
                         "consumer_unit_number": 49,
+                        "source_unit_number": 49,
                         "from_x": 78,
                         "from_y": -20,
                         "pickup_x": 46,
@@ -2313,7 +2790,9 @@ mod tests {
                         "inserter_x": 46.5,
                         "inserter_y": 10.5,
                         "inserter_direction": "north",
-                        "inserter_name": "burner-inserter"
+                        "inserter_name": "burner-inserter",
+                        "provisional_source_unit_number": 49,
+                        "bootstrap_consumer_fuel_count": 5
                     }
                 }
             }],
@@ -2323,17 +2802,270 @@ mod tests {
         let args = ready_fuel_supply_args(&report).expect("ready args");
 
         assert_eq!(args.consumer_unit_number, 49);
+        assert_eq!(args.source_unit_number, 49);
         assert_eq!(args.from_x, 78);
         assert_eq!(args.pickup_y, 11);
         assert_eq!(args.inserter_name, "burner-inserter");
+        assert_eq!(args.inserter_fuel_count, 5);
+        assert_eq!(args.provisional_source_unit_number, Some(49));
+        assert_eq!(args.bootstrap_consumer_fuel_count, 5);
         assert_eq!(args.belt_type, "transport-belt");
         assert!(args.extend_existing);
     }
 
     #[test]
-    fn build_fuel_supply_params_accept_factorio_center_coordinates_for_tiles() {
+    fn compact_fuel_diagnosis_removes_repeated_internal_proof_graphs() {
+        let proof = serde_json::json!({
+            "reason": "burner_coal_drill_fuel_not_durable",
+            "fuel_proof": {
+                "reason": "manual_burner_fuel_buffer",
+                "huge_internal_trace": "x".repeat(8_000),
+            },
+        });
+        let source = serde_json::json!({
+            "kind": "coal_drill",
+            "unit_number": 206,
+            "name": "burner-mining-drill",
+            "position": {"x": -54.0, "y": 51.0},
+            "route_tile": {"x": -52, "y": 50},
+            "durable": false,
+            "operational": false,
+            "self_bootstrap_capable": true,
+            "upstream_proof": proof,
+        });
+        let consumer = serde_json::json!({
+            "unit_number": 206,
+            "name": "burner-mining-drill",
+            "type": "mining-drill",
+            "position": {"x": -54.0, "y": 51.0},
+            "status": "no_fuel",
+            "fuel_count": 0,
+            "candidate_sources": vec![source.clone(); 8],
+            "fuel_connections": [],
+            "proven_fuel_connections": [],
+            "ready_to_call": {
+                "tool": "repair_fuel_sustainability",
+                "transaction_args": {
+                    "consumer_unit_number": 206,
+                    "source_unit_number": 206,
+                    "from_x": -52,
+                    "from_y": 50,
+                    "pickup_x": -54,
+                    "pickup_y": 49,
+                    "inserter_x": -53.5,
+                    "inserter_y": 49.5,
+                    "inserter_direction": "north",
+                    "provisional_source_unit_number": 206,
+                    "bootstrap_consumer_fuel_count": 5,
+                },
+            },
+        });
+        let report = serde_json::json!({
+            "area": {"left_top": {"x": -64, "y": 40}, "right_bottom": {"x": -40, "y": 64}},
+            "consumer_count": 7,
+            "consumers": vec![consumer; 7],
+            "coal_sources": {
+                "mining_drills": vec![source.clone(); 8],
+                "belts": vec![source.clone(); 8],
+                "chests": vec![source; 8],
+                "resource_tiles": 16,
+            },
+            "suggested_actions": [{
+                "type": "repair_fuel_sustainability",
+                "tool": "repair_fuel_sustainability",
+                "target_unit_number": 206,
+                "description": "close the loop",
+                "connections": ["x".repeat(8_000)],
+            }],
+            "truncated": false,
+        });
+
+        let compact = compact_fuel_diagnosis(&report);
+        let encoded = serde_json::to_string(&compact).expect("compact diagnosis JSON");
+
+        assert!(
+            encoded.len() < 12_000,
+            "compact response was {} bytes",
+            encoded.len()
+        );
+        assert!(!encoded.contains("huge_internal_trace"));
+        assert!(!encoded.contains("fuel_proof"));
+        assert_eq!(compact["consumers"][0]["unit_number"], 206);
+        assert_eq!(
+            compact["consumers"][0]["candidate_sources"][0]["upstream_reason"],
+            "burner_coal_drill_fuel_not_durable"
+        );
+        assert_eq!(compact["coal_sources"]["mining_drills_count"], 8);
+        assert_eq!(
+            compact["suggested_actions"][0]["description"],
+            "close the loop"
+        );
+    }
+
+    #[test]
+    fn fuel_payload_projection_is_bounded_and_preserves_exact_repair_evidence() {
+        let bulk: Vec<_> = (0..2_000)
+            .map(|unit| {
+                serde_json::json!({
+                    "unit_number": unit,
+                    "name": "transport-belt",
+                    "position": {"x": unit, "y": unit},
+                    "trace": "x".repeat(128),
+                })
+            })
+            .collect();
+        let proof = serde_json::json!({
+            "reason": "closed_self_sustaining_coal_cycle",
+            "trace": "p".repeat(120_000),
+            "nested": {"reason": "producer_operational"},
+        });
+
+        for success in [true, false] {
+            let raw = serde_json::json!({
+                "success": success,
+                "error_kind": if success { serde_json::Value::Null } else { serde_json::json!("fuel_supply_not_live") },
+                "route": {
+                    "success": success,
+                    "complete_route": success,
+                    "belt_count": 2_000,
+                    "placed_entities": bulk.clone(),
+                    "planned_belts": bulk.clone(),
+                    "planned_new_belts": bulk.clone(),
+                    "endpoint_incompatibility": {
+                        "endpoint_kind": "goal",
+                        "unit_number": 991,
+                        "required_direction": "east",
+                    },
+                    "next_action": {
+                        "tool": "rotate_entity",
+                        "args": {"unit_number": 991, "direction": "east"},
+                        "after_success": {"tool": "repair_fuel_sustainability", "args": {"dry_run": true}},
+                    },
+                },
+                "infrastructure_verified": {
+                    "success": success,
+                    "route": {"success": true, "complete_route": true, "topology_connected": true},
+                    "inserter": {"expected_unit_number": 992, "actual_unit_number": 992},
+                    "durable_fuel_topology": {
+                        "success": success,
+                        "structural_success": true,
+                        "consumer_unit_number": 990,
+                        "inserter_unit_number": 992,
+                        "exact_connection_present": true,
+                        "durable_connection_verified": true,
+                        "live_supply_verified": success,
+                        "connection": {
+                            "connection_kind": "belt_inserter_fuel",
+                            "inserter_unit_number": 992,
+                            "durable": true,
+                            "live": success,
+                            "source": {
+                                "kind": "coal_drill",
+                                "unit_number": 990,
+                                "upstream_proof": proof,
+                            },
+                        },
+                    },
+                },
+                "verification": {
+                    "success": success,
+                    "proof": "currently_working",
+                    "entities": bulk.clone(),
+                    "report": {"entities": bulk.clone()},
+                },
+                "rollback": {
+                    "success": true,
+                    "transaction_fuel_cleared": true,
+                    "consumer_state": {
+                        "success": true,
+                        "consumer_state_restored": true,
+                        "feeder_quiesced": true,
+                        "before": {"unit_number": 990, "fuel_total": 5, "cold": false},
+                        "expected": {"unit_number": 990, "fuel_total": 0, "cold": true},
+                        "after": {"unit_number": 990, "fuel_total": 0, "cold": true},
+                    },
+                    "infrastructure": {
+                        "success": true,
+                        "units": {
+                            "success": true,
+                            "removed_units": (0..2_000).collect::<Vec<_>>(),
+                            "attempts": bulk.clone(),
+                        },
+                    },
+                },
+            });
+            let raw_size = serde_json::to_string_pretty(&raw).unwrap().len();
+            assert!(
+                raw_size > 100_000,
+                "fixture must exercise an oversized payload"
+            );
+
+            let compact = compact_fuel_repair(&raw);
+            let encoded = serde_json::to_string_pretty(&compact).unwrap();
+            assert!(
+                encoded.len() < 65_536,
+                "bounded fuel payload was {} bytes",
+                encoded.len()
+            );
+            assert_eq!(compact["success"], success);
+            assert_eq!(compact["route"]["next_action"]["args"]["unit_number"], 991);
+            assert_eq!(
+                compact["infrastructure_verified"]["durable_fuel_topology"]["consumer_unit_number"],
+                990
+            );
+            assert_eq!(
+                compact["infrastructure_verified"]["durable_fuel_topology"]["inserter_unit_number"],
+                992
+            );
+            assert!(
+                compact["infrastructure_verified"]["durable_fuel_topology"]["proof_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason == "closed_self_sustaining_coal_cycle")
+            );
+            for forbidden in [
+                "placed_entities",
+                "planned_belts",
+                "planned_new_belts",
+                "huge_internal_trace",
+                "\"entities\"",
+                "\"report\"",
+                "\"attempts\"",
+            ] {
+                assert!(
+                    !encoded.contains(forbidden),
+                    "compact payload retained {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_conflict_prefers_goal() {
+        let start = GridPos::new(1, 2);
+        let goal = GridPos::new(9, 2);
+        let conflicts = vec![
+            (
+                start,
+                serde_json::json!({"unit_number": 40, "required_direction": "west"}),
+            ),
+            (
+                goal,
+                serde_json::json!({"unit_number": 41, "required_direction": "east"}),
+            ),
+        ];
+        let selected = endpoint_belt_incompatibility(&conflicts, start, goal).unwrap();
+        assert_eq!(selected["endpoint_kind"], "goal");
+        assert_eq!(selected["unit_number"], 41);
+        assert_eq!(selected["required_direction"], "east");
+    }
+
+    #[test]
+    fn build_fuel_supply_params_require_source_identity_and_accept_factorio_centers() {
         let args: BuildFuelSupplyParams = serde_json::from_value(serde_json::json!({
             "consumer_unit_number": 49,
+            "source_unit_number": 87,
             "from_x": 73.5,
             "from_y": -27.5,
             "pickup_x": 54.5,
@@ -2348,6 +3080,22 @@ mod tests {
         assert_eq!(args.from_y, -28);
         assert_eq!(args.pickup_x, 54);
         assert_eq!(args.pickup_y, -10);
+        assert_eq!(args.source_unit_number, 87);
+
+        let missing_source = serde_json::json!({
+            "consumer_unit_number": 49,
+            "from_x": 73.5,
+            "from_y": -27.5,
+            "pickup_x": 54.5,
+            "pickup_y": -9.5,
+            "inserter_x": 54.5,
+            "inserter_y": -8.5,
+            "inserter_direction": "north"
+        });
+        assert!(
+            serde_json::from_value::<BuildFuelSupplyParams>(missing_source).is_err(),
+            "fuel transactions must fail closed without an exact diagnosed source"
+        );
     }
 
     #[test]
@@ -2359,6 +3107,7 @@ mod tests {
                 "tool": "repair_fuel_sustainability",
                 "transaction_args": {
                     "consumer_unit_number": 73,
+                    "source_unit_number": 74,
                     "from_x": 5,
                     "from_y": 6,
                     "pickup_x": 7,
@@ -3265,11 +4014,38 @@ fn existing_belt_compatibility(
     Ok(())
 }
 
+fn endpoint_belt_incompatibility(
+    incompatible: &[(GridPos, serde_json::Value)],
+    start: GridPos,
+    goal: GridPos,
+) -> Option<serde_json::Value> {
+    [(&goal, "goal"), (&start, "start")]
+        .into_iter()
+        .find_map(|(endpoint_tile, endpoint_kind)| {
+            incompatible
+                .iter()
+                .find(|(tile, _)| tile == endpoint_tile)
+                .map(|(tile, error)| {
+                    let mut error = error.clone();
+                    if let Some(object) = error.as_object_mut() {
+                        object.insert(
+                            "endpoint_kind".to_string(),
+                            serde_json::json!(endpoint_kind),
+                        );
+                        object.insert("endpoint_tile".to_string(), serde_json::json!(tile));
+                    }
+                    error
+                })
+        })
+}
+
 /// Parameters for build_fuel_supply tool.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct BuildFuelSupplyParams {
     /// Fuel consumer to supply, used for verification context.
     pub consumer_unit_number: u32,
+    /// Exact diagnosed coal source. Existing belt sources are tapped without mutation.
+    pub source_unit_number: u32,
     /// Coal source or existing coal belt X tile.
     #[serde(deserialize_with = "deserialize_tile_i32")]
     #[schemars(with = "f64")]
@@ -3299,8 +4075,14 @@ pub struct BuildFuelSupplyParams {
     #[serde(default = "default_fuel_item")]
     pub inserter_fuel_item: String,
     /// Bootstrap fuel count for a burner inserter.
-    #[serde(default = "default_furnace_fuel_count")]
+    #[serde(default = "default_bootstrap_fuel_count")]
     pub inserter_fuel_count: u32,
+    /// Self-bootstrap coal drill; must equal consumer_unit_number.
+    #[serde(default)]
+    pub provisional_source_unit_number: Option<u32>,
+    /// Bounded startup fuel for that provisional drill.
+    #[serde(default)]
+    pub bootstrap_consumer_fuel_count: u32,
     /// Belt type to route.
     #[serde(default = "default_belt_type")]
     pub belt_type: String,
@@ -4056,6 +4838,842 @@ fn machine_output_build_args(
         extend_existing,
         verify_radius,
     })
+}
+
+fn copy_json_fields(
+    value: &serde_json::Value,
+    fields: &[&str],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut result = serde_json::Map::new();
+    for field in fields {
+        if let Some(field_value) = value.get(*field) {
+            result.insert((*field).to_string(), field_value.clone());
+        }
+    }
+    result
+}
+
+fn compact_fuel_source(source: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        source,
+        &[
+            "kind",
+            "unit_number",
+            "name",
+            "position",
+            "route_position",
+            "route_tile",
+            "status",
+            "coal_count",
+            "durable",
+            "operational",
+            "producer_operational",
+            "self_bootstrap_capable",
+            "distance",
+        ],
+    );
+    if let Some(reason) = source
+        .get("upstream_proof")
+        .and_then(|proof| proof.get("reason"))
+    {
+        result.insert("upstream_reason".to_string(), reason.clone());
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_fuel_connection(connection: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        connection,
+        &[
+            "connection_kind",
+            "inserter_unit_number",
+            "inserter_name",
+            "inserter_status",
+            "inserter_operational",
+            "pickup_position",
+            "drop_position",
+            "source_durable",
+            "source_operational",
+            "durable",
+            "live",
+        ],
+    );
+    if let Some(source) = connection.get("source") {
+        result.insert("source".to_string(), compact_fuel_source(source));
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_fuel_consumer(consumer: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        consumer,
+        &[
+            "priority",
+            "unit_number",
+            "name",
+            "type",
+            "position",
+            "status",
+            "fuel_count",
+            "remaining_burning_fuel",
+            "issue",
+            "fuel_topology_present",
+            "automated",
+            "ready_to_call",
+        ],
+    );
+    for field in ["fuel_connections", "proven_fuel_connections"] {
+        if let Some(values) = consumer.get(field).and_then(|value| value.as_array()) {
+            result.insert(
+                field.to_string(),
+                serde_json::Value::Array(
+                    values.iter().take(4).map(compact_fuel_connection).collect(),
+                ),
+            );
+        }
+    }
+    if let Some(sources) = consumer
+        .get("candidate_sources")
+        .and_then(|value| value.as_array())
+    {
+        result.insert(
+            "candidate_sources".to_string(),
+            serde_json::Value::Array(sources.iter().take(3).map(compact_fuel_source).collect()),
+        );
+    }
+    if let Some(candidates) = consumer
+        .get("fuel_inserter_candidates")
+        .and_then(|value| value.as_array())
+    {
+        let candidates = candidates
+            .iter()
+            .take(4)
+            .map(|candidate| {
+                serde_json::Value::Object(copy_json_fields(
+                    candidate,
+                    &[
+                        "inserter_position",
+                        "inserter_direction",
+                        "inserter_direction_name",
+                        "inserter_name",
+                        "pickup_tile",
+                        "can_place_inserter",
+                        "placement_reason",
+                        "fuel_transaction_args",
+                    ],
+                ))
+            })
+            .collect();
+        result.insert(
+            "fuel_inserter_candidates".to_string(),
+            serde_json::Value::Array(candidates),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_fuel_action(action: &serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Object(copy_json_fields(
+        action,
+        &[
+            "type",
+            "tool",
+            "target_unit_number",
+            "args",
+            "transaction_args",
+            "follow_up",
+            "source_kind",
+            "source_is_proposed",
+            "coal_resource_position",
+            "description",
+        ],
+    ))
+}
+
+/// Project the internal proof graph into the small, actionable view a model
+/// needs. The complete diagnosis remains available inside the controller for
+/// exact verification; it is not duplicated across every consumer response.
+fn compact_fuel_diagnosis(report: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        report,
+        &["area", "consumer_count", "truncated", "guidance", "error"],
+    );
+    if let Some(consumers) = report.get("consumers").and_then(|value| value.as_array()) {
+        let mut selected = Vec::new();
+        if let Some(ready) = consumers
+            .iter()
+            .find(|consumer| consumer.get("ready_to_call").is_some())
+        {
+            selected.push(ready);
+        }
+        for consumer in consumers {
+            if selected.len() >= 3 {
+                break;
+            }
+            if !selected
+                .iter()
+                .any(|existing| std::ptr::eq(*existing, consumer))
+            {
+                selected.push(consumer);
+            }
+        }
+        result.insert(
+            "consumers".to_string(),
+            serde_json::Value::Array(selected.into_iter().map(compact_fuel_consumer).collect()),
+        );
+    }
+    if let Some(sources) = report.get("coal_sources") {
+        let mut compact_sources = copy_json_fields(
+            sources,
+            &[
+                "resource_tiles",
+                "mining_drills_count",
+                "belts_count",
+                "chests_count",
+            ],
+        );
+        for field in ["mining_drills", "belts", "chests"] {
+            if let Some(values) = sources.get(field).and_then(|value| value.as_array()) {
+                compact_sources
+                    .entry(format!("{field}_count"))
+                    .or_insert_with(|| serde_json::json!(values.len()));
+                compact_sources.insert(
+                    field.to_string(),
+                    serde_json::Value::Array(
+                        values.iter().take(3).map(compact_fuel_source).collect(),
+                    ),
+                );
+            }
+        }
+        result.insert(
+            "coal_sources".to_string(),
+            serde_json::Value::Object(compact_sources),
+        );
+    }
+    if let Some(actions) = report
+        .get("suggested_actions")
+        .and_then(|value| value.as_array())
+    {
+        result.insert(
+            "suggested_actions".to_string(),
+            serde_json::Value::Array(actions.iter().take(2).map(compact_fuel_action).collect()),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn capped_array(value: &serde_json::Value, field: &str, limit: usize) -> serde_json::Value {
+    serde_json::Value::Array(
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(limit)
+            .cloned()
+            .collect(),
+    )
+}
+
+fn compact_next_action(action: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        action,
+        &["tool", "operation", "type", "args", "reason", "description"],
+    );
+    if let Some(after_success) = action.get("after_success") {
+        result.insert(
+            "after_success".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                after_success,
+                &["tool", "operation", "args", "reason"],
+            )),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn fuel_proof_reasons(value: &serde_json::Value) -> serde_json::Value {
+    const LIMIT: usize = 8;
+    const CLOSED_CYCLE: &str = "closed_self_sustaining_coal_cycle";
+    let mut stack = vec![value];
+    let mut reasons = Vec::new();
+    let mut seen = HashSet::new();
+    while let Some(current) = stack.pop() {
+        match current {
+            serde_json::Value::Object(object) => {
+                if let Some(reason) = object.get("reason").and_then(serde_json::Value::as_str) {
+                    if seen.insert(reason.to_string()) {
+                        if reasons.len() < LIMIT {
+                            reasons.push(reason.to_string());
+                        } else if reason == CLOSED_CYCLE
+                            && !reasons.iter().any(|existing| existing == CLOSED_CYCLE)
+                        {
+                            reasons[LIMIT - 1] = reason.to_string();
+                        }
+                    }
+                }
+                stack.extend(object.values());
+            }
+            serde_json::Value::Array(values) => stack.extend(values),
+            _ => {}
+        }
+    }
+    serde_json::json!(reasons)
+}
+
+fn compact_fuel_topology(topology: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        topology,
+        &[
+            "success",
+            "structural_success",
+            "scope",
+            "diagnostic_available",
+            "consumer_found",
+            "consumer_unit_number",
+            "inserter_unit_number",
+            "exact_connection_present",
+            "durable_connection_verified",
+            "durable_connection_reported",
+            "live_supply_verified",
+            "diagnostic_error",
+        ],
+    );
+    if let Some(connection) = topology.get("connection") {
+        result.insert(
+            "connection".to_string(),
+            compact_fuel_connection(connection),
+        );
+    }
+    result.insert("proof_reasons".to_string(), fuel_proof_reasons(topology));
+    serde_json::Value::Object(result)
+}
+
+fn compact_controller_rollback(rollback: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        rollback,
+        &["success", "passes", "skipped", "error", "error_kind"],
+    );
+    for field in [
+        "removed_units",
+        "pending_units",
+        "errors",
+        "restored_rotations",
+        "rotation_errors",
+        "rollback_errors",
+    ] {
+        if let Some(values) = rollback.get(field).and_then(serde_json::Value::as_array) {
+            result.insert(format!("{field}_count"), serde_json::json!(values.len()));
+            result.insert(field.to_string(), capped_array(rollback, field, 8));
+        }
+    }
+    if let Some(attempts) = rollback
+        .get("attempts")
+        .and_then(serde_json::Value::as_array)
+    {
+        result.insert(
+            "attempt_count".to_string(),
+            serde_json::json!(attempts.len()),
+        );
+    }
+    if let Some(units) = rollback.get("units") {
+        result.insert("units".to_string(), compact_controller_rollback(units));
+    }
+    if let Some(recipe) = rollback.get("recipe") {
+        result.insert(
+            "recipe".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                recipe,
+                &[
+                    "success",
+                    "skipped",
+                    "unit_number",
+                    "operation",
+                    "restored_recipe",
+                    "error",
+                ],
+            )),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_fuel_route(route: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        route,
+        &[
+            "success",
+            "complete_route",
+            "dry_run",
+            "error_kind",
+            "error",
+            "from",
+            "to",
+            "built_to",
+            "belt_type",
+            "belt_count",
+            "new_belt_count",
+            "placed",
+            "skipped_existing",
+            "turn_count",
+            "underground_count",
+            "resource_tiles_observed",
+            "planned_surface_resource_tiles_crossed_count",
+            "materials",
+            "materials_sufficient",
+            "ready_to_execute",
+            "material_shortfall",
+            "topology",
+            "endpoint_incompatibility",
+            "incompatible_existing_count",
+            "guidance",
+        ],
+    );
+    if let Some(values) = route
+        .get("incompatible_existing")
+        .and_then(serde_json::Value::as_array)
+    {
+        result
+            .entry("incompatible_existing_count".to_string())
+            .or_insert_with(|| serde_json::json!(values.len()));
+        result.insert(
+            "incompatible_existing".to_string(),
+            capped_array(route, "incompatible_existing", 4),
+        );
+    }
+    if let Some(values) = route.get("errors").and_then(serde_json::Value::as_array) {
+        result.insert("error_count".to_string(), serde_json::json!(values.len()));
+        result.insert("errors".to_string(), capped_array(route, "errors", 8));
+    }
+    if let Some(next_action) = route.get("next_action") {
+        result.insert("next_action".to_string(), compact_next_action(next_action));
+    }
+    if let Some(ready_to_call) = route.get("ready_to_call") {
+        result.insert(
+            "ready_to_call".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                ready_to_call,
+                &["tool", "execute_args", "args"],
+            )),
+        );
+    }
+    if let Some(rollback) = route.get("rollback") {
+        result.insert(
+            "rollback".to_string(),
+            compact_controller_rollback(rollback),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_fuel_preflight(preflight: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        preflight,
+        &[
+            "ready",
+            "materials",
+            "reserved_route_tiles",
+            "reserved_entity_tiles",
+            "reserved_tiles",
+            "new_belt_tiles",
+            "bootstrap_fuel",
+        ],
+    );
+    if let Some(routes) = preflight.get("routes") {
+        let mut compact_routes = copy_json_fields(
+            routes,
+            &[
+                "ready",
+                "materials",
+                "reserved_route_tiles",
+                "reserved_entity_tiles",
+                "reserved_tiles",
+                "new_belt_tiles",
+            ],
+        );
+        if let Some(errors) = routes.get("errors").and_then(serde_json::Value::as_array) {
+            compact_routes.insert("error_count".to_string(), serde_json::json!(errors.len()));
+            compact_routes.insert("errors".to_string(), capped_array(routes, "errors", 8));
+        }
+        result.insert(
+            "routes".to_string(),
+            serde_json::Value::Object(compact_routes),
+        );
+    }
+    if let Some(placements) = preflight
+        .get("placements")
+        .and_then(serde_json::Value::as_array)
+    {
+        result.insert(
+            "placement_count".to_string(),
+            serde_json::json!(placements.len()),
+        );
+        result.insert(
+            "placements".to_string(),
+            serde_json::Value::Array(
+                placements
+                    .iter()
+                    .take(4)
+                    .map(|placement| {
+                        serde_json::Value::Object(copy_json_fields(
+                            placement,
+                            &[
+                                "allowed",
+                                "item_name",
+                                "entity_name",
+                                "position",
+                                "direction",
+                                "error",
+                            ],
+                        ))
+                    })
+                    .collect(),
+            ),
+        );
+    } else if let Some(placements) = preflight
+        .get("placements")
+        .and_then(serde_json::Value::as_object)
+    {
+        result.insert(
+            "placement_count".to_string(),
+            serde_json::json!(placements.len()),
+        );
+        result.insert(
+            "placements".to_string(),
+            serde_json::Value::Object(
+                placements
+                    .iter()
+                    .take(4)
+                    .map(|(label, placement)| {
+                        (
+                            label.clone(),
+                            serde_json::Value::Object(copy_json_fields(
+                                placement,
+                                &[
+                                    "allowed",
+                                    "item_name",
+                                    "entity_name",
+                                    "position",
+                                    "direction",
+                                    "error",
+                                ],
+                            )),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(errors) = preflight
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+    {
+        result.insert("error_count".to_string(), serde_json::json!(errors.len()));
+        result.insert("errors".to_string(), capped_array(preflight, "errors", 8));
+    }
+    if let Some(endpoint) = preflight.get("endpoint_topology") {
+        result.insert("endpoint_topology".to_string(), endpoint.clone());
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_production_observation(observation: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        observation,
+        &[
+            "success",
+            "error",
+            "error_kind",
+            "proof",
+            "observation_ticks",
+            "producer_count",
+            "working_count",
+            "total",
+            "status_counts",
+            "scope",
+            "observation_call_ok",
+            "target_unit_number",
+            "production_applicable",
+            "target_working_or_progressed",
+        ],
+    );
+    for field in ["progressed_units", "working_units"] {
+        if let Some(values) = observation.get(field).and_then(serde_json::Value::as_array) {
+            result.insert(format!("{field}_count"), serde_json::json!(values.len()));
+            result.insert(field.to_string(), capped_array(observation, field, 16));
+        }
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_fuel_transaction(report: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        report,
+        &[
+            "operation",
+            "unit_number",
+            "item",
+            "count",
+            "inventory_type",
+            "temporary_startup_buffer",
+            "success",
+            "skipped",
+            "reason",
+            "error",
+            "error_kind",
+        ],
+    );
+    if let Some(inner) = report.get("report") {
+        result.insert(
+            "report".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                inner,
+                &[
+                    "success",
+                    "requested",
+                    "available",
+                    "removed",
+                    "inserted",
+                    "returned",
+                    "partial",
+                    "error",
+                    "error_kind",
+                ],
+            )),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_source_tap(report: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        report,
+        &[
+            "success",
+            "source_unit_number",
+            "source_direction_preserved",
+            "unit_number",
+            "layout",
+            "route_start_matches_drop",
+            "branch_extend_existing",
+            "filter_readback_verified",
+            "allowed_items",
+            "self_fueling_live",
+            "source_preservation",
+            "error",
+            "error_kind",
+        ],
+    );
+    for field in ["topology", "final_topology"] {
+        if let Some(topology) = report.get(field) {
+            result.insert(field.to_string(), compact_fuel_topology(topology));
+        }
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_burner_state(state: &serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Object(copy_json_fields(
+        state,
+        &[
+            "unit_number",
+            "name",
+            "type",
+            "surface_index",
+            "fuel_inventory",
+            "fuel_total",
+            "currently_burning",
+            "remaining_burning_fuel",
+            "heat",
+            "cold",
+        ],
+    ))
+}
+
+fn compact_fuel_rollback(rollback: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        rollback,
+        &["success", "transaction_fuel_cleared", "error", "error_kind"],
+    );
+    if let Some(consumer_state) = rollback.get("consumer_state") {
+        let mut state = copy_json_fields(
+            consumer_state,
+            &[
+                "success",
+                "classification",
+                "consumer_unit_number",
+                "feeder_unit_number",
+                "feeder_quiesced",
+                "feeder_error",
+                "consumer_state_restored",
+                "transaction_fuel_cleared",
+                "identity_valid",
+                "returned_excess",
+                "spilled_excess",
+                "unrecovered_excess",
+                "active_fuel_voided",
+                "error",
+                "error_kind",
+            ],
+        );
+        for field in ["before", "expected", "after"] {
+            if let Some(value) = consumer_state.get(field) {
+                state.insert(field.to_string(), compact_burner_state(value));
+            }
+        }
+        if let Some(errors) = consumer_state
+            .get("restore_errors")
+            .and_then(serde_json::Value::as_array)
+        {
+            state.insert(
+                "restore_error_count".to_string(),
+                serde_json::json!(errors.len()),
+            );
+            state.insert(
+                "restore_errors".to_string(),
+                capped_array(consumer_state, "restore_errors", 8),
+            );
+        }
+        result.insert(
+            "consumer_state".to_string(),
+            serde_json::Value::Object(state),
+        );
+    }
+    if let Some(infrastructure) = rollback.get("infrastructure") {
+        result.insert(
+            "infrastructure".to_string(),
+            compact_controller_rollback(infrastructure),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_fuel_infrastructure(report: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        report,
+        &["success", "scope", "route", "inserter", "endpoint_topology"],
+    );
+    if let Some(topology) = report.get("durable_fuel_topology") {
+        result.insert(
+            "durable_fuel_topology".to_string(),
+            compact_fuel_topology(topology),
+        );
+    }
+    if let Some(source_tap) = report.get("source_tap") {
+        result.insert("source_tap".to_string(), compact_source_tap(source_tap));
+    }
+    serde_json::Value::Object(result)
+}
+
+fn compact_fuel_repair(repair: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        repair,
+        &[
+            "success",
+            "error_kind",
+            "error",
+            "placement_success",
+            "dry_run",
+            "consumer",
+            "consumer_unit_number",
+            "inserter",
+            "automation_verified",
+            "guidance",
+        ],
+    );
+    if let Some(route) = repair.get("route") {
+        result.insert("route".to_string(), compact_fuel_route(route));
+    }
+    if let Some(preflight) = repair.get("preflight") {
+        result.insert("preflight".to_string(), compact_fuel_preflight(preflight));
+    }
+    for field in [
+        "bootstrap_fuel",
+        "bootstrap_source_tap_fuel",
+        "bootstrap_consumer_fuel",
+    ] {
+        if let Some(value) = repair.get(field) {
+            result.insert(field.to_string(), compact_fuel_transaction(value));
+        }
+    }
+    if let Some(source_tap) = repair.get("source_tap") {
+        result.insert("source_tap".to_string(), compact_source_tap(source_tap));
+    }
+    if let Some(source_preservation) = repair.get("source_preservation") {
+        result.insert(
+            "source_preservation".to_string(),
+            source_preservation.clone(),
+        );
+    }
+    if let Some(infrastructure) = repair.get("infrastructure_verified") {
+        result.insert(
+            "infrastructure_verified".to_string(),
+            compact_fuel_infrastructure(infrastructure),
+        );
+    }
+    for field in ["production_verified", "verification"] {
+        if let Some(value) = repair.get(field) {
+            result.insert(field.to_string(), compact_production_observation(value));
+        }
+    }
+    if let Some(diagnosis) = repair.get("fuel_diagnosis") {
+        result.insert(
+            "fuel_diagnosis".to_string(),
+            compact_fuel_diagnosis(diagnosis),
+        );
+    }
+    if let Some(snapshot) = repair.get("consumer_snapshot") {
+        result.insert(
+            "consumer_snapshot".to_string(),
+            compact_burner_state(snapshot),
+        );
+    }
+    if let Some(rollback) = repair.get("rollback") {
+        result.insert("rollback".to_string(), compact_fuel_rollback(rollback));
+    }
+    if let Some(next_action) = repair.get("next_action") {
+        result.insert("next_action".to_string(), compact_next_action(next_action));
+    }
+    if let Some(steps) = repair.get("steps").and_then(serde_json::Value::as_array) {
+        result.insert("step_count".to_string(), serde_json::json!(steps.len()));
+        result.insert(
+            "steps".to_string(),
+            serde_json::Value::Array(
+                steps
+                    .iter()
+                    .take(8)
+                    .map(|step| {
+                        serde_json::Value::Object(copy_json_fields(
+                            step,
+                            &[
+                                "tool",
+                                "operation",
+                                "args",
+                                "required",
+                                "unit_number",
+                                "item",
+                                "count",
+                            ],
+                        ))
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(repair_hint) = repair.get("repair_hint") {
+        let mut hint = copy_json_fields(repair_hint, &["context", "if_success", "anti_pattern"]);
+        if let Some(actions) = repair_hint
+            .get("if_failed")
+            .and_then(serde_json::Value::as_array)
+        {
+            hint.insert(
+                "if_failed".to_string(),
+                serde_json::Value::Array(actions.iter().take(8).map(compact_next_action).collect()),
+            );
+        }
+        result.insert("repair_hint".to_string(), serde_json::Value::Object(hint));
+    }
+    serde_json::Value::Object(result)
 }
 
 fn ready_fuel_supply_args(report: &serde_json::Value) -> Option<BuildFuelSupplyParams> {
@@ -7453,7 +9071,7 @@ impl FactorioMcp {
 
     /// Add one bounded fuel buffer to an existing burner entity.
     #[tool(
-        description = "Put 1-10 fuel items into an existing burner drill/inserter without replacing it. Temporary bootstrap only; then repair_fuel_sustainability."
+        description = "Put 1-10 fuel items into an existing burner drill/inserter without replacing it. Temporary bootstrap only; then repair_fuel_sustainability. Not a substitute for a pending next_action."
     )]
     async fn bootstrap_burner_once(
         &self,
@@ -8254,16 +9872,24 @@ impl FactorioMcp {
         }
 
         let mut existing_surface_belts: HashMap<GridPos, Entity> = HashMap::new();
-        if params.extend_existing {
-            for entity in route_entities {
-                if !is_existing_belt_entity(&entity.name)
-                    || entity.entity_type.as_deref() != Some("transport-belt")
-                {
-                    continue;
-                }
-                let tile = GridPos::from_position(&entity.position);
+        for entity in route_entities {
+            if !is_existing_belt_entity(&entity.name)
+                || entity.entity_type.as_deref() != Some("transport-belt")
+            {
+                continue;
+            }
+            let tile = GridPos::from_position(&entity.position);
+            if params.extend_existing {
                 collision_map.unblock(tile);
                 existing_surface_belts.insert(tile, entity);
+            } else {
+                // The shared collision map models where a character can walk,
+                // so ordinary belts are intentionally absent from it. An
+                // independent route cannot treat those occupied tiles as
+                // empty: doing so makes Factorio's manual placement check
+                // advertise a fast replacement that this controller neither
+                // requested nor may safely perform.
+                collision_map.block(tile);
             }
         }
 
@@ -8306,6 +9932,9 @@ impl FactorioMcp {
                 find_belt_route_with_options(start, goal, &collision_map, &routing_options);
             if !candidate.success {
                 if !rejected_existing.is_empty() {
+                    let incompatible_existing_count = rejected_existing.len();
+                    let incompatible_existing: Vec<_> =
+                        rejected_existing.iter().take(8).cloned().collect();
                     return Ok(serde_json::json!({
                         "success": false,
                         "complete_route": false,
@@ -8315,7 +9944,8 @@ impl FactorioMcp {
                         "from": { "x": params.from_x, "y": params.from_y },
                         "to": { "x": params.to_x, "y": params.to_y },
                         "belt_type": params.belt_type,
-                        "incompatible_existing": rejected_existing,
+                        "incompatible_existing_count": incompatible_existing_count,
+                        "incompatible_existing": incompatible_existing,
                         "materials_sufficient": false,
                         "guidance": "Use a correctly aligned belt highway, or explicitly rotate/rebuild the exact incompatible units before retrying. The router will not silently skip wrong-facing belts.",
                     }));
@@ -8358,14 +9988,26 @@ impl FactorioMcp {
                 break candidate;
             }
 
-            let endpoint_incompatible = incompatible
-                .iter()
-                .any(|(tile, _)| *tile == start || *tile == goal);
+            let endpoint_incompatibility =
+                endpoint_belt_incompatibility(&incompatible, start, goal);
             for (tile, error) in incompatible {
                 collision_map.block(tile);
                 rejected_existing.push(error);
             }
-            if endpoint_incompatible {
+            if let Some(endpoint_incompatibility) = endpoint_incompatibility {
+                let incompatible_existing_count = rejected_existing.len();
+                let incompatible_existing: Vec<_> =
+                    rejected_existing.iter().take(4).cloned().collect();
+                let required_direction = endpoint_incompatibility
+                    .get("required_direction")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let unit_number = endpoint_incompatibility
+                    .get("unit_number")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let retry_args =
+                    serde_json::to_value(params).unwrap_or_else(|_| serde_json::json!({}));
                 return Ok(serde_json::json!({
                     "success": false,
                     "complete_route": false,
@@ -8375,10 +10017,24 @@ impl FactorioMcp {
                     "from": { "x": params.from_x, "y": params.from_y },
                     "to": { "x": params.to_x, "y": params.to_y },
                     "belt_type": params.belt_type,
-                    "incompatible_existing": rejected_existing,
+                    "endpoint_incompatibility": endpoint_incompatibility,
+                    "incompatible_existing_count": incompatible_existing_count,
+                    "incompatible_existing": incompatible_existing,
                     "materials_sufficient": false,
                     "topology": compact_belt_topology(candidate.topology.as_ref()),
-                    "guidance": "Choose an endpoint whose existing belt already flows in the required direction, or explicitly rotate/rebuild that exact belt before routing.",
+                    "next_action": {
+                        "tool": "rotate_entity",
+                        "args": {
+                            "unit_number": unit_number,
+                            "direction": required_direction,
+                        },
+                        "reason": "Align the exact existing endpoint belt with this planned route.",
+                        "after_success": {
+                            "tool": "route_belt",
+                            "args": retry_args,
+                        },
+                    },
+                    "guidance": "Rotate only endpoint_incompatibility.unit_number to its required direction, then retry this same dry-run. Other rejected candidates are diagnostic only.",
                 }));
             }
         };
@@ -8470,6 +10126,72 @@ impl FactorioMcp {
             },
         });
 
+        let underground_entity = underground_config.as_ref().map(|c| c.entity_name.as_str());
+        let skipped_existing = build_belts
+            .iter()
+            .filter(|belt| existing_belt_tiles.contains(&GridPos::from_position(&belt.position)))
+            .count();
+        let mut preflight_errors = Vec::new();
+
+        // A dry-run is an executable placement plan, not just an A* sketch.
+        // Check every new tile with the same script-build semantics used by
+        // the mutation path before advertising it as ready to execute.
+        for belt in &build_belts {
+            if existing_belt_tiles.contains(&GridPos::from_position(&belt.position)) {
+                continue;
+            }
+            let entity_name = match belt.kind {
+                BeltKind::Surface => &params.belt_type,
+                BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
+                    underground_entity.unwrap_or(&params.belt_type)
+                }
+            };
+            match client
+                .check_entity_placement(entity_name, belt.position, belt.direction)
+                .await
+            {
+                Ok(report) if placement_report_allowed(&report) => {}
+                Ok(report) => preflight_errors.push(serde_json::json!({
+                    "position": belt.position,
+                    "entity": entity_name,
+                    "direction": belt.direction,
+                    "error": report.get("error"),
+                    "occupied_by": report.get("occupied_by"),
+                })),
+                Err(error) => preflight_errors.push(serde_json::json!({
+                    "position": belt.position,
+                    "entity": entity_name,
+                    "direction": belt.direction,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+
+        if !preflight_errors.is_empty() {
+            return Ok(serde_json::json!({
+                "success": false,
+                "complete_route": false,
+                "dry_run": params.dry_run,
+                "error_kind": "placement_preflight_failed",
+                "error": "Complete route preflight failed; no belts were placed.",
+                "from": { "x": params.from_x, "y": params.from_y },
+                "to": { "x": params.to_x, "y": params.to_y },
+                "belt_type": params.belt_type,
+                "belt_count": result.belt_count,
+                "new_belt_count": surface_belts_needed + underground_belts_needed,
+                "placed": 0,
+                "skipped_existing": skipped_existing,
+                "materials": materials,
+                "materials_sufficient": materials_sufficient,
+                "topology": compact_belt_topology(result.topology.as_ref()),
+                "resource_tiles_observed": resource_tiles.len(),
+                "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
+                "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
+                "preflight_errors": preflight_errors,
+                "guidance": "Fix the reported blocker or choose different endpoints, then retry the complete route. Do not place around the failure one tile at a time.",
+            }));
+        }
+
         if params.dry_run {
             let planned_new_belts: Vec<&BeltPlacement> = build_belts
                 .iter()
@@ -8543,69 +10265,6 @@ impl FactorioMcp {
                 );
             }
             return Ok(failure);
-        }
-
-        let underground_entity = underground_config.as_ref().map(|c| c.entity_name.as_str());
-        let skipped_existing = build_belts
-            .iter()
-            .filter(|belt| existing_belt_tiles.contains(&GridPos::from_position(&belt.position)))
-            .count();
-        let mut preflight_errors = Vec::new();
-
-        for belt in &build_belts {
-            if existing_belt_tiles.contains(&GridPos::from_position(&belt.position)) {
-                continue;
-            }
-            let entity_name = match belt.kind {
-                BeltKind::Surface => &params.belt_type,
-                BeltKind::UndergroundEntry | BeltKind::UndergroundExit => {
-                    underground_entity.unwrap_or(&params.belt_type)
-                }
-            };
-            match client
-                .check_entity_placement(entity_name, belt.position, belt.direction)
-                .await
-            {
-                Ok(report) if placement_report_allowed(&report) => {}
-                Ok(report) => preflight_errors.push(serde_json::json!({
-                    "position": belt.position,
-                    "entity": entity_name,
-                    "direction": belt.direction,
-                    "error": report.get("error"),
-                    "occupied_by": report.get("occupied_by"),
-                })),
-                Err(error) => preflight_errors.push(serde_json::json!({
-                    "position": belt.position,
-                    "entity": entity_name,
-                    "direction": belt.direction,
-                    "error": error.to_string(),
-                })),
-            }
-        }
-
-        if !preflight_errors.is_empty() {
-            return Ok(serde_json::json!({
-                "success": false,
-                "complete_route": false,
-                "dry_run": false,
-                "error_kind": "placement_preflight_failed",
-                "error": "Complete route preflight failed; no belts were placed.",
-                "from": { "x": params.from_x, "y": params.from_y },
-                "to": { "x": params.to_x, "y": params.to_y },
-                "belt_type": params.belt_type,
-                "belt_count": result.belt_count,
-                "new_belt_count": surface_belts_needed + underground_belts_needed,
-                "placed": 0,
-                "skipped_existing": skipped_existing,
-                "materials": materials,
-                "materials_sufficient": true,
-                "topology": compact_belt_topology(result.topology.as_ref()),
-                "resource_tiles_observed": resource_tiles.len(),
-                "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
-                "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
-                "preflight_errors": preflight_errors,
-                "guidance": "Fix the reported blocker or choose different endpoints, then retry the complete route. Do not place around the failure one tile at a time.",
-            }));
         }
 
         let mut placed_entities = Vec::new();
@@ -8813,6 +10472,68 @@ impl FactorioMcp {
             Ok(entity) => entity,
             Err(e) => return Err(format!("Error: {}", e)),
         };
+        let source_unit_number = params.source_unit_number;
+        let provisional_self_bootstrap = match params.provisional_source_unit_number {
+            Some(source_unit)
+                if source_unit == params.consumer_unit_number
+                    && source_unit == source_unit_number
+                    && consumer.unit_number == Some(source_unit)
+                    && consumer.entity_type.as_deref() == Some("mining-drill")
+                    && consumer.name == "burner-mining-drill"
+                    && params.bootstrap_consumer_fuel_count <= 10 =>
+            {
+                true
+            }
+            Some(source_unit) => {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "invalid_provisional_self_source",
+                    "error": "A provisional coal source must be the exact burner mining-drill consumer and use a bounded 0-10 item startup buffer.",
+                    "consumer_unit_number": params.consumer_unit_number,
+                    "provisional_source_unit_number": source_unit,
+                    "bootstrap_consumer_fuel_count": params.bootstrap_consumer_fuel_count,
+                }));
+            }
+            None if params.bootstrap_consumer_fuel_count == 0 => false,
+            None => {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "bootstrap_without_provisional_source",
+                    "error": "Consumer startup fuel is only valid for the exact provisional coal-drill self-source selected by diagnose_fuel_sustainability.",
+                    "consumer_unit_number": params.consumer_unit_number,
+                    "bootstrap_consumer_fuel_count": params.bootstrap_consumer_fuel_count,
+                }));
+            }
+        };
+        if provisional_self_bootstrap {
+            let drop = client
+                .call_remote(
+                    "get_entity_drop_position",
+                    &[serde_json::json!(params.consumer_unit_number)],
+                )
+                .await
+                .map_err(|error| format!("validating provisional coal-drill output: {error}"))?;
+            let drop: serde_json::Value = serde_json::from_str(&drop)
+                .map_err(|error| format!("decoding provisional coal-drill output: {error}"))?;
+            let expected_from_x = drop
+                .get("drop_x")
+                .and_then(|value| value.as_f64())
+                .map(|value| value.floor() as i32);
+            let expected_from_y = drop
+                .get("drop_y")
+                .and_then(|value| value.as_f64())
+                .map(|value| value.floor() as i32);
+            if expected_from_x != Some(params.from_x) || expected_from_y != Some(params.from_y) {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "provisional_source_output_mismatch",
+                    "error": "The provisional route must start at the exact output tile of the same burner coal drill.",
+                    "consumer_unit_number": params.consumer_unit_number,
+                    "requested_from": {"x": params.from_x, "y": params.from_y},
+                    "expected_from": {"x": expected_from_x, "y": expected_from_y},
+                }));
+            }
+        }
         let inserter_direction = match Direction::parse(&params.inserter_direction) {
             Some(direction) => direction,
             None => {
@@ -8822,46 +10543,249 @@ impl FactorioMcp {
                 ));
             }
         };
-
-        let route_params = RouteBeltParams {
-            from_x: params.from_x,
-            from_y: params.from_y,
-            to_x: params.pickup_x,
-            to_y: params.pickup_y,
-            belt_type: params.belt_type.clone(),
-            search_radius: params.search_radius,
-            dry_run: true,
-            respect_zones: params.respect_zones,
-            allow_underground: params.allow_underground,
-            extend_existing: params.extend_existing,
-        };
-        let route = self
-            .route_belt_core(client, &route_params)
-            .await
-            .unwrap_or_else(|error| {
-                route_belt_failure_json(&route_params, "infrastructure_failure", error)
-            });
+        if params.inserter_name.contains("burner")
+            && !(1..=10).contains(&params.inserter_fuel_count)
+        {
+            return Ok(serde_json::json!({
+                "success": false,
+                "error_kind": "invalid_inserter_bootstrap_count",
+                "error": "A burner fuel inserter requires a bounded 1-10 item startup buffer.",
+                "inserter_fuel_count": params.inserter_fuel_count,
+            }));
+        }
         let inserter_position = Position::new(params.inserter_x, params.inserter_y);
+        let fuel_inserter_placement = ControllerPlacement {
+            label: "fuel_inserter",
+            item_name: &params.inserter_name,
+            entity_name: &params.inserter_name,
+            position: inserter_position,
+            direction: inserter_direction,
+        };
         let inserter_args = serde_json::json!({
             "entity_name": params.inserter_name,
             "x": params.inserter_x,
             "y": params.inserter_y,
             "direction": params.inserter_direction,
         });
-        let preflight = controller_preflight(
-            client,
-            &[("fuel", &route)],
-            &params.belt_type,
-            &HashSet::new(),
-            &[ControllerPlacement {
-                label: "fuel_inserter",
-                item_name: &params.inserter_name,
-                entity_name: &params.inserter_name,
-                position: inserter_position,
-                direction: inserter_direction,
-            }],
-        )
-        .await?;
+
+        let diagnosed_source = match client.get_entity(source_unit_number).await {
+            Ok(entity) => entity,
+            Err(error) => {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "fuel_source_identity_changed",
+                    "error": error.to_string(),
+                    "source_unit_number": source_unit_number,
+                    "guidance": "The diagnosed source no longer exists. Refresh diagnose_fuel_sustainability; no infrastructure was changed.",
+                }));
+            }
+        };
+        let source_tap_entity = Some(&diagnosed_source).filter(|source| {
+            matches!(
+                source.entity_type.as_deref(),
+                Some("transport-belt" | "underground-belt" | "container" | "logistic-container")
+            )
+        });
+        if let Some(source) = source_tap_entity {
+            let actual_source_tile = GridPos::from_position(&source.position);
+            let requested_source_tile = GridPos::new(params.from_x, params.from_y);
+            if actual_source_tile != requested_source_tile {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "fuel_source_tile_mismatch",
+                    "error": "The exact diagnosed source is no longer at the transaction's source tile.",
+                    "source_unit_number": source.unit_number,
+                    "requested_source_tile": requested_source_tile,
+                    "actual_source_tile": actual_source_tile,
+                    "guidance": "Refresh diagnose_fuel_sustainability; no source or route entity was changed.",
+                }));
+            }
+        } else if diagnosed_source.entity_type.as_deref() == Some("mining-drill") {
+            let drop = client
+                .call_remote(
+                    "get_entity_drop_position",
+                    &[serde_json::json!(source_unit_number)],
+                )
+                .await
+                .map_err(|error| format!("validating coal-drill output: {error}"))?;
+            let drop: serde_json::Value = serde_json::from_str(&drop)
+                .map_err(|error| format!("decoding coal-drill output: {error}"))?;
+            let actual_route_tile = GridPos::new(
+                drop.get("drop_x")
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|value| value.floor() as i32)
+                    .unwrap_or(i32::MIN),
+                drop.get("drop_y")
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|value| value.floor() as i32)
+                    .unwrap_or(i32::MIN),
+            );
+            let requested_route_tile = GridPos::new(params.from_x, params.from_y);
+            if actual_route_tile != requested_route_tile {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "fuel_source_output_mismatch",
+                    "error": "The fuel route must start at the exact output tile of the diagnosed coal drill.",
+                    "source_unit_number": source_unit_number,
+                    "source_name": diagnosed_source.name,
+                    "requested_from": requested_route_tile,
+                    "expected_from": actual_route_tile,
+                    "guidance": "Refresh diagnose_fuel_sustainability; no source or route entity was changed.",
+                }));
+            }
+        } else {
+            return Ok(serde_json::json!({
+                "success": false,
+                "error_kind": "unsupported_fuel_source_tap",
+                "error": "This diagnosed source cannot be safely tapped by the durable fuel controller.",
+                "source_unit_number": source_unit_number,
+                "source_name": diagnosed_source.name,
+                "source_type": diagnosed_source.entity_type,
+                "guidance": "Choose a mining drill, surface belt, underground belt, or 1x1 coal container source. No source entity was rotated or removed.",
+            }));
+        }
+
+        let source_tap_plan = if let Some(source) = source_tap_entity {
+            let source_tile = GridPos::from_position(&source.position);
+            let mut selected: Option<((u8, u8, u64, usize), FuelSourceTapPlan)> = None;
+            for (layout_index, layout) in
+                belt_source_tap_layouts(source_tile).into_iter().enumerate()
+            {
+                let route_params = RouteBeltParams {
+                    from_x: layout.drop_tile.x,
+                    from_y: layout.drop_tile.y,
+                    to_x: params.pickup_x,
+                    to_y: params.pickup_y,
+                    belt_type: params.belt_type.clone(),
+                    search_radius: params.search_radius,
+                    dry_run: true,
+                    respect_zones: params.respect_zones,
+                    allow_underground: params.allow_underground,
+                    // A tap creates an independent, coal-only branch. It must
+                    // not merge into an unrelated or mixed existing belt.
+                    extend_existing: false,
+                };
+                let route = self
+                    .route_belt_core(client, &route_params)
+                    .await
+                    .unwrap_or_else(|error| {
+                        route_belt_failure_json(&route_params, "infrastructure_failure", error)
+                    });
+                let source_tap_placement = ControllerPlacement {
+                    label: "source_tap_inserter",
+                    item_name: FUEL_SOURCE_TAP_INSERTER,
+                    entity_name: FUEL_SOURCE_TAP_INSERTER,
+                    position: layout.inserter_position(),
+                    direction: layout.inserter_direction,
+                };
+                let preflight = controller_preflight(
+                    client,
+                    &[("fuel", &route)],
+                    &params.belt_type,
+                    &HashSet::new(),
+                    &[source_tap_placement, fuel_inserter_placement],
+                )
+                .await?;
+                let rank = source_tap_plan_rank(&route, &preflight, layout_index);
+                let plan = FuelSourceTapPlan {
+                    layout,
+                    route_params,
+                    route,
+                    preflight,
+                };
+                if selected
+                    .as_ref()
+                    .is_none_or(|(best_rank, _)| rank < *best_rank)
+                {
+                    selected = Some((rank, plan));
+                }
+            }
+            selected.map(|(_, plan)| plan)
+        } else {
+            None
+        };
+
+        let (route_params, route, mut preflight, source_tap_layout) =
+            if let Some(plan) = source_tap_plan {
+                (
+                    plan.route_params,
+                    plan.route,
+                    plan.preflight,
+                    Some(plan.layout),
+                )
+            } else {
+                let route_params = RouteBeltParams {
+                    from_x: params.from_x,
+                    from_y: params.from_y,
+                    to_x: params.pickup_x,
+                    to_y: params.pickup_y,
+                    belt_type: params.belt_type.clone(),
+                    search_radius: params.search_radius,
+                    dry_run: true,
+                    respect_zones: params.respect_zones,
+                    allow_underground: params.allow_underground,
+                    extend_existing: params.extend_existing,
+                };
+                let route = self
+                    .route_belt_core(client, &route_params)
+                    .await
+                    .map(fuel_route_protects_existing_source)
+                    .unwrap_or_else(|error| {
+                        route_belt_failure_json(&route_params, "infrastructure_failure", error)
+                    });
+                let preflight = controller_preflight(
+                    client,
+                    &[("fuel", &route)],
+                    &params.belt_type,
+                    &HashSet::new(),
+                    &[fuel_inserter_placement],
+                )
+                .await?;
+                (route_params, route, preflight, None)
+            };
+        let inserter_bootstrap_count = if params.inserter_name.contains("burner") {
+            params.inserter_fuel_count
+        } else {
+            0
+        };
+        let source_tap_bootstrap_count = if source_tap_layout.is_some() {
+            params.inserter_fuel_count
+        } else {
+            0
+        };
+        let total_bootstrap_fuel = inserter_bootstrap_count
+            .saturating_add(source_tap_bootstrap_count)
+            .saturating_add(params.bootstrap_consumer_fuel_count);
+        let available_bootstrap_fuel = client
+            .character_inventory()
+            .await
+            .map_err(|error| format!("checking bootstrap fuel: {error}"))?
+            .items
+            .iter()
+            .find(|item| item.name == params.inserter_fuel_item)
+            .map(|item| item.count)
+            .unwrap_or(0);
+        let bootstrap_fuel_ready = available_bootstrap_fuel >= total_bootstrap_fuel;
+        if let Some(report) = preflight.as_object_mut() {
+            let route_and_placement_ready =
+                report.get("ready").and_then(|value| value.as_bool()) == Some(true);
+            report.insert(
+                "ready".to_string(),
+                serde_json::json!(route_and_placement_ready && bootstrap_fuel_ready),
+            );
+            report.insert(
+                "bootstrap_fuel".to_string(),
+                serde_json::json!({
+                    "item": params.inserter_fuel_item,
+                    "available": available_bootstrap_fuel,
+                    "required": total_bootstrap_fuel,
+                    "inserter_required": inserter_bootstrap_count,
+                    "source_tap_required": source_tap_bootstrap_count,
+                    "consumer_required": params.bootstrap_consumer_fuel_count,
+                    "ready": bootstrap_fuel_ready,
+                }),
+            );
+        }
         let preflight_ready =
             preflight.get("ready").and_then(|value| value.as_bool()) == Some(true);
 
@@ -8876,12 +10800,43 @@ impl FactorioMcp {
                 },
                 "route": route,
                 "preflight": preflight,
+                "next_action": route.get("next_action"),
+                "source_tap": source_tap_layout.map(|layout| serde_json::json!({
+                    "source_unit_number": params.source_unit_number,
+                    "source_direction_preserved": true,
+                    "layout": layout,
+                    "route_start_matches_drop": route_topology_tile(&route, "start_tile")
+                        == Some(layout.drop_tile),
+                    "branch_extend_existing": false,
+                })),
                 "steps": [{
                     "tool": "route_belt",
                     "args": route_params,
                 }, {
                     "tool": "place_entity",
+                    "required": source_tap_layout.is_some(),
+                    "args": source_tap_layout.map(|layout| serde_json::json!({
+                        "entity_name": FUEL_SOURCE_TAP_INSERTER,
+                        "x": layout.inserter_position().x,
+                        "y": layout.inserter_position().y,
+                        "direction": layout.inserter_direction,
+                    })),
+                }, {
+                    "tool": "configure_inserter",
+                    "required": source_tap_layout.is_some(),
+                    "args": {
+                        "unit_number": serde_json::Value::Null,
+                        "allowed_items": ["coal"],
+                    },
+                }, {
+                    "tool": "place_entity",
                     "args": inserter_args,
+                }, {
+                    "operation": "bootstrap_provisional_consumer",
+                    "required": provisional_self_bootstrap,
+                    "unit_number": params.provisional_source_unit_number,
+                    "item": params.inserter_fuel_item,
+                    "count": params.bootstrap_consumer_fuel_count,
                 }, {
                     "tool": "verify_production",
                     "args": {
@@ -8890,7 +10845,7 @@ impl FactorioMcp {
                         "radius": params.verify_radius,
                     },
                 }],
-                "guidance": "Execute only when preflight.ready is true; the route and inserter are reserved as one transaction.",
+                "guidance": "Execute only when preflight.ready is true; the independent route, filtered source tap, and terminal inserter are reserved as one transaction.",
             }));
         }
 
@@ -8907,7 +10862,44 @@ impl FactorioMcp {
                 },
                 "route": route,
                 "preflight": preflight,
-                "guidance": "Resolve every preflight error before retrying; no partial fuel infrastructure was left behind.",
+                "next_action": route.get("next_action"),
+                "source_tap": source_tap_layout.map(|layout| serde_json::json!({
+                    "source_unit_number": params.source_unit_number,
+                    "layout": layout,
+                    "branch_extend_existing": false,
+                })),
+                "guidance": "Resolve every preflight error before retrying; no source entity or partial fuel infrastructure was changed.",
+            }));
+        }
+
+        let consumer_snapshot = match client
+            .snapshot_burner_state(params.consumer_unit_number)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "consumer_snapshot_failed",
+                    "error": error.to_string(),
+                    "consumer_unit_number": params.consumer_unit_number,
+                    "guidance": "Refresh fuel diagnosis before retrying; no infrastructure was changed.",
+                }));
+            }
+        };
+        if params.bootstrap_consumer_fuel_count > 0
+            && consumer_snapshot
+                .get("cold")
+                .and_then(|value| value.as_bool())
+                != Some(true)
+        {
+            return Ok(serde_json::json!({
+                "success": false,
+                "error_kind": "consumer_state_changed_before_bootstrap",
+                "error": "The provisional burner consumer is no longer cold, so the stale bootstrap transaction was not started.",
+                "consumer_unit_number": params.consumer_unit_number,
+                "consumer_snapshot": consumer_snapshot,
+                "guidance": "Rerun repair_fuel_sustainability dry_run to use current burner state.",
             }));
         }
 
@@ -8932,8 +10924,13 @@ impl FactorioMcp {
         {
             Ok(entity) => entity,
             Err(error) => {
-                let rollback =
-                    rollback_controller_transaction(client, &transaction_units, &[], None).await;
+                let rollback = rollback_failed_fuel_transaction(
+                    client,
+                    &consumer_snapshot,
+                    None,
+                    &transaction_units,
+                )
+                .await;
                 return Ok(serde_json::json!({
                     "success": false,
                     "error_kind": "inserter_placement_failed",
@@ -8947,6 +10944,160 @@ impl FactorioMcp {
         if let Some(unit_number) = placed_inserter_unit {
             transaction_units.push(unit_number);
         }
+        let terminal_filter = match placed_inserter_unit {
+            Some(unit_number) => match client
+                .configure_inserter(unit_number, &["coal".to_string()])
+                .await
+            {
+                Ok(report) if source_tap_filter_verified(&report) => report,
+                Ok(report) => {
+                    let rollback = rollback_failed_fuel_transaction(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": "fuel_inserter_filter_verification_failed",
+                        "error": "The terminal fuel inserter did not read back an exact coal whitelist.",
+                        "filter": report,
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+                Err(error) => {
+                    let rollback = rollback_failed_fuel_transaction(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": "fuel_inserter_filter_failed",
+                        "error": error.to_string(),
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+            },
+            None => {
+                let rollback = rollback_failed_fuel_transaction(
+                    client,
+                    &consumer_snapshot,
+                    None,
+                    &transaction_units,
+                )
+                .await;
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "fuel_inserter_missing_identity",
+                    "error": "The placed terminal inserter had no exact unit identity.",
+                    "route": route,
+                    "rollback": rollback,
+                }));
+            }
+        };
+
+        let source_tap_inserter = if let Some(layout) = source_tap_layout {
+            match client
+                .place_entity(
+                    FUEL_SOURCE_TAP_INSERTER,
+                    layout.inserter_position(),
+                    layout.inserter_direction,
+                )
+                .await
+            {
+                Ok(entity) => Some(entity),
+                Err(error) => {
+                    let rollback = rollback_failed_fuel_transaction(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": "source_tap_placement_failed",
+                        "error": error.to_string(),
+                        "source_unit_number": params.source_unit_number,
+                        "layout": layout,
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+            }
+        } else {
+            None
+        };
+        let source_tap_unit = source_tap_inserter
+            .as_ref()
+            .and_then(|entity| entity.unit_number);
+        if source_tap_inserter.is_some() && source_tap_unit.is_none() {
+            let rollback = rollback_failed_fuel_transaction(
+                client,
+                &consumer_snapshot,
+                placed_inserter_unit,
+                &transaction_units,
+            )
+            .await;
+            return Ok(serde_json::json!({
+                "success": false,
+                "error_kind": "source_tap_missing_identity",
+                "error": "The placed source tap had no exact unit identity and cannot enter an atomic transaction.",
+                "route": route,
+                "rollback": rollback,
+            }));
+        }
+        if let Some(unit_number) = source_tap_unit {
+            transaction_units.push(unit_number);
+        }
+        let source_tap_filter = match source_tap_unit {
+            Some(unit_number) => match client
+                .configure_inserter(unit_number, &["coal".to_string()])
+                .await
+            {
+                Ok(report) if source_tap_filter_verified(&report) => Some(report),
+                Ok(report) => {
+                    let rollback = rollback_failed_fuel_transaction(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": "source_tap_filter_verification_failed",
+                        "error": "The source tap did not read back an exact coal whitelist.",
+                        "filter": report,
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+                Err(error) => {
+                    let rollback = rollback_failed_fuel_transaction(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": "source_tap_filter_failed",
+                        "error": error.to_string(),
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+            },
+            None => None,
+        };
         let bootstrap_fuel = if params.inserter_name.contains("burner") {
             match placed_inserter_unit {
                 Some(unit) => {
@@ -8958,28 +11109,58 @@ impl FactorioMcp {
                             "fuel",
                         )
                         .await;
-                    if let Err(error) = inserted {
-                        let rollback =
-                            rollback_controller_transaction(client, &transaction_units, &[], None)
+                    match inserted {
+                        Ok(report) => {
+                            let inserter_bootstrap_inserted = report
+                                .get("inserted")
+                                .and_then(|value| value.as_u64())
+                                .and_then(|value| u32::try_from(value).ok())
+                                .unwrap_or(0);
+                            if inserter_bootstrap_inserted != params.inserter_fuel_count {
+                                let rollback = rollback_failed_fuel_transaction(
+                                    client,
+                                    &consumer_snapshot,
+                                    placed_inserter_unit,
+                                    &transaction_units,
+                                )
                                 .await;
-                        return Ok(serde_json::json!({
-                            "success": false,
-                            "error_kind": "bootstrap_fuel_failed",
-                            "error": error.to_string(),
-                            "route": route,
-                            "rollback": rollback,
-                        }));
+                                return Ok(serde_json::json!({
+                                    "success": false,
+                                    "error_kind": "bootstrap_fuel_incomplete",
+                                    "error": "The burner inserter did not accept its complete bounded startup buffer.",
+                                    "bootstrap_fuel": report,
+                                    "route": route,
+                                    "rollback": rollback,
+                                }));
+                            }
+                            serde_json::json!({
+                                "operation": "bootstrap_inserter_fuel",
+                                "unit_number": unit,
+                                "item": params.inserter_fuel_item,
+                                "count": params.inserter_fuel_count,
+                                "inventory_type": "fuel",
+                                "temporary_startup_buffer": true,
+                                "success": true,
+                                "report": report,
+                            })
+                        }
+                        Err(error) => {
+                            let rollback = rollback_failed_fuel_transaction(
+                                client,
+                                &consumer_snapshot,
+                                placed_inserter_unit,
+                                &transaction_units,
+                            )
+                            .await;
+                            return Ok(serde_json::json!({
+                                "success": false,
+                                "error_kind": "bootstrap_fuel_failed",
+                                "error": error.to_string(),
+                                "route": route,
+                                "rollback": rollback,
+                            }));
+                        }
                     }
-                    serde_json::json!({
-                        "operation": "bootstrap_inserter_fuel",
-                        "unit_number": unit,
-                        "item": params.inserter_fuel_item,
-                        "count": params.inserter_fuel_count,
-                        "inventory_type": "fuel",
-                        "temporary_startup_buffer": true,
-                        "success": true,
-                        "error": serde_json::Value::Null,
-                    })
                 }
                 None => serde_json::json!({
                     "skipped": true,
@@ -8992,13 +11173,195 @@ impl FactorioMcp {
                 "reason": "inserter is not burner-powered",
             })
         };
+        let bootstrap_source_tap_fuel = match source_tap_unit {
+            Some(unit_number) => match client
+                .insert_items(
+                    unit_number,
+                    &params.inserter_fuel_item,
+                    params.inserter_fuel_count,
+                    "fuel",
+                )
+                .await
+            {
+                Ok(report)
+                    if report.get("inserted").and_then(serde_json::Value::as_u64)
+                        == Some(u64::from(params.inserter_fuel_count)) =>
+                {
+                    serde_json::json!({
+                        "operation": "bootstrap_source_tap_fuel",
+                        "unit_number": unit_number,
+                        "item": params.inserter_fuel_item,
+                        "count": params.inserter_fuel_count,
+                        "inventory_type": "fuel",
+                        "temporary_startup_buffer": true,
+                        "success": true,
+                        "report": report,
+                    })
+                }
+                Ok(report) => {
+                    let rollback = rollback_failed_fuel_transaction(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": "source_tap_bootstrap_incomplete",
+                        "error": "The source tap did not accept its complete bounded startup buffer.",
+                        "bootstrap_source_tap_fuel": report,
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+                Err(error) => {
+                    let rollback = rollback_failed_fuel_transaction(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": "source_tap_bootstrap_failed",
+                        "error": error.to_string(),
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+            },
+            None => serde_json::json!({
+                "skipped": true,
+                "reason": "the selected source does not require a source-side tap",
+            }),
+        };
         let inserter_report = serde_json::json!({
             "tool": "place_entity",
             "args": inserter_args,
             "success": true,
             "unit_number": placed_inserter_unit,
+            "filter": terminal_filter,
             "error": serde_json::Value::Null,
         });
+
+        let bootstrap_consumer_fuel = if provisional_self_bootstrap
+            && params.bootstrap_consumer_fuel_count > 0
+        {
+            match client
+                .insert_items(
+                    params.consumer_unit_number,
+                    &params.inserter_fuel_item,
+                    params.bootstrap_consumer_fuel_count,
+                    "fuel",
+                )
+                .await
+            {
+                Ok(report) => {
+                    let consumer_bootstrap_inserted = report
+                        .get("inserted")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(0);
+                    if consumer_bootstrap_inserted != params.bootstrap_consumer_fuel_count {
+                        let rollback = rollback_failed_fuel_transaction(
+                            client,
+                            &consumer_snapshot,
+                            placed_inserter_unit,
+                            &transaction_units,
+                        )
+                        .await;
+                        return Ok(serde_json::json!({
+                            "success": false,
+                            "error_kind": "consumer_bootstrap_fuel_incomplete",
+                            "error": "The exact provisional coal drill did not accept its complete bounded startup buffer.",
+                            "bootstrap_consumer_fuel": report,
+                            "route": route,
+                            "rollback": rollback,
+                        }));
+                    }
+                    serde_json::json!({
+                        "operation": "bootstrap_provisional_consumer",
+                        "unit_number": params.consumer_unit_number,
+                        "item": params.inserter_fuel_item,
+                        "count": params.bootstrap_consumer_fuel_count,
+                        "inventory_type": "fuel",
+                        "temporary_startup_buffer": true,
+                        "success": true,
+                        "report": report,
+                    })
+                }
+                Err(error) => {
+                    let rollback = rollback_failed_fuel_transaction(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": "consumer_bootstrap_fuel_failed",
+                        "error": error.to_string(),
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+            }
+        } else if provisional_self_bootstrap {
+            serde_json::json!({
+                "skipped": true,
+                "reason": "the provisional coal drill already has startup fuel",
+                "unit_number": params.consumer_unit_number,
+                "count": 0,
+            })
+        } else {
+            serde_json::json!({
+                "skipped": true,
+                "reason": "fuel source is already durable; no consumer bootstrap needed",
+            })
+        };
+
+        if source_tap_layout.is_some() {
+            if let Err(error) = client.wait_ticks(360).await {
+                let rollback = rollback_failed_fuel_transaction(
+                    client,
+                    &consumer_snapshot,
+                    placed_inserter_unit,
+                    &transaction_units,
+                )
+                .await;
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "source_tap_startup_observation_failed",
+                    "error": error.to_string(),
+                    "bootstrap_source_tap_fuel": bootstrap_source_tap_fuel,
+                    "route": route,
+                    "rollback": rollback,
+                }));
+            }
+        }
+
+        if provisional_self_bootstrap {
+            if let Err(error) = client.wait_ticks(600).await {
+                let rollback = rollback_failed_fuel_transaction(
+                    client,
+                    &consumer_snapshot,
+                    placed_inserter_unit,
+                    &transaction_units,
+                )
+                .await;
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": "self_bootstrap_observation_failed",
+                    "error": error.to_string(),
+                    "bootstrap_consumer_fuel": bootstrap_consumer_fuel,
+                    "route": route,
+                    "rollback": rollback,
+                }));
+            }
+        }
 
         let verify_radius = params.verify_radius.clamp(1, 50) as f64;
         let verify_area = Area::new(
@@ -9008,6 +11371,10 @@ impl FactorioMcp {
             consumer.position.y + verify_radius,
         );
         let persisted_inserter = match placed_inserter_unit {
+            Some(unit_number) => client.get_entity(unit_number).await.ok(),
+            None => None,
+        };
+        let persisted_source_tap = match source_tap_unit {
             Some(unit_number) => client.get_entity(unit_number).await.ok(),
             None => None,
         };
@@ -9028,8 +11395,82 @@ impl FactorioMcp {
             params.consumer_unit_number,
             placed_inserter_unit,
         );
-        let infrastructure_success =
-            report_success(&infrastructure_verified) && report_success(&durable_fuel_topology);
+        let structural_fuel_topology = durable_fuel_topology
+            .get("structural_success")
+            .and_then(|value| value.as_bool())
+            == Some(true);
+        let source_after_build = client.get_entity(source_unit_number).await.ok();
+        let source_preservation = source_tap_entity.map(|source| {
+            source_entity_preservation(
+                source,
+                source_after_build.as_ref(),
+                GridPos::new(params.from_x, params.from_y),
+            )
+        });
+        let mut source_tap_infrastructure = match (source_tap_layout, source_tap_unit) {
+            (Some(layout), Some(unit_number)) => {
+                let placement = incremental_infrastructure_verification(
+                    &route,
+                    Some(unit_number),
+                    persisted_source_tap.as_ref(),
+                    FUEL_SOURCE_TAP_INSERTER,
+                    layout.inserter_position(),
+                    layout.inserter_direction,
+                );
+                let tap_radius = 6.0;
+                let tap_area = Area::new(
+                    layout.inserter_position().x - tap_radius,
+                    layout.inserter_position().y - tap_radius,
+                    layout.inserter_position().x + tap_radius,
+                    layout.inserter_position().y + tap_radius,
+                );
+                let tap_diagnosis = client
+                    .diagnose_fuel_sustainability(tap_area, 100)
+                    .await
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+                let topology =
+                    fuel_topology_verification(&tap_diagnosis, unit_number, Some(unit_number));
+                let route_start_matches_drop =
+                    route_topology_tile(&route, "start_tile") == Some(layout.drop_tile);
+                let source_preserved = source_preservation.as_ref().is_some_and(report_success);
+                let filter_verified = source_tap_filter
+                    .as_ref()
+                    .is_some_and(source_tap_filter_verified);
+                let success = report_success(&placement)
+                    && topology
+                        .get("structural_success")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && route_start_matches_drop
+                    && source_preserved
+                    && filter_verified;
+                Some(serde_json::json!({
+                    "success": success,
+                    "source_unit_number": params.source_unit_number,
+                    "source_direction_preserved": source_preserved,
+                    "unit_number": unit_number,
+                    "layout": layout,
+                    "route_start_matches_drop": route_start_matches_drop,
+                    "branch_extend_existing": false,
+                    "filter_readback_verified": filter_verified,
+                    "allowed_items": ["coal"],
+                    "placement": placement,
+                    "topology": topology,
+                    "source_preservation": source_preservation,
+                }))
+            }
+            (None, None) => None,
+            _ => Some(serde_json::json!({
+                "success": false,
+                "error": "source tap layout and exact unit identity did not agree",
+            })),
+        };
+        let source_tap_structural_success = source_tap_infrastructure
+            .as_ref()
+            .is_none_or(report_success);
+        let infrastructure_success = report_success(&infrastructure_verified)
+            && structural_fuel_topology
+            && source_tap_structural_success;
         if let Some(report) = infrastructure_verified.as_object_mut() {
             report.insert(
                 "success".to_string(),
@@ -9039,10 +11480,18 @@ impl FactorioMcp {
                 "durable_fuel_topology".to_string(),
                 durable_fuel_topology.clone(),
             );
+            if let Some(source_tap) = source_tap_infrastructure.as_ref() {
+                report.insert("source_tap".to_string(), source_tap.clone());
+            }
         }
         if !infrastructure_success {
-            let rollback =
-                rollback_controller_transaction(client, &transaction_units, &[], None).await;
+            let rollback = rollback_failed_fuel_transaction(
+                client,
+                &consumer_snapshot,
+                placed_inserter_unit,
+                &transaction_units,
+            )
+            .await;
             return Ok(serde_json::json!({
                 "success": false,
                 "error_kind": "infrastructure_verification_failed",
@@ -9051,7 +11500,12 @@ impl FactorioMcp {
                 "consumer": consumer,
                 "route": route,
                 "infrastructure_verified": infrastructure_verified,
-                "fuel_diagnosis": model_safe_payload(fuel_diagnosis),
+                "source_tap": source_tap_infrastructure,
+                "source_preservation": source_preservation,
+                "bootstrap_fuel": bootstrap_fuel,
+                "bootstrap_source_tap_fuel": bootstrap_source_tap_fuel,
+                "bootstrap_consumer_fuel": bootstrap_consumer_fuel,
+                "fuel_diagnosis": compact_fuel_diagnosis(&fuel_diagnosis),
                 "rollback": rollback,
             }));
         }
@@ -9061,13 +11515,117 @@ impl FactorioMcp {
             Err(error) => serde_json::json!({"success": false, "error": error.to_string()}),
         };
         let production_verified =
-            production_verification_summary(&verification, consumer.unit_number);
+            fuel_consumer_activity_verification_summary(&verification, consumer.unit_number);
         let production_success = report_success(&production_verified);
-        let fuel_supply_live = durable_fuel_topology
+        let final_fuel_diagnosis = client
+            .diagnose_fuel_sustainability(verify_area, 100)
+            .await
+            .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+        let final_fuel_topology = fuel_topology_verification(
+            &final_fuel_diagnosis,
+            params.consumer_unit_number,
+            placed_inserter_unit,
+        );
+        let final_structural_success = final_fuel_topology
+            .get("structural_success")
+            .and_then(|value| value.as_bool())
+            == Some(true);
+        let fuel_supply_live = final_fuel_topology
             .get("live_supply_verified")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let automation_success = production_success && fuel_supply_live;
+        let final_source_after = client.get_entity(source_unit_number).await.ok();
+        let final_source_preservation = source_tap_entity.map(|source| {
+            source_entity_preservation(
+                source,
+                final_source_after.as_ref(),
+                GridPos::new(params.from_x, params.from_y),
+            )
+        });
+        let final_source_tap_topology = match (source_tap_layout, source_tap_unit) {
+            (Some(layout), Some(unit_number)) => {
+                let tap_radius = 6.0;
+                let tap_position = layout.inserter_position();
+                let tap_area = Area::new(
+                    tap_position.x - tap_radius,
+                    tap_position.y - tap_radius,
+                    tap_position.x + tap_radius,
+                    tap_position.y + tap_radius,
+                );
+                let diagnosis = client
+                    .diagnose_fuel_sustainability(tap_area, 100)
+                    .await
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+                Some(fuel_topology_verification(
+                    &diagnosis,
+                    unit_number,
+                    Some(unit_number),
+                ))
+            }
+            _ => None,
+        };
+        let source_tap_final_success = if source_tap_layout.is_some() {
+            final_source_preservation
+                .as_ref()
+                .is_some_and(report_success)
+                && final_source_tap_topology.as_ref().is_some_and(|topology| {
+                    topology
+                        .get("structural_success")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && topology
+                            .get("live_supply_verified")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                })
+        } else {
+            true
+        };
+        let automation_success = infrastructure_success
+            && final_structural_success
+            && production_success
+            && fuel_supply_live
+            && source_tap_final_success;
+        if let Some(source_tap) = source_tap_infrastructure
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            source_tap.insert(
+                "success".to_string(),
+                serde_json::json!(source_tap_final_success),
+            );
+            source_tap.insert(
+                "self_fueling_live".to_string(),
+                serde_json::json!(source_tap_final_success),
+            );
+            source_tap.insert(
+                "final_topology".to_string(),
+                final_source_tap_topology
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            source_tap.insert(
+                "source_preservation".to_string(),
+                final_source_preservation
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Some(report) = infrastructure_verified.as_object_mut() {
+            report.insert(
+                "success".to_string(),
+                serde_json::json!(
+                    infrastructure_success && final_structural_success && source_tap_final_success
+                ),
+            );
+            report.insert(
+                "durable_fuel_topology".to_string(),
+                final_fuel_topology.clone(),
+            );
+            if let Some(source_tap) = source_tap_infrastructure.as_ref() {
+                report.insert("source_tap".to_string(), source_tap.clone());
+            }
+        }
         let repair_hint = automation_repair_hint(
             "repair_fuel_sustainability",
             "durable fuel delivery",
@@ -9076,9 +11634,71 @@ impl FactorioMcp {
             &[],
             Some(true),
         );
+        if (provisional_self_bootstrap || source_tap_layout.is_some()) && !automation_success {
+            let rollback = rollback_failed_fuel_transaction(
+                client,
+                &consumer_snapshot,
+                placed_inserter_unit,
+                &transaction_units,
+            )
+            .await;
+            return Ok(serde_json::json!({
+                "success": false,
+                "error_kind": if !final_structural_success {
+                    "fuel_topology_lost"
+                } else if !fuel_supply_live {
+                    "fuel_supply_not_live"
+                } else if !source_tap_final_success {
+                    "source_tap_not_live"
+                } else {
+                    "target_production_not_verified"
+                },
+                "error": if provisional_self_bootstrap {
+                    "The provisional coal-drill loop did not prove live self-sustaining production, so its startup fuel and new infrastructure were rolled back."
+                } else {
+                    "The source-tap transaction did not prove preserved source flow, live durable fuel delivery, and target production, so the complete new branch was rolled back."
+                },
+                "placement_success": true,
+                "dry_run": false,
+                "consumer": {
+                    "unit_number": consumer.unit_number,
+                    "name": consumer.name,
+                    "position": consumer.position,
+                },
+                "route": route,
+                "bootstrap_fuel": bootstrap_fuel,
+                "bootstrap_source_tap_fuel": bootstrap_source_tap_fuel,
+                "bootstrap_consumer_fuel": bootstrap_consumer_fuel,
+                "source_tap": source_tap_infrastructure,
+                "source_preservation": final_source_preservation,
+                "infrastructure_verified": infrastructure_verified,
+                "production_verified": production_verified,
+                "automation_verified": {
+                    "success": false,
+                    "infrastructure_success": infrastructure_success && final_structural_success,
+                    "production_success": production_success,
+                    "fuel_supply_live": fuel_supply_live,
+                    "source_tap_success": source_tap_final_success,
+                },
+                "fuel_diagnosis": compact_fuel_diagnosis(&final_fuel_diagnosis),
+                "rollback": rollback,
+                "repair_hint": repair_hint,
+            }));
+        }
+        let error_kind = if automation_success {
+            serde_json::Value::Null
+        } else if !final_structural_success {
+            serde_json::json!("fuel_topology_lost")
+        } else if !fuel_supply_live {
+            serde_json::json!("fuel_supply_not_live")
+        } else if !source_tap_final_success {
+            serde_json::json!("source_tap_not_live")
+        } else {
+            serde_json::json!("target_production_not_verified")
+        };
         Ok(serde_json::json!({
-            "success": true,
-            "error_kind": serde_json::Value::Null,
+            "success": automation_success,
+            "error_kind": error_kind,
             "placement_success": true,
             "dry_run": false,
             "consumer": {
@@ -9090,20 +11710,25 @@ impl FactorioMcp {
             "preflight": preflight,
             "inserter": inserter_report,
             "bootstrap_fuel": bootstrap_fuel,
+            "bootstrap_source_tap_fuel": bootstrap_source_tap_fuel,
+            "bootstrap_consumer_fuel": bootstrap_consumer_fuel,
+            "source_tap": source_tap_infrastructure,
+            "source_preservation": final_source_preservation,
             "infrastructure_verified": infrastructure_verified,
             "production_verified": production_verified,
             "automation_verified": {
                 "success": automation_success,
-                "infrastructure_success": true,
+                "infrastructure_success": infrastructure_success && final_structural_success,
                 "production_success": production_success,
                 "fuel_supply_live": fuel_supply_live,
+                "source_tap_success": source_tap_final_success,
             },
             "verification": verification,
             "repair_hint": repair_hint,
-            "guidance": if production_success {
+            "guidance": if automation_success {
                 "Fuel delivery infrastructure and target production are both verified."
             } else {
-                "Fuel delivery infrastructure is verified and retained. Target production is not yet live; inspect production_verified and repair_hint without rebuilding this route."
+                "Structurally valid fuel infrastructure was retained, but live fuel delivery and target production were not both verified. Inspect automation_verified and repair_hint without claiming success."
             },
         }))
     }
@@ -9121,7 +11746,7 @@ impl FactorioMcp {
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
         let result = match self.build_fuel_supply_core(&mut client, &params).await {
-            Ok(result) => model_safe_payload(result),
+            Ok(result) => model_safe_payload(compact_fuel_repair(&result)),
             Err(e) => {
                 return self
                     .with_player_messages(semantic_failure("fuel_supply_failed", e))
@@ -9134,7 +11759,7 @@ impl FactorioMcp {
 
     /// Diagnose and repair the highest-priority missing durable fuel supply.
     #[tool(
-        description = "One-call durable fuel repair. Diagnoses nearby burners, selects the highest-priority consumer with a proven coal source, then atomically routes coal and places its fuel inserter. Use dry_run=true to inspect the selected consumer and full transaction before building."
+        description = "Build and verify one durable coal feed. A cold burner coal drill may bootstrap its own return loop, but success still requires strict closed-cycle proof. Existing coal belts are tapped without rotation. Use dry_run=true to preview."
     )]
     async fn repair_fuel_sustainability(
         &self,
@@ -9177,16 +11802,27 @@ impl FactorioMcp {
             Ok(report) => report,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
-        let model_diagnosis = model_safe_payload(diagnosis.clone());
+        let model_diagnosis = compact_fuel_diagnosis(&diagnosis);
         let mut selected_args = match ready_fuel_supply_args(&diagnosis) {
             Some(args) => args,
             None => {
+                let next_action = model_diagnosis
+                    .get("suggested_actions")
+                    .and_then(|value| value.as_array())
+                    .and_then(|actions| actions.first())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({
+                        "type": "inspect_ranked_consumer",
+                        "description": "No executable fuel transaction is available in this area. Inspect the primary consumer and establish a coal drill or clear one adjacent inserter position."
+                    }));
                 let result = serde_json::json!({
                     "success": false,
+                    "error_kind": "no_ready_fuel_transaction",
                     "dry_run": params.dry_run,
                     "selected": null,
                     "diagnosis": model_diagnosis,
-                    "guidance": "No ready durable fuel transaction was found. Build a coal source or clear inserter placement near the ranked consumer, then rerun repair_fuel_sustainability.",
+                    "next_action": next_action,
+                    "guidance": "No executable durable fuel transaction was found. Follow next_action for the ranked consumer, then rerun repair_fuel_sustainability.",
                 });
                 let msg = serde_json::to_string_pretty(&result)
                     .unwrap_or_else(|e| format!("Error: {}", e));
@@ -9215,16 +11851,17 @@ impl FactorioMcp {
             .get("success")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        let model_repair = compact_fuel_repair(&repair);
         let result = model_safe_payload(serde_json::json!({
             "success": success,
             "dry_run": params.dry_run,
             "selected_transaction": selected_args,
             "diagnosis": model_diagnosis,
-            "repair": repair,
+            "repair": model_repair,
             "guidance": if success {
                 "Durable fuel repair succeeded. Rerun repair_fuel_sustainability with dry_run=true before manually touching fuel again."
             } else {
-                "Durable fuel repair did not verify success. Follow repair.repair_hint or route.next_segment if present; do not fall back to repeated manual fuel insertion."
+                "Durable fuel repair did not verify success. Inspect repair, repair_hint, or route diagnostics; do not fall back to repeated manual fuel insertion."
             },
         }));
         let msg = serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));

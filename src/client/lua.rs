@@ -870,6 +870,34 @@ impl LuaCommand {
         )
     }
 
+    /// Snapshot exact burner state before a compound controller transaction.
+    pub fn snapshot_burner_state(unit_number: u32) -> String {
+        Self::claude_interface_json_call(
+            "snapshot_burner_state",
+            &[unit_number.to_string()],
+            "Run just sync/resume so the updated claude-interface mod is loaded before snapshotting burner state.",
+        )
+    }
+
+    /// Quiesce the transaction feeder and restore exact pre-transaction burner
+    /// state before new infrastructure is removed.
+    pub fn rollback_burner_bootstrap(
+        agent_id: &AgentId,
+        snapshot: &serde_json::Value,
+        feeder_unit_number: Option<u32>,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "rollback_burner_bootstrap",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                serde_json::to_string(snapshot)
+                    .expect("burner snapshot JSON serialization cannot fail"),
+                feeder_unit_number.map_or_else(|| "nil".to_string(), |unit| unit.to_string()),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before rolling back burner state.",
+        )
+    }
+
     /// Collect a bounded item count from an existing chest without mining or
     /// replacing the chest.
     pub fn collect_from_chest(
