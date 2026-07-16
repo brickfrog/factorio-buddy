@@ -33,7 +33,7 @@ pub fn analyze_entity_reach(
     let all_inserters = analyze_inserters(entities);
     let inserters: Vec<InserterAnalysis> = all_inserters
         .into_iter()
-        .filter(|i| i.pickup_position == origin || i.dropoff_position == origin)
+        .filter(|i| i.pickup_position.to_tile() == origin || i.dropoff_position.to_tile() == origin)
         .collect();
 
     // Find other interacting entities (assemblers, chests, etc.) within range
@@ -78,6 +78,8 @@ mod tests {
             health: Some(100.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         }
     }
 
@@ -113,7 +115,10 @@ mod tests {
 
         // Should find the inserter that drops to our target position
         assert_eq!(result.inserters.len(), 1);
-        assert_eq!(result.inserters[0].dropoff_position, TilePos::new(0, 0));
+        assert_eq!(
+            result.inserters[0].dropoff_position,
+            Position::new(0.5, 0.5)
+        );
     }
 
     #[test]

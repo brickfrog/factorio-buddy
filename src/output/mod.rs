@@ -634,7 +634,7 @@ impl Outputable for Vec<crate::analyze::InserterAnalysis> {
         let mut lines = vec![format!("Found {} inserters:", self.len())];
         for inserter in self {
             lines.push(format!(
-                "  #{} {} at ({}, {}) facing {:?}",
+                "  #{} {} at ({:.3}, {:.3}) facing {:?}",
                 inserter.unit_number,
                 inserter.inserter_type,
                 inserter.position.x,
@@ -652,11 +652,11 @@ impl Outputable for Vec<crate::analyze::InserterAnalysis> {
                 .map(|e| e.name.as_str())
                 .unwrap_or("empty");
             lines.push(format!(
-                "    Pickup ({}, {}): {}",
+                "    Pickup ({:.3}, {:.3}): {}",
                 inserter.pickup_position.x, inserter.pickup_position.y, pickup
             ));
             lines.push(format!(
-                "    Dropoff ({}, {}): {}",
+                "    Dropoff ({:.3}, {:.3}): {}",
                 inserter.dropoff_position.x, inserter.dropoff_position.y, dropoff
             ));
         }
@@ -678,7 +678,7 @@ impl Outputable for crate::analyze::EntityReachResult {
         if !self.inserters.is_empty() {
             lines.push("  Interacting inserters:".to_string());
             for inserter in &self.inserters {
-                let role = if inserter.pickup_position == self.origin {
+                let role = if inserter.pickup_position.to_tile() == self.origin {
                     "picks up from"
                 } else {
                     "drops to"

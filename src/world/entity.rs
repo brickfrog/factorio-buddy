@@ -36,6 +36,14 @@ pub struct Entity {
     /// Collision bounding box in world coordinates
     #[serde(default)]
     pub bounding_box: Option<Area>,
+
+    /// Authoritative pickup point exposed by Factorio for inserters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_position: Option<Position>,
+
+    /// Authoritative drop point exposed by Factorio for inserters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_position: Option<Position>,
 }
 
 impl Entity {

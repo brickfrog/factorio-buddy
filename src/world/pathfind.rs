@@ -344,6 +344,8 @@ impl PartialOrd for PathNode {
 struct BeltRouteState {
     pos: GridPos,
     arrival: Option<Direction>,
+    /// Underground exits cannot turn or immediately become another entrance.
+    arrived_underground: bool,
 }
 
 #[derive(Clone)]
@@ -422,6 +424,7 @@ pub fn find_belt_route_with_options(
     let start_state = BeltRouteState {
         pos: start,
         arrival: None,
+        arrived_underground: false,
     };
     g_score.insert(start_state, 0.0);
     open_set.push(BeltPathNode {
@@ -462,9 +465,13 @@ pub fn find_belt_route_with_options(
 
         // Explore surface neighbors
         for (neighbor, move_direction) in current.state.pos.cardinal_neighbors() {
+            if current.state.arrived_underground && current.state.arrival != Some(move_direction) {
+                continue;
+            }
             let neighbor_state = BeltRouteState {
                 pos: neighbor,
                 arrival: Some(move_direction),
+                arrived_underground: false,
             };
             if !collision_map.is_walkable(&neighbor) || closed_set.contains(&neighbor_state) {
                 continue;
@@ -500,7 +507,7 @@ pub fn find_belt_route_with_options(
 
         // Explore underground jumps if enabled
         if let Some(ref ug_config) = options.underground_config {
-            if options.allow_underground {
+            if options.allow_underground && !current.state.arrived_underground {
                 for direction in [
                     Direction::North,
                     Direction::East,
@@ -513,6 +520,7 @@ pub fn find_belt_route_with_options(
                         let exit_state = BeltRouteState {
                             pos: exit_pos,
                             arrival: Some(direction),
+                            arrived_underground: true,
                         };
 
                         // Check exit is walkable (entry is current pos, already validated)
@@ -1022,10 +1030,12 @@ mod tests {
         let east = BeltRouteState {
             pos: GridPos::new(4, 7),
             arrival: Some(Direction::East),
+            arrived_underground: false,
         };
         let north = BeltRouteState {
             pos: GridPos::new(4, 7),
             arrival: Some(Direction::North),
+            arrived_underground: false,
         };
         let mut states = HashSet::new();
         states.insert(east);
@@ -1033,6 +1043,21 @@ mod tests {
 
         assert_ne!(east, north);
         assert_eq!(states.len(), 2);
+    }
+
+    #[test]
+    fn belt_route_state_distinguishes_underground_exit_at_same_tile() {
+        let surface = BeltRouteState {
+            pos: GridPos::new(4, 7),
+            arrival: Some(Direction::East),
+            arrived_underground: false,
+        };
+        let underground_exit = BeltRouteState {
+            arrived_underground: true,
+            ..surface
+        };
+
+        assert_ne!(surface, underground_exit);
     }
 
     #[test]
@@ -1318,6 +1343,39 @@ mod tests {
             .steps
             .iter()
             .any(|step| step.connection.starts_with("underground ")));
+    }
+
+    #[test]
+    fn underground_exit_cannot_turn_into_a_disconnected_route() {
+        let bounds = Area {
+            left_top: Position::new(-5.0, -5.0),
+            right_bottom: Position::new(8.0, 5.0),
+        };
+        let mut collision_map = CollisionMap::new(bounds);
+        collision_map.block(GridPos::new(1, 0));
+        collision_map.block(GridPos::new(2, 0));
+
+        let options = RoutingOptions {
+            allow_underground: true,
+            underground_config: Some(UndergroundConfig {
+                max_distance: 4,
+                entity_name: "underground-belt".into(),
+                required_tech: "logistics".into(),
+            }),
+            underground_penalty: 0.5,
+            underground_skip_cost: 0.05,
+        };
+        let result = find_belt_route_with_options(
+            GridPos::new(0, 0),
+            GridPos::new(3, -1),
+            &collision_map,
+            &options,
+        );
+
+        assert!(result.success);
+        let topology = result.topology.expect("successful route topology");
+        assert!(topology.connected, "{:?}", topology.errors);
+        assert!(topology.steps.iter().all(|step| step.connects_to_next));
     }
 
     #[test]

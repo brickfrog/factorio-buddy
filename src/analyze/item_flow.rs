@@ -307,7 +307,7 @@ fn source_belt_from_inserter(
                     .as_ref()
                     .is_some_and(|target| target.name.contains("belt"))
         })
-        .map(|i| i.dropoff_position)
+        .map(|i| i.dropoff_position.to_tile())
 }
 
 fn target_belt_from_inserter(
@@ -324,7 +324,7 @@ fn target_belt_from_inserter(
                     .as_ref()
                     .is_some_and(|target| target.name.contains("belt"))
         })
-        .map(|i| i.pickup_position)
+        .map(|i| i.pickup_position.to_tile())
 }
 
 fn same_endpoint(unit_number: Option<u32>, position: TilePos, endpoint: &ItemFlowEndpoint) -> bool {
@@ -564,6 +564,8 @@ mod tests {
             health: Some(100.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         }
     }
 
@@ -587,6 +589,8 @@ mod tests {
             health: Some(100.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         }
     }
 

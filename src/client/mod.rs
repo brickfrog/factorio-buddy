@@ -3031,6 +3031,8 @@ mod tests {
             health: Some(100.0),
             force: Some("player".to_string()),
             bounding_box: Some(Area::new(0.1, 0.1, 0.9, 0.9)),
+            pickup_position: None,
+            drop_position: None,
         }
     }
 

@@ -2071,6 +2071,21 @@ fn inserter_mutations_report_engine_geometry_and_direct_smelter_uses_pickup_dire
 }
 
 #[test]
+fn entity_observations_include_authoritative_inserter_geometry() {
+    let entities_lua = include_str!("../mod/claude-interface/entities.lua");
+    for required in [
+        "if entity.type == \"inserter\" then",
+        "result.pickup_position = pos_table(entity.pickup_position)",
+        "result.drop_position = pos_table(entity.drop_position)",
+    ] {
+        assert!(
+            entities_lua.contains(required),
+            "entity summaries should include {required:?}"
+        );
+    }
+}
+
+#[test]
 fn fuel_inserter_candidates_use_the_belt_as_factorio_pickup_side() {
     let entities_lua = include_str!("../mod/claude-interface/entities.lua");
     let function_start = entities_lua

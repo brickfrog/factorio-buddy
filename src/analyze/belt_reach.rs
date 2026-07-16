@@ -100,6 +100,8 @@ mod tests {
             health: Some(100.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         }
     }
 

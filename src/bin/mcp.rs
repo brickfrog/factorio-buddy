@@ -1925,6 +1925,8 @@ mod tests {
             health: Some(160.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
         let infrastructure = incremental_infrastructure_verification(
             &route,
@@ -1989,6 +1991,8 @@ mod tests {
             health: Some(160.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
 
         let report = incremental_infrastructure_verification(
@@ -2016,6 +2020,8 @@ mod tests {
             health: Some(300.0),
             force: Some("player".to_string()),
             bounding_box: Some(Area::new(10.0, 10.0, 13.0, 13.0)),
+            pickup_position: None,
+            drop_position: None,
         }
     }
 
@@ -2354,6 +2360,8 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
 
         let failure = rollback_missing_identity_error(&entity);
@@ -2629,6 +2637,8 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: Some(Area::new(9.0, 19.0, 12.0, 22.0)),
+            pickup_position: None,
+            drop_position: None,
         };
 
         let north = machine_side_layout(&entity, "north").expect("north side");
@@ -2668,6 +2678,8 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
         let furnace_north = machine_side_layout(&furnace, "north").expect("furnace north side");
         assert_eq!(furnace_north.inserter_x, 42.5);
@@ -2685,6 +2697,8 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
         let assembler_south =
             machine_side_layout(&assembler_without_bbox, "south").expect("assembler south side");
@@ -2782,6 +2796,8 @@ mod tests {
             health: Some(150.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
         let east_surface = BeltPlacement {
             position: entity.position,
@@ -3067,6 +3083,8 @@ mod tests {
             health: Some(150.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
         let preserved = source_entity_preservation(&before, Some(&before), GridPos::new(-45, 44));
         assert_eq!(preserved["success"], true);
@@ -3167,6 +3185,7 @@ mod tests {
             "\"missing_identity_errors\"",
             "\"complete_route\": true",
             "\"ready_to_call\"",
+            "\"disconnected_topology\"",
             "\"resource_tiles_observed\"",
             "\"planned_surface_resource_tiles_crossed\"",
         ] {
@@ -3215,6 +3234,16 @@ mod tests {
             placement_preflight < dry_run,
             "dry-run must execute the same placement preflight before claiming readiness"
         );
+        let topology_gate = route_core
+            .find("\"disconnected_topology\"")
+            .expect("route_belt_core should reject disconnected topology");
+        let inventory_read = route_core
+            .find("character_inventory()")
+            .expect("route_belt_core should retain inventory preflight");
+        assert!(
+            topology_gate < inventory_read,
+            "disconnected topology must fail before inventory reads or any placement path"
+        );
     }
 
     #[test]
@@ -3240,6 +3269,8 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
         let furnace = Entity {
             unit_number: Some(2),
@@ -3250,6 +3281,8 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
         let belt = Entity {
             unit_number: Some(3),
@@ -3260,6 +3293,8 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
 
         assert!(is_machine_output_source(&assembler));
@@ -3700,6 +3735,8 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
 
         let args = machine_output_build_args(
@@ -10731,6 +10768,28 @@ impl FactorioMcp {
                 }));
             }
         };
+
+        if result
+            .topology
+            .as_ref()
+            .is_none_or(|topology| !topology.connected)
+        {
+            return Ok(serde_json::json!({
+                "success": false,
+                "complete_route": false,
+                "dry_run": params.dry_run,
+                "error_kind": "disconnected_topology",
+                "error": "The planned belt topology is not connected end to end. No belts were placed.",
+                "from": { "x": params.from_x, "y": params.from_y },
+                "to": { "x": params.to_x, "y": params.to_y },
+                "belt_type": params.belt_type,
+                "belt_count": result.belt_count,
+                "placed": 0,
+                "materials_sufficient": false,
+                "topology": compact_belt_topology(result.topology.as_ref()),
+                "guidance": "Choose different endpoints or disable underground routing, then dry-run the complete route again.",
+            }));
+        }
 
         let existing_belt_tiles: HashSet<GridPos> = result
             .belts

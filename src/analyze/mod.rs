@@ -222,16 +222,16 @@ pub struct BeltGapResult {
 pub struct InserterAnalysis {
     /// Inserter unit number
     pub unit_number: u32,
-    /// Inserter position (tile)
-    pub position: TilePos,
+    /// Inserter center in Factorio world coordinates.
+    pub position: crate::world::Position,
     /// Direction the inserter faces
     pub direction: Direction,
     /// Type of inserter
     pub inserter_type: String,
-    /// Position it picks up from
-    pub pickup_position: TilePos,
-    /// Position it drops to
-    pub dropoff_position: TilePos,
+    /// Authoritative Factorio pickup point.
+    pub pickup_position: crate::world::Position,
+    /// Authoritative Factorio drop point.
+    pub dropoff_position: crate::world::Position,
     /// Entity at pickup position (if any)
     pub pickup_target: Option<EntityRef>,
     /// Entity at dropoff position (if any)

@@ -96,6 +96,11 @@ function M.summary(entity, include_bounding_box)
         result.bounding_box = bounding_box_table(entity.bounding_box)
     end
 
+    if entity.type == "inserter" then
+        result.pickup_position = pos_table(entity.pickup_position)
+        result.drop_position = pos_table(entity.drop_position)
+    end
+
     return result
 end
 

@@ -1,12 +1,12 @@
 //! Inserter pickup/dropoff analysis
 
-use super::{EntityRef, InserterAnalysis};
-use crate::world::{entity_occupied_tiles, Direction, Entity, TilePos};
+use super::{build_entity_occupancy_lookup, EntityRef, InserterAnalysis};
+use crate::world::{Direction, Entity, Position, TilePos};
 use std::collections::HashMap;
 
 /// Analyze all inserters in the entity list
 pub fn analyze_inserters(entities: &[Entity]) -> Vec<InserterAnalysis> {
-    let entity_at = build_entity_lookup(entities);
+    let entity_at = build_entity_occupancy_lookup(entities);
 
     entities
         .iter()
@@ -15,64 +15,53 @@ pub fn analyze_inserters(entities: &[Entity]) -> Vec<InserterAnalysis> {
         .collect()
 }
 
-fn build_entity_lookup(entities: &[Entity]) -> HashMap<TilePos, &Entity> {
-    let mut entity_at: HashMap<TilePos, &Entity> = HashMap::new();
-    for entity in entities {
-        for tile in entity_occupied_tiles(entity) {
-            match entity_at.get(&tile) {
-                Some(existing) if entity_priority(existing) >= entity_priority(entity) => {}
-                _ => {
-                    entity_at.insert(tile, entity);
-                }
-            }
-        }
-    }
-    entity_at
-}
-
-fn entity_priority(entity: &Entity) -> u8 {
-    match entity.entity_type.as_deref() {
-        Some("resource") => 0,
-        Some("tree") | Some("simple-entity") => 1,
-        _ => 2,
-    }
-}
-
 /// Analyze a single inserter
 fn analyze_single_inserter(
     inserter: &Entity,
     entity_at: &HashMap<TilePos, &Entity>,
 ) -> Option<InserterAnalysis> {
     let unit_number = inserter.unit_number?;
-    let position = inserter.position.to_tile();
+    let position = inserter.position;
     let direction = Direction::from_factorio(inserter.direction);
 
     // Standard inserters FACE a direction (where they PICK from)
     // and DROP items to the OPPOSITE direction
     // direction = pickup direction, opposite = dropoff direction
-    let pickup_position = position.offset_in_direction(direction);
-    let dropoff_position = position.offset_in_direction(direction.opposite());
+    let fallback_pickup_tile = position.to_tile().offset_in_direction(direction);
+    let fallback_dropoff_tile = position.to_tile().offset_in_direction(direction.opposite());
 
     // Check for long inserter (picks up 2 tiles away in facing direction)
     let is_long = inserter.name.contains("long");
-    let pickup_position = if is_long {
-        pickup_position.offset_in_direction(direction) // One more tile in same direction
+    let fallback_pickup_tile = if is_long {
+        fallback_pickup_tile.offset_in_direction(direction) // One more tile in same direction
     } else {
-        pickup_position
+        fallback_pickup_tile
     };
 
-    let pickup_target = entity_at.get(&pickup_position).map(|e| EntityRef {
+    // Live entity summaries carry Factorio's exact interaction points. The
+    // tile-derived fallback keeps offline analyses usable for older fixtures,
+    // but normal MCP traffic must use the authoritative values.
+    let pickup_position = inserter
+        .pickup_position
+        .unwrap_or_else(|| fallback_pickup_tile.to_world_1x1());
+    let dropoff_position = inserter
+        .drop_position
+        .unwrap_or_else(|| fallback_dropoff_tile.to_world_1x1());
+    let pickup_tile = pickup_position.to_tile();
+    let dropoff_tile = dropoff_position.to_tile();
+
+    let pickup_target = entity_at.get(&pickup_tile).map(|e| EntityRef {
         unit_number: e.unit_number,
         name: e.name.clone(),
         entity_type: e.entity_type.clone().unwrap_or_default(),
-        position: pickup_position,
+        position: pickup_tile,
     });
 
-    let dropoff_target = entity_at.get(&dropoff_position).map(|e| EntityRef {
+    let dropoff_target = entity_at.get(&dropoff_tile).map(|e| EntityRef {
         unit_number: e.unit_number,
         name: e.name.clone(),
         entity_type: e.entity_type.clone().unwrap_or_default(),
-        position: dropoff_position,
+        position: dropoff_tile,
     });
 
     Some(InserterAnalysis {
@@ -91,7 +80,7 @@ fn analyze_single_inserter(
 pub fn find_inserters_at_position(entities: &[Entity], target: TilePos) -> Vec<InserterAnalysis> {
     analyze_inserters(entities)
         .into_iter()
-        .filter(|i| i.pickup_position == target || i.dropoff_position == target)
+        .filter(|i| i.pickup_position.to_tile() == target || i.dropoff_position.to_tile() == target)
         .collect()
 }
 
@@ -110,6 +99,8 @@ mod tests {
             health: Some(100.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         }
     }
 
@@ -127,6 +118,8 @@ mod tests {
             health: Some(100.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         }
     }
 
@@ -138,9 +131,9 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let analysis = &results[0];
-        assert_eq!(analysis.position, TilePos::new(1, 0));
-        assert_eq!(analysis.pickup_position, TilePos::new(2, 0)); // In front (east) - where inserter faces/picks
-        assert_eq!(analysis.dropoff_position, TilePos::new(0, 0)); // Behind (west) - opposite of facing
+        assert_eq!(analysis.position, Position::new(1.5, 0.5));
+        assert_eq!(analysis.pickup_position, Position::new(2.5, 0.5)); // In front (east) - where inserter faces/picks
+        assert_eq!(analysis.dropoff_position, Position::new(0.5, 0.5)); // Behind (west) - opposite of facing
     }
 
     #[test]
@@ -151,8 +144,8 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let analysis = &results[0];
-        assert_eq!(analysis.pickup_position, TilePos::new(4, 0)); // 2 tiles in front (where inserter faces/picks)
-        assert_eq!(analysis.dropoff_position, TilePos::new(1, 0)); // 1 tile behind (opposite of facing)
+        assert_eq!(analysis.pickup_position, Position::new(4.5, 0.5)); // 2 tiles in front (where inserter faces/picks)
+        assert_eq!(analysis.dropoff_position, Position::new(1.5, 0.5)); // 1 tile behind (opposite of facing)
     }
 
     #[test]
@@ -245,6 +238,36 @@ mod tests {
         assert_eq!(
             analysis.dropoff_target.as_ref().unwrap().name,
             "stone-furnace"
+        );
+    }
+
+    #[test]
+    fn uses_authoritative_geometry_and_prefers_building_over_loose_item() {
+        let mut inserter = make_inserter(-40, 59, Direction::East, "long-handed-inserter");
+        inserter.position = Position::new(-39.5, 59.5);
+        inserter.pickup_position = Some(Position::new(-37.5, 59.5));
+        inserter.drop_position = Some(Position::new(-41.699, 59.5));
+
+        let entities = vec![
+            inserter,
+            make_typed_entity(-41, 59, "transport-belt", "transport-belt"),
+            make_typed_entity(-42, 59, "iron-chest", "container"),
+            make_typed_entity(-42, 59, "item-on-ground", "item-entity"),
+        ];
+
+        let results = analyze_inserters(&entities);
+        assert_eq!(results.len(), 1);
+        let analysis = &results[0];
+        assert_eq!(analysis.position, Position::new(-39.5, 59.5));
+        assert_eq!(analysis.pickup_position, Position::new(-37.5, 59.5));
+        assert_eq!(analysis.dropoff_position, Position::new(-41.699, 59.5));
+        assert_eq!(analysis.dropoff_position.to_tile(), TilePos::new(-42, 59));
+        assert_eq!(
+            analysis
+                .dropoff_target
+                .as_ref()
+                .map(|target| target.name.as_str()),
+            Some("iron-chest")
         );
     }
 

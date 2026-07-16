@@ -118,7 +118,7 @@ impl std::fmt::Display for TilePos {
 }
 
 /// A position in the game world (float coordinates for Factorio API)
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     pub x: f64,
     pub y: f64,
@@ -442,6 +442,8 @@ mod tests {
             health: None,
             force: None,
             bounding_box: Some(Area::new(2.1, -0.9, 4.9, 1.9)),
+            pickup_position: None,
+            drop_position: None,
         };
 
         let occupied = entity_occupied_tiles(&entity);
@@ -461,6 +463,8 @@ mod tests {
             health: None,
             force: None,
             bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
         };
 
         let occupied = entity_occupied_tiles(&entity);
