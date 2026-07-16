@@ -710,6 +710,29 @@ fn fuel_topology_verification(
     })
 }
 
+fn fuel_delivery_path_operational(topology: &serde_json::Value) -> bool {
+    topology
+        .pointer("/connection/inserter_operational")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && topology
+            .pointer("/connection/source/producer_operational")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+fn exact_fuel_feeder_transfer_observed(topology: &serde_json::Value) -> bool {
+    fuel_delivery_path_operational(topology)
+        && topology
+            .pointer("/connection/inserter_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("working")
+        && topology
+            .pointer("/connection/inserter_held_item")
+            .and_then(serde_json::Value::as_str)
+            == Some("coal")
+}
+
 fn tool_text_indicates_error(text: &str) -> bool {
     let payload = text
         .split("\n\n--- Player Messages ---")
@@ -934,6 +957,10 @@ fn fuel_route_protects_existing_source(mut route: serde_json::Value) -> serde_js
 fn source_tap_filter_verified(report: &serde_json::Value) -> bool {
     report_success(report)
         && report
+            .get("atomic_with_placement")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
             .get("readback_verified")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
@@ -950,6 +977,134 @@ fn source_tap_filter_verified(report: &serde_json::Value) -> bool {
                     && filters[0].get("slot").and_then(serde_json::Value::as_u64) == Some(1)
                     && filters[0].get("name").and_then(serde_json::Value::as_str) == Some("coal")
             })
+}
+
+fn atomic_filtered_placement_unit(report: &serde_json::Value) -> Option<u32> {
+    report
+        .get("unit_number")
+        .or_else(|| report.pointer("/placement/unit_number"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|unit_number| u32::try_from(unit_number).ok())
+}
+
+fn atomic_filtered_placement_local_rollback_verified(report: &serde_json::Value) -> bool {
+    report
+        .pointer("/rollback/success")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && report
+            .pointer("/rollback/entity_removed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .pointer("/rollback/item_returned")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+}
+
+fn atomic_filtered_placement_cleanup_unit(report: &serde_json::Value) -> Option<u32> {
+    let unit_number = atomic_filtered_placement_unit(report)?;
+    let local_entity_removed = report
+        .pointer("/rollback/entity_removed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if report_success(report) || !local_entity_removed {
+        Some(unit_number)
+    } else {
+        None
+    }
+}
+
+fn verified_atomic_filtered_placement(
+    report: &serde_json::Value,
+) -> Result<(Entity, serde_json::Value), String> {
+    if !report_success(report) {
+        return Err(report
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("atomic filtered placement failed")
+            .to_string());
+    }
+    let filter = report
+        .get("filter")
+        .cloned()
+        .ok_or_else(|| "atomic filtered placement omitted filter proof".to_string())?;
+    if !source_tap_filter_verified(&filter) {
+        return Err(
+            "atomically placed inserter did not read back an exact coal whitelist".to_string(),
+        );
+    }
+    let entity: Entity = serde_json::from_value(report.clone())
+        .map_err(|error| format!("atomic filtered placement omitted entity proof: {error}"))?;
+    Ok((entity, filter))
+}
+
+fn rollback_removed_exact_unit(rollback: &serde_json::Value, unit_number: u32) -> bool {
+    rollback
+        .pointer("/infrastructure/units/removed_units")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|removed_units| {
+            removed_units
+                .iter()
+                .any(|removed| removed.as_u64() == Some(u64::from(unit_number)))
+        })
+}
+
+fn atomic_filtered_placement_cleanup_evidence(
+    report: Option<&serde_json::Value>,
+    rollback: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(report) = report else {
+        return serde_json::json!({
+            "success": false,
+            "outcome_known": false,
+            "error": "The atomic placement response was unavailable, so exact entity and item conservation cannot be certified.",
+        });
+    };
+
+    let remote_success = report_success(report);
+    let unit_number = atomic_filtered_placement_unit(report);
+    let local_rollback_verified = atomic_filtered_placement_local_rollback_verified(report);
+    let explicit_outcome_known = report
+        .get("atomic_outcome_known")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let no_entity_created = !remote_success
+        && explicit_outcome_known
+        && report
+            .get("entity_created")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    let outcome_known = explicit_outcome_known || remote_success || unit_number.is_some();
+    let host_cleanup_attempted = atomic_filtered_placement_cleanup_unit(report).is_some();
+    let host_exact_unit_removed =
+        unit_number.is_some_and(|unit_number| rollback_removed_exact_unit(rollback, unit_number));
+
+    // A failed Lua rollback remains a failed conservation proof even when the
+    // host later removes the exact entity: the missing placement item was not
+    // independently recovered. A Rust-only verifier rejection is different;
+    // the accepted entity is conserved when exact-unit host removal succeeds.
+    let success = if !outcome_known {
+        false
+    } else if no_entity_created {
+        true
+    } else if remote_success {
+        host_exact_unit_removed
+    } else {
+        local_rollback_verified
+    };
+
+    serde_json::json!({
+        "success": success,
+        "outcome_known": outcome_known,
+        "remote_success": remote_success,
+        "unit_number": unit_number,
+        "no_entity_created": no_entity_created,
+        "local_rollback_verified": local_rollback_verified,
+        "local_rollback": report.get("rollback"),
+        "host_cleanup_attempted": host_cleanup_attempted,
+        "host_exact_unit_removed": host_exact_unit_removed,
+    })
 }
 
 fn source_entity_preservation(
@@ -1322,6 +1477,49 @@ async fn rollback_failed_fuel_transaction(
     })
 }
 
+async fn rollback_failed_atomic_fuel_placement(
+    client: &mut FactorioClient,
+    consumer_snapshot: &serde_json::Value,
+    feeder_unit_number: Option<u32>,
+    transaction_units: &[u32],
+    atomic_report: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let cleanup_unit = atomic_report.and_then(atomic_filtered_placement_cleanup_unit);
+    let mut rollback_units = transaction_units.to_vec();
+    if let Some(unit_number) = cleanup_unit {
+        rollback_units.push(unit_number);
+    }
+
+    // For a rejected terminal placement, disable the exact new feeder before
+    // slower reach-aware removal. Source-tap failures pass the already-known
+    // terminal feeder explicitly, so it remains the consumer rollback guard.
+    let feeder_unit_number = feeder_unit_number.or(cleanup_unit);
+    let mut rollback = rollback_failed_fuel_transaction(
+        client,
+        consumer_snapshot,
+        feeder_unit_number,
+        &rollback_units,
+    )
+    .await;
+    let atomic_cleanup = atomic_filtered_placement_cleanup_evidence(atomic_report, &rollback);
+    let success = report_success(&rollback) && report_success(&atomic_cleanup);
+    if let Some(object) = rollback.as_object_mut() {
+        object.insert("success".to_string(), serde_json::json!(success));
+        object.insert("atomic_cleanup".to_string(), atomic_cleanup);
+    }
+    rollback
+}
+
+fn belt_topology_travel_tiles(topology: &BeltRouteTopology) -> u32 {
+    topology.steps.iter().fold(0_u32, |distance, step| {
+        distance.saturating_add(
+            step.next_tile
+                .map(|next| step.tile.manhattan_distance(&next))
+                .unwrap_or(0),
+        )
+    })
+}
+
 fn compact_belt_topology(topology: Option<&BeltRouteTopology>) -> serde_json::Value {
     match topology {
         Some(topology) => serde_json::json!({
@@ -1329,10 +1527,49 @@ fn compact_belt_topology(topology: Option<&BeltRouteTopology>) -> serde_json::Va
             "start_tile": topology.start_tile,
             "goal_tile": topology.goal_tile,
             "step_count": topology.steps.len(),
+            "travel_distance_tiles": belt_topology_travel_tiles(topology),
             "errors": topology.errors,
         }),
         None => serde_json::Value::Null,
     }
+}
+
+fn fuel_delivery_wait_budget(route: &serde_json::Value) -> (u32, u32) {
+    let transit_tiles = route
+        .pointer("/topology/travel_distance_tiles")
+        .or_else(|| route.get("belt_count"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or(0);
+    (transit_tiles, fuel_delivery_budget_ticks(transit_tiles))
+}
+
+fn fuel_delivery_budget_ticks(transit_tiles: u32) -> u32 {
+    transit_tiles
+        .saturating_mul(40)
+        .saturating_add(600)
+        .max(600)
+}
+
+fn fuel_topology_upstream_hops(topology: &serde_json::Value) -> u32 {
+    topology
+        .pointer("/connection/source/upstream_proof/hops")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|hops| u32::try_from(hops).ok())
+        .unwrap_or(0)
+}
+
+fn unsupported_fuel_transport(allow_underground: bool, dry_run: bool) -> Option<serde_json::Value> {
+    allow_underground.then(|| {
+        serde_json::json!({
+            "success": false,
+            "error_kind": "unsupported_fuel_transport",
+            "error": "Underground belts are not yet supported by durable fuel-topology verification; no route was planned or placed.",
+            "allow_underground": true,
+            "dry_run": dry_run,
+            "guidance": "Retry with allow_underground=false so the complete coal path can be verified before commit.",
+        })
+    })
 }
 
 fn deserialize_tile_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
@@ -1487,22 +1724,27 @@ struct ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::{
+        atomic_filtered_placement_cleanup_evidence, atomic_filtered_placement_cleanup_unit,
+        atomic_filtered_placement_local_rollback_verified, atomic_filtered_placement_unit,
         attach_endpoint_preflight, automation_repair_hint, belt_source_tap_layouts,
         compact_fuel_diagnosis, compact_fuel_repair, compound_route_preflight,
-        endpoint_belt_incompatibility, execute_lua_refusal, existing_belt_compatibility,
-        flow_lookup, flow_scan_area, fuel_consumer_activity_verification_summary,
-        fuel_route_protects_existing_source, fuel_topology_verification,
-        incremental_infrastructure_verification, inserter_machine_endpoint_verification,
-        invalid_direction_failure, is_machine_output_source, machine_output_build_args,
-        machine_side_layout, mark_semantic_tool_errors, model_safe_payload, parse_controller_steps,
+        endpoint_belt_incompatibility, exact_fuel_feeder_transfer_observed, execute_lua_refusal,
+        existing_belt_compatibility, flow_lookup, flow_scan_area,
+        fuel_consumer_activity_verification_summary, fuel_delivery_budget_ticks,
+        fuel_delivery_path_operational, fuel_delivery_wait_budget,
+        fuel_route_protects_existing_source, fuel_topology_upstream_hops,
+        fuel_topology_verification, incremental_infrastructure_verification,
+        inserter_machine_endpoint_verification, invalid_direction_failure,
+        is_machine_output_source, machine_output_build_args, machine_side_layout,
+        mark_semantic_tool_errors, model_safe_payload, parse_controller_steps,
         placement_report_allowed, production_observation_json, production_unit_verified,
         production_verification_json, production_verification_summary, raw_lua_enabled,
         ready_fuel_supply_args, recipe_restore_action, rollback_missing_identity_error,
         rollback_pending_after_pass, rollback_retry_order, route_belt_failure_json,
         route_material_shortfall, route_segment_waypoint, semantic_failure,
         source_entity_preservation, source_tap_filter_verified, source_tap_plan_rank,
-        tool_text_indicates_error, BuildFuelSupplyParams, FactorioMcp, InserterMachineFlow,
-        RecipeRestoreAction, RouteBeltParams, MODEL_VISIBLE_TOOLS,
+        tool_text_indicates_error, unsupported_fuel_transport, BuildFuelSupplyParams, FactorioMcp,
+        InserterMachineFlow, RecipeRestoreAction, RouteBeltParams, MODEL_VISIBLE_TOOLS,
     };
     use factorioctl::analyze::EntityLookup;
     use factorioctl::world::{
@@ -1938,6 +2180,99 @@ mod tests {
         let unrelated = fuel_topology_verification(&durable, 100, Some(99));
         assert_eq!(unrelated["success"], false);
         assert_eq!(unrelated["exact_connection_present"], false);
+    }
+
+    #[test]
+    fn delivery_path_requires_the_exact_feeder_and_producer_to_remain_operational() {
+        let operational = serde_json::json!({
+            "connection": {
+                "inserter_operational": true,
+                "inserter_status": "working",
+                "inserter_held_item": "coal",
+                "source": {"producer_operational": true},
+            },
+        });
+        assert!(fuel_delivery_path_operational(&operational));
+        assert!(exact_fuel_feeder_transfer_observed(&operational));
+
+        let idle = serde_json::json!({
+            "connection": {
+                "inserter_operational": true,
+                "inserter_status": "waiting_for_source_items",
+                "inserter_held_item": null,
+                "source": {"producer_operational": true},
+            },
+        });
+        assert!(fuel_delivery_path_operational(&idle));
+        assert!(!exact_fuel_feeder_transfer_observed(&idle));
+
+        let dead_feeder = serde_json::json!({
+            "connection": {
+                "inserter_operational": false,
+                "inserter_status": "no_fuel",
+                "source": {"producer_operational": true},
+            },
+        });
+        assert!(!fuel_delivery_path_operational(&dead_feeder));
+        assert!(!exact_fuel_feeder_transfer_observed(&dead_feeder));
+
+        let wrong_item = serde_json::json!({
+            "connection": {
+                "inserter_operational": true,
+                "inserter_status": "working",
+                "inserter_held_item": "wood",
+                "source": {"producer_operational": true},
+            },
+        });
+        assert!(fuel_delivery_path_operational(&wrong_item));
+        assert!(!exact_fuel_feeder_transfer_observed(&wrong_item));
+
+        let dead_producer = serde_json::json!({
+            "connection": {
+                "inserter_operational": true,
+                "source": {"producer_operational": false},
+            },
+        });
+        assert!(!fuel_delivery_path_operational(&dead_producer));
+    }
+
+    #[test]
+    fn fuel_delivery_budget_uses_route_travel_distance_not_entity_count() {
+        let underground = serde_json::json!({
+            "belt_count": 2,
+            "topology": {"travel_distance_tiles": 4},
+        });
+        assert_eq!(fuel_delivery_wait_budget(&underground), (4, 760));
+
+        let legacy_surface = serde_json::json!({"belt_count": 37});
+        assert_eq!(fuel_delivery_wait_budget(&legacy_surface), (37, 2_080));
+
+        let long_existing_trunk = serde_json::json!({
+            "connection": {
+                "source": {
+                    "upstream_proof": {"hops": 100}
+                }
+            }
+        });
+        assert_eq!(fuel_topology_upstream_hops(&long_existing_trunk), 100);
+        assert_eq!(fuel_delivery_budget_ticks(100), 4_600);
+        let route_tiles = fuel_delivery_wait_budget(&legacy_surface).0;
+        let proof_hops = fuel_topology_upstream_hops(&long_existing_trunk);
+        assert_eq!(route_tiles.max(proof_hops), 100);
+        assert_eq!(
+            fuel_delivery_budget_ticks(route_tiles.max(proof_hops)),
+            4_600
+        );
+    }
+
+    #[test]
+    fn fuel_transport_rejects_underground_before_planning_or_mutation() {
+        assert!(unsupported_fuel_transport(false, false).is_none());
+        let rejected = unsupported_fuel_transport(true, true).expect("unsupported transport");
+        assert_eq!(rejected["success"], false);
+        assert_eq!(rejected["error_kind"], "unsupported_fuel_transport");
+        assert_eq!(rejected["dry_run"], true);
+        assert_eq!(rejected["allow_underground"], true);
     }
 
     #[test]
@@ -2527,6 +2862,7 @@ mod tests {
     fn source_tap_filter_requires_exact_verified_coal_whitelist() {
         let exact = serde_json::json!({
             "success": true,
+            "atomic_with_placement": true,
             "readback_verified": true,
             "filtering_enabled": true,
             "mode": "whitelist",
@@ -2537,6 +2873,15 @@ mod tests {
         for invalid in [
             serde_json::json!({
                 "success": true,
+                "atomic_with_placement": false,
+                "readback_verified": true,
+                "filtering_enabled": true,
+                "mode": "whitelist",
+                "filters": [{"slot": 1, "name": "coal"}],
+            }),
+            serde_json::json!({
+                "success": true,
+                "atomic_with_placement": true,
                 "readback_verified": true,
                 "filtering_enabled": true,
                 "mode": "whitelist",
@@ -2544,6 +2889,7 @@ mod tests {
             }),
             serde_json::json!({
                 "success": true,
+                "atomic_with_placement": true,
                 "readback_verified": true,
                 "filtering_enabled": true,
                 "mode": "whitelist",
@@ -2551,6 +2897,7 @@ mod tests {
             }),
             serde_json::json!({
                 "success": true,
+                "atomic_with_placement": true,
                 "readback_verified": false,
                 "filtering_enabled": true,
                 "mode": "whitelist",
@@ -2559,6 +2906,154 @@ mod tests {
         ] {
             assert!(!source_tap_filter_verified(&invalid));
         }
+    }
+
+    #[test]
+    fn atomic_filtered_placement_extracts_nested_failure_identity() {
+        let report = serde_json::json!({
+            "success": false,
+            "placement": {"unit_number": 812},
+            "rollback": {
+                "success": true,
+                "entity_removed": true,
+                "item_returned": 1,
+            },
+        });
+
+        assert_eq!(atomic_filtered_placement_unit(&report), Some(812));
+        assert!(atomic_filtered_placement_local_rollback_verified(&report));
+        assert_eq!(atomic_filtered_placement_cleanup_unit(&report), None);
+    }
+
+    #[test]
+    fn failed_lua_entity_removal_schedules_exact_best_effort_cleanup() {
+        let report = serde_json::json!({
+            "success": false,
+            "placement": {"unit_number": 813},
+            "rollback": {
+                "success": false,
+                "entity_removed": false,
+                "item_returned": 0,
+            },
+        });
+        let host_rollback = serde_json::json!({
+            "success": true,
+            "infrastructure": {
+                "units": {"removed_units": [813]},
+            },
+        });
+
+        assert_eq!(atomic_filtered_placement_cleanup_unit(&report), Some(813));
+        let evidence = atomic_filtered_placement_cleanup_evidence(Some(&report), &host_rollback);
+        assert_eq!(evidence["host_cleanup_attempted"], true);
+        assert_eq!(evidence["host_exact_unit_removed"], true);
+        assert_eq!(evidence["local_rollback_verified"], false);
+        assert_eq!(evidence["success"], false);
+    }
+
+    #[test]
+    fn failed_lua_item_return_cannot_be_re_reported_as_host_success() {
+        let report = serde_json::json!({
+            "success": false,
+            "placement": {"unit_number": 814},
+            "rollback": {
+                "success": false,
+                "entity_removed": true,
+                "item_returned": 0,
+            },
+        });
+        let otherwise_successful_rollback = serde_json::json!({
+            "success": true,
+            "infrastructure": {
+                "units": {"removed_units": []},
+            },
+        });
+
+        assert_eq!(atomic_filtered_placement_cleanup_unit(&report), None);
+        let evidence = atomic_filtered_placement_cleanup_evidence(
+            Some(&report),
+            &otherwise_successful_rollback,
+        );
+        assert_eq!(evidence["local_rollback_verified"], false);
+        assert_eq!(evidence["success"], false);
+    }
+
+    #[test]
+    fn rust_verifier_mismatch_requires_exact_host_removal() {
+        let report = serde_json::json!({
+            "success": true,
+            "unit_number": 815,
+            "filter": {"success": true, "filters": []},
+        });
+        let removed = serde_json::json!({
+            "success": true,
+            "infrastructure": {
+                "units": {"removed_units": [815]},
+            },
+        });
+        let not_removed = serde_json::json!({
+            "success": true,
+            "infrastructure": {
+                "units": {"removed_units": []},
+            },
+        });
+
+        assert_eq!(atomic_filtered_placement_cleanup_unit(&report), Some(815));
+        assert_eq!(
+            atomic_filtered_placement_cleanup_evidence(Some(&report), &removed)["success"],
+            true
+        );
+        assert_eq!(
+            atomic_filtered_placement_cleanup_evidence(Some(&report), &not_removed)["success"],
+            false
+        );
+    }
+
+    #[test]
+    fn atomic_placement_cleanup_distinguishes_no_mutation_from_unknown_outcome() {
+        let rejected_before_placement = serde_json::json!({
+            "success": false,
+            "error": "Cannot place entity",
+            "atomic_outcome_known": true,
+            "entity_created": false,
+        });
+        let successful_known_rollback = serde_json::json!({
+            "success": true,
+            "infrastructure": {
+                "units": {"removed_units": []},
+            },
+        });
+
+        let no_mutation = atomic_filtered_placement_cleanup_evidence(
+            Some(&rejected_before_placement),
+            &successful_known_rollback,
+        );
+        assert_eq!(no_mutation["no_entity_created"], true);
+        assert_eq!(no_mutation["success"], true);
+
+        let unmarked_lua_error = serde_json::json!({
+            "success": false,
+            "error_kind": "lua_error",
+            "error": "unexpected exception",
+        });
+        let unmarked = atomic_filtered_placement_cleanup_evidence(
+            Some(&unmarked_lua_error),
+            &successful_known_rollback,
+        );
+        assert_eq!(unmarked["outcome_known"], false);
+        assert_eq!(unmarked["no_entity_created"], false);
+        assert_eq!(unmarked["success"], false);
+
+        let unknown = atomic_filtered_placement_cleanup_evidence(None, &successful_known_rollback);
+        assert_eq!(unknown["outcome_known"], false);
+        assert_eq!(unknown["success"], false);
+
+        let claimed_success_without_identity = serde_json::json!({"success": true});
+        let missing_identity = atomic_filtered_placement_cleanup_evidence(
+            Some(&claimed_success_without_identity),
+            &successful_known_rollback,
+        );
+        assert_eq!(missing_identity["success"], false);
     }
 
     #[test]
@@ -2946,6 +3441,16 @@ mod tests {
                     "success": success,
                     "route": {"success": true, "complete_route": true, "topology_connected": true},
                     "inserter": {"expected_unit_number": 992, "actual_unit_number": 992},
+                    "delivery_observation": {
+                        "success": success,
+                        "scope": "exact_terminal_or_filtered_feeder_transfer",
+                        "terminal_coal_observed": false,
+                        "exact_feeder_transfer_observed": success,
+                        "delivery_path_operational": success,
+                        "route_transit_tiles": 2_400,
+                        "waited_ticks": 1_200,
+                        "budget_ticks": 96_600,
+                    },
                     "durable_fuel_topology": {
                         "success": success,
                         "structural_success": true,
@@ -3017,6 +3522,14 @@ mod tests {
                 compact["infrastructure_verified"]["durable_fuel_topology"]["inserter_unit_number"],
                 992
             );
+            assert_eq!(
+                compact["infrastructure_verified"]["delivery_observation"]["success"],
+                success
+            );
+            assert_eq!(
+                compact["infrastructure_verified"]["delivery_observation"]["route_transit_tiles"],
+                2_400
+            );
             assert!(
                 compact["infrastructure_verified"]["durable_fuel_topology"]["proof_reasons"]
                     .as_array()
@@ -3039,6 +3552,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compact_fuel_repair_preserves_atomic_failure_and_cleanup_evidence() {
+        let raw = serde_json::json!({
+            "success": false,
+            "error_kind": "atomic_fuel_inserter_placement_failed",
+            "atomic_placement": {
+                "success": false,
+                "error_kind": "atomic_filter_configuration_failed",
+                "error": "duplicate item",
+                "placement": {
+                    "unit_number": 812,
+                    "name": "burner-inserter",
+                    "position": {"x": 4.5, "y": 8.5},
+                },
+                "filter": {
+                    "success": false,
+                    "error_kind": "invalid_allowed_items",
+                    "error": "duplicate item",
+                },
+                "rollback": {
+                    "success": false,
+                    "entity_removed": true,
+                    "item_returned": 0,
+                },
+            },
+            "rollback": {
+                "success": false,
+                "atomic_cleanup": {
+                    "success": false,
+                    "outcome_known": true,
+                    "remote_success": false,
+                    "unit_number": 812,
+                    "local_rollback_verified": false,
+                    "host_cleanup_attempted": false,
+                    "host_exact_unit_removed": false,
+                },
+            },
+        });
+
+        let compact = compact_fuel_repair(&raw);
+        assert_eq!(compact["atomic_placement"]["placement"]["unit_number"], 812);
+        assert_eq!(compact["atomic_placement"]["rollback"]["item_returned"], 0);
+        assert_eq!(
+            compact["rollback"]["atomic_cleanup"]["local_rollback_verified"],
+            false
+        );
+        assert_eq!(compact["rollback"]["success"], false);
     }
 
     #[test]
@@ -4095,7 +4657,7 @@ pub struct BuildFuelSupplyParams {
     /// Respect zone boundaries when routing.
     #[serde(default)]
     pub respect_zones: bool,
-    /// Allow underground belts if researched.
+    /// Unsupported for fuel repair; must be false.
     #[serde(default)]
     pub allow_underground: bool,
     /// Allow routing to start/end on existing belts.
@@ -4126,7 +4688,7 @@ pub struct RepairFuelSustainabilityParams {
     /// Respect zone boundaries when routing.
     #[serde(default)]
     pub respect_zones: bool,
-    /// Allow underground belts if researched.
+    /// Unsupported for fuel repair; must be false.
     #[serde(default)]
     pub allow_underground: bool,
     /// Allow routing to start/end on existing belts.
@@ -4889,6 +5451,7 @@ fn compact_fuel_connection(connection: &serde_json::Value) -> serde_json::Value 
             "inserter_unit_number",
             "inserter_name",
             "inserter_status",
+            "inserter_held_item",
             "inserter_operational",
             "pickup_position",
             "drop_position",
@@ -5457,6 +6020,7 @@ fn compact_source_tap(report: &serde_json::Value) -> serde_json::Value {
             "route_start_matches_drop",
             "branch_extend_existing",
             "filter_readback_verified",
+            "filter_atomic_with_placement",
             "allowed_items",
             "self_fueling_live",
             "source_preservation",
@@ -5488,6 +6052,70 @@ fn compact_burner_state(state: &serde_json::Value) -> serde_json::Value {
             "cold",
         ],
     ))
+}
+
+fn compact_atomic_filtered_placement(report: &serde_json::Value) -> serde_json::Value {
+    let mut result = copy_json_fields(
+        report,
+        &[
+            "success",
+            "error",
+            "error_kind",
+            "unit_number",
+            "name",
+            "position",
+            "atomic_filter_configuration",
+            "atomic_outcome_known",
+            "entity_created",
+        ],
+    );
+    if let Some(placement) = report.get("placement") {
+        result.insert(
+            "placement".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                placement,
+                &["unit_number", "name", "position", "direction"],
+            )),
+        );
+    }
+    if let Some(filter) = report.get("filter") {
+        result.insert(
+            "filter".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                filter,
+                &[
+                    "success",
+                    "error",
+                    "error_kind",
+                    "unit_number",
+                    "atomic_with_placement",
+                    "readback_verified",
+                    "entity_identity_preserved",
+                    "filtering_enabled",
+                    "mode",
+                    "filters",
+                    "held_stack_before",
+                    "held_stack_after",
+                ],
+            )),
+        );
+    }
+    if let Some(rollback) = report.get("rollback") {
+        result.insert(
+            "rollback".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                rollback,
+                &[
+                    "success",
+                    "entity_removed",
+                    "item_returned",
+                    "cleanup_completed",
+                    "error",
+                ],
+            )),
+        );
+    }
+    serde_json::Value::Object(result)
 }
 
 fn compact_fuel_rollback(rollback: &serde_json::Value) -> serde_json::Value {
@@ -5545,6 +6173,27 @@ fn compact_fuel_rollback(rollback: &serde_json::Value) -> serde_json::Value {
             compact_controller_rollback(infrastructure),
         );
     }
+    if let Some(atomic_cleanup) = rollback.get("atomic_cleanup") {
+        result.insert(
+            "atomic_cleanup".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                atomic_cleanup,
+                &[
+                    "success",
+                    "outcome_known",
+                    "remote_success",
+                    "unit_number",
+                    "no_entity_created",
+                    "local_rollback_verified",
+                    "local_rollback",
+                    "host_cleanup_attempted",
+                    "host_exact_unit_removed",
+                    "error",
+                    "error_kind",
+                ],
+            )),
+        );
+    }
     serde_json::Value::Object(result)
 }
 
@@ -5561,6 +6210,25 @@ fn compact_fuel_infrastructure(report: &serde_json::Value) -> serde_json::Value 
     }
     if let Some(source_tap) = report.get("source_tap") {
         result.insert("source_tap".to_string(), compact_source_tap(source_tap));
+    }
+    if let Some(observation) = report.get("delivery_observation") {
+        result.insert(
+            "delivery_observation".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                observation,
+                &[
+                    "success",
+                    "scope",
+                    "terminal_coal_observed",
+                    "exact_feeder_transfer_observed",
+                    "delivery_path_operational",
+                    "route_transit_tiles",
+                    "certified_upstream_hops",
+                    "waited_ticks",
+                    "budget_ticks",
+                ],
+            )),
+        );
     }
     serde_json::Value::Object(result)
 }
@@ -5583,6 +6251,12 @@ fn compact_fuel_repair(repair: &serde_json::Value) -> serde_json::Value {
     );
     if let Some(route) = repair.get("route") {
         result.insert("route".to_string(), compact_fuel_route(route));
+    }
+    if let Some(atomic_placement) = repair.get("atomic_placement") {
+        result.insert(
+            "atomic_placement".to_string(),
+            compact_atomic_filtered_placement(atomic_placement),
+        );
     }
     if let Some(preflight) = repair.get("preflight") {
         result.insert("preflight".to_string(), compact_fuel_preflight(preflight));
@@ -5609,6 +6283,25 @@ fn compact_fuel_repair(repair: &serde_json::Value) -> serde_json::Value {
         result.insert(
             "infrastructure_verified".to_string(),
             compact_fuel_infrastructure(infrastructure),
+        );
+    }
+    if let Some(observation) = repair.get("delivery_observation") {
+        result.insert(
+            "delivery_observation".to_string(),
+            serde_json::Value::Object(copy_json_fields(
+                observation,
+                &[
+                    "success",
+                    "scope",
+                    "terminal_coal_observed",
+                    "exact_feeder_transfer_observed",
+                    "delivery_path_operational",
+                    "route_transit_tiles",
+                    "certified_upstream_hops",
+                    "waited_ticks",
+                    "budget_ticks",
+                ],
+            )),
         );
     }
     for field in ["production_verified", "verification"] {
@@ -10468,6 +11161,10 @@ impl FactorioMcp {
         client: &mut FactorioClient,
         params: &BuildFuelSupplyParams,
     ) -> Result<serde_json::Value, String> {
+        if let Some(failure) = unsupported_fuel_transport(params.allow_underground, params.dry_run)
+        {
+            return Ok(failure);
+        }
         let consumer = match client.get_entity(params.consumer_unit_number).await {
             Ok(entity) => entity,
             Err(e) => return Err(format!("Error: {}", e)),
@@ -10918,112 +11615,136 @@ impl FactorioMcp {
             Err(error) => return Err(format!("Error: executing fuel route: {error}")),
         };
         let mut transaction_units = route_report_placed_units(&route);
-        let inserter = match client
-            .place_entity(&params.inserter_name, inserter_position, inserter_direction)
+        let terminal_placement_report = match client
+            .place_filtered_inserter(
+                &params.inserter_name,
+                inserter_position,
+                inserter_direction,
+                &["coal".to_string()],
+            )
             .await
         {
-            Ok(entity) => entity,
+            Ok(report) => report,
             Err(error) => {
-                let rollback = rollback_failed_fuel_transaction(
+                let rollback = rollback_failed_atomic_fuel_placement(
                     client,
                     &consumer_snapshot,
                     None,
                     &transaction_units,
+                    None,
                 )
                 .await;
                 return Ok(serde_json::json!({
                     "success": false,
-                    "error_kind": "inserter_placement_failed",
+                    "error_kind": "atomic_fuel_inserter_placement_failed",
                     "error": error.to_string(),
                     "route": route,
                     "rollback": rollback,
                 }));
             }
         };
+        let (inserter, terminal_filter) =
+            match verified_atomic_filtered_placement(&terminal_placement_report) {
+                Ok(placement) => placement,
+                Err(error) => {
+                    let remote_success = report_success(&terminal_placement_report);
+                    let rollback = rollback_failed_atomic_fuel_placement(
+                        client,
+                        &consumer_snapshot,
+                        None,
+                        &transaction_units,
+                        Some(&terminal_placement_report),
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": if remote_success {
+                            "fuel_inserter_filter_verification_failed"
+                        } else {
+                            "atomic_fuel_inserter_placement_failed"
+                        },
+                        "error": error,
+                        "atomic_placement": terminal_placement_report,
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+            };
         let placed_inserter_unit = inserter.unit_number;
         if let Some(unit_number) = placed_inserter_unit {
             transaction_units.push(unit_number);
         }
-        let terminal_filter = match placed_inserter_unit {
-            Some(unit_number) => match client
-                .configure_inserter(unit_number, &["coal".to_string()])
-                .await
-            {
-                Ok(report) if source_tap_filter_verified(&report) => report,
-                Ok(report) => {
-                    let rollback = rollback_failed_fuel_transaction(
-                        client,
-                        &consumer_snapshot,
-                        placed_inserter_unit,
-                        &transaction_units,
-                    )
-                    .await;
-                    return Ok(serde_json::json!({
-                        "success": false,
-                        "error_kind": "fuel_inserter_filter_verification_failed",
-                        "error": "The terminal fuel inserter did not read back an exact coal whitelist.",
-                        "filter": report,
-                        "route": route,
-                        "rollback": rollback,
-                    }));
-                }
-                Err(error) => {
-                    let rollback = rollback_failed_fuel_transaction(
-                        client,
-                        &consumer_snapshot,
-                        placed_inserter_unit,
-                        &transaction_units,
-                    )
-                    .await;
-                    return Ok(serde_json::json!({
-                        "success": false,
-                        "error_kind": "fuel_inserter_filter_failed",
-                        "error": error.to_string(),
-                        "route": route,
-                        "rollback": rollback,
-                    }));
-                }
-            },
-            None => {
-                let rollback = rollback_failed_fuel_transaction(
-                    client,
-                    &consumer_snapshot,
-                    None,
-                    &transaction_units,
-                )
-                .await;
-                return Ok(serde_json::json!({
-                    "success": false,
-                    "error_kind": "fuel_inserter_missing_identity",
-                    "error": "The placed terminal inserter had no exact unit identity.",
-                    "route": route,
-                    "rollback": rollback,
-                }));
-            }
-        };
+        if placed_inserter_unit.is_none() {
+            let rollback = rollback_failed_atomic_fuel_placement(
+                client,
+                &consumer_snapshot,
+                None,
+                &transaction_units,
+                Some(&terminal_placement_report),
+            )
+            .await;
+            return Ok(serde_json::json!({
+                "success": false,
+                "error_kind": "fuel_inserter_missing_identity",
+                "error": "The atomically placed terminal inserter had no exact unit identity.",
+                "atomic_placement": terminal_placement_report,
+                "route": route,
+                "rollback": rollback,
+            }));
+        }
 
-        let source_tap_inserter = if let Some(layout) = source_tap_layout {
-            match client
-                .place_entity(
+        let source_tap_placement = if let Some(layout) = source_tap_layout {
+            let source_tap_placement_report = match client
+                .place_filtered_inserter(
                     FUEL_SOURCE_TAP_INSERTER,
                     layout.inserter_position(),
                     layout.inserter_direction,
+                    &["coal".to_string()],
                 )
                 .await
             {
-                Ok(entity) => Some(entity),
+                Ok(report) => report,
                 Err(error) => {
-                    let rollback = rollback_failed_fuel_transaction(
+                    let rollback = rollback_failed_atomic_fuel_placement(
                         client,
                         &consumer_snapshot,
                         placed_inserter_unit,
                         &transaction_units,
+                        None,
                     )
                     .await;
                     return Ok(serde_json::json!({
                         "success": false,
-                        "error_kind": "source_tap_placement_failed",
+                        "error_kind": "atomic_source_tap_placement_failed",
                         "error": error.to_string(),
+                        "source_unit_number": params.source_unit_number,
+                        "layout": layout,
+                        "route": route,
+                        "rollback": rollback,
+                    }));
+                }
+            };
+            match verified_atomic_filtered_placement(&source_tap_placement_report) {
+                Ok((entity, filter)) => Some((entity, filter, source_tap_placement_report)),
+                Err(error) => {
+                    let remote_success = report_success(&source_tap_placement_report);
+                    let rollback = rollback_failed_atomic_fuel_placement(
+                        client,
+                        &consumer_snapshot,
+                        placed_inserter_unit,
+                        &transaction_units,
+                        Some(&source_tap_placement_report),
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "error_kind": if remote_success {
+                            "source_tap_filter_verification_failed"
+                        } else {
+                            "atomic_source_tap_placement_failed"
+                        },
+                        "error": error,
+                        "atomic_placement": source_tap_placement_report,
                         "source_unit_number": params.source_unit_number,
                         "layout": layout,
                         "route": route,
@@ -11034,21 +11755,27 @@ impl FactorioMcp {
         } else {
             None
         };
-        let source_tap_unit = source_tap_inserter
+        let source_tap_unit = source_tap_placement
             .as_ref()
-            .and_then(|entity| entity.unit_number);
-        if source_tap_inserter.is_some() && source_tap_unit.is_none() {
-            let rollback = rollback_failed_fuel_transaction(
+            .and_then(|(entity, _filter, _report)| entity.unit_number);
+        if source_tap_placement.is_some() && source_tap_unit.is_none() {
+            let source_tap_placement_report = source_tap_placement
+                .as_ref()
+                .map(|(_entity, _filter, report)| report)
+                .expect("source tap placement checked as present");
+            let rollback = rollback_failed_atomic_fuel_placement(
                 client,
                 &consumer_snapshot,
                 placed_inserter_unit,
                 &transaction_units,
+                Some(source_tap_placement_report),
             )
             .await;
             return Ok(serde_json::json!({
                 "success": false,
                 "error_kind": "source_tap_missing_identity",
                 "error": "The placed source tap had no exact unit identity and cannot enter an atomic transaction.",
+                "atomic_placement": source_tap_placement_report,
                 "route": route,
                 "rollback": rollback,
             }));
@@ -11056,48 +11783,7 @@ impl FactorioMcp {
         if let Some(unit_number) = source_tap_unit {
             transaction_units.push(unit_number);
         }
-        let source_tap_filter = match source_tap_unit {
-            Some(unit_number) => match client
-                .configure_inserter(unit_number, &["coal".to_string()])
-                .await
-            {
-                Ok(report) if source_tap_filter_verified(&report) => Some(report),
-                Ok(report) => {
-                    let rollback = rollback_failed_fuel_transaction(
-                        client,
-                        &consumer_snapshot,
-                        placed_inserter_unit,
-                        &transaction_units,
-                    )
-                    .await;
-                    return Ok(serde_json::json!({
-                        "success": false,
-                        "error_kind": "source_tap_filter_verification_failed",
-                        "error": "The source tap did not read back an exact coal whitelist.",
-                        "filter": report,
-                        "route": route,
-                        "rollback": rollback,
-                    }));
-                }
-                Err(error) => {
-                    let rollback = rollback_failed_fuel_transaction(
-                        client,
-                        &consumer_snapshot,
-                        placed_inserter_unit,
-                        &transaction_units,
-                    )
-                    .await;
-                    return Ok(serde_json::json!({
-                        "success": false,
-                        "error_kind": "source_tap_filter_failed",
-                        "error": error.to_string(),
-                        "route": route,
-                        "rollback": rollback,
-                    }));
-                }
-            },
-            None => None,
-        };
+        let source_tap_filter = source_tap_placement.map(|(_entity, filter, _report)| filter);
         let bootstrap_fuel = if params.inserter_name.contains("burner") {
             match placed_inserter_unit {
                 Some(unit) => {
@@ -11242,6 +11928,7 @@ impl FactorioMcp {
             "args": inserter_args,
             "success": true,
             "unit_number": placed_inserter_unit,
+            "atomic_filter_configuration": true,
             "filter": terminal_filter,
             "error": serde_json::Value::Null,
         });
@@ -11323,46 +12010,6 @@ impl FactorioMcp {
             })
         };
 
-        if source_tap_layout.is_some() {
-            if let Err(error) = client.wait_ticks(360).await {
-                let rollback = rollback_failed_fuel_transaction(
-                    client,
-                    &consumer_snapshot,
-                    placed_inserter_unit,
-                    &transaction_units,
-                )
-                .await;
-                return Ok(serde_json::json!({
-                    "success": false,
-                    "error_kind": "source_tap_startup_observation_failed",
-                    "error": error.to_string(),
-                    "bootstrap_source_tap_fuel": bootstrap_source_tap_fuel,
-                    "route": route,
-                    "rollback": rollback,
-                }));
-            }
-        }
-
-        if provisional_self_bootstrap {
-            if let Err(error) = client.wait_ticks(600).await {
-                let rollback = rollback_failed_fuel_transaction(
-                    client,
-                    &consumer_snapshot,
-                    placed_inserter_unit,
-                    &transaction_units,
-                )
-                .await;
-                return Ok(serde_json::json!({
-                    "success": false,
-                    "error_kind": "self_bootstrap_observation_failed",
-                    "error": error.to_string(),
-                    "bootstrap_consumer_fuel": bootstrap_consumer_fuel,
-                    "route": route,
-                    "rollback": rollback,
-                }));
-            }
-        }
-
         let verify_radius = params.verify_radius.clamp(1, 50) as f64;
         let verify_area = Area::new(
             consumer.position.x - verify_radius,
@@ -11370,6 +12017,99 @@ impl FactorioMcp {
             consumer.position.x + verify_radius,
             consumer.position.y + verify_radius,
         );
+        // A connected route is only infrastructure. Poll the exact terminal
+        // connection until coal reaches its pickup belt, with enough time for
+        // one mining cycle plus basic-belt transit across the complete route.
+        let (route_transit_tiles, mut delivery_wait_budget) = fuel_delivery_wait_budget(&route);
+        let mut delivery_waited_ticks = 0_u32;
+        let mut certified_upstream_hops = 0_u32;
+        let (fuel_diagnosis, durable_fuel_topology) = loop {
+            let diagnosis = client
+                .diagnose_fuel_sustainability(verify_area, 100)
+                .await
+                .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let topology = fuel_topology_verification(
+                &diagnosis,
+                params.consumer_unit_number,
+                placed_inserter_unit,
+            );
+            certified_upstream_hops =
+                certified_upstream_hops.max(fuel_topology_upstream_hops(&topology));
+            // The recursive proof starts at the terminal belt, so its hop
+            // count already includes the new surface route plus any existing
+            // upstream trunk. Keep the larger of that full proof distance and
+            // the route's physical span (important for underground segments).
+            delivery_wait_budget = delivery_wait_budget.max(fuel_delivery_budget_ticks(
+                route_transit_tiles.max(certified_upstream_hops),
+            ));
+            let terminal_coal_observed = topology
+                .get("live_supply_verified")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            let exact_feeder_transfer_observed = exact_fuel_feeder_transfer_observed(&topology);
+            let delivery_observed = terminal_coal_observed || exact_feeder_transfer_observed;
+            if delivery_observed || delivery_waited_ticks >= delivery_wait_budget {
+                break (diagnosis, topology);
+            }
+
+            // Inserter swings can begin and finish between one-second samples.
+            // Quarter-second polling observes the exact filtered feeder without
+            // treating unrelated consumer inventory changes as route delivery.
+            let step = 15.min(delivery_wait_budget - delivery_waited_ticks);
+            if let Err(error) = client.wait_ticks(step).await {
+                let rollback = rollback_failed_fuel_transaction(
+                    client,
+                    &consumer_snapshot,
+                    placed_inserter_unit,
+                    &transaction_units,
+                )
+                .await;
+                let error_kind = if provisional_self_bootstrap {
+                    "self_bootstrap_observation_failed"
+                } else if source_tap_layout.is_some() {
+                    "source_tap_startup_observation_failed"
+                } else {
+                    "fuel_delivery_observation_failed"
+                };
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error_kind": error_kind,
+                    "error": error.to_string(),
+                    "route": route,
+                    "bootstrap_fuel": bootstrap_fuel,
+                    "bootstrap_source_tap_fuel": bootstrap_source_tap_fuel,
+                    "bootstrap_consumer_fuel": bootstrap_consumer_fuel,
+                    "delivery_observation": {
+                        "route_transit_tiles": route_transit_tiles,
+                        "certified_upstream_hops": certified_upstream_hops,
+                        "waited_ticks": delivery_waited_ticks,
+                        "budget_ticks": delivery_wait_budget,
+                    },
+                    "rollback": rollback,
+                }));
+            }
+            delivery_waited_ticks = delivery_waited_ticks.saturating_add(step);
+        };
+        let terminal_coal_observed = durable_fuel_topology
+            .get("live_supply_verified")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let delivery_path_operational_during_observation =
+            fuel_delivery_path_operational(&durable_fuel_topology);
+        let exact_feeder_transfer_observed =
+            exact_fuel_feeder_transfer_observed(&durable_fuel_topology);
+        let fuel_delivery_observed = terminal_coal_observed || exact_feeder_transfer_observed;
+        let delivery_observation = serde_json::json!({
+            "success": fuel_delivery_observed,
+            "scope": "exact_terminal_or_filtered_feeder_transfer",
+            "terminal_coal_observed": terminal_coal_observed,
+            "exact_feeder_transfer_observed": exact_feeder_transfer_observed,
+            "delivery_path_operational": delivery_path_operational_during_observation,
+            "route_transit_tiles": route_transit_tiles,
+            "certified_upstream_hops": certified_upstream_hops,
+            "waited_ticks": delivery_waited_ticks,
+            "budget_ticks": delivery_wait_budget,
+        });
         let persisted_inserter = match placed_inserter_unit {
             Some(unit_number) => client.get_entity(unit_number).await.ok(),
             None => None,
@@ -11385,15 +12125,6 @@ impl FactorioMcp {
             &params.inserter_name,
             inserter_position,
             inserter_direction,
-        );
-        let fuel_diagnosis = client
-            .diagnose_fuel_sustainability(verify_area, 100)
-            .await
-            .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
-        let durable_fuel_topology = fuel_topology_verification(
-            &fuel_diagnosis,
-            params.consumer_unit_number,
-            placed_inserter_unit,
         );
         let structural_fuel_topology = durable_fuel_topology
             .get("structural_success")
@@ -11453,6 +12184,7 @@ impl FactorioMcp {
                     "route_start_matches_drop": route_start_matches_drop,
                     "branch_extend_existing": false,
                     "filter_readback_verified": filter_verified,
+                    "filter_atomic_with_placement": filter_verified,
                     "allowed_items": ["coal"],
                     "placement": placement,
                     "topology": topology,
@@ -11470,6 +12202,7 @@ impl FactorioMcp {
             .is_none_or(report_success);
         let infrastructure_success = report_success(&infrastructure_verified)
             && structural_fuel_topology
+            && fuel_delivery_observed
             && source_tap_structural_success;
         if let Some(report) = infrastructure_verified.as_object_mut() {
             report.insert(
@@ -11479,6 +12212,10 @@ impl FactorioMcp {
             report.insert(
                 "durable_fuel_topology".to_string(),
                 durable_fuel_topology.clone(),
+            );
+            report.insert(
+                "delivery_observation".to_string(),
+                delivery_observation.clone(),
             );
             if let Some(source_tap) = source_tap_infrastructure.as_ref() {
                 report.insert("source_tap".to_string(), source_tap.clone());
@@ -11494,12 +12231,21 @@ impl FactorioMcp {
             .await;
             return Ok(serde_json::json!({
                 "success": false,
-                "error_kind": "infrastructure_verification_failed",
-                "error": "Fuel controller could not verify its complete route, exact inserter placement, and target fuel connection; the route and inserter were rolled back.",
+                "error_kind": if !fuel_delivery_observed {
+                    "fuel_delivery_not_observed"
+                } else {
+                    "infrastructure_verification_failed"
+                },
+                "error": if !fuel_delivery_observed {
+                    "Coal delivery was not observed at the exact terminal pickup belt or in the newly placed filtered feeder within the route-length-aware observation window; the route and inserter were rolled back."
+                } else {
+                    "Fuel controller could not verify its complete route, exact inserter placement, and target fuel connection; the route and inserter were rolled back."
+                },
                 "dry_run": false,
                 "consumer": consumer,
                 "route": route,
                 "infrastructure_verified": infrastructure_verified,
+                "delivery_observation": delivery_observation,
                 "source_tap": source_tap_infrastructure,
                 "source_preservation": source_preservation,
                 "bootstrap_fuel": bootstrap_fuel,
@@ -11530,10 +12276,11 @@ impl FactorioMcp {
             .get("structural_success")
             .and_then(|value| value.as_bool())
             == Some(true);
-        let fuel_supply_live = final_fuel_topology
-            .get("live_supply_verified")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        // Delivery was observed over time above. A later between-items sample
+        // may be empty, but the exact producer and feeder must still be able to
+        // operate when the transaction commits.
+        let final_delivery_path_operational = fuel_delivery_path_operational(&final_fuel_topology);
+        let fuel_supply_live = fuel_delivery_observed && final_delivery_path_operational;
         let final_source_after = client.get_entity(source_unit_number).await.ok();
         let final_source_preservation = source_tap_entity.map(|source| {
             source_entity_preservation(
@@ -11573,11 +12320,9 @@ impl FactorioMcp {
                         .get("structural_success")
                         .and_then(serde_json::Value::as_bool)
                         == Some(true)
-                        && topology
-                            .get("live_supply_verified")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(true)
+                        && fuel_delivery_path_operational(topology)
                 })
+                && fuel_delivery_observed
         } else {
             true
         };

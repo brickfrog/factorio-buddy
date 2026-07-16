@@ -985,15 +985,23 @@ fn critical_mod_safety_contracts_are_explicit() {
             && entities_lua.contains("source_is_proposed = provisional_self_source")
             && entities_lua.contains("source_unit_number = source.unit_number")
             && entities_lua.contains("connection_kind = \"self_fueling_coal_pickup\"")
+            && entities_lua.contains("local status = entity_status_string(consumer)")
+            && !entities_lua.contains("local status = consumer.status")
+            && entities_lua.contains("return status == \"working\"")
+            && entities_lua.contains("or status == \"waiting_for_source_items\"")
+            && entities_lua.contains("or status == \"waiting_for_space_in_destination\"")
+            && entities_lua.contains("inserter_held_item = held_stack_item_name(consumer)")
+            && entities_lua.contains("inserter_held_item = held_stack_item_name(inserter)")
             && entities_lua.contains("remaining_burning_fuel > 0")
             && entities_lua.contains("proof.producer_operational == true")
-            && entities_lua.matches("live = proof.live == true").count() >= 3
+            && entities_lua
+                .matches("live = coal_count > 0 and proof.producer_operational == true")
+                .count()
+                >= 3
             && !entities_lua.contains("live = proof.producer_operational == true")
-            && !entities_lua
-                .contains("live = coal_count > 0 and proof.producer_operational == true")
             && entities_lua.contains("if a.operational ~= b.operational then")
             && entities_lua.contains("if a.distance_sq ~= b.distance_sq then"),
-        "fuel diagnosis must prove adjacent inserter/source operation and rank unproven sources explicitly"
+        "fuel diagnosis must separate durable upstream topology from coal delivered to the exact endpoint"
     );
     assert!(
         entities_lua.contains("local function mining_drill_energy_source(entity)")
@@ -2854,6 +2862,17 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
             "place_entity",
         ),
         (
+            "place_filtered_inserter",
+            LuaCommand::place_filtered_inserter(
+                &named_agent(),
+                "burner-inserter",
+                pos(-38.0, 37.0),
+                Direction::East,
+                &["coal".to_string()],
+            ),
+            "place_filtered_inserter",
+        ),
+        (
             "check_entity_placement",
             LuaCommand::check_entity_placement(
                 &named_agent(),
@@ -2959,6 +2978,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
     for required in [
         "local placement = require(\"placement\")",
         "placement.place_entity",
+        "placement.place_filtered_inserter",
         "placement.place_underground_belt",
         "placement.check_entity_placement",
         "placement.find_entity_placements",
@@ -2969,6 +2989,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "placement.rotate_entity",
         "placement.configure_inserter",
         "place_entity = function(agent_id, entity_name, x, y, direction)",
+        "place_filtered_inserter = function(agent_id, entity_name, x, y, direction, allowed_items)",
         "place_underground_belt = function(agent_id, entity_name, x, y, direction, belt_type)",
         "check_entity_placement = function(agent_id, entity_name, x, y, direction)",
         "find_entity_placements = function(agent_id, entity_name, center_x, center_y, radius, limit)",
@@ -3106,6 +3127,7 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "target.guidance = policy.guidance",
         "add_resource_policy_details(result, policy)",
         "function M.configure_inserter(agent_id, unit_number, allowed_items)",
+        "function M.place_filtered_inserter(agent_id, entity_name, x, y, direction, allowed_items)",
         "entity.filter_slot_count",
         "entity.set_filter(slot, nil)",
         "read_inserter_filter_state",
@@ -3113,6 +3135,14 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         "readback_verified = true",
         "entity_identity_preserved",
         "rollback_readback_verified",
+        "configured.atomic_with_placement = true",
+        "placed.atomic_filter_configuration = true",
+        "local placement_ok, placed_or_error = pcall(",
+        "local configure_ok, configured_or_error = pcall(",
+        "placed.atomic_outcome_known = true",
+        "placed.entity_created = false",
+        "local cleanup_ok, cleanup_error = pcall(function()",
+        "cleanup_completed = cleanup_ok",
     ] {
         assert!(
             placement_lua.contains(required),

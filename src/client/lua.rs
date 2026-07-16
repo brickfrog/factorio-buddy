@@ -561,6 +561,29 @@ impl LuaCommand {
         )
     }
 
+    /// Place and filter a new inserter in one engine-owned remote call.
+    pub fn place_filtered_inserter(
+        agent_id: &AgentId,
+        entity_name: &str,
+        position: Position,
+        direction: Direction,
+        allowed_items: &[String],
+    ) -> String {
+        Self::claude_interface_json_call(
+            "place_filtered_inserter",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                Self::lua_string_arg(entity_name),
+                position.x.to_string(),
+                position.y.to_string(),
+                direction.to_factorio().to_string(),
+                serde_json::to_string(allowed_items)
+                    .expect("inserter whitelist JSON serialization cannot fail"),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before placing filtered inserters.",
+        )
+    }
+
     /// Check whether Factorio itself can place an entity at a position
     pub fn check_entity_placement(
         agent_id: &AgentId,

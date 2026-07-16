@@ -1560,6 +1560,35 @@ impl FactorioClient {
         Ok(entity)
     }
 
+    /// Place a new inserter and install its whitelist in the same Factorio
+    /// remote call, before the simulation can advance and pick up an item.
+    pub async fn place_filtered_inserter(
+        &mut self,
+        entity_name: &str,
+        position: Position,
+        direction: Direction,
+        allowed_items: &[String],
+    ) -> Result<serde_json::Value> {
+        self.approach_position(position, "build").await?;
+        let response = self
+            .call_remote(
+                "place_filtered_inserter",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(entity_name),
+                    json!(position.x),
+                    json!(position.y),
+                    json!(direction.to_factorio()),
+                    json!(allowed_items),
+                ],
+            )
+            .await?;
+        // Semantic failures are structured transaction reports: they retain
+        // the exact placed unit and Lua-side rollback evidence. Do not flatten
+        // them into anyhow text before the controller can finish rollback.
+        Ok(serde_json::from_str(&response)?)
+    }
+
     pub async fn check_entity_placement(
         &mut self,
         entity_name: &str,

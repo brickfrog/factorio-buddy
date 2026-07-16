@@ -2178,4 +2178,100 @@ function M.configure_inserter(agent_id, unit_number, allowed_items)
     }
 end
 
+-- Place and filter a new inserter in one remote call. Factorio does not advance
+-- simulation ticks while this Lua call runs, so the arm cannot pick up a
+-- pre-filter item from a mixed belt. If filter verification fails, undo the
+-- placement here before returning control to the host.
+function M.place_filtered_inserter(agent_id, entity_name, x, y, direction, allowed_items)
+    local placement_ok, placed_or_error = pcall(
+        M.place_entity,
+        agent_id,
+        entity_name,
+        x,
+        y,
+        direction
+    )
+    if not placement_ok then
+        return {
+            success = false,
+            error_kind = "atomic_placement_exception",
+            error = tostring(placed_or_error),
+            atomic_outcome_known = false,
+        }
+    end
+
+    local placed = placed_or_error
+    if not (placed and placed.unit_number) then
+        if type(placed) == "table" then
+            -- M.place_entity returns without a unit only before create_entity
+            -- has succeeded. Make that no-mutation fact explicit; the host
+            -- must never infer it merely from a missing identity.
+            placed.atomic_outcome_known = true
+            placed.entity_created = false
+            return placed
+        end
+        return {
+            success = false,
+            error_kind = "atomic_placement_result_invalid",
+            error = "Atomic placement returned neither a report nor an exact entity identity",
+            atomic_outcome_known = false,
+        }
+    end
+    placed.atomic_outcome_known = true
+    placed.entity_created = true
+
+    local configure_ok, configured_or_error = pcall(
+        M.configure_inserter,
+        agent_id,
+        placed.unit_number,
+        allowed_items
+    )
+    local configured = configure_ok and configured_or_error or {
+        success = false,
+        error_kind = "atomic_filter_configuration_exception",
+        error = tostring(configured_or_error),
+        unit_number = placed.unit_number,
+    }
+    if configured and configured.success == true
+        and configured.held_stack_before == nil
+        and configured.held_stack_after == nil
+    then
+        configured.atomic_with_placement = true
+        placed.success = true
+        placed.filter = configured
+        placed.atomic_filter_configuration = true
+        return placed
+    end
+
+    local removed = false
+    local returned = 0
+    local cleanup_ok, cleanup_error = pcall(function()
+        local character = characters.find(agent_id)
+        local inv = character and character.valid and character.get_main_inventory() or nil
+        local entity = entities.find_by_unit_number(placed.unit_number)
+        if entity and entity.valid then removed = entity.destroy() == true end
+        if removed and storage.factorioctl_entities then
+            storage.factorioctl_entities[placed.unit_number] = nil
+        end
+        returned = removed and inv and inv.insert{name = entity_name, count = 1} or 0
+    end)
+    return {
+        success = false,
+        error_kind = "atomic_filter_configuration_failed",
+        error = configured and configured.error
+            or "New inserter held an item before its whitelist was verified",
+        placement = placed,
+        filter = configured,
+        atomic_outcome_known = true,
+        entity_created = true,
+        rollback = {
+            success = cleanup_ok and removed and returned == 1,
+            entity_removed = removed,
+            item_returned = returned,
+            cleanup_completed = cleanup_ok,
+            error = cleanup_ok and nil or tostring(cleanup_error),
+        },
+    }
+end
+
 return M

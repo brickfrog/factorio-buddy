@@ -182,6 +182,12 @@ local function safe_inventory(entity, inventory_define)
     return nil
 end
 
+local function held_stack_item_name(entity)
+    local ok, stack = pcall(function() return entity.held_stack end)
+    if ok and stack and stack.valid_for_read then return stack.name end
+    return nil
+end
+
 local function entity_status_string(entity)
     return status_name(raw_entity_status(entity))
 end
@@ -273,12 +279,12 @@ local function entity_drops_to(source, target)
 end
 
 local function inserter_can_operate(status)
-    return status ~= nil
-        and status ~= "no_power"
-        and status ~= "low_power"
-        and status ~= "no_fuel"
-        and status ~= "disabled"
-        and status ~= "marked_for_deconstruction"
+    -- Fail closed. Factorio has many non-operational statuses (including
+    -- script-, circuit-, and freeze-driven variants), so a denylist silently
+    -- turns new engine statuses into false liveness proofs.
+    return status == "working"
+        or status == "waiting_for_source_items"
+        or status == "waiting_for_space_in_destination"
 end
 
 local function expanded_box(box, margin)
@@ -579,10 +585,9 @@ coal_upstream_proof = function(surface, force, entity, state)
             if proof.certified then
                 return finish({
                     certified = true,
-                    -- A certified connected path from an operating producer is
-                    -- live even when this intermediate tile is between items
-                    -- in the sampled tick.
-                    live = proof.live == true,
+                    -- Topology proves that this tile can be supplied; liveness
+                    -- requires coal to have reached this exact tile.
+                    live = coal_count > 0 and proof.producer_operational == true,
                     reason = coal_count > 0 and "direct_durable_coal_drill" or "upstream_ready_but_source_empty",
                     producer_unit_number = drill.unit_number,
                     producer_operational = proof.producer_operational == true,
@@ -610,7 +615,7 @@ coal_upstream_proof = function(surface, force, entity, state)
                     if proof.certified then
                         return finish({
                             certified = true,
-                            live = proof.live == true,
+                            live = coal_count > 0 and proof.producer_operational == true,
                             reason = coal_count > 0 and "connected_surface_belt" or "upstream_ready_but_source_empty",
                             producer_unit_number = proof.producer_unit_number,
                             producer_operational = proof.producer_operational == true,
@@ -640,7 +645,7 @@ coal_upstream_proof = function(surface, force, entity, state)
                     if proof.certified then
                         return finish({
                             certified = true,
-                            live = proof.live == true,
+                            live = coal_count > 0 and proof.producer_operational == true,
                             reason = coal_count > 0 and "operational_inserter_feed" or "upstream_ready_but_source_empty",
                             producer_unit_number = proof.producer_unit_number,
                             producer_operational = proof.producer_operational == true,
@@ -750,13 +755,14 @@ local function fuel_connections(surface, force, consumer)
             then
                 local source_record = coal_source_record(surface, force, source, proof_cache)
                 if source_record then
-                    local status = consumer.status
+                    local status = entity_status_string(consumer)
                     local operational = inserter_can_operate(status)
                     table.insert(result, {
                         connection_kind = "self_fueling_coal_pickup",
                         inserter_unit_number = consumer.unit_number,
                         inserter_name = consumer.name,
                         inserter_status = status,
+                        inserter_held_item = held_stack_item_name(consumer),
                         inserter_operational = operational,
                         pickup_position = pos_table(pickup),
                         drop_position = pos_table(consumer.drop_position),
@@ -785,6 +791,7 @@ local function fuel_connections(surface, force, consumer)
                             inserter_unit_number = inserter.unit_number,
                             inserter_name = inserter.name,
                             inserter_status = inserter_status,
+                            inserter_held_item = held_stack_item_name(inserter),
                             inserter_operational = inserter_operational,
                             pickup_position = pos_table(pickup),
                             drop_position = pos_table(inserter.drop_position),

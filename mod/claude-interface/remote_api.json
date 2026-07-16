@@ -86,6 +86,7 @@
     "mine_nearest": {"args": ["agent_id", "entity_name", "count"], "returns": "json"},
     "place_blueprint": {"args": ["agent_id", "name", "x", "y", "direction"], "returns": "json"},
     "place_entity": {"args": ["agent_id", "entity_name", "x", "y", "direction"], "returns": "json"},
+    "place_filtered_inserter": {"args": ["agent_id", "entity_name", "x", "y", "direction", "allowed_items"], "returns": "json"},
     "place_ghost": {"args": ["agent_id", "entity_name", "x", "y", "direction"], "returns": "json"},
     "place_underground_belt": {"args": ["agent_id", "entity_name", "x", "y", "direction", "belt_type"], "returns": "json"},
     "plan_entity_placement_near": {"args": ["agent_id", "entity_name", "target_x", "target_y", "radius", "limit"], "returns": "json"},

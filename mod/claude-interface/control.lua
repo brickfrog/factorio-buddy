@@ -2362,6 +2362,10 @@ local api = {
         return json_remote_call("place_entity", placement.place_entity, agent_id, entity_name, x, y, direction)
     end,
 
+    place_filtered_inserter = function(agent_id, entity_name, x, y, direction, allowed_items)
+        return json_remote_call("place_filtered_inserter", placement.place_filtered_inserter, agent_id, entity_name, x, y, direction, allowed_items)
+    end,
+
     place_underground_belt = function(agent_id, entity_name, x, y, direction, belt_type)
         return json_remote_call("place_underground_belt", placement.place_underground_belt, agent_id, entity_name, x, y, direction, belt_type)
     end,
