@@ -1727,8 +1727,8 @@ mod tests {
         atomic_filtered_placement_cleanup_evidence, atomic_filtered_placement_cleanup_unit,
         atomic_filtered_placement_local_rollback_verified, atomic_filtered_placement_unit,
         attach_endpoint_preflight, automation_repair_hint, belt_source_tap_layouts,
-        compact_fuel_diagnosis, compact_fuel_repair, compound_route_preflight,
-        direct_placement_requires_route, endpoint_belt_incompatibility,
+        bounded_bootstrap_output_count, compact_fuel_diagnosis, compact_fuel_repair,
+        compound_route_preflight, direct_placement_requires_route, endpoint_belt_incompatibility,
         exact_fuel_feeder_transfer_observed, execute_lua_refusal, existing_belt_compatibility,
         existing_underground_pair_reservations, flow_lookup, flow_scan_area,
         fuel_consumer_activity_verification_summary, fuel_delivery_budget_ticks,
@@ -1752,6 +1752,13 @@ mod tests {
         Area, BeltKind, BeltPlacement, Direction, Entity, GridPos, Position, TilePos,
     };
     use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn bootstrap_output_collection_is_bounded_but_independent_of_source_count() {
+        assert_eq!(bounded_bootstrap_output_count(0), 1);
+        assert_eq!(bounded_bootstrap_output_count(39), 39);
+        assert_eq!(bounded_bootstrap_output_count(1_001), 1_000);
+    }
 
     fn assert_emitted_tool_fields_are_model_visible(value: &serde_json::Value) {
         match value {
@@ -4541,7 +4548,7 @@ pub struct BootstrapSmeltingOnceParams {
     /// Output item to extract after waiting.
     #[serde(default = "default_bootstrap_output_item")]
     pub output_item: String,
-    /// Target output count to extract into inventory.
+    /// Target output count to extract into inventory (1-1000), independent of source_count.
     #[serde(default = "default_bootstrap_output_count")]
     pub output_count: u32,
     /// Optional recipe to craft after extracting plates, such as burner-inserter.
@@ -4587,6 +4594,12 @@ fn default_bootstrap_output_item() -> String {
 
 fn default_bootstrap_output_count() -> u32 {
     5
+}
+
+const MAX_BOOTSTRAP_OUTPUT_COUNT: u32 = 1_000;
+
+fn bounded_bootstrap_output_count(output_count: u32) -> u32 {
+    output_count.clamp(1, MAX_BOOTSTRAP_OUTPUT_COUNT)
 }
 
 fn default_bootstrap_wait_ticks() -> u32 {
@@ -10347,7 +10360,7 @@ impl FactorioMcp {
         };
         let verify_radius = params.verify_radius.clamp(1, 25) as f64;
         let wait_ticks = params.wait_ticks.clamp(1, 7200);
-        let output_count = params.output_count.clamp(1, params.source_count.max(1));
+        let output_count = bounded_bootstrap_output_count(params.output_count);
         let craft_recipe = params.craft_recipe.trim().to_string();
         let verify_area = Area::new(
             furnace.position.x - verify_radius,

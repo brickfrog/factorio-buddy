@@ -3942,6 +3942,84 @@ rcon.print(helpers.table_to_json({
 assert_json "absent-recipe rollback leaves no fragments or recipe" "$EMPTY_RECIPE_ROLLBACK_WORLD" \
     '.belts == 0 and .inserters == 0 and .recipe == null'
 
+# Banked furnace output is existing recoverable stock, not a function of how
+# much new source material this one-shot bootstrap inserts. A caller requesting
+# 39 output with one source item must receive all 39 available plates.
+BANKED_FURNACE_FIXTURE="$(raw_lua "
+game.tick_paused = false
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+remote.call('claude_interface', 'clear_walk_target', '$AGENT_ID')
+c.force = game.forces.player
+c.teleport({23.5, -20.5}, game.surfaces['buddy-live-regression'])
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{16, -27}, {28, -13}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local inv = c.get_main_inventory()
+inv.clear()
+local seeded_coal = inv.insert{name = 'coal', count = 1}
+local seeded_source = inv.insert{name = 'copper-ore', count = 1}
+local furnace = s.create_entity{name = 'stone-furnace', position = {20, -20}, force = c.force}
+if not furnace then error('failed to construct banked furnace fixture') end
+local result_inventory = furnace.get_inventory(defines.inventory.furnace_result)
+local banked_output = result_inventory.insert{name = 'iron-plate', count = 39}
+rcon.print(helpers.table_to_json({
+    furnace_unit = furnace.unit_number,
+    seeded_coal = seeded_coal,
+    seeded_source = seeded_source,
+    banked_output = banked_output
+}))
+")"
+require_json "banked furnace fixture has one new source item and 39 finished plates" \
+    "$BANKED_FURNACE_FIXTURE" \
+    '.seeded_coal == 1
+     and .seeded_source == 1
+     and .banked_output == 39
+     and (.furnace_unit | type) == "number"'
+BANKED_FURNACE_UNIT="$(jq -r '.furnace_unit' <<<"$BANKED_FURNACE_FIXTURE")"
+
+BANKED_COLLECTION="$(mcp_tool bootstrap_smelting_once "$(jq -cn \
+    --argjson unit "$BANKED_FURNACE_UNIT" \
+    '{
+        furnace_unit_number:$unit,
+        fuel_item:"coal",
+        fuel_count:1,
+        source_item:"copper-ore",
+        source_count:1,
+        output_item:"iron-plate",
+        output_count:39,
+        wait_ticks:1,
+        verify_radius:4,
+        dry_run:false
+    }')")"
+BANKED_COLLECTION_PAYLOAD="$(tool_payload "$BANKED_COLLECTION")"
+assert_json "bootstrap collection honors output_count independently of source_count" \
+    "$BANKED_COLLECTION_PAYLOAD" \
+    --argjson unit "$BANKED_FURNACE_UNIT" \
+    '.success == true
+     and .furnace.unit_number == $unit
+     and ((.actions | map(select(.operation == "collect_furnace_output")) | first) as $collect
+        | $collect.requested_count == 39
+          and $collect.result == 39
+          and $collect.success == true)'
+
+BANKED_FURNACE_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local furnace
+for _, entity in pairs(s.find_entities_filtered{area = {{16, -27}, {28, -13}}}) do
+    if entity.unit_number == $BANKED_FURNACE_UNIT then furnace = entity break end
+end
+rcon.print(helpers.table_to_json({
+    same_unit = furnace and furnace.valid and furnace.unit_number == $BANKED_FURNACE_UNIT or false,
+    furnace_result = furnace and furnace.get_inventory(defines.inventory.furnace_result).get_item_count('iron-plate') or -1,
+    character_output = c.get_main_inventory().get_item_count('iron-plate')
+}))
+")"
+assert_json "banked collection preserves furnace identity and transfers all finished output" \
+    "$BANKED_FURNACE_WORLD" \
+    '.same_unit == true and .furnace_result == 0 and .character_output == 39'
+
 # Bounded inventory recovery must operate on exact existing entities without
 # the destructive remove-and-replace workaround. Freeze ticks so burner fuel
 # cannot begin burning between the transfer response and the conservation
