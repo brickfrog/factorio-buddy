@@ -3298,6 +3298,8 @@ mod tests {
             "\"disconnected_topology\"",
             "\"resource_tiles_observed\"",
             "\"planned_surface_resource_tiles_crossed\"",
+            "for tile in reserved_route_tiles",
+            "collision_map.block(*tile)",
         ] {
             assert!(
                 route_core.contains(required),
@@ -3354,6 +3356,35 @@ mod tests {
             topology_gate < inventory_read,
             "disconnected topology must fail before inventory reads or any placement path"
         );
+    }
+
+    #[test]
+    fn assembler_feed_reserves_inserter_tile_for_plan_and_execution() {
+        let source = include_str!("mcp.rs");
+        let controller = source
+            .rsplit("    async fn build_assembler_feed(")
+            .next()
+            .and_then(|tail| tail.split("    async fn plan_machine_output(").next())
+            .expect("build_assembler_feed should precede plan_machine_output");
+
+        assert_eq!(
+            controller.matches(".route_belt_core_avoiding(").count(),
+            2,
+            "assembler-feed planning and execution must use the same reserved route geometry"
+        );
+        for required in [
+            "let reserved_route_tiles = HashSet::from([GridPos::from_position(&inserter_position)])",
+            "report.remove(\"ready_to_call\")",
+            "\"controller_reserved_tiles\"",
+            "\"tool\": \"build_assembler_feed\"",
+            "\"args\": execute_args.clone()",
+            "\"ready_to_call\": ready_to_call",
+        ] {
+            assert!(
+                controller.contains(required),
+                "assembler-feed executable dry-run should include {required:?}"
+            );
+        }
     }
 
     #[test]
@@ -10738,6 +10769,16 @@ impl FactorioMcp {
         client: &mut FactorioClient,
         params: &RouteBeltParams,
     ) -> Result<serde_json::Value, String> {
+        self.route_belt_core_avoiding(client, params, &HashSet::new())
+            .await
+    }
+
+    async fn route_belt_core_avoiding(
+        &self,
+        client: &mut FactorioClient,
+        params: &RouteBeltParams,
+        reserved_route_tiles: &HashSet<GridPos>,
+    ) -> Result<serde_json::Value, String> {
         let padding = params.search_radius as i32;
         let area = Area {
             left_top: Position::new(
@@ -10897,6 +10938,10 @@ impl FactorioMcp {
         }
         if existing_surface_belts.contains_key(&goal) {
             underground_forbidden_tiles.insert(goal);
+        }
+        for tile in reserved_route_tiles {
+            collision_map.block(*tile);
+            underground_forbidden_tiles.insert(*tile);
         }
 
         let routing_options = RoutingOptions {
@@ -13272,10 +13317,22 @@ impl FactorioMcp {
             extend_existing: params.extend_existing,
         };
 
-        let route = match self.route_belt_core(&mut client, &route_params).await {
+        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
+        let reserved_route_tiles = HashSet::from([GridPos::from_position(&inserter_position)]);
+        let mut route = match self
+            .route_belt_core_avoiding(&mut client, &route_params, &reserved_route_tiles)
+            .await
+        {
             Ok(report) => report,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
+        if let Some(report) = route.as_object_mut() {
+            report.remove("ready_to_call");
+            report.insert(
+                "controller_reserved_tiles".to_string(),
+                serde_json::json!(&reserved_route_tiles),
+            );
+        }
 
         let recipe_args = serde_json::json!({
             "unit_number": params.assembler_unit_number,
@@ -13287,7 +13344,6 @@ impl FactorioMcp {
             "y": params.inserter_y,
             "direction": params.inserter_direction,
         });
-        let inserter_position = Position::new(params.inserter_x, params.inserter_y);
         let preflight = match controller_preflight(
             &mut client,
             &[("assembler_feed", &route)],
@@ -13318,29 +13374,19 @@ impl FactorioMcp {
         let preflight_ready = preflight["ready"].as_bool() == Some(true);
 
         if params.dry_run {
-            let mut steps = Vec::new();
-            if !params.recipe.trim().is_empty() {
-                steps.push(serde_json::json!({
-                    "tool": "set_recipe",
-                    "args": recipe_args,
-                }));
+            let mut execute_args =
+                serde_json::to_value(&params).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(args) = execute_args.as_object_mut() {
+                args.insert("dry_run".to_string(), serde_json::json!(false));
             }
-            steps.push(serde_json::json!({
-                "tool": "route_belt",
-                "args": route_params,
-            }));
-            steps.push(serde_json::json!({
-                "tool": "place_entity",
-                "args": inserter_args,
-            }));
-            steps.push(serde_json::json!({
-                "tool": "verify_production",
-                "args": {
-                    "x": assembler.position.x,
-                    "y": assembler.position.y,
-                    "radius": params.verify_radius,
-                },
-            }));
+            let execute_step = serde_json::json!({
+                "tool": "build_assembler_feed",
+                "args": execute_args.clone(),
+            });
+            let ready_to_call = serde_json::json!({
+                "tool": "build_assembler_feed",
+                "execute_args": execute_args,
+            });
             let result = serde_json::json!({
                 "success": preflight_ready,
                 "dry_run": true,
@@ -13352,8 +13398,9 @@ impl FactorioMcp {
                 },
                 "route": route,
                 "preflight": preflight,
-                "steps": steps,
-                "guidance": "Execute only when preflight.ready is true. For multi-input recipes prefer a complete compound cell so verification can prove the assembler working.",
+                "steps": [execute_step],
+                "ready_to_call": ready_to_call,
+                "guidance": "Execute only ready_to_call when preflight.ready is true so the route keeps the inserter footprint reserved. For multi-input recipes prefer a complete compound cell so verification can prove the assembler working.",
             });
             let msg =
                 serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e));
@@ -13387,7 +13434,10 @@ impl FactorioMcp {
         };
         let mut route_execute = route_params.clone();
         route_execute.dry_run = false;
-        let route = match self.route_belt_core(&mut client, &route_execute).await {
+        let route = match self
+            .route_belt_core_avoiding(&mut client, &route_execute, &reserved_route_tiles)
+            .await
+        {
             Ok(report) if report_success(&report) => report,
             Ok(report) => {
                 let result = serde_json::json!({

@@ -3853,6 +3853,146 @@ rcon.print(helpers.table_to_json({
 assert_json "disconnected controller leaves no pointless belts or inserters" "$DISCONNECTED_LAB_WORLD" \
     '.belts == 0 and .inserters == 0'
 
+# Reproduce the assembler-feed contradiction with canonical geometry: the
+# unreserved shortest route enters the pickup goal through the future inserter
+# tile, while a longer complete route exists around it. The controller must
+# reserve that footprint during both dry-run and execution.
+ASSEMBLER_FEED_ROUTE_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{76, -56}, {86, -42}}}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+local tiles = {}
+for x = 76, 85 do
+    for y = -56, -43 do
+        table.insert(tiles, {name = 'landfill', position = {x, y}})
+    end
+end
+s.set_tiles(tiles, true)
+c.teleport({84.5, -51.5})
+local inv = c.get_main_inventory()
+inv.insert{name = 'transport-belt', count = 100}
+inv.insert{name = 'inserter', count = 1}
+local assembler = s.create_entity{
+    name = 'assembling-machine-1', position = {80.5, -47.5}, force = c.force
+}
+local west_wall = s.create_entity{
+    name = 'stone-wall', position = {79.5, -44.5}, force = c.force
+}
+local east_wall = s.create_entity{
+    name = 'stone-wall', position = {81.5, -44.5}, force = c.force
+}
+rcon.print(helpers.table_to_json({
+    assembler_unit = assembler and assembler.unit_number or nil,
+    assembler_position = assembler and assembler.position or nil,
+    west_wall_unit = west_wall and west_wall.unit_number or nil,
+    east_wall_unit = east_wall and east_wall.unit_number or nil,
+    inserters_before = inv.get_item_count('inserter'),
+}))
+")"
+require_json "assembler-feed fixture has one clear machine and two goal-side blockers" \
+    "$ASSEMBLER_FEED_ROUTE_FIXTURE" \
+    '.assembler_position == {x:80.5,y:-47.5}
+     and (.assembler_unit | type) == "number"
+     and (.west_wall_unit | type) == "number"
+     and (.east_wall_unit | type) == "number"
+     and .inserters_before >= 1'
+
+ASSEMBLER_FEED_UNRESERVED="$(mcp_tool route_belt '{
+    "from_x":80,
+    "from_y":-54,
+    "to_x":80,
+    "to_y":-45,
+    "belt_type":"transport-belt",
+    "search_radius":5,
+    "dry_run":true,
+    "extend_existing":false,
+    "allow_underground":false,
+    "respect_zones":false
+}')"
+ASSEMBLER_FEED_UNRESERVED_PAYLOAD="$(tool_payload "$ASSEMBLER_FEED_UNRESERVED")"
+require_json "ordinary shortest route reproduces the future inserter-footprint conflict" \
+    "$ASSEMBLER_FEED_UNRESERVED_PAYLOAD" \
+    '.success == true
+     and any(.planned_belts[];
+         (.position.x | floor) == 80 and (.position.y | floor) == -46)'
+
+ASSEMBLER_FEED_PLAN="$(mcp_tool build_assembler_feed "$(jq -cn \
+    --argjson unit "$(jq '.assembler_unit' <<<"$ASSEMBLER_FEED_ROUTE_FIXTURE")" \
+    '{
+        assembler_unit_number:$unit,
+        recipe:"",
+        item_name:"iron-plate",
+        from_x:80,
+        from_y:-54,
+        pickup_x:80,
+        pickup_y:-45,
+        inserter_x:80.5,
+        inserter_y:-45.5,
+        inserter_direction:"south",
+        belt_type:"transport-belt",
+        search_radius:5,
+        dry_run:true,
+        respect_zones:false,
+        allow_underground:false,
+        extend_existing:false,
+        verify_radius:5
+    }')")"
+ASSEMBLER_FEED_PLAN_PAYLOAD="$(tool_payload "$ASSEMBLER_FEED_PLAN")"
+assert_json "assembler-feed dry-run finds a complete route around its inserter" \
+    "$ASSEMBLER_FEED_PLAN" '.result.isError != true'
+require_json "assembler-feed preflight is internally consistent and executable" \
+    "$ASSEMBLER_FEED_PLAN_PAYLOAD" \
+    '.success == true
+     and .preflight.ready == true
+     and .preflight.placements.input_inserter.allowed == true
+     and .preflight.endpoint_topology.success == true
+     and .route.controller_reserved_tiles == [{x:80,y:-46}]
+     and all(.route.planned_belts[];
+         ((.position.x | floor) == 80 and (.position.y | floor) == -46) | not)
+     and all(.preflight.routes.errors[]?; .kind != "route_entity_overlap")
+     and .ready_to_call.tool == "build_assembler_feed"
+     and .ready_to_call.execute_args.dry_run == false'
+
+ASSEMBLER_FEED_EXEC_ARGS="$(jq -c '.ready_to_call.execute_args' \
+    <<<"$ASSEMBLER_FEED_PLAN_PAYLOAD")"
+ASSEMBLER_FEED_RESULT="$(mcp_tool build_assembler_feed "$ASSEMBLER_FEED_EXEC_ARGS")"
+ASSEMBLER_FEED_RESULT_PAYLOAD="$(tool_payload "$ASSEMBLER_FEED_RESULT")"
+require_json "assembler-feed executes the same disjoint route and exact inserter" \
+    "$ASSEMBLER_FEED_RESULT_PAYLOAD" \
+    '.success == true
+     and .placement_success == true
+     and .infrastructure_verified.success == true
+     and .infrastructure_verified.endpoint_topology.success == true
+     and all(.route.placed_entities[];
+         ((.position.x | floor) == 80 and (.position.y | floor) == -46) | not)'
+
+ASSEMBLER_FEED_ROUTE_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local inv = c.get_main_inventory()
+rcon.print(helpers.table_to_json({
+    reserved_tile_belts = s.count_entities_filtered{
+        type = 'transport-belt', position = {80.5, -45.5}, radius = 0.1
+    },
+    pickup_belts = s.count_entities_filtered{
+        type = 'transport-belt', position = {80.5, -44.5}, radius = 0.1
+    },
+    input_inserters = s.count_entities_filtered{
+        type = 'inserter', position = {80.5, -45.5}, radius = 0.1
+    },
+    inserters_after = inv.get_item_count('inserter'),
+}))
+")"
+require_json "executed assembler feed keeps route and inserter footprints disjoint" \
+    "$ASSEMBLER_FEED_ROUTE_WORLD" \
+    --argjson fixture "$ASSEMBLER_FEED_ROUTE_FIXTURE" \
+    '.reserved_tile_belts == 0
+     and .pickup_belts == 1
+     and .input_inserters == 1
+     and .inserters_after == ($fixture.inserters_before - 1)'
+
 PRODUCTION="$(mcp_tool verify_production '{"x":16,"y":1,"radius":5}')"
 PRODUCTION_PAYLOAD="$(tool_payload "$PRODUCTION")"
 assert_json "production verifier rejects an idle furnace" "$PRODUCTION_PAYLOAD" \
