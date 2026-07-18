@@ -890,13 +890,13 @@ local function inserter_fuel_candidates(surface, force, entity)
             position = candidate.inserter,
             direction = candidate.direction,
             force = force,
-            build_check_type = defines.build_check_type.script,
+            build_check_type = defines.build_check_type.manual,
         }
         local pickup_belt_can_place = surface.can_place_entity{
             name = "transport-belt",
             position = candidate.pickup,
             force = force,
-            build_check_type = defines.build_check_type.script,
+            build_check_type = defines.build_check_type.manual,
         }
         table.insert(viable, {
             side = candidate.side,

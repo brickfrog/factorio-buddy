@@ -2122,7 +2122,7 @@ fn fuel_inserter_candidates_use_the_belt_as_factorio_pickup_side() {
         "local east_edge = math.ceil(bb.right_bottom.x)",
         "local south_edge = math.ceil(bb.right_bottom.y)",
         "local west_edge = math.floor(bb.left_top.x)",
-        "build_check_type = defines.build_check_type.script",
+        "build_check_type = defines.build_check_type.manual",
     ] {
         assert!(
             function.contains(required),
@@ -3103,15 +3103,15 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
         placement_lua
             .matches("build_check_type = defines.build_check_type.manual")
             .count(),
-        1,
-        "manual build checks are only valid for character standing-space probes; scripted placement must not advertise implicit fast replacement"
+        5,
+        "character standing plus every generic placement planner, preflight, and executor must use ordinary player collision legality"
     );
-    assert!(
+    assert_eq!(
         placement_lua
             .matches("build_check_type = defines.build_check_type.script")
-            .count()
-            >= 8,
-        "all non-fast-replacing placement planners and executors must use script build semantics"
+            .count(),
+        4,
+        "only specialized drill-output and underground/direct-smelter probes retain script build semantics"
     );
     assert!(
         !placement_lua.contains("belt_alternate_candidates")

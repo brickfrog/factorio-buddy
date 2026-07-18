@@ -512,7 +512,7 @@ local function placement_candidate(surface, force, entity_name, position, direct
             position = position,
             direction = direction,
             force = force,
-            build_check_type = defines.build_check_type.script,
+            build_check_type = defines.build_check_type.manual,
         }
     end)
     diagnostic.factorio_allowed = ok and can_place_or_error == true
@@ -1203,7 +1203,7 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
             position = position,
             direction = direction,
             force = character.force,
-            build_check_type = defines.build_check_type.script,
+            build_check_type = defines.build_check_type.manual,
         }
     end)
 
@@ -1410,7 +1410,7 @@ function M.check_entity_placement(agent_id, entity_name, x, y, direction)
             position = position,
             direction = direction,
             force = character.force,
-            build_check_type = defines.build_check_type.script,
+            build_check_type = defines.build_check_type.manual,
         }
     end)
 
@@ -1515,7 +1515,7 @@ function M.find_entity_placements(agent_id, entity_name, center_x, center_y, rad
                         position = position,
                         direction = dir,
                         force = character.force,
-                        build_check_type = defines.build_check_type.script,
+                        build_check_type = defines.build_check_type.manual,
                     }
                 end)
                 if not character_blocker and ok and can_place == true then

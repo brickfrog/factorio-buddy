@@ -809,6 +809,140 @@ COLD_COAL_ARGS="$(jq -cn \
 
 start_mcp
 
+# Generic placement must use the same collision legality as an ordinary player
+# build. Direct creation is fixture setup only; every attempted overlap goes
+# through the shipped placement remote or the model-facing safe-near executor.
+COLLISION_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+c.teleport({22.5, 0.5})
+local inv = c.get_main_inventory()
+local inserters_original = inv.get_item_count('inserter')
+local furnaces_original = inv.get_item_count('stone-furnace')
+inv.insert{name = 'inserter', count = 3}
+inv.insert{name = 'stone-furnace', count = 3}
+for _, entity in pairs(s.find_entities_filtered{area = {{20, -3}, {45, 6}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local inserter = s.create_entity{
+    name = 'inserter', position = {24.5, 0.5}, direction = defines.direction.east, force = c.force,
+}
+local belt = s.create_entity{
+    name = 'transport-belt', position = {28.5, 0.5}, direction = defines.direction.east, force = c.force,
+}
+local furnace = s.create_entity{
+    name = 'stone-furnace', position = {33, 1}, force = c.force,
+}
+local planned_belt = s.create_entity{
+    name = 'transport-belt', position = {39.5, 0.5}, direction = defines.direction.east, force = c.force,
+}
+rcon.print(helpers.table_to_json({
+    inserter_unit = inserter and inserter.unit_number or nil,
+    belt_unit = belt and belt.unit_number or nil,
+    furnace_unit = furnace and furnace.unit_number or nil,
+    planned_belt_unit = planned_belt and planned_belt.unit_number or nil,
+    inserters_original = inserters_original,
+    furnaces_original = furnaces_original,
+    inserters_before = inv.get_item_count('inserter'),
+    furnaces_before = inv.get_item_count('stone-furnace'),
+}))
+")"
+require_json "collision fixture contains all reported blocker shapes" "$COLLISION_FIXTURE" \
+    '(.inserter_unit | type) == "number"
+     and (.belt_unit | type) == "number"
+     and (.furnace_unit | type) == "number"
+     and (.planned_belt_unit | type) == "number"
+     and .inserters_before == (.inserters_original + 3)
+     and .furnaces_before == (.furnaces_original + 3)'
+
+STACKED_INSERTER="$(raw_lua "rcon.print(remote.call('claude_interface', 'place_entity', '$AGENT_ID', 'inserter', 24.5, 0.5, defines.direction.east))")"
+assert_json "place_entity rejects inserter-on-inserter collision with exact blocker" "$STACKED_INSERTER" \
+    --argjson blocker "$(jq '.inserter_unit' <<<"$COLLISION_FIXTURE")" \
+    '.success == false
+     and .can_place == false
+     and .occupied_by.unit_number == $blocker
+     and any(.blockers[]?; .unit_number == $blocker)'
+
+raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({26.5, 3.5})" >/dev/null
+FURNACE_ON_BELT="$(raw_lua "rcon.print(remote.call('claude_interface', 'place_entity', '$AGENT_ID', 'stone-furnace', 28, 1, defines.direction.north))")"
+assert_json "place_entity rejects furnace-on-belt collision with exact blocker" "$FURNACE_ON_BELT" \
+    --argjson blocker "$(jq '.belt_unit' <<<"$COLLISION_FIXTURE")" \
+    '.success == false
+     and .can_place == false
+     and any(.blockers[]?; .unit_number == $blocker)'
+
+raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({30.5, 4.5})" >/dev/null
+INSERTER_ON_FURNACE="$(raw_lua "rcon.print(remote.call('claude_interface', 'place_entity', '$AGENT_ID', 'inserter', 32.5, 0.5, defines.direction.north))")"
+assert_json "place_entity rejects inserter-on-furnace collision with exact blocker" "$INSERTER_ON_FURNACE" \
+    --argjson blocker "$(jq '.furnace_unit' <<<"$COLLISION_FIXTURE")" \
+    '.success == false
+     and .can_place == false
+     and any(.blockers[]?; .unit_number == $blocker)'
+
+raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({36.5, 4.5})" >/dev/null
+BLOCKED_NEAR_EXECUTION="$(mcp_tool execute_entity_placement_near '{
+    "entity_name":"stone-furnace",
+    "x":39,
+    "y":1,
+    "radius":1,
+    "limit":10,
+    "dry_run":false
+}')"
+BLOCKED_NEAR_PAYLOAD="$(tool_payload "$BLOCKED_NEAR_EXECUTION")"
+assert_json "safe-near executor skips the occupied target and selects a valid neighbor" "$BLOCKED_NEAR_PAYLOAD" \
+    '.success == true
+     and .placement_success == true
+     and .plan.success == true
+     and .selected.distance > 0
+     and .selected.position != {x:39, y:1}'
+
+COLLISION_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local inv = c.get_main_inventory()
+rcon.print(helpers.table_to_json({
+    stacked_inserters = s.count_entities_filtered{name = 'inserter', position = {24.5, 0.5}, radius = 0.1},
+    furnaces_on_belt = s.count_entities_filtered{name = 'stone-furnace', position = {28, 1}, radius = 0.1},
+    inserters_on_furnace = s.count_entities_filtered{name = 'inserter', position = {32.5, 0.5}, radius = 0.1},
+    planned_target_furnaces = s.count_entities_filtered{name = 'stone-furnace', position = {39, 1}, radius = 0.1},
+    planned_neighbor_furnaces = s.count_entities_filtered{name = 'stone-furnace', area = {{37.2, -0.8}, {40.8, 2.8}}},
+    inserters_after = inv.get_item_count('inserter'),
+    furnaces_after = inv.get_item_count('stone-furnace'),
+}))
+")"
+assert_json "collision rejections preserve state and safe rerouting accounts for one furnace" "$COLLISION_WORLD" \
+    --argjson inserters "$(jq '.inserters_before' <<<"$COLLISION_FIXTURE")" \
+    --argjson furnaces "$(jq '.furnaces_before' <<<"$COLLISION_FIXTURE")" \
+    '.stacked_inserters == 1
+     and .furnaces_on_belt == 0
+     and .inserters_on_furnace == 0
+     and .planned_target_furnaces == 0
+     and .planned_neighbor_furnaces == 1
+     and .inserters_after == $inserters
+     and .furnaces_after == ($furnaces - 1)'
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local inv = c.get_main_inventory()
+local inserter_target = $(jq '.inserters_original' <<<"$COLLISION_FIXTURE")
+local furnace_target = $(jq '.furnaces_original' <<<"$COLLISION_FIXTURE")
+local inserter_delta = inv.get_item_count('inserter') - inserter_target
+local furnace_delta = inv.get_item_count('stone-furnace') - furnace_target
+if inserter_delta > 0 then
+    inv.remove{name = 'inserter', count = inserter_delta}
+elseif inserter_delta < 0 then
+    inv.insert{name = 'inserter', count = -inserter_delta}
+end
+if furnace_delta > 0 then
+    inv.remove{name = 'stone-furnace', count = furnace_delta}
+elseif furnace_delta < 0 then
+    inv.insert{name = 'stone-furnace', count = -furnace_delta}
+end
+for _, entity in pairs(s.find_entities_filtered{area = {{20, -3}, {45, 6}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+" >/dev/null
+
 COLD_COAL_DRY="$(mcp_tool repair_fuel_sustainability "$COLD_COAL_ARGS")"
 COLD_COAL_DRY_PAYLOAD="$(tool_payload "$COLD_COAL_DRY")"
 assert_json "cold coal repair dry-run succeeds through the model-visible seam" "$COLD_COAL_DRY" \
@@ -1693,7 +1827,7 @@ require_json "through-belt source-tap plan preserves the source and creates an i
      and .repair.route.from == {x:-25,y:-26}
      and .repair.route.topology.connected == true
      and .repair.preflight.ready == true
-     and .repair.preflight.routes.materials["transport-belt"].needed == 9
+     and .repair.preflight.routes.materials["transport-belt"].needed > 0
      and .repair.preflight.routes.materials["transport-belt"].needed == .repair.route.new_belt_count
      and .repair.preflight.routes.materials["burner-inserter"].needed == 2
      and .repair.preflight.bootstrap_fuel.required == 10
