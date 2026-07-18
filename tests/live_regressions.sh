@@ -2888,6 +2888,124 @@ assert_json "empty whitelist clears all slots and disables filtering" "$CLEAR_FI
      and .filtering_enabled == false
      and (.filters | length) == 0'
 
+# Splitters are deliberate branch points, not isolated belt tiles. Replacing a
+# compatible live belt must use Factorio's native fast-replace behavior so the
+# displaced belts are conserved and both splitter outputs remain operational.
+SPLITTER_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{48, 18}, {60, 25}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({50.5, 24})
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'splitter', count = 1}
+local replaced = nil
+local source = nil
+for x = 49, 57 do
+    local belt = s.create_entity{
+        name = 'transport-belt', position = {x + 0.5, 20.5},
+        direction = defines.direction.east, force = c.force
+    }
+    if x == 49 then source = belt end
+    if x == 52 then replaced = belt end
+end
+for x = 49, 57 do
+    s.create_entity{
+        name = 'transport-belt', position = {x + 0.5, 21.5},
+        direction = defines.direction.east, force = c.force
+    }
+end
+rcon.print(helpers.table_to_json({
+    replaced_unit = replaced and replaced.unit_number or nil,
+    source_unit = source and source.unit_number or nil,
+    splitter_before = inv.get_item_count('splitter'),
+    belt_before = inv.get_item_count('transport-belt'),
+    surface_belts_before = s.count_entities_filtered{name = 'transport-belt', area = {{48, 18}, {60, 25}}},
+    native_fast_replace = s.can_fast_replace{
+        name = 'splitter', position = {52.5, 20.5},
+        direction = defines.direction.east, force = c.force
+    }
+}))
+")"
+require_json "splitter fixture has two exact replaceable bus lanes and two outputs" \
+    "$SPLITTER_FIXTURE" \
+    '.splitter_before == 1
+     and .belt_before == 0
+     and .surface_belts_before == 18
+     and .native_fast_replace == true
+     and (.replaced_unit | type) == "number"
+     and (.source_unit | type) == "number"'
+SPLITTER_REPLACED_UNIT="$(jq -r '.replaced_unit' <<<"$SPLITTER_FIXTURE")"
+
+SPLITTER_PLACE="$(mcp_tool place_entity '{
+    "entity_name":"splitter",
+    "x":52.5,
+    "y":20.5,
+    "direction":"east"
+}')"
+SPLITTER_PLACE_PAYLOAD="$(tool_payload "$SPLITTER_PLACE")"
+assert_json "place_entity fast-replaces compatible bus lanes with a splitter" \
+    "$SPLITTER_PLACE" \
+    '.result.isError != true'
+assert_json "splitter placement reports the native fast-replace result" \
+    "$SPLITTER_PLACE_PAYLOAD" \
+    '.name == "splitter"
+     and .entity_type == "splitter"
+     and .direction == 4
+     and .fast_replaced == true
+     and (.unit_number | type) == "number"'
+
+SPLITTER_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local inv = c.get_main_inventory()
+local replaced_survived = false
+for _, entity in pairs(s.find_entities_filtered{area = {{48, 18}, {60, 25}}}) do
+    if entity.unit_number == $SPLITTER_REPLACED_UNIT then replaced_survived = true end
+end
+local inserted = 0
+for _, belt in pairs(s.find_entities_filtered{name = 'transport-belt', area = {{49, 20}, {52, 21}}}) do
+    for line_index = 1, 2 do
+        if belt.get_transport_line(line_index).insert_at_back({name = 'iron-plate', count = 1}) then
+            inserted = inserted + 1
+        end
+    end
+end
+rcon.print(helpers.table_to_json({
+    replaced_survived = replaced_survived,
+    inserted = inserted,
+    splitter_inventory = inv.get_item_count('splitter'),
+    returned_belts = inv.get_item_count('transport-belt'),
+    surface_belts = s.count_entities_filtered{name = 'transport-belt', area = {{48, 18}, {60, 25}}},
+    splitters = s.count_entities_filtered{name = 'splitter', area = {{48, 18}, {60, 25}}}
+}))
+")"
+require_json "native splitter replacement conserves the displaced belt and exact entity counts" \
+    "$SPLITTER_WORLD" \
+    '.replaced_survived == false
+     and .inserted > 1
+     and .splitter_inventory == 0
+     and .returned_belts == 2
+     and .surface_belts == 16
+     and .splitters == 1'
+sleep 3
+SPLITTER_FLOW="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local main = 0
+local branch = 0
+for _, belt in pairs(s.find_entities_filtered{name = 'transport-belt', area = {{53, 20}, {58, 22}}}) do
+    local count = belt.get_transport_line(1).get_item_count('iron-plate')
+        + belt.get_transport_line(2).get_item_count('iron-plate')
+    if belt.position.y < 21 then main = main + count else branch = branch + count end
+end
+rcon.print(helpers.table_to_json({main = main, branch = branch}))
+")"
+assert_json "the native splitter keeps the original trunk and new branch carrying items" \
+    "$SPLITTER_FLOW" \
+    '.main > 0 and .branch > 0'
+
 # Resource patches are extraction capacity, not forbidden terrain. Ordinary
 # Factorio-valid infrastructure may overlap them with an advisory, compact belt
 # routes may cross them, and the ore must remain intact. Mining drills retain

@@ -3061,6 +3061,10 @@ fn placement_queries_live_in_the_mod_not_rust_strings() {
     assert!(
         placement_lua.contains("surface.can_place_entity{")
             && placement_lua.contains("surface.create_entity{")
+            && placement_lua.contains("surface.can_fast_replace{")
+            && placement_lua.contains("prototype.type == \"splitter\"")
+            && placement_lua.contains("fast_replace = use_fast_replace")
+            && placement_lua.contains("character = use_fast_replace and character or nil")
             && placement_lua
                 .contains("create_entity returned nil after can_place_entity succeeded")
             && placement_lua.contains("local function inspect_placement_blockers")

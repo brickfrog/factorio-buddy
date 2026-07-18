@@ -1728,13 +1728,14 @@ mod tests {
         atomic_filtered_placement_local_rollback_verified, atomic_filtered_placement_unit,
         attach_endpoint_preflight, automation_repair_hint, belt_source_tap_layouts,
         compact_fuel_diagnosis, compact_fuel_repair, compound_route_preflight,
-        endpoint_belt_incompatibility, exact_fuel_feeder_transfer_observed, execute_lua_refusal,
-        existing_belt_compatibility, existing_underground_pair_reservations, flow_lookup,
-        flow_scan_area, fuel_consumer_activity_verification_summary, fuel_delivery_budget_ticks,
+        direct_placement_requires_route, endpoint_belt_incompatibility,
+        exact_fuel_feeder_transfer_observed, execute_lua_refusal, existing_belt_compatibility,
+        existing_underground_pair_reservations, flow_lookup, flow_scan_area,
+        fuel_consumer_activity_verification_summary, fuel_delivery_budget_ticks,
         fuel_delivery_path_operational, fuel_delivery_wait_budget,
         fuel_route_protects_existing_source, fuel_topology_upstream_hops,
         fuel_topology_verification, incremental_infrastructure_verification,
-        inserter_machine_endpoint_verification, invalid_direction_failure,
+        inserter_machine_endpoint_verification, invalid_direction_failure, is_existing_belt_entity,
         is_machine_output_source, machine_output_build_args, machine_side_layout,
         mark_semantic_tool_errors, model_safe_payload, parse_controller_steps,
         placement_report_allowed, production_observation_json, production_unit_verified,
@@ -2898,6 +2899,27 @@ mod tests {
         assert!(reserved.contains(&GridPos::new(-41, 52)));
         assert!(!reserved.contains(&GridPos::new(-44, 52)));
         assert!(!reserved.contains(&GridPos::new(-40, 52)));
+    }
+
+    #[test]
+    fn direct_placement_allows_splitters_but_keeps_belt_tiles_route_only() {
+        for belt in [
+            "transport-belt",
+            "fast-transport-belt",
+            "underground-belt",
+            "express-underground-belt",
+        ] {
+            assert!(direct_placement_requires_route(belt), "{belt}");
+        }
+        for splitter in [
+            "splitter",
+            "fast-splitter",
+            "express-splitter",
+            "turbo-splitter",
+        ] {
+            assert!(!direct_placement_requires_route(splitter), "{splitter}");
+            assert!(is_existing_belt_entity(splitter), "{splitter}");
+        }
     }
 
     #[test]
@@ -4137,7 +4159,7 @@ pub struct AnalyzeItemFlowParams {
 /// Parameters for place_entity tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct PlaceEntityParams {
-    /// Entity name (e.g., 'transport-belt', 'inserter')
+    /// Entity name (e.g., 'inserter', 'splitter')
     pub entity_name: String,
     /// X coordinate to place at
     pub x: f64,
@@ -4682,6 +4704,20 @@ fn is_existing_belt_entity(name: &str) -> bool {
             | "fast-splitter"
             | "express-splitter"
             | "turbo-splitter"
+    )
+}
+
+fn direct_placement_requires_route(name: &str) -> bool {
+    matches!(
+        name,
+        "transport-belt"
+            | "fast-transport-belt"
+            | "express-transport-belt"
+            | "turbo-transport-belt"
+            | "underground-belt"
+            | "fast-underground-belt"
+            | "express-underground-belt"
+            | "turbo-underground-belt"
     )
 }
 
@@ -8745,10 +8781,10 @@ impl FactorioMcp {
 
     /// Place an entity from character inventory.
     #[tool(
-        description = "Place one non-belt entity at an exact position. Use route_belt for belts; inserters face their pickup side. Ordinary infrastructure may overlap resources. Live Factorio collision and extractor-category checks remain authoritative."
+        description = "Place an entity exactly. Use route_belt for belt tiles; splitters may fast-replace compatible belts. Inserters face their pickup side. Factorio collision and resource rules are authoritative."
     )]
     async fn place_entity(&self, Parameters(params): Parameters<PlaceEntityParams>) -> String {
-        if is_existing_belt_entity(&params.entity_name) {
+        if direct_placement_requires_route(&params.entity_name) {
             let result = serde_json::json!({
                 "success": false,
                 "error_kind": "belt_requires_route",

@@ -1174,7 +1174,8 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
         return placement_failure(entity_name, position, direction, inventory_count, false, "Item not in inventory")
     end
 
-    if not prototypes.entity[entity_name] then
+    local prototype = prototypes.entity[entity_name]
+    if not prototype then
         return placement_failure(entity_name, position, direction, inventory_count, false, "Unknown entity prototype")
     end
 
@@ -1206,8 +1207,17 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
             build_check_type = defines.build_check_type.manual,
         }
     end)
+    local fast_replace_ok, can_fast_replace = pcall(function()
+        return prototype.type == "splitter" and surface.can_fast_replace{
+            name = entity_name,
+            position = position,
+            direction = direction,
+            force = character.force,
+        }
+    end)
+    local use_fast_replace = fast_replace_ok and can_fast_replace == true
 
-    if not can_place_ok or can_place_or_error ~= true then
+    if (not can_place_ok or can_place_or_error ~= true) and not use_fast_replace then
         local blocker_details = placement_diagnostics(surface, character.force, entity_name, position, direction, character)
         return placement_failure(
             entity_name,
@@ -1243,6 +1253,9 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
             position = position,
             direction = direction,
             force = character.force,
+            fast_replace = use_fast_replace,
+            character = use_fast_replace and character or nil,
+            spill = true,
         }
     end)
 
@@ -1279,6 +1292,7 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
     end
     inv.remove{name = entity_name, count = 1}
     local result = placement_entity_result(entity)
+    result.fast_replaced = use_fast_replace
     add_resource_policy_details(result, policy)
     return result
 end
