@@ -918,8 +918,9 @@ function M.diagnose_steam_power(character, x, y, radius)
                     append_steam_issue(result, "steam_engine_no_steam", "critical", entity, "Steam engine is missing steam input.", "Connect a boiler steam output to steam engine unit " .. tostring(entity.unit_number) .. ".")
                 end
             end
-            local nearby_poles = surface.find_entities_filtered{type = "electric-pole", position = entity.position, radius = 8, force = force, limit = 1}
-            if #nearby_poles == 0 then
+            local disconnected_from_grid = item.status == "not_plugged_in_electric_network"
+                or item.connected_to_electric_network == false
+            if disconnected_from_grid then
                 local nearest_pole = nearest_entity_record(poles, entity.position)
                 if nearest_pole then
                     append_steam_issue(
@@ -927,12 +928,12 @@ function M.diagnose_steam_power(character, x, y, radius)
                         "steam_engine_pole_route_incomplete",
                         "warning",
                         entity,
-                        "Steam engine has poles in the diagnostic area, but none close enough to receive generated power.",
+                        "Steam engine is not connected to an electric network even though poles exist in the diagnostic area.",
                         "Extend the pole line from nearest pole unit " .. tostring(nearest_pole.unit_number) .. " to steam engine unit " .. tostring(entity.unit_number) .. ".",
                         {nearest_pole = nearest_pole}
                     )
                 else
-                    append_steam_issue(result, "steam_engine_not_on_grid", "warning", entity, "Steam engine has no electric pole close enough to receive generated power.", "Place an electric pole within wire reach of steam engine unit " .. tostring(entity.unit_number) .. ".")
+                    append_steam_issue(result, "steam_engine_not_on_grid", "warning", entity, "Steam engine is not connected to an electric network.", "Place an electric pole within supply range of steam engine unit " .. tostring(entity.unit_number) .. ".")
                 end
             end
         elseif entity.name == "offshore-pump" then

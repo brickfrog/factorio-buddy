@@ -3554,6 +3554,65 @@ assert_json "dense-patch output belt leaves the resource entities intact" "$DENS
      and .resource_amount <= 224000
      and .resource_amount > 223000'
 
+DISCONNECTED_ENGINE_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{92, -58}, {110, -42}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local engine = s.create_entity{
+    name = 'steam-engine', position = {100.5, -50.5},
+    direction = defines.direction.north, force = c.force
+}
+local pole = s.create_entity{
+    name = 'small-electric-pole', position = {106.5, -50.5}, force = c.force
+}
+engine.fluidbox[1] = {name = 'steam', amount = 200, temperature = 165}
+local fluids = engine.get_fluid_contents()
+local status = nil
+for name, value in pairs(defines.entity_status) do
+    if value == engine.status then status = name break end
+end
+rcon.print(helpers.table_to_json({
+    engine_unit = engine.unit_number,
+    engine_position = engine.position,
+    pole_unit = pole.unit_number,
+    pole_position = pole.position,
+    status = status,
+    connected = engine.is_connected_to_electric_network(),
+    steam = fluids.steam or 0,
+}))
+")"
+require_json "steam fixture has a fueled engine and nearby pole but no electric connection" \
+    "$DISCONNECTED_ENGINE_FIXTURE" \
+    '.status == "not_plugged_in_electric_network"
+     and .connected == false
+     and .steam > 0
+     and (.engine_unit | type) == "number"
+     and (.pole_unit | type) == "number"'
+DISCONNECTED_ENGINE_DIAG="$(mcp_tool diagnose_steam_power '{"x":101,"y":-50,"radius":10}')"
+DISCONNECTED_ENGINE_PAYLOAD="$(tool_payload "$DISCONNECTED_ENGINE_DIAG")"
+assert_json "disconnected steam engine diagnosis is a successful model-visible query" \
+    "$DISCONNECTED_ENGINE_DIAG" \
+    '.result.isError != true'
+require_json "diagnosis promotes the authoritative disconnected status into an actionable warning" \
+    "$DISCONNECTED_ENGINE_PAYLOAD" \
+    --argjson fixture "$DISCONNECTED_ENGINE_FIXTURE" \
+    '.status == "warning"
+     and .next_action == "inspect_existing_steam_power"
+     and .summary.warning_issues == 1
+     and .summary.issue_count == 1
+     and any(.entities[];
+         .unit_number == $fixture.engine_unit
+         and .status == "not_plugged_in_electric_network"
+         and .connected_to_electric_network == false)
+     and any(.issues[];
+         .type == "steam_engine_pole_route_incomplete"
+         and .severity == "warning"
+         and .entity.unit_number == $fixture.engine_unit
+         and .details.nearest_pole.unit_number == $fixture.pole_unit
+         and (.action | contains($fixture.engine_unit | tostring)))'
+
 ROTATION_FIXTURE="$(raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local s = c.surface

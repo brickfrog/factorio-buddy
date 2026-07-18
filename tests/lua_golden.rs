@@ -3638,6 +3638,8 @@ fn steam_power_diagnostic_lives_in_mod_remote_interface() {
         "boiler_water_alignment_mismatch",
         "steam_engine_no_steam",
         "steam_engine_alignment_mismatch",
+        "item.status == \"not_plugged_in_electric_network\"",
+        "item.connected_to_electric_network == false",
         "steam_engine_not_on_grid",
         "steam_engine_pole_route_incomplete",
         "offshore-pump",
