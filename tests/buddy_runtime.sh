@@ -168,7 +168,11 @@ cleanup() {
 
     local scenario
     local pid
-    for scenario in "$TEST_ROOT"/clean "$TEST_ROOT"/no-player-autonomy "$TEST_ROOT"/server-death; do
+    for scenario in \
+        "$TEST_ROOT"/clean \
+        "$TEST_ROOT"/no-player-autonomy \
+        "$TEST_ROOT"/provider-limit \
+        "$TEST_ROOT"/server-death; do
         if pid="$(find_owned_server_pid "$scenario" "$RCON_PORT" 2>/dev/null)"; then
             kill -KILL "$pid" 2>/dev/null || true
         fi
@@ -206,6 +210,7 @@ start_buddy() {
     local scenario_name="$1"
     local mode="${2:-fresh}"
     local heartbeat_seconds="${3:-0}"
+    local claude_fixture="${4:-success}"
     local scenario="$TEST_ROOT/$scenario_name"
     local log="$scenario/buddy-$mode.log"
     local fresh_args=()
@@ -217,10 +222,29 @@ start_buddy() {
     mkdir -p "$scenario/bin" "$scenario/home/.factorio/mods" "$scenario/write-data"
     printf 'isolated-home\n' > "$scenario/home/.factorio/mods/runtime-test-sentinel"
     cp -a "$ROOT/mod/claude-interface" "$scenario/home/.factorio/mods/"
-    printf '%s\n' \
-        '#!/usr/bin/env bash' \
-        'printf '\''%s\n'\'' '\''{"type":"result","subtype":"success","is_error":false,"result":"runtime fake reply","session_id":"runtime-fake-session"}'\''' \
-        > "$scenario/bin/claude"
+    if [[ "$claude_fixture" == "success" ]]; then
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'printf '\''invoke\n'\'' >> "$FAKE_CLAUDE_STATE"' \
+            'printf '\''%s\n'\'' '\''{"type":"result","subtype":"success","is_error":false,"result":"runtime fake reply","session_id":"runtime-fake-session"}'\''' \
+            > "$scenario/bin/claude"
+    elif [[ "$claude_fixture" == "provider-limit" ]]; then
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'printf '\''invoke\n'\'' >> "$FAKE_CLAUDE_STATE"' \
+            'for argument in "$@"; do' \
+            '    if [[ "$argument" == "--resume" ]]; then' \
+            '        printf '\''%s\n'\'' '\''{"type":"system","subtype":"init","session_id":"wedged-provider-session"}'\''' \
+            '        printf '\''%s\n'\'' '\''{"type":"system","subtype":"status","status":"compacting","session_id":"wedged-provider-session"}'\''' \
+            '        sleep 120' \
+            '        exit 0' \
+            '    fi' \
+            'done' \
+            'printf '\''%s\n'\'' '\''{"type":"result","subtype":"error","is_error":true,"result":"API Error: Request rejected (429) - Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-07-20 01:09:22","session_id":"wedged-provider-session"}'\''' \
+            > "$scenario/bin/claude"
+    else
+        fail "unknown Claude fixture: $claude_fixture"
+    fi
     chmod +x "$scenario/bin/claude"
 
     env \
@@ -232,6 +256,7 @@ start_buddy() {
         -u FACTORIO_SCRIPT_OUTPUT \
         HOME="$scenario/home" \
         PATH="$scenario/bin:$PATH" \
+        FAKE_CLAUDE_STATE="$scenario/claude-invocations" \
         BUDDY_HEARTBEAT_SECONDS="$heartbeat_seconds" \
         RUST_LOG=info \
         "$BUDDY_BIN" \
@@ -392,6 +417,57 @@ CURRENT_SERVER_PID=""
 assert_no_owned_server "$NO_PLAYER_ROOT" \
     || fail "no-player autonomy left an owned Factorio process or listener"
 pass "autonomy continues with zero connected players"
+
+# A terminal subscription limit must discard the resumed Claude session, keep
+# the managed Factorio server alive, pause autonomy, and answer later player
+# messages through the existing RCON response seam without spawning Claude.
+assert_ports_unused
+start_buddy provider-limit fresh 1 provider-limit
+LIMIT_ROOT="$TEST_ROOT/provider-limit"
+LIMIT_LOG="$LIMIT_ROOT/buddy-fresh.log"
+wait_for_log "$CURRENT_BUDDY_PID" "$LIMIT_LOG" \
+    "Claude provider usage limit active; pausing autonomous turns" 20 \
+    || fail "Buddy did not classify and back off the terminal provider limit"
+process_active "$CURRENT_BUDDY_PID" \
+    || fail "provider limit terminated the Buddy controller"
+process_active "$CURRENT_SERVER_PID" \
+    || fail "provider limit terminated the managed Factorio server"
+[[ "$(grep -c '^invoke$' "$LIMIT_ROOT/claude-invocations" 2>/dev/null || true)" == "1" ]] \
+    || fail "provider-limit fixture did not execute exactly one initial Claude turn"
+
+LIMIT_RUN_DIRECTORY="$(find "$LIMIT_ROOT/write-data/managed-runs" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+[[ -n "$LIMIT_RUN_DIRECTORY" ]] \
+    || fail "provider-limit managed run directory is missing"
+LIMIT_INBOX="$LIMIT_RUN_DIRECTORY/script-output/claude-chat/input.jsonl"
+mkdir -p "$(dirname "$LIMIT_INBOX")"
+printf '%s\n' \
+    '{"id":1,"message":"hi","player_index":0,"target_agent":"runtime-live"}' \
+    >> "$LIMIT_INBOX"
+wait_for_log "$CURRENT_BUDDY_PID" "$LIMIT_LOG" \
+    "responded to player without starting Claude while its usage limit is active" 5 \
+    || fail "capped Buddy did not send the bounded provider-unavailable response"
+sleep 1
+[[ "$(grep -c '^invoke$' "$LIMIT_ROOT/claude-invocations" 2>/dev/null || true)" == "1" ]] \
+    || fail "player message resumed the permanently wedged Claude session"
+process_active "$CURRENT_BUDDY_PID" \
+    || fail "bounded capped response terminated the Buddy controller"
+process_active "$CURRENT_SERVER_PID" \
+    || fail "bounded capped response disconnected the managed Factorio runtime"
+
+kill -TERM "$CURRENT_BUDDY_PID"
+wait_for_process_stop "$CURRENT_BUDDY_PID" 75 \
+    || fail "provider-limit Buddy did not shut down cleanly"
+set +e
+wait "$CURRENT_BUDDY_PID"
+LIMIT_STATUS=$?
+set -e
+CURRENT_BUDDY_PID=""
+CURRENT_SERVER_PID=""
+(( LIMIT_STATUS == 0 )) \
+    || fail "provider-limit Buddy exited with status $LIMIT_STATUS"
+assert_no_owned_server "$LIMIT_ROOT" \
+    || fail "provider-limit path left an owned Factorio process or listener"
+pass "provider limits back off without wedging chat or controlling Factorio connectivity"
 
 # Failure lifecycle: killing the owned child must terminate Buddy promptly and
 # non-zero instead of leaving a useless controller alive.

@@ -36,6 +36,9 @@ const AUTONOMY_DIRECTIVE: &str = "Autonomy tick: re-evaluate the whole factory f
 // a temporarily starved background client connected instead of dropping it at
 // Factorio's 20-second default.
 const MANAGED_CLIENT_DROP_THRESHOLD_SECONDS: u64 = 86_400;
+const PROVIDER_LIMIT_RETRY_SECONDS: u64 = 300;
+const PROVIDER_LIMIT_MESSAGE: &str =
+    "Claude is temporarily unavailable because the subscription usage limit was reached. Buddy will retry automatically; your Factorio game is still running.";
 
 #[derive(Clone, Debug, Parser)]
 #[command(about = "Run the autonomous Factorio buddy using the Rust MCP tool server")]
@@ -138,6 +141,10 @@ struct ClaudeReply {
     already_delivered: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Claude subscription usage limit reached")]
+struct ClaudeUsageLimit;
+
 struct Inbox {
     path: PathBuf,
     cursor_path: PathBuf,
@@ -161,6 +168,7 @@ struct TurnRequest {
 struct TurnCompletion {
     session_id: Option<String>,
     succeeded: bool,
+    provider_limited: bool,
 }
 
 struct ActiveTurn {
@@ -1208,6 +1216,18 @@ fn stream_event_session_id(event: &Value) -> Option<&str> {
     event.get("session_id").and_then(Value::as_str)
 }
 
+fn is_provider_usage_limit(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("limit")
+        && message.contains("reset")
+        && (message.contains("weekly/monthly limit exhausted")
+            || message.contains("usage limit reached"))
+}
+
+fn provider_limit_active(retry_at: Option<Instant>, now: Instant) -> bool {
+    retry_at.is_some_and(|retry_at| now < retry_at)
+}
+
 fn autonomy_prompt(snapshot: &str) -> String {
     let formatted_snapshot = serde_json::from_str::<Value>(snapshot)
         .and_then(|value| serde_json::to_string_pretty(&value))
@@ -1460,6 +1480,11 @@ async fn invoke_claude(
             *session_id = Some(id);
         }
         if parsed.is_error {
+            if is_provider_usage_limit(&parsed.result) {
+                warn!(event = "provider_limit", message = %parsed.result, "Claude subscription usage limit reached");
+                *session_id = None;
+                return Err(ClaudeUsageLimit.into());
+            }
             bail!("claude returned an error: {}", parsed.result);
         }
         if !parsed.result.trim().is_empty() {
@@ -1528,6 +1553,11 @@ async fn handle_turn(
         .await;
     }
 
+    let provider_limited = result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.downcast_ref::<ClaudeUsageLimit>().is_some());
+
     let succeeded = match result {
         Ok(reply) => {
             if !reply.already_delivered {
@@ -1549,13 +1579,18 @@ async fn handle_turn(
         }
         Err(error) => {
             warn!(%error, "agent turn failed");
+            let response = if provider_limited {
+                PROVIDER_LIMIT_MESSAGE.to_owned()
+            } else {
+                format!("Agent error: {error}")
+            };
             let _ = lifecycle
                 .call(
                     "receive_response",
                     &[
                         json!(request.player_index),
                         json!(request.response_agent),
-                        json!(format!("Agent error: {error}")),
+                        json!(response),
                     ],
                 )
                 .await;
@@ -1574,6 +1609,7 @@ async fn handle_turn(
     TurnCompletion {
         session_id,
         succeeded,
+        provider_limited,
     }
 }
 
@@ -1669,6 +1705,7 @@ async fn run_buddy(args: Arc<Args>, local_server: &mut Option<LocalServer>) -> R
     timer.tick().await;
     let mut next_autonomy = Instant::now() + Duration::from_secs(args.heartbeat_seconds.max(1));
     let mut session_id = None;
+    let mut provider_retry_at = None;
     let mut pending: VecDeque<TurnRequest> = VecDeque::new();
     let mut active: Option<ActiveTurn> = None;
     let shutdown = shutdown_signal();
@@ -1704,6 +1741,20 @@ async fn run_buddy(args: Arc<Args>, local_server: &mut Option<LocalServer>) -> R
                 match completion {
                     Ok(completion) => {
                         session_id = completion.session_id;
+                        if completion.provider_limited {
+                            session_id = None;
+                            provider_retry_at = Some(
+                                Instant::now()
+                                    + Duration::from_secs(PROVIDER_LIMIT_RETRY_SECONDS),
+                            );
+                            pending.clear();
+                            warn!(
+                                retry_seconds = PROVIDER_LIMIT_RETRY_SECONDS,
+                                "Claude provider usage limit active; pausing autonomous turns"
+                            );
+                        } else if completion.succeeded {
+                            provider_retry_at = None;
+                        }
                         info!(?kind, succeeded = completion.succeeded, "Claude turn finished");
                     }
                     Err(error) if error.is_cancelled() => {
@@ -1725,12 +1776,17 @@ async fn run_buddy(args: Arc<Args>, local_server: &mut Option<LocalServer>) -> R
                     warn!(%error, "failed to read Factorio chat inbox");
                     Vec::new()
                 });
+                let now = Instant::now();
+                let provider_unavailable = provider_limit_active(provider_retry_at, now);
+                if provider_retry_at.is_some() && !provider_unavailable {
+                    provider_retry_at = None;
+                    info!("Claude provider retry interval elapsed; the next turn will start a fresh session");
+                }
                 let mut received_human_message = false;
                 for message in messages {
                     if message.target_agent != args.agent && message.target_agent != "all" {
                         continue;
                     }
-                    received_human_message = true;
                     let target = message
                         .response_to
                         .as_deref()
@@ -1742,6 +1798,31 @@ async fn run_buddy(args: Arc<Args>, local_server: &mut Option<LocalServer>) -> R
                         target_agent = %message.target_agent,
                         "received player message"
                     );
+                    if provider_unavailable {
+                        match lifecycle
+                            .call(
+                                "receive_response",
+                                &[
+                                    json!(message.player_index),
+                                    json!(target),
+                                    json!(PROVIDER_LIMIT_MESSAGE),
+                                ],
+                            )
+                            .await
+                        {
+                            Ok(_) => info!(
+                                event = "provider_unavailable_response",
+                                player_index = message.player_index,
+                                "responded to player without starting Claude while its usage limit is active"
+                            ),
+                            Err(error) => warn!(
+                                %error,
+                                "failed to send provider-unavailable response to Factorio"
+                            ),
+                        }
+                        continue;
+                    }
+                    received_human_message = true;
                     pending.push_back(TurnRequest {
                         kind: TurnKind::Human,
                         prompt: Some(message.message),
@@ -1760,6 +1841,7 @@ async fn run_buddy(args: Arc<Args>, local_server: &mut Option<LocalServer>) -> R
                 if active.is_some()
                     || !pending.is_empty()
                     || args.heartbeat_seconds == 0
+                    || provider_unavailable
                     || Instant::now() < next_autonomy
                 {
                     continue;
@@ -1870,6 +1952,34 @@ mod tests {
         let event = json!({"type": "system", "subtype": "init", "session_id": "abc-123"});
         assert_eq!(stream_event_session_id(&event), Some("abc-123"));
         assert_eq!(stream_event_session_id(&json!({"type": "assistant"})), None);
+    }
+
+    #[test]
+    fn provider_limit_classification_requires_a_terminal_limit_message() {
+        for terminal in [
+            "API Error: Request rejected (429) - Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-07-20 01:09:22",
+            "Usage limit reached for 5 hour. Your limit will reset at 2026-07-18 13:00:00",
+        ] {
+            assert!(is_provider_usage_limit(terminal), "{terminal}");
+        }
+
+        for non_terminal in [
+            r#"{"type":"system","subtype":"api_retry","error":"unknown","error_status":null}"#,
+            r#"{"type":"system","subtype":"status","status":"compacting"}"#,
+            "context window limit reached",
+            "rate limit retry from SDK",
+        ] {
+            assert!(!is_provider_usage_limit(non_terminal), "{non_terminal}");
+        }
+    }
+
+    #[test]
+    fn provider_limit_backoff_expires_without_persisted_state() {
+        let now = Instant::now();
+        let retry_at = now + Duration::from_secs(PROVIDER_LIMIT_RETRY_SECONDS);
+        assert!(provider_limit_active(Some(retry_at), now));
+        assert!(!provider_limit_active(Some(retry_at), retry_at));
+        assert!(!provider_limit_active(None, now));
     }
 
     #[test]
