@@ -2700,6 +2700,98 @@ assert_json "invalid rotation validation sets isError" "$INVALID_ROTATION" \
      and (.result.content[0].text | fromjson
           | .success == false and .error_kind == "invalid_direction")'
 
+# place_entity must surface Factorio's resolved inserter endpoints immediately.
+# A resource or bare drop tile remains a successful placement, but receives an
+# explicit warning because neither destination can accept inserted items.
+INSERTER_PLACE_TARGET_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+c.teleport({18.5, -7})
+local inv = c.get_main_inventory()
+for _, entity in pairs(s.find_entities_filtered{area = {{16, -11}, {21, -2}}}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+inv.insert{name = 'inserter', count = 2}
+local source = s.create_entity{
+    name = 'iron-chest', position = {17.5, -9.5}, force = c.force
+}
+local resource = s.create_entity{
+    name = 'iron-ore', position = {19.5, -9.5}, amount = 1000
+}
+rcon.print(helpers.table_to_json({
+    inventory_before = inv.get_item_count('inserter'),
+    source_unit = source and source.unit_number or nil,
+    source_position = source and source.position or nil,
+    resource_position = resource and resource.position or nil,
+}))
+")"
+require_json "inserter placement target fixture has a chest source and resource destination" \
+    "$INSERTER_PLACE_TARGET_FIXTURE" \
+    '.inventory_before >= 2
+     and (.source_unit | type) == "number"
+     and .source_position == {x:17.5,y:-9.5}
+     and .resource_position == {x:19.5,y:-9.5}'
+
+RESOURCE_DROP_PLACE="$(mcp_tool place_entity \
+    '{"entity_name":"inserter","x":18.5,"y":-9.5,"direction":"west"}')"
+RESOURCE_DROP_PAYLOAD="$(tool_payload "$RESOURCE_DROP_PLACE")"
+assert_json "resource-drop inserter placement remains successful" "$RESOURCE_DROP_PLACE" \
+    '.result.isError != true'
+require_json "place_entity exposes exact inserter targets and warns on a resource drop tile" \
+    "$RESOURCE_DROP_PAYLOAD" \
+    --argjson fixture "$INSERTER_PLACE_TARGET_FIXTURE" \
+    '.name == "inserter"
+     and (.unit_number | type) == "number"
+     and .pickup_target_present == true
+     and .pickup_target.unit_number == $fixture.source_unit
+     and .pickup_target.position == $fixture.source_position
+     and .dropoff_target_present == true
+     and .dropoff_target.name == "iron-ore"
+     and .dropoff_target.entity_type == "resource"
+     and .dropoff_target.position == $fixture.resource_position
+     and .dropoff_target_usable == false
+     and .inserter_target_advisory.kind == "unusable_inserter_drop_target"
+     and .inserter_target_advisory.severity == "warning"
+     and .inserter_target_advisory.reason == "resource"
+     and (.warning | contains("cannot accept inserted items"))'
+
+BARE_DROP_PLACE="$(mcp_tool place_entity \
+    '{"entity_name":"inserter","x":18.5,"y":-4.5,"direction":"west"}')"
+BARE_DROP_PAYLOAD="$(tool_payload "$BARE_DROP_PLACE")"
+assert_json "bare-drop inserter placement remains successful" "$BARE_DROP_PLACE" \
+    '.result.isError != true'
+require_json "place_entity reports a null target and warns on bare-ground dropoff" \
+    "$BARE_DROP_PAYLOAD" \
+    '.name == "inserter"
+     and (.unit_number | type) == "number"
+     and .dropoff_target_present == false
+     and .dropoff_target_usable == false
+     and (.dropoff_target | not)
+     and .inserter_target_advisory.kind == "unusable_inserter_drop_target"
+     and .inserter_target_advisory.severity == "warning"
+     and .inserter_target_advisory.reason == "bare_ground"'
+
+INSERTER_PLACE_TARGET_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local inv = c.get_main_inventory()
+rcon.print(helpers.table_to_json({
+    resource_drop_inserters = s.count_entities_filtered{
+        name = 'inserter', position = {18.5, -9.5}, radius = 0.1
+    },
+    bare_drop_inserters = s.count_entities_filtered{
+        name = 'inserter', position = {18.5, -4.5}, radius = 0.1
+    },
+    inventory_after = inv.get_item_count('inserter'),
+}))
+")"
+require_json "advisory inserter placements persist and consume both items" \
+    "$INSERTER_PLACE_TARGET_WORLD" \
+    --argjson fixture "$INSERTER_PLACE_TARGET_FIXTURE" \
+    '.resource_drop_inserters == 1
+     and .bare_drop_inserters == 1
+     and .inventory_after == ($fixture.inventory_before - 2)'
+
 # Inserter targets are resolved through occupied footprint tiles, but their
 # reported position must remain the resolved entity's exact Factorio center.
 # Two arms touching different tiles of one assembler must not make that same

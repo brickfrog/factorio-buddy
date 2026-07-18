@@ -9,24 +9,6 @@ local function pos_table(pos)
     return {x = pos.x, y = pos.y}
 end
 
-local function placement_entity_result(entity)
-    local result = {
-        unit_number = entity.unit_number,
-        name = entity.name,
-        type = entity.type,
-        entity_type = entity.type,
-        position = pos_table(entity.position),
-        direction = entity.direction,
-        health = entity.health,
-        force = entity.force and entity.force.name or nil,
-    }
-    if entity.type == "inserter" then
-        result.pickup_position = pos_table(entity.pickup_position)
-        result.drop_position = pos_table(entity.drop_position)
-    end
-    return result
-end
-
 local function bounding_box_table(entity)
     if not (entity and entity.valid and entity.bounding_box) then return nil end
     return {
@@ -47,6 +29,124 @@ local function entity_summary(entity)
         force = entity.force and entity.force.name or nil,
         bounding_box = bounding_box_table(entity),
     }
+end
+
+local function inserter_engine_target(entity, property)
+    local ok, target = pcall(function() return entity[property] end)
+    if ok and target and target.valid then return target end
+    return nil
+end
+
+local transport_entity_types = {
+    ["transport-belt"] = true,
+    ["underground-belt"] = true,
+    ["splitter"] = true,
+    ["loader"] = true,
+    ["loader-1x1"] = true,
+    ["linked-belt"] = true,
+}
+
+local function interaction_target_priority(entity)
+    if transport_entity_types[entity.type] then return 3 end
+    if entity.type == "resource" or entity.type == "item-entity" then return 0 end
+    if entity.type == "tree" or entity.type == "simple-entity" then return 1 end
+    return 2
+end
+
+local function stable_entity_precedes(left, right)
+    if left.name ~= right.name then return left.name < right.name end
+    if left.type ~= right.type then return left.type < right.type end
+    if left.unit_number ~= right.unit_number then
+        if left.unit_number == nil then return true end
+        if right.unit_number == nil then return false end
+        return left.unit_number < right.unit_number
+    end
+    if left.position.x ~= right.position.x then return left.position.x < right.position.x end
+    if left.position.y ~= right.position.y then return left.position.y < right.position.y end
+    return (left.direction or 0) < (right.direction or 0)
+end
+
+local function entity_at_interaction_position(entity, position)
+    if not (entity and entity.valid and position) then return nil end
+    local tile_x = math.floor(position.x)
+    local tile_y = math.floor(position.y)
+    local candidates = entity.surface.find_entities_filtered{
+        area = {{tile_x, tile_y}, {tile_x + 1, tile_y + 1}},
+    }
+    table.sort(candidates, function(left, right)
+        local left_priority = interaction_target_priority(left)
+        local right_priority = interaction_target_priority(right)
+        if left_priority ~= right_priority then return left_priority > right_priority end
+        return stable_entity_precedes(left, right)
+    end)
+    for _, candidate in ipairs(candidates) do
+        if candidate.valid and candidate ~= entity then return candidate end
+    end
+    return nil
+end
+
+local function append_advisory_text(existing, additional)
+    if not existing or existing == "" then return additional end
+    return existing .. " " .. additional
+end
+
+local function add_inserter_target_details(result, entity)
+    if not (entity and entity.valid and entity.type == "inserter") then return end
+
+    local pickup_target = inserter_engine_target(entity, "pickup_target")
+    local dropoff_target = inserter_engine_target(entity, "drop_target")
+    local physical_pickup_target = pickup_target
+        or entity_at_interaction_position(entity, entity.pickup_position)
+    local physical_dropoff_target = dropoff_target
+        or entity_at_interaction_position(entity, entity.drop_position)
+
+    result.pickup_target = entity_summary(physical_pickup_target)
+    result.pickup_target_present = physical_pickup_target ~= nil
+    result.dropoff_target = entity_summary(physical_dropoff_target)
+    result.dropoff_target_present = physical_dropoff_target ~= nil
+    local dropoff_target_usable = dropoff_target ~= nil and dropoff_target.type ~= "resource"
+    result.dropoff_target_usable = dropoff_target_usable
+
+    if dropoff_target_usable then return end
+
+    local resource_drop = physical_dropoff_target and physical_dropoff_target.type == "resource"
+    local reason = resource_drop and "resource" or "bare_ground"
+    local message
+    if resource_drop then
+        message = "Inserter drop position resolves to a resource tile, which cannot accept inserted items."
+    else
+        message = "Inserter drop position does not resolve to an entity that can accept inserted items."
+    end
+    local guidance = "Rotate, move, or replace the inserter so drop_target resolves to the intended receiving entity."
+    result.inserter_target_advisory = {
+        kind = "unusable_inserter_drop_target",
+        severity = "warning",
+        reason = reason,
+        message = message,
+        drop_position = pos_table(entity.drop_position),
+        dropoff_target = entity_summary(physical_dropoff_target),
+        guidance = guidance,
+    }
+    result.warning = append_advisory_text(result.warning, message)
+    result.guidance = append_advisory_text(result.guidance, guidance)
+end
+
+local function placement_entity_result(entity)
+    local result = {
+        unit_number = entity.unit_number,
+        name = entity.name,
+        type = entity.type,
+        entity_type = entity.type,
+        position = pos_table(entity.position),
+        direction = entity.direction,
+        health = entity.health,
+        force = entity.force and entity.force.name or nil,
+    }
+    if entity.type == "inserter" then
+        result.pickup_position = pos_table(entity.pickup_position)
+        result.drop_position = pos_table(entity.drop_position)
+    end
+    return result
 end
 
 local function placement_area(entity_name, position, margin)
@@ -1318,6 +1418,7 @@ function M.place_entity(agent_id, entity_name, x, y, direction)
     local result = placement_entity_result(entity)
     result.fast_replaced = use_fast_replace
     add_resource_policy_details(result, policy)
+    add_inserter_target_details(result, entity)
     return result
 end
 
