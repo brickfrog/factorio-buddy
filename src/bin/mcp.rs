@@ -6362,6 +6362,11 @@ fn compact_atomic_filtered_placement(report: &serde_json::Value) -> serde_json::
                     "filters",
                     "held_stack_before",
                     "held_stack_after",
+                    "held_stack_present_before",
+                    "held_stack_present_after",
+                    "held_stack_violated_whitelist",
+                    "held_stack_evacuated",
+                    "held_stack_returned_count",
                 ],
             )),
         );
@@ -10701,7 +10706,7 @@ impl FactorioMcp {
 
     /// Replace an existing inserter's complete item whitelist.
     #[tool(
-        description = "Atomically replace an exact inserter's complete item whitelist. Pass allowed_items such as [\"copper-plate\"]; [] clears and disables filtering. Validates capacity, reads back, and rolls back on mismatch. Filters affect future pickups, not upstream belt purity or an already-held item."
+        description = "Replace an exact inserter whitelist atomically; [] disables filtering. Readback or held-item return failure rolls back. A held item excluded by the new whitelist is returned intact to the character without replacing the inserter. Filtering does not purify upstream belts."
     )]
     async fn configure_inserter(
         &self,

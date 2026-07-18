@@ -2801,6 +2801,152 @@ assert_json "rejected whitelist leaves every prior filter unchanged" "$FILTER_AF
     --argjson before "$FILTER_BEFORE_INVALID" \
     '. == $before'
 
+JAMMED_FILTER_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local target = nil
+for _, candidate in pairs(s.find_entities_filtered{type = 'inserter'}) do
+    if candidate.unit_number == $ELECTRIC_FILTER_UNIT then target = candidate end
+end
+local inv = c.get_main_inventory()
+local coal_before = inv.get_item_count('coal')
+local seeded = target and target.held_stack.set_stack{name = 'coal', count = 1} or false
+rcon.print(helpers.table_to_json({
+    seeded = seeded,
+    unit_number = target and target.unit_number or nil,
+    coal_before = coal_before,
+    held = target and target.held_stack.valid_for_read and {
+        name = target.held_stack.name,
+        count = target.held_stack.count,
+    } or nil,
+}))
+")"
+require_json "jammed-filter fixture puts one excluded item in the disabled inserter hand" \
+    "$JAMMED_FILTER_FIXTURE" \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '.seeded == true
+     and .unit_number == $unit
+     and .held == {name:"coal",count:1}'
+JAMMED_COAL_BEFORE="$(jq -r '.coal_before' <<<"$JAMMED_FILTER_FIXTURE")"
+
+UNJAM_FILTER="$(mcp_tool configure_inserter "$(jq -cn \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '{unit_number:$unit,allowed_items:["iron-plate"]}')")"
+UNJAM_FILTER_PAYLOAD="$(tool_payload "$UNJAM_FILTER")"
+assert_json "configure_inserter returns an excluded held item instead of reporting a false recovery" \
+    "$UNJAM_FILTER" \
+    '.result.isError != true'
+assert_json "held-item recovery preserves identity and reports explicit before/after state" \
+    "$UNJAM_FILTER_PAYLOAD" \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '.success == true
+     and .unit_number == $unit
+     and .entity_identity_preserved == true
+     and .readback_verified == true
+     and [.filters[].name] == ["iron-plate"]
+     and .held_stack_present_before == true
+     and .held_stack_before.name == "coal"
+     and .held_stack_before.count == 1
+     and .held_stack_present_after == false
+     and .held_stack_violated_whitelist == true
+     and .held_stack_evacuated == true
+     and .held_stack_returned_count == 1'
+UNJAM_FILTER_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local target = nil
+for _, candidate in pairs(s.find_entities_filtered{type = 'inserter'}) do
+    if candidate.unit_number == $ELECTRIC_FILTER_UNIT then target = candidate end
+end
+local filter = target and target.get_filter(1) or nil
+rcon.print(helpers.table_to_json({
+    same_unit = target and target.unit_number == $ELECTRIC_FILTER_UNIT or false,
+    held_present = target and target.held_stack.valid_for_read or false,
+    coal = c.get_main_inventory().get_item_count('coal'),
+    filter = type(filter) == 'table' and filter.name or filter,
+}))
+")"
+require_json "live inserter is unjammed and the excluded item is conserved in character inventory" \
+    "$UNJAM_FILTER_WORLD" \
+    --argjson coal_before "$JAMMED_COAL_BEFORE" \
+    '.same_unit == true
+     and .held_present == false
+     and .coal == ($coal_before + 1)
+     and .filter == "iron-plate"'
+
+FULL_INVENTORY_JAM="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local target = nil
+for _, candidate in pairs(s.find_entities_filtered{type = 'inserter'}) do
+    if candidate.unit_number == $ELECTRIC_FILTER_UNIT then target = candidate end
+end
+local inv = c.get_main_inventory()
+inv.clear()
+for index = 1, #inv do inv[index].set_stack{name = 'stone', count = 50} end
+local seeded = target and target.held_stack.set_stack{name = 'coal', count = 1} or false
+rcon.print(helpers.table_to_json({
+    seeded = seeded,
+    coal_capacity = inv.get_insertable_count{name = 'coal'},
+    filter = target and target.get_filter(1) or nil,
+}))
+")"
+require_json "full-inventory fixture cannot accept the excluded held stack" \
+    "$FULL_INVENTORY_JAM" \
+    '.seeded == true
+     and .coal_capacity == 0
+     and ((.filter | if type == "object" then .name else . end) == "iron-plate")'
+BLOCKED_UNJAM="$(mcp_tool configure_inserter "$(jq -cn \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '{unit_number:$unit,allowed_items:["copper-plate"]}')")"
+BLOCKED_UNJAM_PAYLOAD="$(tool_payload "$BLOCKED_UNJAM")"
+assert_json "configure_inserter fails rather than losing an excluded held item" \
+    "$BLOCKED_UNJAM" \
+    '.result.isError == true'
+assert_json "failed held-item evacuation reports the jam and verifies filter rollback" \
+    "$BLOCKED_UNJAM_PAYLOAD" \
+    --argjson unit "$ELECTRIC_FILTER_UNIT" \
+    '.success == false
+     and .error_kind == "held_stack_evacuation_failed"
+     and .unit_number == $unit
+     and .held_stack_present_before == true
+     and .held_stack_present_after == true
+     and .held_stack_before.name == "coal"
+     and .held_stack_after.name == "coal"
+     and .held_stack_violated_whitelist == true
+     and .held_stack_evacuation.required == true
+     and .held_stack_evacuation.succeeded == false
+     and .held_stack_evacuation.insertable_count == 0
+     and .rollback_succeeded == true
+     and .rollback_readback_verified == true'
+BLOCKED_UNJAM_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local target = nil
+for _, candidate in pairs(s.find_entities_filtered{type = 'inserter'}) do
+    if candidate.unit_number == $ELECTRIC_FILTER_UNIT then target = candidate end
+end
+local filter = target and target.get_filter(1) or nil
+local report = {
+    same_unit = target and target.unit_number == $ELECTRIC_FILTER_UNIT or false,
+    held = target and target.held_stack.valid_for_read and {
+        name = target.held_stack.name,
+        count = target.held_stack.count,
+    } or nil,
+    filter = type(filter) == 'table' and filter.name or filter,
+    coal = c.get_main_inventory().get_item_count('coal'),
+}
+if target then target.held_stack.clear() end
+c.get_main_inventory().clear()
+rcon.print(helpers.table_to_json(report))
+")"
+require_json "failed evacuation preserves the exact inserter, held item, and previous filter" \
+    "$BLOCKED_UNJAM_WORLD" \
+    '.same_unit == true
+     and .held == {name:"coal",count:1}
+     and .filter == "iron-plate"
+     and .coal == 0'
+
 ATOMIC_FILTER_FAILURE="$(raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local s = c.surface

@@ -1988,6 +1988,89 @@ local function held_stack_record(entity)
     }
 end
 
+local function item_with_quality(name, quality, count)
+    local item = {name = name}
+    if quality ~= nil then item.quality = quality end
+    if count ~= nil then item.count = count end
+    return item
+end
+
+local function allowed_item_lookup(allowed_items)
+    local lookup = {}
+    for _, item in ipairs(allowed_items) do lookup[item] = true end
+    return lookup
+end
+
+local function evacuate_disallowed_held_stack(character, entity, allowed_items, held_before)
+    local outcome = {
+        required = false,
+        succeeded = true,
+        returned_count = 0,
+    }
+    if not held_before or #allowed_items == 0 then return outcome end
+    if allowed_item_lookup(allowed_items)[held_before.name] then return outcome end
+
+    outcome.required = true
+    local inventory = character.get_main_inventory()
+    if not (inventory and inventory.valid) then
+        outcome.succeeded = false
+        outcome.error = "Character has no valid main inventory for the disallowed held item"
+        return outcome
+    end
+
+    local item = item_with_quality(held_before.name, held_before.quality, held_before.count)
+    local capacity_ok, insertable = pcall(function()
+        return inventory.get_insertable_count(item_with_quality(held_before.name, held_before.quality))
+    end)
+    if not capacity_ok then
+        outcome.succeeded = false
+        outcome.error = "Could not inspect character inventory capacity: " .. tostring(insertable)
+        return outcome
+    end
+    if insertable < held_before.count then
+        outcome.succeeded = false
+        outcome.error = "Character inventory cannot accept the complete disallowed held stack"
+        outcome.insertable_count = insertable
+        return outcome
+    end
+
+    -- LuaInventory.insert accepts a LuaItemStack and copies its complete item
+    -- data. Only clear the inserter hand after the whole stack is safely in the
+    -- character inventory; no simulation tick can occur during this call.
+    local held_stack = entity.held_stack
+    local insert_ok, insert_result = pcall(function() return inventory.insert(held_stack) end)
+    local inserted = insert_ok and tonumber(insert_result) or 0
+    if not insert_ok or inserted ~= held_before.count then
+        local removed = inserted > 0 and inventory.remove(item_with_quality(
+            held_before.name,
+            held_before.quality,
+            inserted
+        )) or 0
+        outcome.succeeded = false
+        outcome.error = insert_ok
+            and "Character inventory accepted only part of the disallowed held stack"
+            or "Could not return the disallowed held stack: " .. tostring(insert_result)
+        outcome.inserted_count = inserted
+        outcome.inventory_rollback_succeeded = removed == inserted
+        return outcome
+    end
+
+    local clear_ok, clear_error = pcall(function() held_stack.clear() end)
+    if not clear_ok or held_stack.valid_for_read then
+        local removed = inventory.remove(item)
+        outcome.succeeded = false
+        outcome.error = clear_ok
+            and "Inserter still held the disallowed item after clearing its hand"
+            or "Could not clear the disallowed held item: " .. tostring(clear_error)
+        outcome.inserted_count = inserted
+        outcome.inventory_rollback_succeeded = removed == inserted
+        return outcome
+    end
+
+    outcome.returned_count = inserted
+    return outcome
+end
+
 local function validate_allowed_items(allowed_items)
     if type(allowed_items) ~= "table" then
         return nil, "allowed_items must be a dense array"
@@ -2017,8 +2100,10 @@ local function validate_allowed_items(allowed_items)
     return normalized, nil
 end
 
--- Replace an existing inserter's complete whitelist atomically. Filters affect
--- future pickups; an item already held by the arm may still finish its drop.
+-- Replace an existing inserter's complete whitelist atomically. If an active
+-- whitelist excludes an item already held by the arm, return that entire stack
+-- to the character before reporting success so the old item cannot remain
+-- permanently jammed in the inserter.
 function M.configure_inserter(agent_id, unit_number, allowed_items)
     unit_number = tonumber(unit_number)
     if not unit_number or unit_number <= 0 or unit_number % 1 ~= 0 then
@@ -2184,6 +2269,38 @@ function M.configure_inserter(agent_id, unit_number, allowed_items)
         }
     end
 
+    local evacuation = evacuate_disallowed_held_stack(character, entity, normalized, held_before)
+    if not evacuation.succeeded then
+        local rollback_ok, rollback_error, rollback_observed = restore_inserter_filter_state(entity, slot_count, before)
+        return {
+            success = false,
+            error_kind = "held_stack_evacuation_failed",
+            error = evacuation.error,
+            unit_number = unit_number,
+            held_stack_before = held_before,
+            held_stack_after = held_stack_record(entity),
+            held_stack_present_before = held_before ~= nil,
+            held_stack_present_after = held_stack_record(entity) ~= nil,
+            held_stack_violated_whitelist = evacuation.required,
+            held_stack_evacuation = evacuation,
+            rollback_succeeded = rollback_ok,
+            rollback_readback_verified = rollback_ok,
+            rollback_error = rollback_ok and nil or tostring(rollback_error),
+            rollback_observed = rollback_observed,
+        }
+    end
+
+    local held_after = held_stack_record(entity)
+    local guidance = nil
+    if evacuation.required then
+        guidance = "Returned the held " .. held_before.name
+            .. " to the character because the new whitelist excludes it. The whitelist applies to future pickups; inspect the upstream belt separately because filtering does not make a mixed belt pure."
+    elseif #normalized > 0 then
+        guidance = "The whitelist applies to future pickups. Inspect the upstream belt separately; this does not make a mixed belt pure."
+    else
+        guidance = "Filtering is disabled and all filter slots are clear."
+    end
+
     return {
         success = true,
         unit_number = unit_number,
@@ -2207,12 +2324,15 @@ function M.configure_inserter(agent_id, unit_number, allowed_items)
         mode = after.mode,
         filters = after.filters,
         held_stack_before = held_before,
-        held_stack_after = held_stack_record(entity),
+        held_stack_after = held_after,
+        held_stack_present_before = held_before ~= nil,
+        held_stack_present_after = held_after ~= nil,
+        held_stack_violated_whitelist = evacuation.required,
+        held_stack_evacuated = evacuation.required,
+        held_stack_returned_count = evacuation.returned_count,
         readback_verified = true,
         entity_identity_preserved = entity.valid and entity.unit_number == unit_number,
-        guidance = #normalized > 0
-            and "The whitelist applies to future pickups only. Inspect the upstream belt separately; this does not make a mixed belt pure."
-            or "Filtering is disabled and all filter slots are clear.",
+        guidance = guidance,
     }
 end
 
