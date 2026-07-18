@@ -300,12 +300,12 @@ fn source_belt_from_inserter(
     inserters
         .iter()
         .find(|i| {
-            i.pickup_target
+            i.pickup_target.as_ref().is_some_and(|target| {
+                same_endpoint(target.unit_number, target.position.to_tile(), endpoint)
+            }) && i
+                .dropoff_target
                 .as_ref()
-                .is_some_and(|target| same_endpoint(target.unit_number, target.position, endpoint))
-                && i.dropoff_target
-                    .as_ref()
-                    .is_some_and(|target| target.name.contains("belt"))
+                .is_some_and(|target| target.name.contains("belt"))
         })
         .map(|i| i.dropoff_position.to_tile())
 }
@@ -317,12 +317,12 @@ fn target_belt_from_inserter(
     inserters
         .iter()
         .find(|i| {
-            i.dropoff_target
+            i.dropoff_target.as_ref().is_some_and(|target| {
+                same_endpoint(target.unit_number, target.position.to_tile(), endpoint)
+            }) && i
+                .pickup_target
                 .as_ref()
-                .is_some_and(|target| same_endpoint(target.unit_number, target.position, endpoint))
-                && i.pickup_target
-                    .as_ref()
-                    .is_some_and(|target| target.name.contains("belt"))
+                .is_some_and(|target| target.name.contains("belt"))
         })
         .map(|i| i.pickup_position.to_tile())
 }

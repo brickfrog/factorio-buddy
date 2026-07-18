@@ -139,6 +139,16 @@ pub struct EntityRef {
     pub position: TilePos,
 }
 
+/// Exact entity reference resolved from an inserter interaction point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InserterTargetRef {
+    pub unit_number: Option<u32>,
+    pub name: String,
+    pub entity_type: String,
+    /// Factorio entity center, not the pickup/dropoff probe tile.
+    pub position: crate::world::Position,
+}
+
 /// Result of belt reachability analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeltReachResult {
@@ -241,9 +251,9 @@ pub struct InserterAnalysis {
     /// Authoritative Factorio drop point.
     pub dropoff_position: crate::world::Position,
     /// Entity at pickup position (if any)
-    pub pickup_target: Option<EntityRef>,
+    pub pickup_target: Option<InserterTargetRef>,
     /// Entity at dropoff position (if any)
-    pub dropoff_target: Option<EntityRef>,
+    pub dropoff_target: Option<InserterTargetRef>,
 }
 
 /// Result of entity reach analysis

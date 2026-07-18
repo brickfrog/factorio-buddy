@@ -2700,6 +2700,60 @@ assert_json "invalid rotation validation sets isError" "$INVALID_ROTATION" \
      and (.result.content[0].text | fromjson
           | .success == false and .error_kind == "invalid_direction")'
 
+# Inserter targets are resolved through occupied footprint tiles, but their
+# reported position must remain the resolved entity's exact Factorio center.
+# Two arms touching different tiles of one assembler must not make that same
+# unit appear at two different probe-tile positions.
+INSERTER_TARGET_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{17, -11}, {29, -2}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local assembler = s.create_entity{
+    name = 'assembling-machine-1', position = {23.5, -6.5}, force = c.force
+}
+local west = s.create_entity{
+    name = 'inserter', position = {21.5, -6.5},
+    direction = defines.direction.west, force = c.force
+}
+local east = s.create_entity{
+    name = 'inserter', position = {25.5, -6.5},
+    direction = defines.direction.east, force = c.force
+}
+west.active = false
+east.active = false
+rcon.print(helpers.table_to_json({
+    assembler_unit = assembler.unit_number,
+    assembler_position = assembler.position,
+    west_unit = west.unit_number,
+    west_drop = west.drop_position,
+    east_unit = east.unit_number,
+    east_drop = east.drop_position,
+}))
+")"
+require_json "inserter-target fixture touches two distinct assembler footprint tiles" \
+    "$INSERTER_TARGET_FIXTURE" \
+    '.assembler_position == {x:23.5,y:-6.5}
+     and (.assembler_unit | type) == "number"
+     and (.west_unit | type) == "number"
+     and (.east_unit | type) == "number"
+     and {x:(.west_drop.x | floor),y:(.west_drop.y | floor)}
+         != {x:(.east_drop.x | floor),y:(.east_drop.y | floor)}'
+INSERTER_TARGETS="$(mcp_tool analyze_inserters '{"x":23,"y":-6,"radius":6}')"
+INSERTER_TARGETS_PAYLOAD="$(tool_payload "$INSERTER_TARGETS")"
+assert_json "analyze_inserters resolves both arms through the shared assembler footprint" \
+    "$INSERTER_TARGETS" \
+    '.result.isError != true'
+require_json "one target unit has one exact entity-center position across distinct probe tiles" \
+    "$INSERTER_TARGETS_PAYLOAD" \
+    --argjson fixture "$INSERTER_TARGET_FIXTURE" \
+    '[.[] | select(.unit_number == $fixture.west_unit or .unit_number == $fixture.east_unit)]
+        | length == 2
+          and all(.[].dropoff_target;
+              .unit_number == $fixture.assembler_unit
+              and .position == $fixture.assembler_position)'
+
 # Inserter filtering is an exact-unit, identity-preserving mutation. Exercise
 # both electric and burner prototypes, then prove a burner inserter takes only
 # copper from a mixed source chest.

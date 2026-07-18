@@ -1,6 +1,6 @@
 //! Inserter pickup/dropoff analysis
 
-use super::{build_entity_occupancy_lookup, EntityRef, InserterAnalysis};
+use super::{build_entity_occupancy_lookup, InserterAnalysis, InserterTargetRef};
 use crate::world::{Direction, Entity, Position, TilePos};
 use std::collections::HashMap;
 
@@ -50,18 +50,18 @@ fn analyze_single_inserter(
     let pickup_tile = pickup_position.to_tile();
     let dropoff_tile = dropoff_position.to_tile();
 
-    let pickup_target = entity_at.get(&pickup_tile).map(|e| EntityRef {
+    let pickup_target = entity_at.get(&pickup_tile).map(|e| InserterTargetRef {
         unit_number: e.unit_number,
         name: e.name.clone(),
         entity_type: e.entity_type.clone().unwrap_or_default(),
-        position: pickup_tile,
+        position: e.position,
     });
 
-    let dropoff_target = entity_at.get(&dropoff_tile).map(|e| EntityRef {
+    let dropoff_target = entity_at.get(&dropoff_tile).map(|e| InserterTargetRef {
         unit_number: e.unit_number,
         name: e.name.clone(),
         entity_type: e.entity_type.clone().unwrap_or_default(),
-        position: dropoff_tile,
+        position: e.position,
     });
 
     Some(InserterAnalysis {
@@ -200,6 +200,33 @@ mod tests {
                 .map(|target| target.name.as_str()),
             Some("assembling-machine-1")
         );
+        assert_eq!(
+            result[0].dropoff_target.as_ref().unwrap().position,
+            Position::new(3.5, 0.5)
+        );
+    }
+
+    #[test]
+    fn target_position_is_the_entity_center_for_every_occupied_tile() {
+        let mut assembler = make_typed_entity(10, 10, "assembling-machine-1", "assembling-machine");
+        assembler.position = Position::new(10.5, 10.5);
+        assembler.bounding_box = Some(crate::world::Area::new(9.0, 9.0, 12.0, 12.0));
+        let assembler_unit = assembler.unit_number;
+
+        let mut west_inserter = make_inserter(8, 9, Direction::East, "inserter");
+        west_inserter.pickup_position = Some(Position::new(7.5, 9.5));
+        west_inserter.drop_position = Some(Position::new(9.5, 9.5));
+        let mut east_inserter = make_inserter(12, 11, Direction::West, "inserter");
+        east_inserter.pickup_position = Some(Position::new(13.5, 11.5));
+        east_inserter.drop_position = Some(Position::new(11.5, 11.5));
+
+        let result = analyze_inserters(&[west_inserter, east_inserter, assembler]);
+        assert_eq!(result.len(), 2);
+        for analysis in result {
+            let target = analysis.dropoff_target.expect("assembler target");
+            assert_eq!(target.unit_number, assembler_unit);
+            assert_eq!(target.position, Position::new(10.5, 10.5));
+        }
     }
 
     #[test]
