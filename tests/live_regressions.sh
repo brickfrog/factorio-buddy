@@ -3371,6 +3371,172 @@ assert_json "independent route preserves the exact crossing belt and its directi
     "$INDEPENDENT_ROUTE_WORLD" \
     '.same_unit == true and .direction == 0 and .belt_count >= 6'
 
+# A new underground endpoint inside an existing pair's span can silently steal
+# the old endpoint in Factorio. The router must preserve the live pair while
+# still allowing harmless surface belts to cross the reserved span.
+UNDERGROUND_PAIR_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{37, -27}, {49, -18}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local force = c.force
+force.technologies['logistics'].researched = true
+local route_start = s.create_entity{
+    name = 'transport-belt', position = {38.5, -24.5},
+    direction = defines.direction.east, force = force
+}
+local before = s.create_entity{
+    name = 'transport-belt', position = {39.5, -24.5},
+    direction = defines.direction.east, force = force
+}
+local input = s.create_entity{
+    name = 'underground-belt', position = {40.5, -24.5},
+    direction = defines.direction.east, type = 'input', force = force
+}
+local output = s.create_entity{
+    name = 'underground-belt', position = {44.5, -24.5},
+    direction = defines.direction.east, type = 'output', force = force
+}
+local after = s.create_entity{
+    name = 'transport-belt', position = {45.5, -24.5},
+    direction = defines.direction.east, force = force
+}
+if not (route_start and before and input and output and after and input.neighbours == output) then
+    error('failed to create authoritative underground pair fixture')
+end
+c.teleport({38.5, -21.5})
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'transport-belt', count = 100}
+inv.insert{name = 'underground-belt', count = 20}
+rcon.print(helpers.table_to_json({
+    route_start_unit = route_start.unit_number,
+    input_unit = input.unit_number,
+    output_unit = output.unit_number,
+    input_direction = input.direction,
+    output_direction = output.direction,
+    input_type = input.belt_to_ground_type,
+    output_type = output.belt_to_ground_type,
+    paired = input.neighbours == output
+}))
+")"
+require_json "underground-pair fixture exposes Factorio's authoritative pair state" \
+    "$UNDERGROUND_PAIR_FIXTURE" \
+    '.paired == true
+     and .input_direction == 4
+     and .output_direction == 4
+     and .input_type == "input"
+     and .output_type == "output"
+     and (.route_start_unit | type) == "number"
+     and (.input_unit | type) == "number"
+     and (.output_unit | type) == "number"'
+UNDERGROUND_PAIR_INPUT_UNIT="$(jq -r '.input_unit' <<<"$UNDERGROUND_PAIR_FIXTURE")"
+UNDERGROUND_PAIR_OUTPUT_UNIT="$(jq -r '.output_unit' <<<"$UNDERGROUND_PAIR_FIXTURE")"
+UNDERGROUND_ROUTE_START_UNIT="$(jq -r '.route_start_unit' <<<"$UNDERGROUND_PAIR_FIXTURE")"
+
+UNDERGROUND_CROSSING_PLAN="$(mcp_tool route_belt '{
+    "from_x":38,
+    "from_y":-24,
+    "to_x":42,
+    "to_y":-24,
+    "belt_type":"transport-belt",
+    "search_radius":6,
+    "dry_run":true,
+    "extend_existing":true,
+    "allow_underground":true,
+    "respect_zones":false
+}')"
+UNDERGROUND_CROSSING_PLAN_PAYLOAD="$(tool_payload "$UNDERGROUND_CROSSING_PLAN")"
+assert_json "route dry-run reserves every tile inside the existing underground pair" \
+    "$UNDERGROUND_CROSSING_PLAN_PAYLOAD" \
+    --argjson input "$UNDERGROUND_PAIR_INPUT_UNIT" \
+    --argjson output "$UNDERGROUND_PAIR_OUTPUT_UNIT" \
+    '.success == true
+     and .ready_to_execute == true
+     and .preserved_underground_pair_count >= 1
+     and any(.preserved_underground_pairs[]?;
+         .first.unit_number == $input and .second.unit_number == $output
+         or .first.unit_number == $output and .second.unit_number == $input)
+     and all(.planned_new_belts[]?;
+         if .kind == "Surface" then true
+         else ((.position.y | floor) != -25
+               or (.position.x | floor) < 41
+               or (.position.x | floor) > 43)
+         end)'
+
+UNDERGROUND_CROSSING_EXECUTE="$(mcp_tool route_belt '{
+    "from_x":38,
+    "from_y":-24,
+    "to_x":42,
+    "to_y":-24,
+    "belt_type":"transport-belt",
+    "search_radius":6,
+    "dry_run":false,
+    "extend_existing":true,
+    "allow_underground":true,
+    "respect_zones":false
+}')"
+UNDERGROUND_CROSSING_EXECUTE_PAYLOAD="$(tool_payload "$UNDERGROUND_CROSSING_EXECUTE")"
+assert_json "route executes without re-pairing the existing underground line" \
+    "$UNDERGROUND_CROSSING_EXECUTE_PAYLOAD" \
+    '.success == true and .complete_route == true and .placed > 0'
+
+UNDERGROUND_PAIR_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local input = nil
+local output = nil
+local route_start = nil
+for _, candidate in pairs(s.find_entities_filtered{name = 'transport-belt'}) do
+    if candidate.unit_number == $UNDERGROUND_ROUTE_START_UNIT then route_start = candidate end
+end
+for _, candidate in pairs(s.find_entities_filtered{name = 'underground-belt'}) do
+    if candidate.unit_number == $UNDERGROUND_PAIR_INPUT_UNIT then input = candidate end
+    if candidate.unit_number == $UNDERGROUND_PAIR_OUTPUT_UNIT then output = candidate end
+end
+local internal_endpoints = 0
+for _, candidate in pairs(s.find_entities_filtered{name = 'underground-belt', area = {{41, -25}, {44, -24}}}) do
+    if candidate.unit_number ~= $UNDERGROUND_PAIR_INPUT_UNIT
+        and candidate.unit_number ~= $UNDERGROUND_PAIR_OUTPUT_UNIT then
+        internal_endpoints = internal_endpoints + 1
+    end
+end
+rcon.print(helpers.table_to_json({
+    same_route_start = route_start and route_start.valid
+        and route_start.unit_number == $UNDERGROUND_ROUTE_START_UNIT
+        and route_start.direction == defines.direction.east or false,
+    same_input = input and input.valid and input.unit_number == $UNDERGROUND_PAIR_INPUT_UNIT or false,
+    same_output = output and output.valid and output.unit_number == $UNDERGROUND_PAIR_OUTPUT_UNIT or false,
+    still_paired = input and output and input.neighbours == output or false,
+    internal_endpoints = internal_endpoints
+}))
+")"
+assert_json "the exact pre-existing underground units remain paired after routing" \
+    "$UNDERGROUND_PAIR_WORLD" \
+    '.same_route_start == true
+     and .same_input == true
+     and .same_output == true
+     and .still_paired == true
+     and .internal_endpoints == 0'
+
+UNDERGROUND_FLOW="$(mcp_tool analyze_item_flow '{
+    "source_x":39,
+    "source_y":-25,
+    "target_x":45,
+    "target_y":-25,
+    "radius":10
+}')"
+UNDERGROUND_FLOW_PAYLOAD="$(tool_payload "$UNDERGROUND_FLOW")"
+assert_json "item-flow analysis certifies the live path through the underground pair" \
+    "$UNDERGROUND_FLOW_PAYLOAD" \
+    '.status == "connected"
+     and .connected == true
+     and .connectivity_certified == true
+     and .analysis_scope.modeled_underground_belts >= 2
+     and .analysis_scope.unsupported_transports == null
+     and any(.reachable_belts[]?; .x == 40 and .y == -25)
+     and any(.reachable_belts[]?; .x == 44 and .y == -25)'
+
 # Build a separate clean route, put a real item on its first transport line,
 # and require both Factorio delivery and the static analyzer to agree. This is
 # the end-to-end proof that a geometrically complete route actually transports.

@@ -117,9 +117,17 @@ pub struct BeltAnalysisScope {
     pub connectivity_model_complete: bool,
     /// Number of exact one-tile surface belts included in the graph.
     pub modeled_surface_belts: u32,
+    /// Number of underground endpoints modeled from Factorio's authoritative
+    /// input/output mode, neighbour, and belt-connection state.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub modeled_underground_belts: u32,
     /// Transport entities deliberately excluded instead of guessed geometrically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsupported_transports: Vec<UnsupportedTransport>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Reference to an entity for analysis results

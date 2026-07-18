@@ -44,6 +44,39 @@ pub struct Entity {
     /// Authoritative drop point exposed by Factorio for inserters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop_position: Option<Position>,
+
+    /// Whether an underground belt is the input or output endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub belt_to_ground_type: Option<String>,
+
+    /// Authoritative paired endpoint exposed by Factorio for underground belts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underground_belt_neighbour: Option<Position>,
+
+    /// Authoritative belt-connectable inputs exposed by Factorio.
+    #[serde(
+        default,
+        deserialize_with = "super::deserialize_lua_empty_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub belt_input_neighbours: Vec<Position>,
+
+    /// Authoritative belt-connectable outputs exposed by Factorio.
+    #[serde(
+        default,
+        deserialize_with = "super::deserialize_lua_empty_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub belt_output_neighbours: Vec<Position>,
+
+    /// Distinguishes an observed empty neighbour list from legacy data that
+    /// did not include Factorio's authoritative belt-neighbour state.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub belt_neighbours_observed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Entity {
@@ -376,5 +409,22 @@ mod tests {
             serde_json::to_string(&CraftingStatus::TimedOut).unwrap(),
             r#""timed_out""#
         );
+    }
+
+    #[test]
+    fn lua_empty_belt_neighbour_maps_deserialize_as_empty_arrays() {
+        let entity: Entity = serde_json::from_value(serde_json::json!({
+            "name": "transport-belt",
+            "type": "transport-belt",
+            "position": {"x": 1.5, "y": 2.5},
+            "belt_input_neighbours": {},
+            "belt_output_neighbours": {},
+            "belt_neighbours_observed": true
+        }))
+        .expect("Factorio empty Lua tables should decode as empty neighbour lists");
+
+        assert!(entity.belt_input_neighbours.is_empty());
+        assert!(entity.belt_output_neighbours.is_empty());
+        assert!(entity.belt_neighbours_observed);
     }
 }

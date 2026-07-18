@@ -17,6 +17,16 @@ local function bounding_box_table(bb)
     }
 end
 
+local function belt_neighbour_positions(neighbours)
+    local positions = {}
+    for _, neighbour in pairs(neighbours or {}) do
+        if neighbour and neighbour.valid then
+            table.insert(positions, pos_table(neighbour.position))
+        end
+    end
+    return positions
+end
+
 local function status_name(status_value)
     if status_value == nil then return nil end
     for name, value in pairs(defines.entity_status) do
@@ -99,6 +109,20 @@ function M.summary(entity, include_bounding_box)
     if entity.type == "inserter" then
         result.pickup_position = pos_table(entity.pickup_position)
         result.drop_position = pos_table(entity.drop_position)
+    end
+
+    if entity.type == "transport-belt" or entity.type == "underground-belt" then
+        local neighbours = entity.belt_neighbours
+        result.belt_neighbours_observed = true
+        result.belt_input_neighbours = belt_neighbour_positions(neighbours.inputs)
+        result.belt_output_neighbours = belt_neighbour_positions(neighbours.outputs)
+    end
+
+    if entity.type == "underground-belt" then
+        result.belt_to_ground_type = entity.belt_to_ground_type
+        -- Factorio 2.0.77 exposes the paired endpoint through `neighbours`.
+        local neighbour = entity.neighbours
+        result.underground_belt_neighbour = neighbour and pos_table(neighbour.position) or nil
     end
 
     return result

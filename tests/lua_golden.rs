@@ -2086,6 +2086,25 @@ fn entity_observations_include_authoritative_inserter_geometry() {
 }
 
 #[test]
+fn entity_observations_include_authoritative_belt_topology() {
+    let entities_lua = include_str!("../mod/claude-interface/entities.lua");
+    for required in [
+        "local neighbours = entity.belt_neighbours",
+        "result.belt_neighbours_observed = true",
+        "result.belt_input_neighbours = belt_neighbour_positions(neighbours.inputs)",
+        "result.belt_output_neighbours = belt_neighbour_positions(neighbours.outputs)",
+        "result.belt_to_ground_type = entity.belt_to_ground_type",
+        "local neighbour = entity.neighbours",
+        "result.underground_belt_neighbour = neighbour and pos_table(neighbour.position) or nil",
+    ] {
+        assert!(
+            entities_lua.contains(required),
+            "entity summaries should include authoritative belt topology via {required:?}"
+        );
+    }
+}
+
+#[test]
 fn fuel_inserter_candidates_use_the_belt_as_factorio_pickup_side() {
     let entities_lua = include_str!("../mod/claude-interface/entities.lua");
     let function_start = entities_lua

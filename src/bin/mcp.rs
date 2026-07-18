@@ -1729,8 +1729,8 @@ mod tests {
         attach_endpoint_preflight, automation_repair_hint, belt_source_tap_layouts,
         compact_fuel_diagnosis, compact_fuel_repair, compound_route_preflight,
         endpoint_belt_incompatibility, exact_fuel_feeder_transfer_observed, execute_lua_refusal,
-        existing_belt_compatibility, flow_lookup, flow_scan_area,
-        fuel_consumer_activity_verification_summary, fuel_delivery_budget_ticks,
+        existing_belt_compatibility, existing_underground_pair_reservations, flow_lookup,
+        flow_scan_area, fuel_consumer_activity_verification_summary, fuel_delivery_budget_ticks,
         fuel_delivery_path_operational, fuel_delivery_wait_budget,
         fuel_route_protects_existing_source, fuel_topology_upstream_hops,
         fuel_topology_verification, incremental_infrastructure_verification,
@@ -1927,6 +1927,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
         let infrastructure = incremental_infrastructure_verification(
             &route,
@@ -1993,6 +1998,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
 
         let report = incremental_infrastructure_verification(
@@ -2022,6 +2032,11 @@ mod tests {
             bounding_box: Some(Area::new(10.0, 10.0, 13.0, 13.0)),
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         }
     }
 
@@ -2362,6 +2377,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
 
         let failure = rollback_missing_identity_error(&entity);
@@ -2639,6 +2659,11 @@ mod tests {
             bounding_box: Some(Area::new(9.0, 19.0, 12.0, 22.0)),
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
 
         let north = machine_side_layout(&entity, "north").expect("north side");
@@ -2680,6 +2705,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
         let furnace_north = machine_side_layout(&furnace, "north").expect("furnace north side");
         assert_eq!(furnace_north.inserter_x, 42.5);
@@ -2699,6 +2729,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
         let assembler_south =
             machine_side_layout(&assembler_without_bbox, "south").expect("assembler south side");
@@ -2798,6 +2833,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
         let east_surface = BeltPlacement {
             position: entity.position,
@@ -2822,6 +2862,42 @@ mod tests {
         };
         assert!(existing_belt_compatibility(&entity, &underground, "transport-belt").is_err());
         assert!(existing_belt_compatibility(&entity, &underground, "fast-transport-belt").is_err());
+    }
+
+    #[test]
+    fn existing_underground_pair_reserves_only_internal_endpoint_tiles() {
+        let make_endpoint = |unit_number, x: f64, mode: &str, neighbour_x: f64| Entity {
+            unit_number: Some(unit_number),
+            name: "underground-belt".to_string(),
+            entity_type: Some("underground-belt".to_string()),
+            position: Position::new(x, 52.5),
+            direction: Direction::East.to_factorio(),
+            health: Some(150.0),
+            force: Some("player".to_string()),
+            bounding_box: None,
+            pickup_position: None,
+            drop_position: None,
+            belt_to_ground_type: Some(mode.to_string()),
+            underground_belt_neighbour: Some(Position::new(neighbour_x, 52.5)),
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: true,
+        };
+        let entities = vec![
+            make_endpoint(1496, -43.5, "input", -39.5),
+            make_endpoint(1497, -39.5, "output", -43.5),
+        ];
+
+        let (reserved, pairs) =
+            existing_underground_pair_reservations(&entities, "underground-belt");
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(reserved.len(), 3);
+        assert!(reserved.contains(&GridPos::new(-43, 52)));
+        assert!(reserved.contains(&GridPos::new(-42, 52)));
+        assert!(reserved.contains(&GridPos::new(-41, 52)));
+        assert!(!reserved.contains(&GridPos::new(-44, 52)));
+        assert!(!reserved.contains(&GridPos::new(-40, 52)));
     }
 
     #[test]
@@ -3085,6 +3161,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
         let preserved = source_entity_preservation(&before, Some(&before), GridPos::new(-45, 44));
         assert_eq!(preserved["success"], true);
@@ -3271,6 +3352,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
         let furnace = Entity {
             unit_number: Some(2),
@@ -3283,6 +3369,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
         let belt = Entity {
             unit_number: Some(3),
@@ -3295,6 +3386,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
 
         assert!(is_machine_output_source(&assembler));
@@ -3737,6 +3833,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
 
         let args = machine_output_build_args(
@@ -4611,6 +4712,85 @@ fn existing_belt_compatibility(
         ));
     }
     Ok(())
+}
+
+fn existing_underground_pair_reservations(
+    entities: &[Entity],
+    underground_name: &str,
+) -> (HashSet<GridPos>, Vec<serde_json::Value>) {
+    let undergrounds: HashMap<GridPos, &Entity> = entities
+        .iter()
+        .filter(|entity| {
+            entity.name == underground_name
+                && entity.entity_type.as_deref() == Some("underground-belt")
+        })
+        .map(|entity| (GridPos::from_position(&entity.position), entity))
+        .collect();
+    let mut seen_pairs = HashSet::new();
+    let mut reserved_tiles = HashSet::new();
+    let mut reservations = Vec::new();
+
+    for (tile, entity) in &undergrounds {
+        let Some(neighbour_position) = entity.underground_belt_neighbour.as_ref() else {
+            continue;
+        };
+        let neighbour_tile = GridPos::from_position(neighbour_position);
+        let Some(neighbour) = undergrounds.get(&neighbour_tile) else {
+            continue;
+        };
+        let pair_key = if (tile.x, tile.y) <= (neighbour_tile.x, neighbour_tile.y) {
+            (*tile, neighbour_tile)
+        } else {
+            (neighbour_tile, *tile)
+        };
+        if !seen_pairs.insert(pair_key) {
+            continue;
+        }
+
+        let dx = neighbour_tile.x - tile.x;
+        let dy = neighbour_tile.y - tile.y;
+        if dx != 0 && dy != 0 {
+            continue;
+        }
+        let distance = dx.unsigned_abs() + dy.unsigned_abs();
+        if distance < 2 {
+            continue;
+        }
+        let step_x = dx.signum();
+        let step_y = dy.signum();
+        let mut pair_reserved = Vec::new();
+        for step in 1..distance {
+            let reserved =
+                GridPos::new(tile.x + step_x * step as i32, tile.y + step_y * step as i32);
+            reserved_tiles.insert(reserved);
+            pair_reserved.push(reserved);
+        }
+        reservations.push(serde_json::json!({
+            "first": {
+                "unit_number": entity.unit_number,
+                "position": tile,
+                "belt_to_ground_type": entity.belt_to_ground_type,
+            },
+            "second": {
+                "unit_number": neighbour.unit_number,
+                "position": neighbour_tile,
+                "belt_to_ground_type": neighbour.belt_to_ground_type,
+            },
+            "reserved_endpoint_tiles": pair_reserved,
+        }));
+    }
+
+    reservations.sort_by_key(|reservation| {
+        (
+            reservation["first"]["position"]["x"]
+                .as_i64()
+                .unwrap_or_default(),
+            reservation["first"]["position"]["y"]
+                .as_i64()
+                .unwrap_or_default(),
+        )
+    });
+    (reserved_tiles, reservations)
 }
 
 fn endpoint_belt_incompatibility(
@@ -10580,6 +10760,27 @@ impl FactorioMcp {
             }
         };
 
+        let underground_config = if params.allow_underground {
+            if let Some(config) = UndergroundConfig::from_belt_type(&params.belt_type) {
+                match client.is_tech_researched(&config.required_tech).await {
+                    Ok(true) => Some(config),
+                    Ok(false) | Err(_) => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let underground_entity_name = underground_config
+            .as_ref()
+            .map(|config| config.entity_name.as_str());
+        let (mut underground_forbidden_tiles, preserved_underground_pairs) =
+            underground_entity_name.map_or_else(
+                || (HashSet::new(), Vec::new()),
+                |name| existing_underground_pair_reservations(&route_entities, name),
+            );
+
         // Resource entities are valid terrain for ordinary logistics. Record
         // their exact live tiles for route diagnostics without blocking A*;
         // Factorio/Lua placement preflights below remain authoritative.
@@ -10637,24 +10838,19 @@ impl FactorioMcp {
             }
         }
 
-        let underground_config = if params.allow_underground {
-            if let Some(config) = UndergroundConfig::from_belt_type(&params.belt_type) {
-                match client.is_tech_researched(&config.required_tech).await {
-                    Ok(true) => Some(config),
-                    Ok(false) | Err(_) => None,
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        if existing_surface_belts.contains_key(&start) {
+            underground_forbidden_tiles.insert(start);
+        }
+        if existing_surface_belts.contains_key(&goal) {
+            underground_forbidden_tiles.insert(goal);
+        }
 
         let routing_options = RoutingOptions {
             allow_underground: underground_config.is_some(),
             underground_config: underground_config.clone(),
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
+            underground_forbidden_tiles,
         };
         let mut rejected_existing = Vec::new();
         let result = loop {
@@ -10969,6 +11165,8 @@ impl FactorioMcp {
                 "resource_tiles_observed": resource_tiles.len(),
                 "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
                 "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
+                "preserved_underground_pair_count": preserved_underground_pairs.len(),
+                "preserved_underground_pairs": &preserved_underground_pairs,
                 "materials": materials,
                 "materials_sufficient": materials_sufficient,
                 "ready_to_execute": materials_sufficient,
@@ -11179,6 +11377,8 @@ impl FactorioMcp {
             "resource_tiles_observed": resource_tiles.len(),
             "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
             "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
+            "preserved_underground_pair_count": preserved_underground_pairs.len(),
+            "preserved_underground_pairs": &preserved_underground_pairs,
             "materials": materials,
             "materials_sufficient": materials_sufficient,
             "topology": compact_belt_topology(result.topology.as_ref()),

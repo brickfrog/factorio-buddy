@@ -11,6 +11,9 @@ pub struct BeltNode {
     pub position: TilePos,
     pub direction: Direction,
     pub belt_type: String,
+    pub belt_to_ground_type: Option<String>,
+    pub underground_belt_neighbour: Option<TilePos>,
+    pub authoritative_outputs: Option<Vec<TilePos>>,
 }
 
 impl BeltNode {
@@ -52,13 +55,28 @@ impl BeltGraph {
     pub fn from_entities(entities: &[Entity]) -> Self {
         let mut nodes = HashMap::new();
         let mut unsupported_transports = Vec::new();
+        let entities_by_tile: HashMap<TilePos, &Entity> = entities
+            .iter()
+            .map(|entity| (entity.position.to_tile(), entity))
+            .collect();
 
         // First pass: collect all belt nodes
         for entity in entities {
-            if !is_surface_transport_belt(entity) {
+            let is_surface = is_surface_transport_belt(entity);
+            let is_underground = is_underground_transport_belt(entity);
+            if !is_surface && !is_underground {
                 if let Some(unsupported) = unsupported_transport(entity) {
                     unsupported_transports.push(unsupported);
                 }
+                continue;
+            }
+
+            if is_underground
+                && (entity.belt_to_ground_type.is_none()
+                    || entity.underground_belt_neighbour.is_none()
+                    || !entity.belt_neighbours_observed)
+            {
+                unsupported_transports.push(unsupported_underground(entity));
                 continue;
             }
 
@@ -72,8 +90,42 @@ impl BeltGraph {
                     position,
                     direction,
                     belt_type: entity.name.clone(),
+                    belt_to_ground_type: entity.belt_to_ground_type.clone(),
+                    underground_belt_neighbour: entity
+                        .underground_belt_neighbour
+                        .as_ref()
+                        .map(|position| position.to_tile()),
+                    authoritative_outputs: entity.belt_neighbours_observed.then(|| {
+                        entity
+                            .belt_output_neighbours
+                            .iter()
+                            .map(|position| position.to_tile())
+                            .collect()
+                    }),
                 },
             );
+        }
+
+        let invalid_undergrounds: Vec<TilePos> = nodes
+            .iter()
+            .filter_map(|(position, node)| {
+                let mode = node.belt_to_ground_type.as_deref()?;
+                let valid = node
+                    .underground_belt_neighbour
+                    .and_then(|neighbour_position| nodes.get(&neighbour_position))
+                    .is_some_and(|neighbour| {
+                        neighbour.belt_to_ground_type.as_deref() != Some(mode)
+                            && neighbour.underground_belt_neighbour == Some(*position)
+                            && neighbour.belt_type == node.belt_type
+                    });
+                (!valid).then_some(*position)
+            })
+            .collect();
+        for position in invalid_undergrounds {
+            nodes.remove(&position);
+            if let Some(entity) = entities_by_tile.get(&position) {
+                unsupported_transports.push(unsupported_underground(entity));
+            }
         }
 
         // Second pass: build edges
@@ -81,21 +133,30 @@ impl BeltGraph {
         let mut upstream: HashMap<TilePos, Vec<TilePos>> = HashMap::new();
 
         for (pos, node) in &nodes {
-            let output = node.output_tile();
-
-            // Check if there's a belt at the output position
-            if let Some(target) = nodes.get(&output) {
-                // The target belt must be able to receive from this direction
-                // A belt can receive from: behind (primary) or sides (side-loading)
-                let can_receive = {
-                    let target_input = target.primary_input_tile();
+            if let Some(authoritative) = &node.authoritative_outputs {
+                for output in authoritative {
+                    if nodes.contains_key(output) {
+                        add_edge(&mut downstream, &mut upstream, *pos, *output);
+                    }
+                }
+            } else {
+                let output = node.output_tile();
+                if let Some(target) = nodes.get(&output) {
                     let [side_left, side_right] = target.side_input_tiles();
-                    *pos == target_input || *pos == side_left || *pos == side_right
-                };
+                    if *pos == target.primary_input_tile()
+                        || *pos == side_left
+                        || *pos == side_right
+                    {
+                        add_edge(&mut downstream, &mut upstream, *pos, output);
+                    }
+                }
+            }
 
-                if can_receive {
-                    downstream.entry(*pos).or_default().push(output);
-                    upstream.entry(output).or_default().push(*pos);
+            if node.belt_to_ground_type.as_deref() == Some("input") {
+                if let Some(neighbour) = node.underground_belt_neighbour {
+                    if nodes.contains_key(&neighbour) {
+                        add_edge(&mut downstream, &mut upstream, *pos, neighbour);
+                    }
                 }
             }
         }
@@ -116,7 +177,14 @@ impl BeltGraph {
         });
         let analysis_scope = BeltAnalysisScope {
             connectivity_model_complete: unsupported_transports.is_empty(),
-            modeled_surface_belts: nodes.len() as u32,
+            modeled_surface_belts: nodes
+                .values()
+                .filter(|node| node.belt_to_ground_type.is_none())
+                .count() as u32,
+            modeled_underground_belts: nodes
+                .values()
+                .filter(|node| node.belt_to_ground_type.is_some())
+                .count() as u32,
             unsupported_transports,
         };
 
@@ -153,10 +221,13 @@ impl BeltGraph {
 
     /// Whether a belt at `target` can receive an item from `source`.
     pub fn can_receive_from(&self, target: &TilePos, source: &TilePos) -> bool {
-        self.nodes.get(target).is_some_and(|target| {
-            let [side_left, side_right] = target.side_input_tiles();
-            *source == target.primary_input_tile() || *source == side_left || *source == side_right
-        })
+        self.upstream_of(target).contains(source)
+            || self.nodes.get(target).is_some_and(|target| {
+                let [side_left, side_right] = target.side_input_tiles();
+                *source == target.primary_input_tile()
+                    || *source == side_left
+                    || *source == side_right
+            })
     }
 
     /// Get all belt positions in the graph
@@ -210,10 +281,53 @@ pub fn is_surface_transport_belt(entity: &Entity) -> bool {
         )
 }
 
+fn is_underground_transport_belt(entity: &Entity) -> bool {
+    entity.entity_type.as_deref() == Some("underground-belt")
+        && matches!(
+            entity.name.as_str(),
+            "underground-belt"
+                | "fast-underground-belt"
+                | "express-underground-belt"
+                | "turbo-underground-belt"
+        )
+}
+
 /// Whether an entity participates in item transport but is either modeled or
 /// deliberately reported as unsupported by the static belt graph.
 pub fn is_transport_entity(entity: &Entity) -> bool {
-    is_surface_transport_belt(entity) || unsupported_transport(entity).is_some()
+    is_surface_transport_belt(entity)
+        || is_underground_transport_belt(entity)
+        || unsupported_transport(entity).is_some()
+}
+
+fn add_edge(
+    downstream: &mut HashMap<TilePos, Vec<TilePos>>,
+    upstream: &mut HashMap<TilePos, Vec<TilePos>>,
+    from: TilePos,
+    to: TilePos,
+) {
+    let downstream_edges = downstream.entry(from).or_default();
+    if !downstream_edges.contains(&to) {
+        downstream_edges.push(to);
+    }
+    let upstream_edges = upstream.entry(to).or_default();
+    if !upstream_edges.contains(&from) {
+        upstream_edges.push(from);
+    }
+}
+
+fn unsupported_underground(entity: &Entity) -> UnsupportedTransport {
+    UnsupportedTransport {
+        unit_number: entity.unit_number,
+        name: entity.name.clone(),
+        entity_type: entity
+            .entity_type
+            .clone()
+            .unwrap_or_else(|| "underground-belt".to_string()),
+        position: entity.position.to_tile(),
+        occupied_tiles: entity_occupied_tiles(entity),
+        reason: UnsupportedTransportReason::UndergroundPairingNotModeled,
+    }
 }
 
 fn unsupported_transport(entity: &Entity) -> Option<UnsupportedTransport> {
@@ -265,7 +379,40 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         }
+    }
+
+    fn make_live_belt(x: i32, y: i32, dir: Direction, outputs: &[(i32, i32)]) -> Entity {
+        let mut belt = make_belt(x, y, dir);
+        belt.belt_neighbours_observed = true;
+        belt.belt_output_neighbours = outputs
+            .iter()
+            .map(|(x, y)| Position::new(*x as f64 + 0.5, *y as f64 + 0.5))
+            .collect();
+        belt
+    }
+
+    fn make_underground(
+        x: i32,
+        y: i32,
+        mode: &str,
+        neighbour: (i32, i32),
+        outputs: &[(i32, i32)],
+    ) -> Entity {
+        let mut belt = make_live_belt(x, y, Direction::East, outputs);
+        belt.name = "underground-belt".to_string();
+        belt.entity_type = Some("underground-belt".to_string());
+        belt.belt_to_ground_type = Some(mode.to_string());
+        belt.underground_belt_neighbour = Some(Position::new(
+            neighbour.0 as f64 + 0.5,
+            neighbour.1 as f64 + 0.5,
+        ));
+        belt
     }
 
     #[test]
@@ -374,6 +521,34 @@ mod tests {
         assert_eq!(
             graph.downstream_of(&TilePos::new(2, 0)),
             &[TilePos::new(3, 0)]
+        );
+    }
+
+    #[test]
+    fn authoritative_underground_pair_is_modeled_as_one_flow_path() {
+        let entities = vec![
+            make_live_belt(0, 0, Direction::East, &[(1, 0)]),
+            make_underground(1, 0, "input", (4, 0), &[]),
+            make_underground(4, 0, "output", (1, 0), &[(5, 0)]),
+            make_live_belt(5, 0, Direction::East, &[]),
+        ];
+
+        let graph = BeltGraph::from_entities(&entities);
+
+        assert!(graph.analysis_scope().connectivity_model_complete);
+        assert_eq!(graph.analysis_scope().modeled_surface_belts, 2);
+        assert_eq!(graph.analysis_scope().modeled_underground_belts, 2);
+        assert_eq!(
+            graph.downstream_of(&TilePos::new(0, 0)),
+            &[TilePos::new(1, 0)]
+        );
+        assert_eq!(
+            graph.downstream_of(&TilePos::new(1, 0)),
+            &[TilePos::new(4, 0)]
+        );
+        assert_eq!(
+            graph.downstream_of(&TilePos::new(4, 0)),
+            &[TilePos::new(5, 0)]
         );
     }
 

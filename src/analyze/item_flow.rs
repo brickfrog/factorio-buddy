@@ -566,6 +566,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         }
     }
 
@@ -591,7 +596,31 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         }
+    }
+
+    fn live_belt(x: i32, outputs: &[(i32, i32)]) -> Entity {
+        let mut entity = belt(x, 0, Direction::East);
+        entity.belt_neighbours_observed = true;
+        entity.belt_output_neighbours = outputs
+            .iter()
+            .map(|(x, y)| Position::new(*x as f64 + 0.5, *y as f64 + 0.5))
+            .collect();
+        entity
+    }
+
+    fn underground(x: i32, mode: &str, neighbour_x: i32, outputs: &[(i32, i32)]) -> Entity {
+        let mut entity = live_belt(x, outputs);
+        entity.name = "underground-belt".to_string();
+        entity.entity_type = Some("underground-belt".to_string());
+        entity.belt_to_ground_type = Some(mode.to_string());
+        entity.underground_belt_neighbour = Some(Position::new(neighbour_x as f64 + 0.5, 0.5));
+        entity
     }
 
     #[test]
@@ -646,6 +675,38 @@ mod tests {
         assert!(report.repair.is_none());
         assert!(!report.analysis_scope.connectivity_model_complete);
         assert_eq!(report.analysis_scope.unsupported_transports.len(), 1);
+    }
+
+    #[test]
+    fn reports_connected_flow_through_authoritative_underground_pair() {
+        let entities = vec![
+            live_belt(0, &[(1, 0)]),
+            underground(1, "input", 4, &[]),
+            underground(4, "output", 1, &[(5, 0)]),
+            live_belt(5, &[]),
+        ];
+
+        let report = analyze_item_flow(
+            &entities,
+            &[],
+            EntityLookup::Tile(TilePos::new(0, 0)),
+            EntityLookup::Tile(TilePos::new(5, 0)),
+        );
+
+        assert_eq!(report.status, "connected");
+        assert!(report.connected);
+        assert!(report.connectivity_certified);
+        assert_eq!(report.analysis_scope.modeled_underground_belts, 2);
+        assert!(report.analysis_scope.unsupported_transports.is_empty());
+        assert_eq!(
+            report.reachable_belts,
+            vec![
+                TilePos::new(0, 0),
+                TilePos::new(1, 0),
+                TilePos::new(4, 0),
+                TilePos::new(5, 0),
+            ]
+        );
     }
 
     #[test]

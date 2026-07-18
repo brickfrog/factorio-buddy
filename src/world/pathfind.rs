@@ -65,6 +65,9 @@ pub struct RoutingOptions {
     pub underground_penalty: f64,
     /// Cost per tile when underground (default: 0.05)
     pub underground_skip_cost: f64,
+    /// Tiles where an underground endpoint may not be placed. Surface belts
+    /// may still cross these tiles.
+    pub underground_forbidden_tiles: HashSet<GridPos>,
 }
 
 impl Default for RoutingOptions {
@@ -74,6 +77,7 @@ impl Default for RoutingOptions {
             underground_config: None,
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
+            underground_forbidden_tiles: HashSet::new(),
         }
     }
 }
@@ -507,7 +511,12 @@ pub fn find_belt_route_with_options(
 
         // Explore underground jumps if enabled
         if let Some(ref ug_config) = options.underground_config {
-            if options.allow_underground && !current.state.arrived_underground {
+            if options.allow_underground
+                && !current.state.arrived_underground
+                && !options
+                    .underground_forbidden_tiles
+                    .contains(&current.state.pos)
+            {
                 for direction in [
                     Direction::North,
                     Direction::East,
@@ -524,7 +533,9 @@ pub fn find_belt_route_with_options(
                         };
 
                         // Check exit is walkable (entry is current pos, already validated)
-                        if !collision_map.is_walkable(&exit_pos) {
+                        if !collision_map.is_walkable(&exit_pos)
+                            || options.underground_forbidden_tiles.contains(&exit_pos)
+                        {
                             continue;
                         }
 
@@ -1323,6 +1334,7 @@ mod tests {
             }),
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
+            underground_forbidden_tiles: HashSet::new(),
         };
         let result_with_underground = find_belt_route_with_options(
             GridPos::new(0, 0),
@@ -1364,6 +1376,7 @@ mod tests {
             }),
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
+            underground_forbidden_tiles: HashSet::new(),
         };
         let result = find_belt_route_with_options(
             GridPos::new(0, 0),
@@ -1401,6 +1414,7 @@ mod tests {
             }),
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
+            underground_forbidden_tiles: HashSet::new(),
         };
 
         let result = find_belt_route_with_options(
@@ -1440,6 +1454,7 @@ mod tests {
             }),
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
+            underground_forbidden_tiles: HashSet::new(),
         };
 
         let result = find_belt_route_with_options(
@@ -1475,6 +1490,7 @@ mod tests {
             }),
             underground_penalty: 0.5,
             underground_skip_cost: 0.05,
+            underground_forbidden_tiles: HashSet::new(),
         };
 
         let result = find_belt_route_with_options(
@@ -1494,6 +1510,41 @@ mod tests {
         // Second belt should be underground exit
         assert_eq!(result.belts[1].kind, BeltKind::UndergroundExit);
         assert_eq!(result.belts[1].direction, Direction::East);
+    }
+
+    #[test]
+    fn underground_endpoint_exclusions_keep_surface_route_endpoints() {
+        let bounds = Area {
+            left_top: Position::new(-5.0, -5.0),
+            right_bottom: Position::new(10.0, 5.0),
+        };
+        let collision_map = CollisionMap::new(bounds);
+        let mut underground_forbidden_tiles = HashSet::new();
+        underground_forbidden_tiles.insert(GridPos::new(0, 0));
+        underground_forbidden_tiles.insert(GridPos::new(5, 0));
+        let options = RoutingOptions {
+            allow_underground: true,
+            underground_config: Some(UndergroundConfig {
+                max_distance: 4,
+                entity_name: "underground-belt".into(),
+                required_tech: "logistics".into(),
+            }),
+            underground_penalty: 0.5,
+            underground_skip_cost: 0.05,
+            underground_forbidden_tiles,
+        };
+
+        let result = find_belt_route_with_options(
+            GridPos::new(0, 0),
+            GridPos::new(5, 0),
+            &collision_map,
+            &options,
+        );
+
+        assert!(result.success);
+        assert_eq!(result.belts.first().unwrap().kind, BeltKind::Surface);
+        assert_eq!(result.belts.last().unwrap().kind, BeltKind::Surface);
+        assert!(result.topology.unwrap().connected);
     }
 
     #[test]

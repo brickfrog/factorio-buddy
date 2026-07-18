@@ -444,6 +444,11 @@ mod tests {
             bounding_box: Some(Area::new(2.1, -0.9, 4.9, 1.9)),
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
 
         let occupied = entity_occupied_tiles(&entity);
@@ -465,6 +470,11 @@ mod tests {
             bounding_box: None,
             pickup_position: None,
             drop_position: None,
+            belt_to_ground_type: None,
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
         };
 
         let occupied = entity_occupied_tiles(&entity);
