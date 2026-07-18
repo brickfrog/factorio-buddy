@@ -176,16 +176,29 @@ local function normalize_direction(direction)
     return nil
 end
 
-local function entity_tile_size(entity_name)
-    if entity_name == "burner-mining-drill" then return 2 end
-    if entity_name == "electric-mining-drill" then return 3 end
-
+local function entity_tile_dimensions(entity_name)
     local proto = prototypes.entity[entity_name]
-    if not (proto and proto.collision_box) then return 1 end
+    if not proto then return 1, 1 end
+    if proto.tile_width and proto.tile_height then
+        return proto.tile_width, proto.tile_height
+    end
+    if not proto.collision_box then return 1, 1 end
     local cb = proto.collision_box
-    local width = math.floor((cb.right_bottom.x - cb.left_top.x) + 0.5)
-    local height = math.floor((cb.right_bottom.y - cb.left_top.y) + 0.5)
+    local width = math.ceil(cb.right_bottom.x - cb.left_top.x)
+    local height = math.ceil(cb.right_bottom.y - cb.left_top.y)
+    return math.max(1, width), math.max(1, height)
+end
+
+local function entity_tile_size(entity_name)
+    local width, height = entity_tile_dimensions(entity_name)
     return math.max(1, width, height)
+end
+
+local function entity_tile_position(entity_name, tile_x, tile_y)
+    local width, height = entity_tile_dimensions(entity_name)
+    local x_offset = width % 2 == 1 and 0.5 or 0.0
+    local y_offset = height % 2 == 1 and 0.5 or 0.0
+    return {tile_x + x_offset, tile_y + y_offset}
 end
 
 local function mining_drill_output_tile(entity_name, position, direction)
@@ -957,7 +970,7 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
     }
 
     local belt_tile = output.belt_tile
-    local belt_position = {belt_tile.x, belt_tile.y}
+    local belt_position = entity_tile_position(belt_name, belt_tile.x, belt_tile.y)
     local existing_belt = entity_on_tile(surface, belt_name, belt_tile.x, belt_tile.y)
     local belt_can_place, belt_error, belt_details = can_place(surface, force, belt_name, belt_position, output.belt_direction, character)
     local belt_ready = belt_can_place or existing_belt ~= nil
@@ -977,22 +990,32 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
     local candidates = {}
     for _, pickup_dir in pairs(directions) do
         local vec = direction_vector(pickup_dir)
-        local inserter_pos = {belt_tile.x - vec.x, belt_tile.y - vec.y}
+        local inserter_pos = entity_tile_position(
+            inserter_name,
+            belt_tile.x - vec.x,
+            belt_tile.y - vec.y
+        )
         local drop_tile = {x = belt_tile.x - (vec.x * 2), y = belt_tile.y - (vec.y * 2)}
         local inserter_ok, inserter_error = can_place(surface, force, inserter_name, inserter_pos, pickup_dir, character)
+        local inserter_area = placement_area(inserter_name, inserter_pos, 0.0)
         if inserter_ok then
             for dx = -radius, radius do
                 for dy = -radius, radius do
-                    local furnace_pos = {belt_tile.x + dx, belt_tile.y + dy}
+                    local furnace_pos = entity_tile_position(
+                        furnace_name,
+                        belt_tile.x + dx,
+                        belt_tile.y + dy
+                    )
                     local furnace_area = placement_area(furnace_name, furnace_pos, 0.0)
                     if area_contains_tile_center(furnace_area, drop_tile) then
                         local furnace_ok, furnace_error = can_place(surface, force, furnace_name, furnace_pos, 0, character)
+                        local entity_overlap = areas_overlap(furnace_area, inserter_area)
                         local distance = math.sqrt(dx * dx + dy * dy)
                         table.insert(candidates, {
                             distance = distance,
                             output_belt = {
                                 entity = belt_name,
-                                position = {x = belt_tile.x, y = belt_tile.y},
+                                position = {x = belt_position[1], y = belt_position[2]},
                                 direction = output.belt_direction,
                                 direction_name = direction_name(output.belt_direction),
                                 existing_unit_number = existing_belt and existing_belt.unit_number or nil,
@@ -1014,9 +1037,10 @@ function M.build_direct_smelter(agent_id, drill_unit_number, output_x, output_y,
                                 direction_name = direction_name(0),
                                 input_tile = drop_tile,
                                 can_place = furnace_ok,
-                                error = furnace_error,
+                                overlaps_input_inserter = entity_overlap,
+                                error = entity_overlap and "Furnace footprint overlaps the input inserter." or furnace_error,
                             },
-                            ready = furnace_ok,
+                            ready = furnace_ok and not entity_overlap,
                         })
                     end
                 end

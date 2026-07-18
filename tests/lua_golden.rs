@@ -2049,8 +2049,14 @@ fn inserter_mutations_report_engine_geometry_and_direct_smelter_uses_pickup_dire
     for required in [
         "result.pickup_position = pos_table(entity.pickup_position)",
         "result.drop_position = pos_table(entity.drop_position)",
-        "local inserter_pos = {belt_tile.x - vec.x, belt_tile.y - vec.y}",
+        "if proto.tile_width and proto.tile_height then",
+        "return proto.tile_width, proto.tile_height",
+        "local inserter_pos = entity_tile_position(",
         "local drop_tile = {x = belt_tile.x - (vec.x * 2), y = belt_tile.y - (vec.y * 2)}",
+        "local furnace_pos = entity_tile_position(",
+        "local inserter_area = placement_area(inserter_name, inserter_pos, 0.0)",
+        "local entity_overlap = areas_overlap(furnace_area, inserter_area)",
+        "ready = furnace_ok and not entity_overlap",
         "direction = pickup_dir",
     ] {
         assert!(

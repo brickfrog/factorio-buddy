@@ -3006,6 +3006,121 @@ assert_json "the native splitter keeps the original trunk and new branch carryin
     "$SPLITTER_FLOW" \
     '.main > 0 and .branch > 0'
 
+# Direct-smelter candidates must apply the same compound footprint invariant as
+# execution. The planner used to mark an individually legal furnace and
+# inserter ready even when their two footprints occupied the same tile.
+DIRECT_SMELTER_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{16, 23}, {36, 33}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({30.5, 31.5})
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'stone-furnace', count = 1}
+inv.insert{name = 'burner-inserter', count = 1}
+inv.insert{name = 'transport-belt', count = 1}
+inv.insert{name = 'coal', count = 50}
+local belt = s.create_entity{
+    name = 'transport-belt', position = {24.5, 27.5},
+    direction = defines.direction.east, force = c.force
+}
+local inserted = 0
+for line_index = 1, 2 do
+    for _ = 1, 8 do
+        if belt.get_transport_line(line_index).insert_at_back({name = 'iron-ore', count = 1}) then
+            inserted = inserted + 1
+        end
+    end
+end
+rcon.print(helpers.table_to_json({
+    belt_unit = belt and belt.unit_number or nil,
+    inserted = inserted,
+    furnaces = inv.get_item_count('stone-furnace'),
+    inserters = inv.get_item_count('burner-inserter'),
+    coal = inv.get_item_count('coal')
+}))
+")"
+require_json "direct-smelter fixture has a live terminal ore belt and exact materials" \
+    "$DIRECT_SMELTER_FIXTURE" \
+    '.inserted == 2
+     and (.belt_unit | type) == "number"
+     and .furnaces == 1
+     and .inserters == 1
+     and .coal == 50'
+
+DIRECT_SMELTER_PLAN="$(mcp_tool execute_direct_smelter '{
+    "output_x":24.5,
+    "output_y":27.5,
+    "output_direction":"east",
+    "furnace_name":"stone-furnace",
+    "inserter_name":"burner-inserter",
+    "belt_name":"transport-belt",
+    "radius":6,
+    "dry_run":true
+}')"
+DIRECT_SMELTER_PLAN_PAYLOAD="$(tool_payload "$DIRECT_SMELTER_PLAN")"
+assert_json "direct-smelter dry-run selects disjoint furnace and inserter footprints" \
+    "$DIRECT_SMELTER_PLAN_PAYLOAD" \
+    '.success == true
+     and .dry_run == true
+     and .preflight.ready == true
+     and .plan.success == true
+     and .plan.selected.ready == true
+     and .plan.selected.furnace.overlaps_input_inserter == false
+     and (.plan.selected.furnace.position != .plan.selected.input_inserter.position)
+     and (all(.preflight.errors[]?; .kind != "entity_footprint_overlap"))'
+
+DIRECT_SMELTER_EXECUTE="$(mcp_tool execute_direct_smelter '{
+    "output_x":24.5,
+    "output_y":27.5,
+    "output_direction":"east",
+    "furnace_name":"stone-furnace",
+    "inserter_name":"burner-inserter",
+    "belt_name":"transport-belt",
+    "radius":6,
+    "dry_run":false
+}')"
+DIRECT_SMELTER_EXECUTE_PAYLOAD="$(tool_payload "$DIRECT_SMELTER_EXECUTE")"
+assert_json "direct-smelter executes and verifies the selected non-overlapping cell" \
+    "$DIRECT_SMELTER_EXECUTE_PAYLOAD" \
+    '.success == true
+     and .placement_success == true
+     and .automation_verified.success == true
+     and .automation_verified.furnace_working == true
+     and .automation_verified.placed_units_exist == true
+     and .preflight.ready == true'
+
+DIRECT_SMELTER_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local furnace = s.find_entities_filtered{name = 'stone-furnace', area = {{16, 23}, {36, 33}}}[1]
+local inserter = s.find_entities_filtered{name = 'burner-inserter', area = {{16, 23}, {36, 33}}}[1]
+local overlap = nil
+if furnace and inserter then
+    local a = furnace.bounding_box
+    local b = inserter.bounding_box
+    overlap = a.left_top.x < b.right_bottom.x
+        and a.right_bottom.x > b.left_top.x
+        and a.left_top.y < b.right_bottom.y
+        and a.right_bottom.y > b.left_top.y
+end
+rcon.print(helpers.table_to_json({
+    furnace_unit = furnace and furnace.unit_number or nil,
+    inserter_unit = inserter and inserter.unit_number or nil,
+    furnace_position = furnace and furnace.position or nil,
+    inserter_position = inserter and inserter.position or nil,
+    bounding_boxes_overlap = overlap
+}))
+")"
+require_json "executed direct-smelter entities have distinct identities and disjoint live bounding boxes" \
+    "$DIRECT_SMELTER_WORLD" \
+    '(.furnace_unit | type) == "number"
+     and (.inserter_unit | type) == "number"
+     and .furnace_unit != .inserter_unit
+     and .furnace_position != .inserter_position
+     and .bounding_boxes_overlap == false'
+
 # Resource patches are extraction capacity, not forbidden terrain. Ordinary
 # Factorio-valid infrastructure may overlap them with an advisory, compact belt
 # routes may cross them, and the ore must remain intact. Mining drills retain
