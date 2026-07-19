@@ -1743,6 +1743,16 @@ impl FactorioClient {
         water_area: Area,
         target: Position,
     ) -> Result<serde_json::Value> {
+        self.plan_steam_power_with_intent(water_area, target, None)
+            .await
+    }
+
+    pub async fn plan_steam_power_with_intent(
+        &mut self,
+        water_area: Area,
+        target: Position,
+        intent: Option<&str>,
+    ) -> Result<serde_json::Value> {
         let response = self
             .call_remote(
                 "plan_steam_power",
@@ -1754,6 +1764,7 @@ impl FactorioClient {
                     json!(water_area.right_bottom.y),
                     json!(target.x),
                     json!(target.y),
+                    intent.map_or(Value::Null, |value| json!(value)),
                 ],
             )
             .await?;

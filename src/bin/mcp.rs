@@ -6874,6 +6874,8 @@ pub struct PlanSteamPowerParams {
     pub target_x: f64,
     /// Y coordinate that should receive power, such as a lab or factory core
     pub target_y: f64,
+    /// Use additional_capacity to plan a separate additive plant
+    pub intent: Option<String>,
 }
 
 /// Parameters for dry-run steam-power repair planning.
@@ -16093,7 +16095,7 @@ impl FactorioMcp {
 
     /// Plan a checked steam-power layout before placing fluid entities.
     #[tool(
-        description = "Plan starter steam power without mutating the game. Given a water bounding box and target position, returns checked offshore-pump, boiler, steam-engine, pipe, fuel, and pole placement arguments plus blockers/missing materials. Use before placing or rebuilding pump/boiler/engine layouts."
+        description = "Plan checked steam power without mutation. Set intent=additional_capacity to add a separate plant beside existing steam power."
     )]
     async fn plan_steam_power(
         &self,
@@ -16111,7 +16113,10 @@ impl FactorioMcp {
             params.water_y2,
         );
         let target = Position::new(params.target_x, params.target_y);
-        let result = match client.plan_steam_power(water_area, target).await {
+        let result = match client
+            .plan_steam_power_with_intent(water_area, target, params.intent.as_deref())
+            .await
+        {
             Ok(value) => {
                 serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
             }

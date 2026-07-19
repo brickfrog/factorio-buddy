@@ -1663,9 +1663,19 @@ function M.get_alerts(character, x, y, radius)
     return alerts
 end
 
-function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
+function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, target_x, target_y, intent)
     if not (character and character.valid) then
         return {success = false, error = "no character; spawn first", blockers = {"no_character"}}
+    end
+    local plan_intent = intent or "starter"
+    if plan_intent == "expand" then plan_intent = "additional_capacity" end
+    if plan_intent ~= "starter" and plan_intent ~= "additional_capacity" then
+        return {
+            success = false,
+            error = "intent must be starter or additional_capacity",
+            error_kind = "invalid_steam_plan_intent",
+            blockers = {"invalid_intent"},
+        }
     end
     local surface = character.surface
     local force = character.force
@@ -1690,10 +1700,19 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
         diagnostic_center.y,
         diagnostic_radius
     )
-    if existing_diagnostic.has_existing_plant then
+    local auto_selected_intent = false
+    if existing_diagnostic.has_existing_plant
+        and existing_diagnostic.status == "ok"
+        and plan_intent == "starter"
+    then
+        plan_intent = "additional_capacity"
+        auto_selected_intent = true
+    end
+    if existing_diagnostic.has_existing_plant and plan_intent ~= "additional_capacity" then
         return {
             success = false,
             placement_success = false,
+            intent = plan_intent,
             water_area = water_area,
             target = target,
             checked = 0,
@@ -1704,10 +1723,22 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
             blockers = {
                 {
                     type = "existing_steam_power_found",
-                    message = "Existing steam-power entities found in the requested area; diagnose and repair them before planning a rebuild.",
+                    message = "Existing steam power found. Repair it, or request intent=additional_capacity for a separate additive plant.",
                 },
             },
-            guidance = "Existing steam power was found. Use existing_plant.issues and suggested_actions, then call diagnose_steam_power and get_power_status again before rebuilding.",
+            suggested_next_tool = {
+                tool = "plan_steam_power",
+                tool_args = {
+                    water_x1 = water_x1,
+                    water_y1 = water_y1,
+                    water_x2 = water_x2,
+                    water_y2 = water_y2,
+                    target_x = target_x,
+                    target_y = target_y,
+                    intent = "additional_capacity",
+                },
+            },
+            guidance = "Use existing_plant.issues for repairs. If the plant is healthy but undersized, call suggested_next_tool to plan separate added capacity.",
         }
     end
 
@@ -1763,6 +1794,9 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
     local result = {
         success = best_plan ~= nil and #missing == 0,
         placement_success = best_plan ~= nil,
+        intent = plan_intent,
+        auto_selected_intent = auto_selected_intent,
+        existing_plant = existing_diagnostic.has_existing_plant and existing_diagnostic or nil,
         water_area = water_area,
         target = target,
         checked = checked,
@@ -1770,7 +1804,9 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
         missing_items = missing,
         plan = selected_plan,
         blockers = {},
-        guidance = "Place components using plan.*.place_args, build a durable coal belt/inserter feed to plan.fuel_target, then call diagnose_steam_power and get_power_status.",
+        guidance = plan_intent == "additional_capacity"
+            and "This plan adds a separate pump, boiler, and engine without replacing the existing plant. Place plan.*.place_args, automate plan.fuel_target, then verify total power."
+            or "Place components using plan.*.place_args, build a durable coal belt/inserter feed to plan.fuel_target, then call diagnose_steam_power and get_power_status.",
     }
 
     if not best_plan then

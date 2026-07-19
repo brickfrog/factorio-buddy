@@ -3851,6 +3851,95 @@ assert_json "dense-patch output belt leaves the resource entities intact" "$DENS
      and .resource_amount <= 224000
      and .resource_amount > 223000'
 
+# Existing steam entities must not make additive capacity a planner dead end.
+# The conservative default still diagnoses/redirects an unhealthy footprint;
+# explicit additional_capacity must run the checked independent-plant search.
+STEAM_EXPANSION_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{112, -80}, {140, -60}}}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+local tiles = {}
+for x = 112, 139 do
+    for y = -80, -61 do
+        table.insert(tiles, {
+            name = x <= 116 and 'water' or 'landfill',
+            position = {x, y},
+        })
+    end
+end
+s.set_tiles(tiles, true)
+local existing = s.create_entity{
+    name = 'steam-engine', position = {132.5, -70.5},
+    direction = defines.direction.north, force = c.force
+}
+local inv = c.get_main_inventory()
+inv.insert{name = 'offshore-pump', count = 2}
+inv.insert{name = 'boiler', count = 2}
+inv.insert{name = 'steam-engine', count = 2}
+inv.insert{name = 'pipe', count = 20}
+inv.insert{name = 'small-electric-pole', count = 20}
+rcon.print(helpers.table_to_json({
+    existing_unit = existing and existing.unit_number or nil,
+    pumps = s.count_entities_filtered{name = 'offshore-pump', area = {{112, -80}, {140, -60}}},
+    boilers = s.count_entities_filtered{name = 'boiler', area = {{112, -80}, {140, -60}}},
+    engines = s.count_entities_filtered{name = 'steam-engine', area = {{112, -80}, {140, -60}}},
+}))
+")"
+require_json "steam expansion fixture has an existing plant footprint and open shoreline" \
+    "$STEAM_EXPANSION_FIXTURE" \
+    '(.existing_unit | type) == "number"
+     and .pumps == 0 and .boilers == 0 and .engines == 1'
+
+STEAM_STARTER_REDIRECT="$(mcp_tool plan_steam_power '{
+    "water_x1":112,"water_y1":-80,"water_x2":116,"water_y2":-61,
+    "target_x":136,"target_y":-70
+}')"
+STEAM_STARTER_REDIRECT_PAYLOAD="$(tool_payload "$STEAM_STARTER_REDIRECT")"
+require_json "starter steam planning names the exact additive-capacity escape hatch" \
+    "$STEAM_STARTER_REDIRECT_PAYLOAD" \
+    '.success == false
+     and .checked == 0
+     and .existing_plant.has_existing_plant == true
+     and any(.blockers[]; .type == "existing_steam_power_found")
+     and .suggested_next_tool.tool == "plan_steam_power"
+     and .suggested_next_tool.tool_args.intent == "additional_capacity"'
+
+STEAM_ADDITIVE_PLAN="$(mcp_tool plan_steam_power '{
+    "water_x1":112,"water_y1":-80,"water_x2":116,"water_y2":-61,
+    "target_x":136,"target_y":-70,"intent":"additional_capacity"
+}')"
+STEAM_ADDITIVE_PAYLOAD="$(tool_payload "$STEAM_ADDITIVE_PLAN")"
+require_json "additive steam planning checks a complete independent capacity layout" \
+    "$STEAM_ADDITIVE_PAYLOAD" \
+    --argjson fixture "$STEAM_EXPANSION_FIXTURE" \
+    '.success == true
+     and .placement_success == true
+     and .intent == "additional_capacity"
+     and .auto_selected_intent == false
+     and .existing_plant.has_existing_plant == true
+     and any(.existing_plant.entities[]; .unit_number == $fixture.existing_unit)
+     and .checked > 0
+     and .pump_candidates > 0
+     and (.missing_items | length) == 0
+     and .plan.success == true
+     and .plan.offshore_pump.allowed == true
+     and .plan.boiler.allowed == true
+     and .plan.steam_engine.allowed == true
+     and (.guidance | contains("separate pump, boiler, and engine"))'
+
+STEAM_ADDITIVE_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+rcon.print(helpers.table_to_json({
+    pumps = s.count_entities_filtered{name = 'offshore-pump', area = {{112, -80}, {140, -60}}},
+    boilers = s.count_entities_filtered{name = 'boiler', area = {{112, -80}, {140, -60}}},
+    engines = s.count_entities_filtered{name = 'steam-engine', area = {{112, -80}, {140, -60}}},
+}))
+")"
+assert_json "additive steam planning remains a non-mutating contract" \
+    "$STEAM_ADDITIVE_WORLD" '.pumps == 0 and .boilers == 0 and .engines == 1'
+
 DISCONNECTED_ENGINE_FIXTURE="$(raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local s = c.surface

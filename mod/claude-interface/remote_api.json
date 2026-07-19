@@ -90,7 +90,7 @@
     "place_ghost": {"args": ["agent_id", "entity_name", "x", "y", "direction"], "returns": "json"},
     "place_underground_belt": {"args": ["agent_id", "entity_name", "x", "y", "direction", "belt_type"], "returns": "json"},
     "plan_entity_placement_near": {"args": ["agent_id", "entity_name", "target_x", "target_y", "radius", "limit"], "returns": "json"},
-    "plan_steam_power": {"args": ["agent_id", "water_x1", "water_y1", "water_x2", "water_y2", "target_x", "target_y"], "returns": "json"},
+    "plan_steam_power": {"args": ["agent_id", "water_x1", "water_y1", "water_x2", "water_y2", "target_x", "target_y", "intent"], "returns": "json"},
     "ping": {"args": [], "returns": "nil"},
     "repair_steam_power": {"args": ["agent_id", "x", "y", "radius", "target_x", "target_y"], "returns": "json"},
     "remove_entity": {"args": ["agent_id", "unit_number", "dry_run"], "returns": "json"},

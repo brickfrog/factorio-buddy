@@ -769,7 +769,7 @@ local function scoped_character(agent_id)
     return find_factorioctl_character(agent_id or "default")
 end
 
-local function plan_steam_power_impl(agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
+local function plan_steam_power_impl(agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y, intent)
     local character = find_factorioctl_character(agent_id)
     if not (character and character.valid) then
         return {
@@ -778,7 +778,7 @@ local function plan_steam_power_impl(agent_id, water_x1, water_y1, water_x2, wat
             blockers = {"no_character"},
         }
     end
-    return power.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
+    return power.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, target_x, target_y, intent)
 end
 
 local function repair_steam_power_impl(agent_id, x, y, radius, target_x, target_y)
@@ -2332,9 +2332,9 @@ local api = {
         return json_remote_call("diagnose_steam_power", power.diagnose_steam_power, scoped_character(agent_id), x, y, radius)
     end,
 
-    -- Plan a checked starter steam-power layout before mutating the world.
-    plan_steam_power = function(agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
-        return json_remote_call("plan_steam_power", plan_steam_power_impl, agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)
+    -- Plan checked starter or additive steam power before mutating the world.
+    plan_steam_power = function(agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y, intent)
+        return json_remote_call("plan_steam_power", plan_steam_power_impl, agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y, intent)
     end,
 
     -- Plan dry-run repairs for an existing steam-power plant.

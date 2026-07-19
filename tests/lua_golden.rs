@@ -3395,6 +3395,7 @@ fn steam_power_planner_uses_mod_remote_not_inline_lua() {
             json!(57),
             json!(55),
             json!(-2),
+            Value::Null,
         ]
     );
     for forbidden in [
@@ -3477,13 +3478,19 @@ fn steam_power_planner_lives_in_power_module() {
         control_lua.contains(r#"local power = require("power")"#)
             && control_lua.contains("local function plan_steam_power_impl")
             && control_lua.contains(
-                r#"json_remote_call("plan_steam_power", plan_steam_power_impl, agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y)"#
+                r#"json_remote_call("plan_steam_power", plan_steam_power_impl, agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y, intent)"#
             ),
         "control.lua should expose the steam-power planner through the power module"
     );
 
     for required in [
-        "function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, target_x, target_y)",
+        "function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, target_x, target_y, intent)",
+        "plan_intent == \"expand\"",
+        "plan_intent ~= \"additional_capacity\"",
+        "existing_diagnostic.status == \"ok\"",
+        "auto_selected_intent = true",
+        "intent = \"additional_capacity\"",
+        "This plan adds a separate pump, boiler, and engine",
         "local BOILER_FLUID_LAYOUTS",
         "local pipe_center = pos(pipe_pos.x + 0.5, pipe_pos.y + 0.5)",
         "steam_target.x - fluid_layout.engine_input.x",

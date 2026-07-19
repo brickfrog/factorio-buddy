@@ -1244,6 +1244,7 @@ impl LuaCommand {
                 water_area.right_bottom.y.to_string(),
                 target.x.to_string(),
                 target.y.to_string(),
+                "nil".to_string(),
             ],
             "Run just sync/resume so the updated claude-interface mod is loaded before planning steam power.",
         )
