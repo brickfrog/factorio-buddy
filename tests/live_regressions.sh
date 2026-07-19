@@ -2633,6 +2633,166 @@ assert_json "factory diagnosis promotes the dead-end belt lane and groups its sy
      and all(.blockers[]; .unit_number != $feeder)
      and .suggested_actions[0].tool == "get_belt_lane_contents"'
 
+# A physically closed belt ring has no terminal tile for the dead-end detector.
+# When both lanes throughout the ring are saturated and a feeder is blocked,
+# diagnosis must promote the cycle rather than repeat the feeder symptom.
+SATURATED_CYCLE_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{-47, -32}, {-34, -22}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local belts = {
+    s.create_entity{name = 'transport-belt', position = {-41.5, -27.5}, direction = defines.direction.east, force = c.force},
+    s.create_entity{name = 'transport-belt', position = {-40.5, -27.5}, direction = defines.direction.south, force = c.force},
+    s.create_entity{name = 'transport-belt', position = {-40.5, -26.5}, direction = defines.direction.west, force = c.force},
+    s.create_entity{name = 'transport-belt', position = {-41.5, -26.5}, direction = defines.direction.north, force = c.force},
+}
+local chest = s.create_entity{name = 'wooden-chest', position = {-43.5, -27.5}, force = c.force}
+local feeder = s.create_entity{
+    name = 'burner-inserter', position = {-42.5, -27.5},
+    direction = defines.direction.west, force = c.force
+}
+if not (belts[1] and belts[2] and belts[3] and belts[4] and chest and feeder) then
+    error('failed to create saturated belt cycle fixture')
+end
+chest.insert{name = 'iron-plate', count = 100}
+feeder.get_fuel_inventory().insert{name = 'coal', count = 5}
+local all_saturated = true
+local lane_count = 0
+for _, belt in ipairs(belts) do
+    for line_index = 1, 2 do
+        local line = belt.get_transport_line(line_index)
+        local capacity = math.floor(line.line_length * 4 + 0.5)
+        for slot = 1, capacity do
+            line.force_insert_at((slot - 0.5) / 4, {name = 'copper-plate', count = 1})
+        end
+        local count = line.get_item_count()
+        if count < capacity or line.can_insert_at_back() then all_saturated = false end
+        lane_count = lane_count + 1
+    end
+end
+local units = {}
+for _, belt in ipairs(belts) do table.insert(units, belt.unit_number) end
+rcon.print(helpers.table_to_json({
+    belt_units = units,
+    feeder_unit = feeder.unit_number,
+    lane_count = lane_count,
+    all_saturated = all_saturated,
+}))
+")"
+require_json "cycle fixture has four closed belts with every lane saturated" \
+    "$SATURATED_CYCLE_FIXTURE" \
+    '.all_saturated == true
+     and .lane_count == 8
+     and (.belt_units | length) == 4
+     and (.feeder_unit | type) == "number"'
+SATURATED_CYCLE_FEEDER_UNIT="$(jq -r '.feeder_unit' <<<"$SATURATED_CYCLE_FIXTURE")"
+SATURATED_CYCLE_UNITS="$(jq -c '.belt_units | sort' <<<"$SATURATED_CYCLE_FIXTURE")"
+SATURATED_CYCLE_FEEDER_STATUS='{}'
+for _ in $(seq 1 100); do
+    SATURATED_CYCLE_FEEDER_STATUS="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local feeder = nil
+for _, entity in pairs(s.find_entities_filtered{type = 'inserter', area = {{-44, -29}, {-41, -26}}}) do
+    if entity.unit_number == $SATURATED_CYCLE_FEEDER_UNIT then feeder = entity break end
+end
+local status = feeder and feeder.status or nil
+local status_name = nil
+for name, value in pairs(defines.entity_status) do
+    if value == status then status_name = name break end
+end
+rcon.print(helpers.table_to_json({status = status_name}))
+")"
+    if jq -e '.status == "waiting_for_space_in_destination"' \
+        >/dev/null 2>&1 <<<"$SATURATED_CYCLE_FEEDER_STATUS"; then
+        break
+    fi
+    sleep 0.1
+done
+require_json "saturated closed ring back-pressures its live feeder" \
+    "$SATURATED_CYCLE_FEEDER_STATUS" \
+    '.status == "waiting_for_space_in_destination"'
+
+SATURATED_CYCLE_DIAGNOSIS="$(mcp_tool diagnose_factory_blockers \
+    '{"x":-41,"y":-27,"radius":6,"limit":20}')"
+SATURATED_CYCLE_PAYLOAD="$(tool_payload "$SATURATED_CYCLE_DIAGNOSIS")"
+assert_json "factory diagnosis promotes a saturated belt cycle and one exact break point" \
+    "$SATURATED_CYCLE_PAYLOAD" \
+    --argjson feeder "$SATURATED_CYCLE_FEEDER_UNIT" \
+    --argjson units "$SATURATED_CYCLE_UNITS" \
+    '.root_cause.type == "saturated_belt_cycle"
+     and .root_cause.severity == "critical"
+     and .root_cause.cycle.belt_count == 4
+     and .root_cause.cycle.all_lanes_saturated == true
+     and ([.root_cause.cycle.unit_numbers[]] | sort) == $units
+     and (.root_cause.stalled_lanes | length) == 8
+     and all(.root_cause.stalled_lanes[]; .saturated == true)
+     and .root_cause.grouped_symptom_count >= 1
+     and any(.root_cause.grouped_symptoms[]; .unit_number == $feeder)
+     and (.root_cause.break_point.belt_unit_number as $break
+         | any($units[]; . == $break))
+     and all(.blockers[]; .unit_number != $feeder)
+     and .suggested_actions[0].type == "drain_or_reroute_cycle"'
+
+# An empty force research queue is a global demand stop. Powered labs in that
+# state must be promoted ahead of the many downstream outputs that may back up.
+EMPTY_RESEARCH_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local force = c.force
+if force.current_research then force.cancel_current_research() end
+if force.research_queue then force.research_queue = {} end
+for _, entity in pairs(s.find_entities_filtered{area = {{40, -32}, {61, -21}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local interface = s.create_entity{name = 'electric-energy-interface', position = {43, -27}, force = force}
+local substation = s.create_entity{name = 'substation', position = {47, -27}, force = force}
+local first = s.create_entity{name = 'lab', position = {52.5, -29.5}, force = force}
+local second = s.create_entity{name = 'lab', position = {52.5, -24.5}, force = force}
+if not (interface and substation and first and second) then
+    error('failed to create empty research queue fixture')
+end
+rcon.print(helpers.table_to_json({
+    first_lab_unit = first.unit_number,
+    second_lab_unit = second.unit_number,
+    current_research = force.current_research and force.current_research.name or nil,
+    queue_count = force.research_queue and #force.research_queue or 0,
+}))
+")"
+require_json "empty-research fixture has two powered candidate labs and no queued technology" \
+    "$EMPTY_RESEARCH_FIXTURE" \
+    '(.first_lab_unit | type) == "number"
+     and (.second_lab_unit | type) == "number"
+     and .current_research == null
+     and .queue_count == 0'
+EMPTY_RESEARCH_FIRST_UNIT="$(jq -r '.first_lab_unit' <<<"$EMPTY_RESEARCH_FIXTURE")"
+EMPTY_RESEARCH_SECOND_UNIT="$(jq -r '.second_lab_unit' <<<"$EMPTY_RESEARCH_FIXTURE")"
+EMPTY_RESEARCH_DIAGNOSIS='{}'
+for _ in $(seq 1 100); do
+    EMPTY_RESEARCH_CALL="$(mcp_tool diagnose_factory_blockers \
+        '{"x":52,"y":-27,"radius":8,"limit":20}')"
+    EMPTY_RESEARCH_DIAGNOSIS="$(tool_payload "$EMPTY_RESEARCH_CALL")"
+    if jq -e '.root_cause.type == "research_queue_empty"' \
+        >/dev/null 2>&1 <<<"$EMPTY_RESEARCH_DIAGNOSIS"; then
+        break
+    fi
+    sleep 0.1
+done
+assert_json "factory diagnosis promotes an empty research queue over lab peer symptoms" \
+    "$EMPTY_RESEARCH_DIAGNOSIS" \
+    --argjson first "$EMPTY_RESEARCH_FIRST_UNIT" \
+    --argjson second "$EMPTY_RESEARCH_SECOND_UNIT" \
+    '.root_cause.type == "research_queue_empty"
+     and .root_cause.severity == "critical"
+     and .root_cause.lab_count == 2
+     and ([.root_cause.labs[].unit_number] | sort) == ([$first, $second] | sort)
+     and all(.root_cause.labs[]; .status == "no_research_in_progress")
+     and .root_cause.grouped_symptom_count == 2
+     and .grouped_symptom_count == 2
+     and all(.blockers[]; .unit_number != $first and .unit_number != $second)
+     and .suggested_actions[0].tool == "start_research"'
+
 # Resource discovery must see every already-generated chunk, report absence as
 # normal structured data, and generate bounded nearby terrain only on explicit
 # request. The distant chunk is part of this disposable test surface.

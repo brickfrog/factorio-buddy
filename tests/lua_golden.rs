@@ -4447,7 +4447,15 @@ fn factory_blocker_diagnostics_promote_terminal_belt_lane_root_causes() {
         "unit_numbers_truncated",
         "type = \"dead_end_belt_lane\"",
         "tool = \"get_belt_lane_contents\"",
-        "belt_root_cause or summarize_power_cause",
+        "local function saturated_belt_cycle_root_cause",
+        "local function stopped_research_root_cause",
+        "all_lanes_saturated = true",
+        "type = \"saturated_belt_cycle\"",
+        "force.current_research",
+        "force.research_queue",
+        "type = \"research_queue_empty\"",
+        "local promoted_cause = dead_end_cause or cycle_cause or research_cause",
+        "promoted_cause or summarize_power_cause",
     ] {
         assert!(
             entities_lua.contains(required),

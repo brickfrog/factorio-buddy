@@ -1178,6 +1178,237 @@ local function compact_waiting_symptom(entity)
     }
 end
 
+local function waiting_symptoms_for_belts(waiting_entities, belts, limit)
+    local belt_keys = {}
+    for _, belt in ipairs(belts) do belt_keys[entity_trace_key(belt)] = true end
+
+    local symptoms = {}
+    local symptom_keys = {}
+    for _, entity in ipairs(waiting_entities) do
+        local target_ok, target = pcall(function() return entity.drop_target end)
+        local target_key = target_ok and target and target.valid
+            and entity_trace_key(target) or nil
+        local associated = target_key and belt_keys[target_key] == true
+        local drop_ok, drop_position = pcall(function() return entity.drop_position end)
+        if not associated and drop_ok and drop_position then
+            for _, belt in ipairs(belts) do
+                if same_tile(drop_position, belt.position) then
+                    associated = true
+                    break
+                end
+            end
+        end
+        if associated then
+            if #symptoms < limit then
+                table.insert(symptoms, compact_waiting_symptom(entity))
+            end
+            symptom_keys[entity_trace_key(entity)] = true
+        end
+    end
+    return symptoms, symptom_keys
+end
+
+local function belt_outputs_in_scan(belt, belt_by_key)
+    local result = {}
+    local neighbours = belt.belt_neighbours
+    for _, output in pairs(neighbours and neighbours.outputs or {}) do
+        if output and output.valid and output.type == "transport-belt"
+            and belt_by_key[entity_trace_key(output)]
+        then
+            table.insert(result, output)
+        end
+    end
+    table.sort(result, function(a, b)
+        return (a.unit_number or math.huge) < (b.unit_number or math.huge)
+    end)
+    return result
+end
+
+local function belt_cycle_from(start, belt_by_key)
+    local start_key = entity_trace_key(start)
+    local queue = {start}
+    local visited = {[start_key] = true}
+    local predecessor = {}
+    local index = 1
+    while index <= #queue and index <= 256 do
+        local belt = queue[index]
+        index = index + 1
+        for _, output in ipairs(belt_outputs_in_scan(belt, belt_by_key)) do
+            local output_key = entity_trace_key(output)
+            if output_key == start_key then
+                local reversed = {}
+                local cursor = belt
+                while cursor do
+                    table.insert(reversed, cursor)
+                    if entity_trace_key(cursor) == start_key then break end
+                    cursor = predecessor[entity_trace_key(cursor)]
+                end
+                local cycle = {}
+                for reverse_index = #reversed, 1, -1 do
+                    table.insert(cycle, reversed[reverse_index])
+                end
+                return cycle
+            end
+            if not visited[output_key] then
+                visited[output_key] = true
+                predecessor[output_key] = belt
+                table.insert(queue, output)
+            end
+        end
+    end
+    return nil
+end
+
+local function saturated_belt_cycle_root_cause(found, waiting_entities, limit)
+    local belts = {}
+    local belt_by_key = {}
+    for _, entity in ipairs(found) do
+        if entity.valid and entity.type == "transport-belt" then
+            table.insert(belts, entity)
+            belt_by_key[entity_trace_key(entity)] = entity
+        end
+    end
+    table.sort(belts, function(a, b)
+        return (a.unit_number or math.huge) < (b.unit_number or math.huge)
+    end)
+
+    local candidates = {}
+    local seen_cycles = {}
+    for _, belt in ipairs(belts) do
+        local cycle = belt_cycle_from(belt, belt_by_key)
+        if cycle then
+            local signature_parts = {}
+            local all_lanes_saturated = true
+            local stalled_lanes = {}
+            for _, cycle_belt in ipairs(cycle) do
+                table.insert(signature_parts, tostring(cycle_belt.unit_number or entity_trace_key(cycle_belt)))
+                for line_index = 1, 2 do
+                    local lane = transport_lane_record(cycle_belt, line_index)
+                    if not (lane and lane.saturated) then all_lanes_saturated = false end
+                    if lane and #stalled_lanes < 64 then
+                        table.insert(stalled_lanes, {
+                            belt_unit_number = cycle_belt.unit_number,
+                            belt_position = pos_table(cycle_belt.position),
+                            lane = lane.lane,
+                            side = lane.side,
+                            item_count = lane.item_count,
+                            capacity = lane.capacity,
+                            items = lane.items,
+                            saturated = lane.saturated,
+                        })
+                    end
+                end
+            end
+            table.sort(signature_parts)
+            local signature = table.concat(signature_parts, ":")
+            if all_lanes_saturated and not seen_cycles[signature] then
+                seen_cycles[signature] = true
+                local symptoms, symptom_keys = waiting_symptoms_for_belts(
+                    waiting_entities,
+                    cycle,
+                    limit
+                )
+                if next(symptom_keys) then
+                    table.insert(candidates, {
+                        belts = cycle,
+                        stalled_lanes = stalled_lanes,
+                        symptoms = symptoms,
+                        symptom_keys = symptom_keys,
+                    })
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if #a.symptoms ~= #b.symptoms then return #a.symptoms > #b.symptoms end
+        if #a.belts ~= #b.belts then return #a.belts > #b.belts end
+        return (a.belts[1].unit_number or math.huge) < (b.belts[1].unit_number or math.huge)
+    end)
+    local selected = candidates[1]
+    if not selected then return nil, {} end
+
+    table.sort(selected.belts, function(a, b)
+        return (a.unit_number or math.huge) < (b.unit_number or math.huge)
+    end)
+    local cycle_units = {}
+    for index, belt in ipairs(selected.belts) do
+        if index > 64 then break end
+        table.insert(cycle_units, belt.unit_number)
+    end
+    local break_belt = selected.belts[1]
+    return {
+        type = "saturated_belt_cycle",
+        severity = "critical",
+        message = "A closed belt cycle has no free lane capacity and is back-pressuring its feeder. Clearing individual waiting entities will not break the ring.",
+        primary_unit_number = break_belt.unit_number,
+        cycle = {
+            belt_count = #selected.belts,
+            unit_numbers = cycle_units,
+            unit_numbers_truncated = #selected.belts > #cycle_units,
+            all_lanes_saturated = true,
+        },
+        stalled_lanes = selected.stalled_lanes,
+        grouped_symptom_count = #selected.symptoms,
+        grouped_symptoms = selected.symptoms,
+        break_point = {
+            belt_unit_number = break_belt.unit_number,
+            position = pos_table(break_belt.position),
+        },
+        actions = {{
+            type = "drain_or_reroute_cycle",
+            tool = "get_belt_lane_contents",
+            description = "Inspect the reported cycle, then add an accepting filtered drain or reroute one lane at break_point before clearing individual backpressure symptoms.",
+        }},
+    }, selected.symptom_keys
+end
+
+local function stopped_research_root_cause(force, found, limit)
+    if force.current_research then return nil, {} end
+    for _ in pairs(force.research_queue or {}) do return nil, {} end
+
+    local labs = {}
+    local symptom_keys = {}
+    for _, entity in ipairs(found) do
+        if entity.valid and entity.type == "lab"
+            and entity_status_string(entity) == "no_research_in_progress"
+        then
+            symptom_keys[entity_trace_key(entity)] = true
+            if #labs < limit then
+                table.insert(labs, {
+                    unit_number = entity.unit_number,
+                    name = entity.name,
+                    position = pos_table(entity.position),
+                    status = "no_research_in_progress",
+                    science_pack_count = inventory_total(safe_inventory(entity, defines.inventory.lab_input)),
+                })
+            end
+        end
+    end
+    if not next(symptom_keys) then return nil, {} end
+    table.sort(labs, function(a, b)
+        return (a.unit_number or math.huge) < (b.unit_number or math.huge)
+    end)
+
+    local lab_count = 0
+    for _ in pairs(symptom_keys) do lab_count = lab_count + 1 end
+    return {
+        type = "research_queue_empty",
+        severity = "critical",
+        message = "Labs are idle because the force has no current or queued research; downstream science backpressure is a symptom until research demand resumes.",
+        primary_unit_number = labs[1] and labs[1].unit_number or nil,
+        lab_count = lab_count,
+        labs = labs,
+        labs_truncated = lab_count > #labs,
+        grouped_symptom_count = lab_count,
+        actions = {{
+            type = "select_research",
+            tool = "start_research",
+            description = "Inspect get_available_research, start one available technology, and re-run factory diagnosis before clearing downstream outputs.",
+        }},
+    }, symptom_keys
+end
+
 local function dead_end_belt_root_cause(surface, force, found, waiting_entities, limit)
     local candidates = {}
     for _, belt in ipairs(found) do
@@ -1380,14 +1611,29 @@ function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
         end
     end
 
-    local belt_root_cause, grouped_symptom_keys = dead_end_belt_root_cause(
+    local dead_end_cause, dead_end_symptom_keys = dead_end_belt_root_cause(
         surface,
         force,
         found,
         waiting_entities,
         limit
     )
-    if belt_root_cause then
+    local cycle_cause, cycle_symptom_keys = saturated_belt_cycle_root_cause(
+        found,
+        waiting_entities,
+        limit
+    )
+    local research_cause, research_symptom_keys = stopped_research_root_cause(
+        force,
+        found,
+        limit
+    )
+    local promoted_cause = dead_end_cause or cycle_cause or research_cause
+    local grouped_symptom_keys = dead_end_cause and dead_end_symptom_keys
+        or cycle_cause and cycle_symptom_keys
+        or research_cause and research_symptom_keys
+        or {}
+    if promoted_cause then
         local ungrouped = {}
         for _, blocker in ipairs(blockers) do
             local key = blocker.unit_number and "unit:" .. tostring(blocker.unit_number) or nil
@@ -1408,7 +1654,7 @@ function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
     end
     for index, blocker in ipairs(blockers) do blocker.rank = index end
 
-    local root_cause = belt_root_cause or summarize_power_cause(blockers, boilers)
+    local root_cause = promoted_cause or summarize_power_cause(blockers, boilers)
     local suggested_actions = {}
     if root_cause and root_cause.actions then
         for _, action in ipairs(root_cause.actions) do table.insert(suggested_actions, action) end
