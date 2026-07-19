@@ -48,6 +48,28 @@ BUDDY_HEARTBEAT_SECONDS=60 just play
 
 Set `BUDDY_HEARTBEAT_SECONDS=0` or run `just chat` for chat-only operation.
 
+## Persona
+
+Buddy's built-in system prompt owns the gameplay, tooling, verification, and
+safety rules. You can append a custom strategic temperament without replacing
+those rules. Copy the example and edit it:
+
+```bash
+cp .env.example .env
+```
+
+The normal `just play`, `just resume`, `just npc`, and `just chat` commands load
+`.env` automatically. Set `BUDDY_PERSONA` there to describe the kind of factory
+manager you want. The included example emphasizes root-cause repairs, scalable
+throughput, expansion, and switching away from unproductive fixation.
+
+For a one-off run, use either the environment or the equivalent CLI option:
+
+```bash
+BUDDY_PERSONA="Build boldly and optimize for sustained expansion." just resume
+./target/release/buddy --persona "Build boldly and optimize for sustained expansion."
+```
+
 ## Current limitations
 
 - TODO: implement end-to-end fluid logistics. Pipe entities can be observed and

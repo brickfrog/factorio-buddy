@@ -106,6 +106,10 @@ struct Args {
 
     #[arg(long, default_value = DEFAULT_SYSTEM_PROMPT)]
     system_prompt: String,
+
+    /// Additional operator-defined temperament appended to the built-in gameplay rules.
+    #[arg(long, env = "BUDDY_PERSONA")]
+    persona: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1235,6 +1239,22 @@ fn autonomy_prompt(snapshot: &str) -> String {
     format!("{AUTONOMY_DIRECTIVE}\n\nAuthoritative current factory snapshot:\n{formatted_snapshot}")
 }
 
+fn effective_system_prompt(args: &Args) -> String {
+    let Some(persona) = args
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return args.system_prompt.clone();
+    };
+    format!(
+        "{}\n\nOperator-defined persona:\n{}",
+        args.system_prompt.trim_end(),
+        persona
+    )
+}
+
 async fn collect_autonomy_prompt(args: &Args, lifecycle: &LifecycleClient) -> String {
     match lifecycle
         .call("autonomy_snapshot", &[json!(args.agent)])
@@ -1276,7 +1296,7 @@ fn claude_arguments(
         "--effort".into(),
         args.effort.clone().into(),
         "--system-prompt".into(),
-        args.system_prompt.clone().into(),
+        effective_system_prompt(args).into(),
     ];
     if let Some(model) = &args.model {
         arguments.push("--model".into());
@@ -2177,6 +2197,37 @@ mod tests {
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--disallowedTools", "mcp__factorio__execute_lua"]));
+    }
+
+    #[test]
+    fn operator_persona_is_appended_without_replacing_gameplay_rules() {
+        let args = Args::try_parse_from([
+            "buddy",
+            "--persona",
+            "  Build boldly, repair root causes, and expand throughput.  ",
+        ])
+        .unwrap();
+        let prompt = effective_system_prompt(&args);
+        assert!(prompt.starts_with(DEFAULT_SYSTEM_PROMPT));
+        assert!(prompt.contains("\n\nOperator-defined persona:\n"));
+        assert!(prompt.ends_with("Build boldly, repair root causes, and expand throughput."));
+
+        let arguments = claude_arguments(&args, "{}", "play", None)
+            .into_iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let system_prompt = arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--system-prompt")
+            .map(|pair| pair[1].as_str())
+            .expect("Claude arguments should include the effective system prompt");
+        assert_eq!(system_prompt, prompt);
+    }
+
+    #[test]
+    fn blank_operator_persona_does_not_change_the_system_prompt() {
+        let args = Args::try_parse_from(["buddy", "--persona", "   "]).unwrap();
+        assert_eq!(effective_system_prompt(&args), DEFAULT_SYSTEM_PROMPT);
     }
 
     #[test]

@@ -24,5 +24,6 @@ logs/
 
 # Misc 
 GOAL.md
+.env
 .factorio-test-data/
 .factorio-buddy/
