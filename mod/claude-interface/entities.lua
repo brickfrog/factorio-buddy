@@ -1058,6 +1058,276 @@ local function summarize_power_cause(blockers, boilers)
     }
 end
 
+local function transport_lane_record(belt, line_index)
+    local line = belt.get_transport_line(line_index)
+    if not line then return nil end
+
+    local items = {}
+    local item_count = 0
+    for _, item in pairs(line.get_contents()) do
+        local quality = item.quality
+        if type(quality) == "table" then quality = quality.name end
+        table.insert(items, {
+            name = item.name,
+            count = item.count,
+            quality = quality,
+        })
+        item_count = item_count + item.count
+    end
+    table.sort(items, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        return tostring(a.quality or "normal") < tostring(b.quality or "normal")
+    end)
+
+    local capacity = math.max(1, math.floor(line.line_length * 4 + 0.5))
+    local back_insertion_blocked = item_count > 0 and not line.can_insert_at_back()
+    return {
+        lane = line_index,
+        side = line_index == 1 and "left" or "right",
+        item_count = item_count,
+        capacity = capacity,
+        items = items,
+        back_insertion_blocked = back_insertion_blocked,
+        saturated = item_count >= capacity and back_insertion_blocked,
+    }
+end
+
+local function same_entity(left, right)
+    if not (left and right and left.valid and right.valid) then return false end
+    if left.unit_number and right.unit_number then
+        return left.unit_number == right.unit_number
+    end
+    return left == right
+end
+
+local function inserter_picks_up_from(inserter, belt)
+    local ok, target = pcall(function() return inserter.pickup_target end)
+    if ok and target and target.valid then return same_entity(target, belt) end
+    return same_tile(inserter.pickup_position, belt.position)
+end
+
+local function lane_has_pickup_inserter(surface, force, belt, lane_index)
+    for _, inserter in pairs(surface.find_entities_filtered{
+        type = "inserter",
+        force = force,
+        area = expanded_box(belt.bounding_box, 3),
+    }) do
+        if inserter_picks_up_from(inserter, belt) then
+            local property = lane_index == 1 and "pickup_from_left_lane" or "pickup_from_right_lane"
+            local ok, enabled = pcall(function() return inserter[property] end)
+            if not ok or enabled ~= false then return true end
+        end
+    end
+    return false
+end
+
+local function terminal_blocker(belt)
+    local dx, dy = direction_step(belt.direction)
+    if not dx then return nil, nil end
+    local output = {x = belt.position.x + dx, y = belt.position.y + dy}
+    local candidates = belt.surface.find_entities_filtered{position = output}
+    table.sort(candidates, function(a, b)
+        if a.type ~= b.type then return a.type < b.type end
+        if a.name ~= b.name then return a.name < b.name end
+        return (a.unit_number or math.huge) < (b.unit_number or math.huge)
+    end)
+    for _, candidate in ipairs(candidates) do
+        if candidate.valid
+            and not same_entity(candidate, belt)
+            and candidate.type ~= "character"
+            and candidate.type ~= "resource"
+            and candidate.type ~= "item-entity"
+            and candidate.type ~= "entity-ghost"
+        then
+            return candidate, output
+        end
+    end
+    return nil, output
+end
+
+local function upstream_belt_run(terminal)
+    local queue = {terminal}
+    local seen = {}
+    local belts = {}
+    local index = 1
+    while index <= #queue and #belts < 256 do
+        local belt = queue[index]
+        index = index + 1
+        local key = entity_trace_key(belt)
+        if not seen[key] then
+            seen[key] = true
+            table.insert(belts, belt)
+            local neighbours = belt.belt_neighbours
+            for _, input in pairs(neighbours and neighbours.inputs or {}) do
+                if input and input.valid and input.type == "transport-belt" then
+                    table.insert(queue, input)
+                end
+            end
+        end
+    end
+    return belts, seen
+end
+
+local function compact_waiting_symptom(entity)
+    return {
+        unit_number = entity.unit_number,
+        name = entity.name,
+        type = entity.type,
+        position = pos_table(entity.position),
+        status = "waiting_for_space_in_destination",
+    }
+end
+
+local function dead_end_belt_root_cause(surface, force, found, waiting_entities, limit)
+    local candidates = {}
+    for _, belt in ipairs(found) do
+        if belt.valid and belt.type == "transport-belt" then
+            local neighbours = belt.belt_neighbours
+            if not next(neighbours and neighbours.outputs or {}) then
+                local stalled_lanes = {}
+                for line_index = 1, 2 do
+                    local lane = transport_lane_record(belt, line_index)
+                    if lane and lane.saturated
+                        and not lane_has_pickup_inserter(surface, force, belt, line_index)
+                    then
+                        table.insert(stalled_lanes, lane)
+                    end
+                end
+
+                if #stalled_lanes > 0 then
+                    local run, run_keys = upstream_belt_run(belt)
+                    local symptoms = {}
+                    local symptom_keys = {}
+                    for _, entity in ipairs(waiting_entities) do
+                        local target_ok, target = pcall(function() return entity.drop_target end)
+                        local target_key = target_ok and target and target.valid
+                            and entity_trace_key(target) or nil
+                        local associated = target_key and run_keys[target_key] == true
+                        local drop_ok, drop_position = pcall(function() return entity.drop_position end)
+                        if not associated and drop_ok and drop_position then
+                            for _, run_belt in ipairs(run) do
+                                if same_tile(drop_position, run_belt.position) then
+                                    associated = true
+                                    break
+                                end
+                            end
+                        end
+                        if associated then
+                            table.insert(symptoms, compact_waiting_symptom(entity))
+                            symptom_keys[entity_trace_key(entity)] = true
+                        end
+                    end
+
+                    if #symptoms > 0 then
+                        local blocked_by, output = terminal_blocker(belt)
+                        table.insert(candidates, {
+                            belt = belt,
+                            run = run,
+                            stalled_lanes = stalled_lanes,
+                            symptoms = symptoms,
+                            symptom_keys = symptom_keys,
+                            blocked_by = blocked_by,
+                            output = output,
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if #a.symptoms ~= #b.symptoms then return #a.symptoms > #b.symptoms end
+        if #a.stalled_lanes ~= #b.stalled_lanes then
+            return #a.stalled_lanes > #b.stalled_lanes
+        end
+        if #a.run ~= #b.run then return #a.run > #b.run end
+        return (a.belt.unit_number or math.huge) < (b.belt.unit_number or math.huge)
+    end)
+    local selected = candidates[1]
+    if not selected then return nil, {} end
+
+    local run_units = {}
+    local bounds = {
+        left = selected.belt.position.x,
+        right = selected.belt.position.x,
+        top = selected.belt.position.y,
+        bottom = selected.belt.position.y,
+    }
+    for _, belt in ipairs(selected.run) do
+        if #run_units < 64 then table.insert(run_units, belt.unit_number) end
+        bounds.left = math.min(bounds.left, belt.position.x)
+        bounds.right = math.max(bounds.right, belt.position.x)
+        bounds.top = math.min(bounds.top, belt.position.y)
+        bounds.bottom = math.max(bounds.bottom, belt.position.y)
+    end
+    table.sort(run_units, function(a, b) return (a or math.huge) < (b or math.huge) end)
+
+    local grouped_symptoms = {}
+    for index, symptom in ipairs(selected.symptoms) do
+        if index > limit then break end
+        table.insert(grouped_symptoms, symptom)
+    end
+
+    local lane_summaries = {}
+    local item_names = {}
+    local seen_items = {}
+    for _, lane in ipairs(selected.stalled_lanes) do
+        table.insert(lane_summaries, lane.side)
+        for _, item in ipairs(lane.items) do
+            if not seen_items[item.name] then
+                seen_items[item.name] = true
+                table.insert(item_names, item.name)
+            end
+        end
+    end
+    table.sort(item_names)
+
+    local blocked_by = selected.blocked_by and {
+        unit_number = selected.blocked_by.unit_number,
+        name = selected.blocked_by.name,
+        type = selected.blocked_by.type,
+        position = pos_table(selected.blocked_by.position),
+    } or nil
+    local terminus = blocked_by
+        and (blocked_by.name .. " " .. tostring(blocked_by.unit_number or ""))
+        or "an empty tile"
+    local message = "Transport belt " .. tostring(selected.belt.unit_number or "")
+        .. " at (" .. tostring(selected.belt.position.x) .. ", " .. tostring(selected.belt.position.y)
+        .. ") faces " .. direction_name(selected.belt.direction) .. " into " .. terminus
+        .. "; its saturated " .. table.concat(lane_summaries, "/") .. " lane(s) contain "
+        .. table.concat(item_names, ", ") .. " with no inserter pickup path."
+
+    return {
+        type = "dead_end_belt_lane",
+        severity = "critical",
+        message = message,
+        primary_unit_number = selected.belt.unit_number,
+        terminal_belt = {
+            unit_number = selected.belt.unit_number,
+            name = selected.belt.name,
+            position = pos_table(selected.belt.position),
+            direction = direction_name(selected.belt.direction),
+            output_position = selected.output,
+            blocked_by = blocked_by,
+        },
+        belt_run = {
+            belt_count = #selected.run,
+            unit_numbers = run_units,
+            unit_numbers_truncated = #selected.run > #run_units,
+            bounds = bounds,
+        },
+        stalled_lanes = selected.stalled_lanes,
+        grouped_symptom_count = #selected.symptoms,
+        grouped_symptoms = grouped_symptoms,
+        grouped_symptoms_truncated = #selected.symptoms > #grouped_symptoms,
+        actions = {{
+            type = "consume_or_reroute_stalled_items",
+            tool = "get_belt_lane_contents",
+            description = "Inspect the reported belt run, then add an accepting filtered consumer or reroute the stalled lane before clearing individual upstream symptoms.",
+        }},
+    }, selected.symptom_keys
+end
+
 function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
     if not (surface and force) then return {error = "agent surface or force not found"} end
     limit = limit or 10
@@ -1068,6 +1338,7 @@ function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
     }
     local blockers = {}
     local boilers = {}
+    local waiting_entities = {}
     local scanned = 0
 
     for _, entity in pairs(found) do
@@ -1088,6 +1359,9 @@ function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
             end
 
             if not working then
+                if status == "waiting_for_space_in_destination" then
+                    table.insert(waiting_entities, entity)
+                end
                 local blocker = {
                     rank = 0,
                     priority = blocker_priority(status, entity),
@@ -1106,6 +1380,22 @@ function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
         end
     end
 
+    local belt_root_cause, grouped_symptom_keys = dead_end_belt_root_cause(
+        surface,
+        force,
+        found,
+        waiting_entities,
+        limit
+    )
+    if belt_root_cause then
+        local ungrouped = {}
+        for _, blocker in ipairs(blockers) do
+            local key = blocker.unit_number and "unit:" .. tostring(blocker.unit_number) or nil
+            if not (key and grouped_symptom_keys[key]) then table.insert(ungrouped, blocker) end
+        end
+        blockers = ungrouped
+    end
+
     table.sort(blockers, function(a, b)
         if a.priority ~= b.priority then return a.priority < b.priority end
         return tostring(a.unit_number or "") < tostring(b.unit_number or "")
@@ -1118,7 +1408,7 @@ function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
     end
     for index, blocker in ipairs(blockers) do blocker.rank = index end
 
-    local root_cause = summarize_power_cause(blockers, boilers)
+    local root_cause = belt_root_cause or summarize_power_cause(blockers, boilers)
     local suggested_actions = {}
     if root_cause and root_cause.actions then
         for _, action in ipairs(root_cause.actions) do table.insert(suggested_actions, action) end
@@ -1130,6 +1420,7 @@ function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
         area = {left_top = {x = math.min(x1, x2), y = math.min(y1, y2)}, right_bottom = {x = math.max(x1, x2), y = math.max(y1, y2)}},
         scanned_entities = scanned,
         blocker_count = #blockers,
+        grouped_symptom_count = root_cause and root_cause.grouped_symptom_count or 0,
         blockers = blockers,
         root_cause = root_cause,
         suggested_actions = suggested_actions,

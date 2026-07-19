@@ -2379,6 +2379,109 @@ else
         "observed $TOOLS_SCHEMA_BYTES bytes"
 fi
 
+# A full belt lane with no output is the physical root of upstream
+# waiting-for-space symptoms. Diagnosis must name that terminus and stalled
+# lane once, then group the directly traced inserter symptom under it.
+DEAD_END_BELT_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{-63, 23}, {-49, 32}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+local belt = s.create_entity{
+    name = 'transport-belt', position = {-55.5, 27.5},
+    direction = defines.direction.east, force = c.force
+}
+local assembler = s.create_entity{
+    name = 'assembling-machine-1', position = {-53.5, 27.5}, force = c.force
+}
+local chest = s.create_entity{
+    name = 'wooden-chest', position = {-55.5, 25.5}, force = c.force
+}
+local feeder = s.create_entity{
+    name = 'burner-inserter', position = {-55.5, 26.5},
+    direction = defines.direction.north, force = c.force
+}
+if not (belt and assembler and chest and feeder) then
+    error('failed to create dead-end belt diagnostic fixture')
+end
+chest.insert{name = 'copper-plate', count = 1000}
+feeder.get_fuel_inventory().insert{name = 'coal', count = 5}
+for line_index = 1, 2 do
+    local line = belt.get_transport_line(line_index)
+    local capacity = math.floor(line.line_length * 4 + 0.5)
+    for slot = 1, capacity do
+        local item = slot % 2 == 0 and 'iron-ore' or 'coal'
+        line.force_insert_at((slot - 0.5) / 4, {name = item, count = 1})
+    end
+end
+rcon.print(helpers.table_to_json({
+    belt_unit = belt.unit_number,
+    assembler_unit = assembler.unit_number,
+    feeder_unit = feeder.unit_number,
+    left_count = belt.get_transport_line(1).get_item_count(),
+    right_count = belt.get_transport_line(2).get_item_count(),
+    line_capacity = math.floor(belt.get_transport_line(1).line_length * 4 + 0.5),
+}))
+")"
+require_json "dead-end diagnostic fixture has two physically full mixed lanes" \
+    "$DEAD_END_BELT_FIXTURE" \
+    '.left_count == .line_capacity
+     and .right_count == .line_capacity
+     and .line_capacity >= 4
+     and (.belt_unit | type) == "number"
+     and (.assembler_unit | type) == "number"
+     and (.feeder_unit | type) == "number"'
+DEAD_END_BELT_UNIT="$(jq -r '.belt_unit' <<<"$DEAD_END_BELT_FIXTURE")"
+DEAD_END_ASSEMBLER_UNIT="$(jq -r '.assembler_unit' <<<"$DEAD_END_BELT_FIXTURE")"
+DEAD_END_FEEDER_UNIT="$(jq -r '.feeder_unit' <<<"$DEAD_END_BELT_FIXTURE")"
+DEAD_END_FEEDER_STATUS='{}'
+for _ in $(seq 1 100); do
+    DEAD_END_FEEDER_STATUS="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local feeder = nil
+for _, entity in pairs(s.find_entities_filtered{type = 'inserter', area = {{-57, 25}, {-54, 28}}}) do
+    if entity.unit_number == $DEAD_END_FEEDER_UNIT then feeder = entity break end
+end
+local status = feeder and feeder.status or nil
+local status_name = nil
+for name, value in pairs(defines.entity_status) do
+    if value == status then status_name = name break end
+end
+rcon.print(helpers.table_to_json({status = status_name}))
+")"
+    if jq -e '.status == "waiting_for_space_in_destination"' \
+        >/dev/null 2>&1 <<<"$DEAD_END_FEEDER_STATUS"; then
+        break
+    fi
+    sleep 0.1
+done
+require_json "full terminal belt back-pressures its live feeder inserter" \
+    "$DEAD_END_FEEDER_STATUS" '.status == "waiting_for_space_in_destination"'
+
+DEAD_END_DIAGNOSIS="$(mcp_tool diagnose_factory_blockers \
+    '{"x":-55.5,"y":27.5,"radius":6,"limit":20}')"
+DEAD_END_DIAGNOSIS_PAYLOAD="$(tool_payload "$DEAD_END_DIAGNOSIS")"
+assert_json "factory diagnosis promotes the dead-end belt lane and groups its symptom" \
+    "$DEAD_END_DIAGNOSIS_PAYLOAD" \
+    --argjson belt "$DEAD_END_BELT_UNIT" \
+    --argjson assembler "$DEAD_END_ASSEMBLER_UNIT" \
+    --argjson feeder "$DEAD_END_FEEDER_UNIT" \
+    '.root_cause.type == "dead_end_belt_lane"
+     and .root_cause.primary_unit_number == $belt
+     and .root_cause.terminal_belt.blocked_by.unit_number == $assembler
+     and .root_cause.belt_run.belt_count == 1
+     and .root_cause.grouped_symptom_count >= 1
+     and .grouped_symptom_count == .root_cause.grouped_symptom_count
+     and any(.root_cause.grouped_symptoms[]; .unit_number == $feeder)
+     and any(.root_cause.stalled_lanes[];
+         .saturated == true
+         and .item_count >= .capacity
+         and any(.items[]; .name == "coal")
+         and any(.items[]; .name == "iron-ore"))
+     and all(.blockers[]; .unit_number != $feeder)
+     and .suggested_actions[0].tool == "get_belt_lane_contents"'
+
 # Resource discovery must see every already-generated chunk, report absence as
 # normal structured data, and generate bounded nearby terrain only on explicit
 # request. The distant chunk is part of this disposable test surface.

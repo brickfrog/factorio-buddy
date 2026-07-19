@@ -4184,6 +4184,7 @@ fn lua_plans_only_recommend_model_visible_tools() {
         "execute_edge_miner",
         "execute_entity_placement_near",
         "feed_lab_from_inventory",
+        "get_belt_lane_contents",
         "get_power_status",
         "get_research_status",
         "place_entity",
@@ -4426,4 +4427,36 @@ fn static_builder_tests_cover_named_legacy_extract_and_registry_contracts() {
     ] {
         assert!(!lua.contains("storage.factorioctl_entities["));
     }
+}
+
+#[test]
+fn factory_blocker_diagnostics_promote_terminal_belt_lane_root_causes() {
+    let entities_lua = include_str!("../mod/claude-interface/entities.lua");
+
+    for required in [
+        "local function dead_end_belt_root_cause",
+        "local neighbours = belt.belt_neighbours",
+        "not next(neighbours and neighbours.outputs or {})",
+        "line.can_insert_at_back()",
+        "inserter.pickup_target",
+        "pickup_from_left_lane",
+        "pickup_from_right_lane",
+        "grouped_symptom_count",
+        "grouped_symptoms",
+        "grouped_symptoms_truncated",
+        "unit_numbers_truncated",
+        "type = \"dead_end_belt_lane\"",
+        "tool = \"get_belt_lane_contents\"",
+        "belt_root_cause or summarize_power_cause",
+    ] {
+        assert!(
+            entities_lua.contains(required),
+            "factory blocker diagnosis must preserve terminal-belt invariant {required:?}"
+        );
+    }
+
+    assert!(
+        entities_lua.contains("if not (key and grouped_symptom_keys[key]) then"),
+        "symptom entities traced to the root belt run must not remain peer-ranked blockers"
+    );
 }
