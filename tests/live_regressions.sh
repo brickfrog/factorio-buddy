@@ -2512,7 +2512,8 @@ REACHABLE_POLE_REMOVE="$(mcp_tool remove_entity "$(jq -cn \
     '{unit_number:$unit}')")"
 assert_json "MCP removes the already-reachable pole" "$REACHABLE_POLE_REMOVE" \
     '(.result.isError // false) == false
-     and .result.content[0].text == "Entity removed successfully"'
+     and (.result.content[0].text | fromjson
+          | .success == true and .removed == true)'
 REACHABLE_POLE_WORLD="$(raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local s = game.surfaces['buddy-live-regression']
@@ -2609,7 +2610,8 @@ OBSTACLE_REACH_UNIT="$(jq -r '.pole_unit' <<<"$OBSTACLE_REACH_FIXTURE")"
 OBSTACLE_REACH_REMOVE="$(mcp_tool remove_entity "$(jq -cn --argjson unit "$OBSTACLE_REACH_UNIT" '{unit_number:$unit}')")"
 assert_json "range-aware A* reaches and removes the pole behind the wall" "$OBSTACLE_REACH_REMOVE" \
     '(.result.isError // false) == false
-     and .result.content[0].text == "Entity removed successfully"'
+     and (.result.content[0].text | fromjson
+          | .success == true and .removed == true)'
 OBSTACLE_REACH_WORLD="$(raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local s = game.surfaces['buddy-live-regression']
@@ -2691,6 +2693,141 @@ assert_json "generic collision diagnostics still identify a real chest blocker" 
      and .report.can_stand == false
      and .report.blocker_count > 0
      and any(.report.blockers[]; .unit_number == $chest_unit)'
+
+# A terminal belt can still be load-bearing when an inserter taps it from the
+# side. Removal preflight must expose that interaction and its downstream
+# machine before an exact-unit removal is allowed to proceed deliberately.
+REMOVAL_DEPENDENCY_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{68, -28}, {77, -19}}}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+local tiles = {}
+for x = 68, 76 do
+    for y = -28, -20 do
+        table.insert(tiles, {name = 'landfill', position = {x, y}})
+    end
+end
+s.set_tiles(tiles, true)
+c.teleport({70.5, -22.5})
+local furnace = s.create_entity{
+    name = 'stone-furnace', position = {72, -22}, force = c.force
+}
+local first = s.create_entity{
+    name = 'transport-belt', position = {70.5, -24.5},
+    direction = defines.direction.east, force = c.force
+}
+local second = s.create_entity{
+    name = 'transport-belt', position = {71.5, -24.5},
+    direction = defines.direction.east, force = c.force
+}
+local tapped = s.create_entity{
+    name = 'transport-belt', position = {72.5, -24.5},
+    direction = defines.direction.east, force = c.force
+}
+local inserter = s.create_entity{
+    name = 'inserter', position = {72.5, -23.5},
+    direction = defines.direction.north, force = c.force
+}
+rcon.print(helpers.table_to_json({
+    furnace_unit = furnace and furnace.unit_number or nil,
+    inserter_unit = inserter and inserter.unit_number or nil,
+    first_unit = first and first.unit_number or nil,
+    second_unit = second and second.unit_number or nil,
+    tapped_unit = tapped and tapped.unit_number or nil,
+    pickup_target_unit = inserter and inserter.pickup_target
+        and inserter.pickup_target.unit_number or nil,
+    drop_target_unit = inserter and inserter.drop_target
+        and inserter.drop_target.unit_number or nil,
+}))
+")"
+require_json "removal fixture has a terminal belt side-tapped into one furnace" \
+    "$REMOVAL_DEPENDENCY_FIXTURE" \
+    '(.furnace_unit | type) == "number"
+     and (.inserter_unit | type) == "number"
+     and (.tapped_unit | type) == "number"
+     and (.second_unit | type) == "number"'
+
+REMOVAL_DEPENDENCY_DRY="$(mcp_tool remove_entity "$(jq -cn \
+    --argjson unit "$(jq '.tapped_unit' <<<"$REMOVAL_DEPENDENCY_FIXTURE")" \
+    '{unit_number:$unit,dry_run:true}')")"
+REMOVAL_DEPENDENCY_DRY_PAYLOAD="$(tool_payload "$REMOVAL_DEPENDENCY_DRY")"
+assert_json "removal dependency dry-run is a successful non-mutation" \
+    "$REMOVAL_DEPENDENCY_DRY" '.result.isError != true'
+require_json "removal preflight warns about the exact side-tapping inserter and furnace" \
+    "$REMOVAL_DEPENDENCY_DRY_PAYLOAD" \
+    --argjson fixture "$REMOVAL_DEPENDENCY_FIXTURE" \
+    '.success == true
+     and .dry_run == true
+     and .removed == false
+     and .would_remove.unit_number == $fixture.tapped_unit
+     and .removal_advisory.severity == "warning"
+     and .removal_advisory.has_dependents == true
+     and any(.removal_advisory.dependencies[];
+         .kind == "inserter_interaction"
+         and .interaction == "pickup"
+         and .inserter.unit_number == $fixture.inserter_unit
+         and .downstream_target.unit_number == $fixture.furnace_unit
+         and .downstream_input_inserter_count == 1
+         and .only_observed_input_path == true)
+     and any(.removal_advisory.dependencies[];
+         .kind == "belt_connection"
+         and .belt.unit_number == $fixture.second_unit)'
+
+REMOVAL_DEPENDENCY_DRY_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+rcon.print(helpers.table_to_json({
+    belts = s.count_entities_filtered{
+        name = 'transport-belt', position = {72.5, -24.5}, radius = 0.1
+    }
+}))
+")"
+assert_json "removal dry-run leaves the tapped belt intact" \
+    "$REMOVAL_DEPENDENCY_DRY_WORLD" '.belts == 1'
+
+REMOVAL_DEPENDENCY_EXEC="$(mcp_tool remove_entity "$(jq -cn \
+    --argjson unit "$(jq '.tapped_unit' <<<"$REMOVAL_DEPENDENCY_FIXTURE")" \
+    '{unit_number:$unit,dry_run:false}')")"
+REMOVAL_DEPENDENCY_EXEC_PAYLOAD="$(tool_payload "$REMOVAL_DEPENDENCY_EXEC")"
+require_json "deliberate removal succeeds but preserves the dependency warning" \
+    "$REMOVAL_DEPENDENCY_EXEC_PAYLOAD" \
+    --argjson fixture "$REMOVAL_DEPENDENCY_FIXTURE" \
+    '.success == true
+     and .dry_run == false
+     and .removed == true
+     and .unit_number == $fixture.tapped_unit
+     and .removal_advisory.severity == "warning"
+     and any(.removal_advisory.dependencies[];
+         .kind == "inserter_interaction"
+         and .inserter.unit_number == $fixture.inserter_unit)'
+
+REMOVAL_DEPENDENCY_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local inserter = nil
+for _, candidate in pairs(s.find_entities_filtered{type = 'inserter'}) do
+    if candidate.unit_number == $(jq '.inserter_unit' <<<"$REMOVAL_DEPENDENCY_FIXTURE") then
+        inserter = candidate
+    end
+end
+rcon.print(helpers.table_to_json({
+    tapped_belts = s.count_entities_filtered{
+        name = 'transport-belt', position = {72.5, -24.5}, radius = 0.1
+    },
+    inserter_remains = inserter ~= nil,
+    pickup_target_after = inserter and inserter.pickup_target
+        and inserter.pickup_target.unit_number or nil,
+    furnaces = s.count_entities_filtered{
+        name = 'stone-furnace', position = {72, -22}, radius = 0.2
+    },
+}))
+")"
+require_json "removal leaves the exact downstream path visibly orphaned" \
+    "$REMOVAL_DEPENDENCY_WORLD" \
+    '.tapped_belts == 0
+     and .inserter_remains == true
+     and (.pickup_target_after | not)
+     and .furnaces == 1'
 
 INVALID_PLACE="$(mcp_tool place_entity '{"entity_name":"not-a-real-entity","x":28,"y":10,"direction":"north"}')"
 assert_json "semantic MCP failures set isError" "$INVALID_PLACE" '.result.isError == true'

@@ -93,7 +93,7 @@
     "plan_steam_power": {"args": ["agent_id", "water_x1", "water_y1", "water_x2", "water_y2", "target_x", "target_y"], "returns": "json"},
     "ping": {"args": [], "returns": "nil"},
     "repair_steam_power": {"args": ["agent_id", "x", "y", "radius", "target_x", "target_y"], "returns": "json"},
-    "remove_entity": {"args": ["agent_id", "unit_number"], "returns": "json"},
+    "remove_entity": {"args": ["agent_id", "unit_number", "dry_run"], "returns": "json"},
     "remove_entity_at": {"args": ["agent_id", "x", "y"], "returns": "json"},
     "rotate_entity": {"args": ["agent_id", "unit_number", "direction"], "returns": "json"},
     "save_blueprint": {"args": ["agent_id", "name", "x1", "y1", "x2", "y2"], "returns": "json"},

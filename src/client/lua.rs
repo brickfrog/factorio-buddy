@@ -820,7 +820,11 @@ impl LuaCommand {
     pub fn remove_entity(agent_id: &AgentId, unit_number: u32) -> String {
         Self::claude_interface_json_call(
             "remove_entity",
-            &[Self::lua_string_arg(agent_id.as_str()), unit_number.to_string()],
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                unit_number.to_string(),
+                "false".to_string(),
+            ],
             "Run just sync/resume so the updated claude-interface mod is loaded before removing entities.",
         )
     }

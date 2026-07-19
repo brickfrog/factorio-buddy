@@ -6718,8 +6718,9 @@ fn ready_fuel_supply_args(report: &serde_json::Value) -> Option<BuildFuelSupplyP
 /// Parameters for remove_entity tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RemoveEntityParams {
-    /// Entity unit number to remove
     pub unit_number: u32,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Parameters for rotate_entity tool
@@ -10684,15 +10685,19 @@ impl FactorioMcp {
     }
 
     /// Remove an entity.
-    #[tool(description = "Remove/mine an entity by its unit number.")]
+    #[tool(description = "Preview/remove an exact unit with dependency advisory.")]
     async fn remove_entity(&self, Parameters(params): Parameters<RemoveEntityParams>) -> String {
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => return self.with_player_messages(format!("Error: {}", e)).await,
         };
 
-        let result = match client.remove_entity(params.unit_number).await {
-            Ok(()) => "Entity removed successfully".to_string(),
+        let result = match client
+            .remove_entity_with_report(params.unit_number, params.dry_run)
+            .await
+        {
+            Ok(report) => serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|error| format!("Error: {error}")),
             Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await

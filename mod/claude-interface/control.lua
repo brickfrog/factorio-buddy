@@ -1659,14 +1659,198 @@ local function remove_entity_at_impl(agent_id, x, y)
     }
 end
 
-local function remove_entity_impl(agent_id, unit_number)
+local function same_entity(left, right)
+    if not (left and left.valid and right and right.valid) then return false end
+    if left.unit_number and right.unit_number then return left.unit_number == right.unit_number end
+    return left == right
+end
+
+local function safe_entity_target(entity, property)
+    local ok, target = pcall(function() return entity[property] end)
+    if ok and target and target.valid then return target end
+    return nil
+end
+
+local function interaction_uses_entity_tile(position, entity)
+    if not (position and entity and entity.valid and entity.bounding_box) then return false end
+    local tile_x = math.floor(position.x)
+    local tile_y = math.floor(position.y)
+    local box = entity.bounding_box
+    return tile_x >= math.floor(box.left_top.x)
+        and tile_x < math.ceil(box.right_bottom.x)
+        and tile_y >= math.floor(box.left_top.y)
+        and tile_y < math.ceil(box.right_bottom.y)
+end
+
+local function compact_dependency_entity(entity)
+    if not (entity and entity.valid) then return nil end
+    return {
+        unit_number = entity.unit_number,
+        name = entity.name,
+        entity_type = entity.type,
+        position = {x = entity.position.x, y = entity.position.y},
+        direction = entity.direction,
+    }
+end
+
+local dependency_transport_types = {
+    ["transport-belt"] = true,
+    ["underground-belt"] = true,
+    ["splitter"] = true,
+    ["loader"] = true,
+    ["loader-1x1"] = true,
+    ["linked-belt"] = true,
+}
+
+local function dependency_target_priority(entity)
+    if dependency_transport_types[entity.type] then return 3 end
+    if entity.type == "resource" or entity.type == "item-entity" then return 0 end
+    if entity.type == "tree" or entity.type == "simple-entity" then return 1 end
+    return 2
+end
+
+local function physical_interaction_target(inserter, position)
+    if not (inserter and inserter.valid and position) then return nil end
+    local tile_x = math.floor(position.x)
+    local tile_y = math.floor(position.y)
+    local candidates = inserter.surface.find_entities_filtered{
+        area = {{tile_x, tile_y}, {tile_x + 1, tile_y + 1}},
+    }
+    table.sort(candidates, function(left, right)
+        local left_priority = dependency_target_priority(left)
+        local right_priority = dependency_target_priority(right)
+        if left_priority ~= right_priority then return left_priority > right_priority end
+        if left.name ~= right.name then return left.name < right.name end
+        return (left.unit_number or math.huge) < (right.unit_number or math.huge)
+    end)
+    for _, candidate in ipairs(candidates) do
+        if candidate.valid and not same_entity(candidate, inserter) then return candidate end
+    end
+    return nil
+end
+
+local function resolved_inserter_target(inserter, property, position)
+    return safe_entity_target(inserter, property)
+        or physical_interaction_target(inserter, position)
+end
+
+local function count_inserters_dropping_to(surface, target)
+    if not target then return 0 end
+    local count = 0
+    for _, inserter in pairs(surface.find_entities_filtered{type = "inserter"}) do
+        if same_entity(
+            resolved_inserter_target(inserter, "drop_target", inserter.drop_position),
+            target
+        ) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function removal_dependency_advisory(entity)
+    local dependencies = {}
+    local surface = entity.surface
+    for _, inserter in pairs(surface.find_entities_filtered{type = "inserter"}) do
+        if not same_entity(inserter, entity) then
+            local interactions = {
+                {kind = "pickup", position = inserter.pickup_position, property = "pickup_target"},
+                {kind = "dropoff", position = inserter.drop_position, property = "drop_target"},
+            }
+            for _, interaction in ipairs(interactions) do
+                local resolved_target = resolved_inserter_target(
+                    inserter,
+                    interaction.property,
+                    interaction.position
+                )
+                if same_entity(resolved_target, entity)
+                    or interaction_uses_entity_tile(interaction.position, entity)
+                then
+                    local downstream = interaction.kind == "pickup"
+                        and resolved_inserter_target(
+                            inserter,
+                            "drop_target",
+                            inserter.drop_position
+                        ) or nil
+                    local downstream_inserters = downstream
+                        and count_inserters_dropping_to(surface, downstream) or nil
+                    table.insert(dependencies, {
+                        kind = "inserter_interaction",
+                        interaction = interaction.kind,
+                        interaction_position = {
+                            x = interaction.position.x,
+                            y = interaction.position.y,
+                        },
+                        inserter = compact_dependency_entity(inserter),
+                        downstream_target = compact_dependency_entity(downstream),
+                        downstream_input_inserter_count = downstream_inserters,
+                        only_observed_input_path = downstream_inserters == 1,
+                    })
+                end
+            end
+        end
+    end
+
+    if entity.type == "transport-belt"
+        or entity.type == "underground-belt"
+        or entity.type == "splitter"
+    then
+        local ok, neighbours = pcall(function() return entity.belt_neighbours end)
+        if ok and neighbours then
+            for _, relationship in ipairs({"inputs", "outputs"}) do
+                for _, neighbour in pairs(neighbours[relationship] or {}) do
+                    if neighbour and neighbour.valid then
+                        table.insert(dependencies, {
+                            kind = "belt_connection",
+                            relationship = relationship,
+                            belt = compact_dependency_entity(neighbour),
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    local has_dependents = #dependencies > 0
+    return {
+        kind = "removal_dependencies",
+        severity = has_dependents and "warning" or "info",
+        has_dependents = has_dependents,
+        dependent_count = #dependencies,
+        dependencies = dependencies,
+        warning = has_dependents
+            and "Removing this entity will disconnect observed inserter or belt dependencies."
+            or nil,
+        guidance = has_dependents
+            and "Inspect dependencies before removal; a belt terminus may still feed a side-tapping inserter."
+            or "No direct inserter interactions or belt connections were observed.",
+    }
+end
+
+local function remove_entity_impl(agent_id, unit_number, dry_run)
     storage.factorioctl_entities = storage.factorioctl_entities or {}
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
         return {error = "Entity not found"}
     end
 
-    return mine_entity_for_agent(agent_id, entity)
+    local advisory = removal_dependency_advisory(entity)
+    if dry_run == true then
+        return {
+            success = true,
+            dry_run = true,
+            removed = false,
+            would_remove = compact_dependency_entity(entity),
+            removal_advisory = advisory,
+            warning = advisory.warning,
+        }
+    end
+
+    local result = mine_entity_for_agent(agent_id, entity)
+    result.dry_run = false
+    result.removal_advisory = advisory
+    result.warning = advisory.warning
+    return result
 end
 
 local function get_entity_reach_impl(agent_id, unit_number)
@@ -2406,8 +2590,8 @@ local api = {
         return json_remote_call("remove_entity_at", remove_entity_at_impl, agent_id, x, y)
     end,
 
-    remove_entity = function(agent_id, unit_number)
-        return json_remote_call("remove_entity", remove_entity_impl, agent_id, unit_number)
+    remove_entity = function(agent_id, unit_number, dry_run)
+        return json_remote_call("remove_entity", remove_entity_impl, agent_id, unit_number, dry_run)
     end,
 
     rotate_entity = function(agent_id, unit_number, direction)

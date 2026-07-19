@@ -1835,15 +1835,31 @@ impl FactorioClient {
 
     /// Remove entity by unit number
     pub async fn remove_entity(&mut self, unit_number: u32) -> Result<()> {
-        self.approach_entity(unit_number).await?;
+        self.remove_entity_with_report(unit_number, false).await?;
+        Ok(())
+    }
+
+    /// Inspect or remove an entity and retain its dependency advisory.
+    pub async fn remove_entity_with_report(
+        &mut self,
+        unit_number: u32,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        if !dry_run {
+            self.approach_entity(unit_number).await?;
+        }
         let response = self
             .call_remote(
                 "remove_entity",
-                &[json!(self.agent_id.as_str()), json!(unit_number)],
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    json!(dry_run),
+                ],
             )
             .await?;
         ensure_lua_success(&response)?;
-        Ok(())
+        Ok(serde_json::from_str(&response)?)
     }
 
     /// Rotate entity to a new direction

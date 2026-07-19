@@ -1050,7 +1050,7 @@ fn coordinate_removal_requires_exact_identity_without_mutating() {
         .and_then(|tail| tail.split("local function remove_entity_impl").next())
         .expect("remove_entity_at_impl should precede remove_entity_impl");
     let exact_remove = control_lua
-        .split("local function remove_entity_impl(agent_id, unit_number)")
+        .split("local function remove_entity_impl(agent_id, unit_number, dry_run)")
         .nth(1)
         .and_then(|tail| tail.split("local function insert_items_impl").next())
         .expect("remove_entity_impl should precede insert_items_impl");
@@ -1077,8 +1077,11 @@ fn coordinate_removal_requires_exact_identity_without_mutating() {
     );
     assert!(
         exact_remove.contains("entities.find_by_unit_number(unit_number)")
-            && exact_remove.contains("return mine_entity_for_agent(agent_id, entity)"),
-        "exact-unit remove_entity must remain the deliberate mutation path"
+            && exact_remove.contains("local advisory = removal_dependency_advisory(entity)")
+            && exact_remove.contains("if dry_run == true then")
+            && exact_remove.contains("local result = mine_entity_for_agent(agent_id, entity)")
+            && exact_remove.contains("result.removal_advisory = advisory"),
+        "exact-unit remove_entity must preflight dependencies and remain the deliberate mutation path"
     );
 }
 
@@ -2474,7 +2477,7 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
         "local function extract_items_impl",
         "local function set_recipe_impl",
         "remove_entity_at = function(agent_id, x, y)",
-        "remove_entity = function(agent_id, unit_number)",
+        "remove_entity = function(agent_id, unit_number, dry_run)",
         "rotate_entity = function(agent_id, unit_number, direction)",
         "insert_items = function(agent_id, unit_number, item, count, inventory_type)",
         "extract_items = function(agent_id, unit_number, item, count, inventory_type)",
