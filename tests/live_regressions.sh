@@ -2379,6 +2379,157 @@ else
         "observed $TOOLS_SCHEMA_BYTES bytes"
 fi
 
+# A route that joins a live belt must distinguish physical connectivity from
+# item compatibility. The occupied lane and its consumer are one belt beyond
+# the reused endpoint, proving the advisory follows the existing downstream
+# graph instead of inspecting only the exact target tile.
+LANE_CONTAMINATION_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, entity in pairs(s.find_entities_filtered{area = {{-64, -32}, {-48, -22}}}) do
+    if entity.type ~= 'resource' and entity.type ~= 'character' then entity.destroy() end
+end
+c.teleport({-60.5, -27.5})
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'transport-belt', count = 20}
+local endpoint = s.create_entity{
+    name = 'transport-belt', position = {-55.5, -27.5},
+    direction = defines.direction.east, force = c.force
+}
+local downstream = s.create_entity{
+    name = 'transport-belt', position = {-54.5, -27.5},
+    direction = defines.direction.east, force = c.force
+}
+local assembler = s.create_entity{
+    name = 'assembling-machine-1', position = {-54.5, -30.5}, force = c.force
+}
+local consumer = s.create_entity{
+    name = 'inserter', position = {-54.5, -28.5},
+    direction = defines.direction.south, force = c.force
+}
+if not (endpoint and downstream and assembler and consumer) then
+    error('failed to create lane contamination fixture')
+end
+assembler.set_recipe('iron-gear-wheel')
+local line = downstream.get_transport_line(1)
+for slot = 1, 4 do
+    line.force_insert_at((slot - 0.5) / 4, {name = 'iron-plate', count = 1})
+end
+rcon.print(helpers.table_to_json({
+    endpoint_unit = endpoint.unit_number,
+    downstream_unit = downstream.unit_number,
+    assembler_unit = assembler.unit_number,
+    consumer_unit = consumer.unit_number,
+    downstream_item_count = line.get_item_count(),
+}))
+")"
+require_json "lane-contamination fixture has an occupied downstream lane and real consumer" \
+    "$LANE_CONTAMINATION_FIXTURE" \
+    '(.endpoint_unit | type) == "number"
+     and (.downstream_unit | type) == "number"
+     and (.assembler_unit | type) == "number"
+     and (.consumer_unit | type) == "number"
+     and .downstream_item_count == 4'
+LANE_CONTAMINATION_ASSEMBLER_UNIT="$(jq -r '.assembler_unit' <<<"$LANE_CONTAMINATION_FIXTURE")"
+LANE_CONTAMINATION_CONSUMER_UNIT="$(jq -r '.consumer_unit' <<<"$LANE_CONTAMINATION_FIXTURE")"
+
+LANE_CONTAMINATION_PLAN="$(mcp_tool route_belt '{
+    "from_x":-59,
+    "from_y":-28,
+    "to_x":-56,
+    "to_y":-28,
+    "belt_type":"transport-belt",
+    "item_name":"iron-ore",
+    "search_radius":5,
+    "dry_run":true,
+    "extend_existing":true,
+    "allow_underground":false,
+    "respect_zones":false
+}')"
+LANE_CONTAMINATION_PAYLOAD="$(tool_payload "$LANE_CONTAMINATION_PLAN")"
+assert_json "route dry-run warns that a connected endpoint would contaminate its downstream lane" \
+    "$LANE_CONTAMINATION_PAYLOAD" \
+    --argjson assembler "$LANE_CONTAMINATION_ASSEMBLER_UNIT" \
+    --argjson consumer "$LANE_CONTAMINATION_CONSUMER_UNIT" \
+    '.success == true
+     and .dry_run == true
+     and .ready_to_execute == true
+     and .topology.connected == true
+     and .lane_contamination_advisory.kind == "lane_contamination_risk"
+     and .lane_contamination_advisory.checked == true
+     and .lane_contamination_advisory.risk == true
+     and .lane_contamination_advisory.risk_unknown == false
+     and .lane_contamination_advisory.item_name == "iron-ore"
+     and .lane_contamination_advisory.existing_route_belt_count >= 1
+     and .lane_contamination_advisory.downstream_belt_count >= 1
+     and .lane_contamination_advisory.incompatible_lane_count >= 1
+     and .lane_contamination_advisory.rejecting_consumer_count >= 1
+     and any(.lane_contamination_advisory.belts[];
+         .position.x == -55 and .position.y == -28
+         and .left_lane.would_mix == true
+         and any(.left_lane.items[]; .name == "iron-plate" and .count == 4))
+     and any(.lane_contamination_advisory.consumers[];
+         .inserter_unit_number == $consumer
+         and .dropoff_target.unit_number == $assembler
+         and .item_acceptance.classification == "rejected"
+         and .item_acceptance.recipe == "iron-gear-wheel"
+         and any(.item_acceptance.accepted_items[]; . == "iron-plate"))
+     and (.warning | type) == "string"
+     and .ready_to_call.execute_args.item_name == "iron-ore"'
+
+LANE_CONTAMINATION_UNKNOWN="$(mcp_tool route_belt '{
+    "from_x":-59,
+    "from_y":-28,
+    "to_x":-56,
+    "to_y":-28,
+    "belt_type":"transport-belt",
+    "search_radius":5,
+    "dry_run":true,
+    "extend_existing":true,
+    "allow_underground":false,
+    "respect_zones":false
+}')"
+LANE_CONTAMINATION_UNKNOWN_PAYLOAD="$(tool_payload "$LANE_CONTAMINATION_UNKNOWN")"
+assert_json "route dry-run reports unknown compatibility when an occupied reused lane has no item intent" \
+    "$LANE_CONTAMINATION_UNKNOWN_PAYLOAD" \
+    '.success == true
+     and .ready_to_execute == true
+     and .lane_contamination_advisory.risk == false
+     and .lane_contamination_advisory.risk_unknown == true
+     and (.warning | type) == "string"'
+
+LANE_CONTAMINATION_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local units = {
+    [$LANE_CONTAMINATION_ASSEMBLER_UNIT] = false,
+    [$LANE_CONTAMINATION_CONSUMER_UNIT] = false,
+}
+local belts = 0
+local item_count = 0
+for _, entity in pairs(s.find_entities_filtered{area = {{-64, -32}, {-48, -22}}}) do
+    if entity.type == 'transport-belt' then
+        belts = belts + 1
+        item_count = item_count
+            + entity.get_transport_line(1).get_item_count()
+            + entity.get_transport_line(2).get_item_count()
+    end
+    if units[entity.unit_number] ~= nil then units[entity.unit_number] = true end
+end
+rcon.print(helpers.table_to_json({
+    belt_count = belts,
+    item_count = item_count,
+    assembler_exists = units[$LANE_CONTAMINATION_ASSEMBLER_UNIT],
+    consumer_exists = units[$LANE_CONTAMINATION_CONSUMER_UNIT],
+}))
+")"
+require_json "lane-contamination dry-runs do not mutate the live fixture" \
+    "$LANE_CONTAMINATION_WORLD" \
+    '.belt_count == 2
+     and .item_count == 4
+     and .assembler_exists == true
+     and .consumer_exists == true'
+
 # A full belt lane with no output is the physical root of upstream
 # waiting-for-space symptoms. Diagnosis must name that terminus and stalled
 # lane once, then group the directly traced inserter symptom under it.

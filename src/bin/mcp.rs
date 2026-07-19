@@ -180,6 +180,7 @@ fn route_belt_failure_json(
         "from": { "x": params.from_x, "y": params.from_y },
         "to": { "x": params.to_x, "y": params.to_y },
         "belt_type": params.belt_type,
+        "item_name": params.item_name,
         "search_radius": params.search_radius,
         "materials_sufficient": false,
     })
@@ -2772,6 +2773,7 @@ mod tests {
             to_x: 51,
             to_y: -6,
             belt_type: "transport-belt".to_string(),
+            item_name: None,
             search_radius: 10,
             dry_run: false,
             respect_zones: false,
@@ -2787,6 +2789,46 @@ mod tests {
         assert_eq!(payload["from"]["x"], 73);
         assert_eq!(payload["to"]["y"], -6);
         assert_eq!(payload["belt_type"], "transport-belt");
+        assert_eq!(payload["item_name"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn route_belt_contamination_advisory_uses_live_lanes_and_downstream_consumers() {
+        let source = include_str!("mcp.rs");
+        let advisory = source
+            .rsplit("    async fn route_lane_contamination_advisory(")
+            .next()
+            .and_then(|tail| tail.split("\n    async fn route_belt_core(").next())
+            .expect("lane contamination advisory should precede route_belt_core");
+
+        for required in [
+            "client.get_belt_lane_contents(area)",
+            "BeltGraph::from_entities(route_entities)",
+            "analyze_belt_reach(&belt_graph, origin)",
+            "analyze_inserters(route_entities)",
+            "affected_belt_tiles.contains(&pickup_tile)",
+            "client.get_entity_recipe(unit_number)",
+            "client.get_recipe(&recipe_name)",
+            "ingredient.name == intended",
+            "\"kind\": \"lane_contamination_risk\"",
+            "\"incompatible_lane_count\"",
+            "\"rejecting_consumer_count\"",
+        ] {
+            assert!(
+                advisory.contains(required),
+                "lane contamination advisory should retain {required:?}"
+            );
+        }
+
+        let route_core = source
+            .rsplit("    async fn route_belt_core(")
+            .next()
+            .and_then(|tail| tail.split("\n    async fn route_belt(").next())
+            .expect("route_belt_core should exist before route_belt");
+        assert!(route_core.contains("params.item_name.as_deref()"));
+        assert!(route_core.contains("\"lane_contamination_advisory\""));
+        assert!(route_core.contains("lane_contamination_advisory.get(\"warning\")"));
+        assert!(!route_core.contains("ready_to_execute: !lane_contamination"));
     }
 
     #[test]
@@ -3328,7 +3370,7 @@ mod tests {
         for required in [
             "if params.extend_existing",
             "collision_map.unblock(tile)",
-            "existing_surface_belts.insert(tile, entity)",
+            "existing_surface_belts.insert(tile, entity.clone())",
             "collision_map.block(tile)",
         ] {
             assert!(
@@ -4706,6 +4748,9 @@ pub struct RouteBeltParams {
     /// Belt type (e.g., 'transport-belt', 'fast-transport-belt')
     #[serde(default = "default_belt_type")]
     pub belt_type: String,
+    /// Route item; enables lane and consumer contamination checks.
+    #[serde(default)]
+    pub item_name: Option<String>,
     /// Search radius for obstacle detection
     #[serde(default = "default_search_radius")]
     pub search_radius: u32,
@@ -10758,6 +10803,286 @@ impl FactorioMcp {
         self.with_player_messages(result).await
     }
 
+    async fn route_lane_contamination_advisory(
+        client: &mut FactorioClient,
+        area: Area,
+        route_entities: &[Entity],
+        existing_belt_tiles: &HashSet<GridPos>,
+        item_name: Option<&str>,
+    ) -> serde_json::Value {
+        if existing_belt_tiles.is_empty() {
+            return serde_json::json!({
+                "kind": "lane_contamination_risk",
+                "checked": true,
+                "risk": false,
+                "risk_unknown": false,
+                "item_name": item_name,
+                "existing_route_belt_count": 0,
+                "affected_belt_count": 0,
+                "downstream_belt_count": 0,
+                "occupied_lane_count": 0,
+                "incompatible_lane_count": 0,
+                "consumer_count": 0,
+                "rejecting_consumer_count": 0,
+                "belts": [],
+                "consumers": [],
+                "guidance": "This route does not reuse an existing surface belt, so it cannot contaminate a live endpoint lane.",
+            });
+        }
+
+        let lane_contents = match client.get_belt_lane_contents(area).await {
+            Ok(contents) => contents,
+            Err(error) => {
+                return serde_json::json!({
+                    "kind": "lane_contamination_risk",
+                    "checked": false,
+                    "risk": false,
+                    "risk_unknown": true,
+                    "item_name": item_name,
+                    "existing_route_belt_count": existing_belt_tiles.len(),
+                    "affected_belt_count": null,
+                    "downstream_belt_count": null,
+                    "error": error.to_string(),
+                    "warning": "Existing belts will be reused, but their live lane contents could not be read. Contamination risk is unknown.",
+                    "guidance": "Retry the dry-run or inspect the endpoint with get_belt_lane_contents before execution.",
+                });
+            }
+        };
+
+        let contents_by_tile: HashMap<GridPos, _> = lane_contents
+            .belts
+            .iter()
+            .map(|belt| (GridPos::new(belt.position.x, belt.position.y), belt))
+            .collect();
+        let entities_by_unit: HashMap<u32, &Entity> = route_entities
+            .iter()
+            .filter_map(|entity| entity.unit_number.map(|unit| (unit, entity)))
+            .collect();
+
+        let belt_graph = BeltGraph::from_entities(route_entities);
+        let mut affected_belt_tiles = existing_belt_tiles.clone();
+        for tile in existing_belt_tiles {
+            let origin = TilePos::new(tile.x, tile.y);
+            if let Some(reach) = analyze_belt_reach(&belt_graph, origin) {
+                affected_belt_tiles.extend(
+                    reach
+                        .downstream
+                        .into_iter()
+                        .map(|position| GridPos::new(position.x, position.y)),
+                );
+            }
+        }
+
+        let mut relevant_tiles: Vec<GridPos> = affected_belt_tiles.iter().copied().collect();
+        relevant_tiles.sort_by_key(|tile| (tile.x, tile.y));
+        let mut occupied_lane_count = 0usize;
+        let mut incompatible_lane_count = 0usize;
+        let mut belt_reports = Vec::new();
+        for tile in relevant_tiles.iter().take(32) {
+            let Some(contents) = contents_by_tile.get(tile) else {
+                belt_reports.push(serde_json::json!({
+                    "position": tile,
+                    "left_lane": {"item_count": 0, "items": [], "would_mix": false},
+                    "right_lane": {"item_count": 0, "items": [], "would_mix": false},
+                }));
+                continue;
+            };
+
+            let lane_report = |lane: &factorioctl::world::LaneContents| {
+                let would_mix = item_name.is_some_and(|intended| {
+                    !lane.items.is_empty() && lane.items.iter().any(|item| item.name != intended)
+                });
+                serde_json::json!({
+                    "lane": lane.lane,
+                    "item_count": lane.item_count,
+                    "items": lane.items,
+                    "would_mix": would_mix,
+                })
+            };
+            for lane in [&contents.left_lane, &contents.right_lane] {
+                if !lane.items.is_empty() {
+                    occupied_lane_count += 1;
+                    if item_name
+                        .is_some_and(|intended| lane.items.iter().any(|item| item.name != intended))
+                    {
+                        incompatible_lane_count += 1;
+                    }
+                }
+            }
+            belt_reports.push(serde_json::json!({
+                "unit_number": contents.unit_number,
+                "position": contents.position,
+                "direction": contents.direction,
+                "belt_type": contents.belt_type,
+                "left_lane": lane_report(&contents.left_lane),
+                "right_lane": lane_report(&contents.right_lane),
+            }));
+        }
+
+        let inserters = analyze_inserters(route_entities);
+        let mut recipe_acceptance: HashMap<u32, serde_json::Value> = HashMap::new();
+        let mut consumers = Vec::new();
+        let mut consumer_count = 0usize;
+        let mut rejecting_consumer_count = 0usize;
+        for inserter in inserters {
+            let pickup_tile = GridPos::new(
+                inserter.pickup_position.x.floor() as i32,
+                inserter.pickup_position.y.floor() as i32,
+            );
+            if !affected_belt_tiles.contains(&pickup_tile) {
+                continue;
+            }
+            consumer_count += 1;
+
+            let acceptance = if let (Some(intended), Some(target)) =
+                (item_name, inserter.dropoff_target.as_ref())
+            {
+                if matches!(
+                    target.entity_type.as_str(),
+                    "assembling-machine" | "furnace"
+                ) {
+                    if let Some(unit_number) = target.unit_number {
+                        if let Some(cached) = recipe_acceptance.get(&unit_number) {
+                            cached.clone()
+                        } else {
+                            let report = match client.get_entity_recipe(unit_number).await {
+                                Ok(Some(recipe_name)) => {
+                                    match client.get_recipe(&recipe_name).await {
+                                        Ok(recipe) => {
+                                            let accepts =
+                                                recipe.ingredients.iter().any(|ingredient| {
+                                                    ingredient.item_type == "item"
+                                                        && ingredient.name == intended
+                                                });
+                                            serde_json::json!({
+                                                "classification": if accepts { "accepted" } else { "rejected" },
+                                                "accepts_item": accepts,
+                                                "recipe": recipe_name,
+                                                "accepted_items": recipe.ingredients.iter()
+                                                    .filter(|ingredient| ingredient.item_type == "item")
+                                                    .map(|ingredient| ingredient.name.clone())
+                                                    .collect::<Vec<_>>(),
+                                            })
+                                        }
+                                        Err(error) => serde_json::json!({
+                                            "classification": "unknown",
+                                            "accepts_item": null,
+                                            "recipe": recipe_name,
+                                            "error": error.to_string(),
+                                        }),
+                                    }
+                                }
+                                Ok(None) => serde_json::json!({
+                                    "classification": "unknown",
+                                    "accepts_item": null,
+                                    "reason": "machine_has_no_active_recipe",
+                                }),
+                                Err(error) => serde_json::json!({
+                                    "classification": "unknown",
+                                    "accepts_item": null,
+                                    "error": error.to_string(),
+                                }),
+                            };
+                            recipe_acceptance.insert(unit_number, report.clone());
+                            report
+                        }
+                    } else {
+                        serde_json::json!({
+                            "classification": "unknown",
+                            "accepts_item": null,
+                            "reason": "consumer_has_no_unit_number",
+                        })
+                    }
+                } else if matches!(
+                    target.entity_type.as_str(),
+                    "container" | "logistic-container" | "transport-belt"
+                ) {
+                    serde_json::json!({
+                        "classification": "accepted",
+                        "accepts_item": true,
+                    })
+                } else {
+                    serde_json::json!({
+                        "classification": "unknown",
+                        "accepts_item": null,
+                        "reason": "consumer_acceptance_not_modeled",
+                    })
+                }
+            } else {
+                serde_json::json!({
+                    "classification": "unknown",
+                    "accepts_item": null,
+                    "reason": if item_name.is_none() {
+                        "route_item_name_not_supplied"
+                    } else {
+                        "inserter_has_no_drop_target"
+                    },
+                })
+            };
+            if acceptance
+                .get("accepts_item")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                rejecting_consumer_count += 1;
+            }
+            if consumers.len() < 64 {
+                consumers.push(serde_json::json!({
+                    "inserter_unit_number": inserter.unit_number,
+                    "inserter_type": inserter.inserter_type,
+                    "position": inserter.position,
+                    "pickup_belt_position": pickup_tile,
+                    "dropoff_target": inserter.dropoff_target,
+                    "item_acceptance": acceptance,
+                    "observed_entity": entities_by_unit.get(&inserter.unit_number)
+                        .map(|entity| serde_json::json!({
+                            "name": entity.name,
+                            "direction": entity.direction,
+                        })),
+                }));
+            }
+        }
+
+        let risk =
+            item_name.is_some() && (incompatible_lane_count > 0 || rejecting_consumer_count > 0);
+        let risk_unknown = item_name.is_none() && occupied_lane_count > 0;
+        let warning = if risk {
+            Some("This route would inject the named item into occupied lanes or consumers that reject it. Connected topology does not make the merge safe.")
+        } else if risk_unknown {
+            Some("This route reuses occupied lanes, but item_name was omitted. Lane contamination compatibility is unknown.")
+        } else {
+            None
+        };
+
+        serde_json::json!({
+            "kind": "lane_contamination_risk",
+            "checked": true,
+            "risk": risk,
+            "risk_unknown": risk_unknown,
+            "severity": if risk || risk_unknown { "warning" } else { "info" },
+            "item_name": item_name,
+            "existing_route_belt_count": existing_belt_tiles.len(),
+            "affected_belt_count": affected_belt_tiles.len(),
+            "downstream_belt_count": affected_belt_tiles.len().saturating_sub(existing_belt_tiles.len()),
+            "belt_details_truncated": affected_belt_tiles.len() > belt_reports.len(),
+            "occupied_lane_count": occupied_lane_count,
+            "incompatible_lane_count": incompatible_lane_count,
+            "consumer_count": consumer_count,
+            "consumer_details_truncated": consumer_count > consumers.len(),
+            "rejecting_consumer_count": rejecting_consumer_count,
+            "belts": belt_reports,
+            "consumers": consumers,
+            "warning": warning,
+            "guidance": if risk {
+                "Do not treat topology.connected as permission to merge. Use a separate belt/lane or filter consumers so the named item has a valid drain path."
+            } else if risk_unknown {
+                "Rerun route_belt with item_name so occupied lanes and machine recipes can be checked before execution."
+            } else {
+                "No contamination conflict was observed on the existing route belts for the named item."
+            },
+        })
+    }
+
     async fn route_belt_core(
         &self,
         client: &mut FactorioClient,
@@ -10825,6 +11150,7 @@ impl FactorioMcp {
                                 "to_x": waypoint.x,
                                 "to_y": waypoint.y,
                                 "belt_type": params.belt_type,
+                                "item_name": params.item_name,
                                 "search_radius": params.search_radius,
                                 "dry_run": params.dry_run,
                                 "respect_zones": params.respect_zones,
@@ -10892,7 +11218,7 @@ impl FactorioMcp {
         }
 
         let mut existing_surface_belts: HashMap<GridPos, Entity> = HashMap::new();
-        for entity in route_entities {
+        for entity in &route_entities {
             if !is_existing_belt_entity(&entity.name)
                 || entity.entity_type.as_deref() != Some("transport-belt")
             {
@@ -10901,7 +11227,7 @@ impl FactorioMcp {
             let tile = GridPos::from_position(&entity.position);
             if params.extend_existing {
                 collision_map.unblock(tile);
-                existing_surface_belts.insert(tile, entity);
+                existing_surface_belts.insert(tile, entity.clone());
             } else {
                 // The shared collision map models where a character can walk,
                 // so ordinary belts are intentionally absent from it. An
@@ -11093,6 +11419,14 @@ impl FactorioMcp {
                     .map(|()| tile)
             })
             .collect();
+        let lane_contamination_advisory = Self::route_lane_contamination_advisory(
+            client,
+            area,
+            &route_entities,
+            &existing_belt_tiles,
+            params.item_name.as_deref(),
+        )
+        .await;
 
         let inventory = match client.character_inventory().await {
             Ok(inventory) => inventory,
@@ -11228,6 +11562,7 @@ impl FactorioMcp {
                 "resource_tiles_observed": resource_tiles.len(),
                 "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
                 "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
+                "lane_contamination_advisory": &lane_contamination_advisory,
                 "preflight_errors": preflight_errors,
                 "guidance": "Fix the reported blocker or choose different endpoints, then retry the complete route. Do not place around the failure one tile at a time.",
             }));
@@ -11260,6 +11595,8 @@ impl FactorioMcp {
                 "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
                 "preserved_underground_pair_count": preserved_underground_pairs.len(),
                 "preserved_underground_pairs": &preserved_underground_pairs,
+                "lane_contamination_advisory": &lane_contamination_advisory,
+                "warning": lane_contamination_advisory.get("warning"),
                 "materials": materials,
                 "materials_sufficient": materials_sufficient,
                 "ready_to_execute": materials_sufficient,
@@ -11299,6 +11636,10 @@ impl FactorioMcp {
                 object.insert(
                     "planned_surface_resource_tiles_crossed_count".to_string(),
                     serde_json::json!(planned_surface_resource_tiles_crossed.len()),
+                );
+                object.insert(
+                    "lane_contamination_advisory".to_string(),
+                    lane_contamination_advisory.clone(),
                 );
                 object.insert(
                     "guidance".to_string(),
@@ -11434,6 +11775,7 @@ impl FactorioMcp {
                 "resource_tiles_observed": resource_tiles.len(),
                 "planned_surface_resource_tiles_crossed": &planned_surface_resource_tiles_crossed,
                 "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
+                "lane_contamination_advisory": &lane_contamination_advisory,
                 "rollback": rollback,
                 "rollback_errors": rollback_errors,
                 "guidance": if rollback_success {
@@ -11472,6 +11814,8 @@ impl FactorioMcp {
             "planned_surface_resource_tiles_crossed_count": planned_surface_resource_tiles_crossed.len(),
             "preserved_underground_pair_count": preserved_underground_pairs.len(),
             "preserved_underground_pairs": &preserved_underground_pairs,
+            "lane_contamination_advisory": &lane_contamination_advisory,
+            "warning": lane_contamination_advisory.get("warning"),
             "materials": materials,
             "materials_sufficient": materials_sufficient,
             "topology": compact_belt_topology(result.topology.as_ref()),
@@ -11481,7 +11825,7 @@ impl FactorioMcp {
 
     /// Route belts from point A to point B using A* pathfinding.
     #[tool(
-        description = "Plan or atomically build a complete A* belt route. Surface belts may cross resources and use ore endpoints; reports include observed resources and exact surface crossings. dry_run returns executable args. Live placement preflight, all-or-nothing materials, reuse, and rollback still apply."
+        description = "Plan or atomically build an A* belt route. Set item_name to check reused lanes and downstream consumers for contamination. A connected route can still be item-unsafe. dry_run returns executable args."
     )]
     async fn route_belt(&self, Parameters(params): Parameters<RouteBeltParams>) -> String {
         let mut client = match self.connect().await {
@@ -11706,6 +12050,7 @@ impl FactorioMcp {
                     to_x: params.pickup_x,
                     to_y: params.pickup_y,
                     belt_type: params.belt_type.clone(),
+                    item_name: Some("coal".to_string()),
                     search_radius: params.search_radius,
                     dry_run: true,
                     respect_zones: params.respect_zones,
@@ -11769,6 +12114,7 @@ impl FactorioMcp {
                     to_x: params.pickup_x,
                     to_y: params.pickup_y,
                     belt_type: params.belt_type.clone(),
+                    item_name: Some("coal".to_string()),
                     search_radius: params.search_radius,
                     dry_run: true,
                     respect_zones: params.respect_zones,
@@ -13006,6 +13352,7 @@ impl FactorioMcp {
             to_x: params.pickup_x,
             to_y: params.pickup_y,
             belt_type: params.belt_type.clone(),
+            item_name: None,
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -13304,6 +13651,7 @@ impl FactorioMcp {
             to_x: params.pickup_x,
             to_y: params.pickup_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some(params.item_name.clone()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -13659,6 +14007,7 @@ impl FactorioMcp {
             to_x: build_args.to_x,
             to_y: build_args.to_y,
             belt_type: build_args.belt_type.clone(),
+            item_name: Some(build_args.item_name.clone()),
             search_radius: build_args.search_radius,
             dry_run: true,
             respect_zones: build_args.respect_zones,
@@ -13747,6 +14096,7 @@ impl FactorioMcp {
             to_x: params.to_x,
             to_y: params.to_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some(params.item_name.clone()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -14070,6 +14420,7 @@ impl FactorioMcp {
             to_x: input.belt_x,
             to_y: input.belt_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some(params.input_item_name.clone()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -14082,6 +14433,7 @@ impl FactorioMcp {
             to_x: params.output_to_x,
             to_y: params.output_to_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some(params.output_item_name.clone()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -14242,6 +14594,7 @@ impl FactorioMcp {
             to_x: params.input_pickup_x,
             to_y: params.input_pickup_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some(params.input_item_name.clone()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -14254,6 +14607,7 @@ impl FactorioMcp {
             to_x: params.output_to_x,
             to_y: params.output_to_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some(params.output_item_name.clone()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -14783,6 +15137,7 @@ impl FactorioMcp {
             to_x: build_args.gear_pickup_x,
             to_y: build_args.gear_pickup_y,
             belt_type: build_args.belt_type.clone(),
+            item_name: Some("iron-gear-wheel".to_string()),
             search_radius: build_args.search_radius,
             dry_run: true,
             respect_zones: build_args.respect_zones,
@@ -14795,6 +15150,7 @@ impl FactorioMcp {
             to_x: build_args.copper_pickup_x,
             to_y: build_args.copper_pickup_y,
             belt_type: build_args.belt_type.clone(),
+            item_name: Some("copper-plate".to_string()),
             search_radius: build_args.search_radius,
             dry_run: true,
             respect_zones: build_args.respect_zones,
@@ -14807,6 +15163,7 @@ impl FactorioMcp {
             to_x: build_args.science_to_x,
             to_y: build_args.science_to_y,
             belt_type: build_args.belt_type.clone(),
+            item_name: Some("automation-science-pack".to_string()),
             search_radius: build_args.search_radius,
             dry_run: true,
             respect_zones: build_args.respect_zones,
@@ -14819,6 +15176,7 @@ impl FactorioMcp {
             to_x: build_args.lab_pickup_x,
             to_y: build_args.lab_pickup_y,
             belt_type: build_args.belt_type.clone(),
+            item_name: Some("automation-science-pack".to_string()),
             search_radius: build_args.search_radius,
             dry_run: true,
             respect_zones: build_args.respect_zones,
@@ -15066,6 +15424,7 @@ impl FactorioMcp {
             to_x: params.gear_pickup_x,
             to_y: params.gear_pickup_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some("iron-gear-wheel".to_string()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -15078,6 +15437,7 @@ impl FactorioMcp {
             to_x: params.copper_pickup_x,
             to_y: params.copper_pickup_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some("copper-plate".to_string()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -15090,6 +15450,7 @@ impl FactorioMcp {
             to_x: params.science_to_x,
             to_y: params.science_to_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some("automation-science-pack".to_string()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
@@ -15102,6 +15463,7 @@ impl FactorioMcp {
             to_x: params.lab_pickup_x,
             to_y: params.lab_pickup_y,
             belt_type: params.belt_type.clone(),
+            item_name: Some("automation-science-pack".to_string()),
             search_radius: params.search_radius,
             dry_run: true,
             respect_zones: params.respect_zones,
