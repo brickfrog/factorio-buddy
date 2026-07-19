@@ -1889,6 +1889,15 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
         "local function aggregate_resource_patches",
         "function M.find_resources",
         "function M.find_nearest_resource",
+        "function M.strategic_summary(",
+        "local STRATEGIC_RESOURCE_CLEARANCE = 32",
+        "local MAX_STRATEGIC_RESOURCE_CANDIDATES = 12",
+        "local STRATEGIC_PATCH_SAMPLE_RADIUS = 50",
+        "surface.find_entities_filtered{type = \"resource\"}",
+        "discovery_scope = \"all_generated_chunks\"",
+        "select_candidate(nearest_by_name[name], \"nearest_external\")",
+        "select_candidate(richest_by_name[name], \"richest_external_sample\")",
+        "candidate.rank = rank",
         "local MAX_RESOURCE_EXPLORE_RADIUS = 512",
         "for _ in surface.get_chunks() do count = count + 1 end",
         "surface.request_to_generate_chunks(",
@@ -1907,6 +1916,22 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
         !world_lua.contains("radius = 200"),
         "find_nearest_resource must not retain the hidden 200-tile discovery ceiling"
     );
+
+    let autonomy_lua = include_str!("../mod/claude-interface/autonomy.lua");
+    for required in [
+        "local world = require(\"world\")",
+        "local function is_factory_entity(entity)",
+        "entity.prototype.items_to_place_this",
+        "local mining_targets = {}",
+        "world.strategic_summary(",
+        "world = strategic.world",
+        "expansion = strategic.expansion",
+    ] {
+        assert!(
+            autonomy_lua.contains(required),
+            "autonomy snapshot should expose strategic expansion evidence {required:?}"
+        );
+    }
 }
 
 #[test]

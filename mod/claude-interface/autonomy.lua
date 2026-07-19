@@ -2,6 +2,7 @@ local diagnostics = require("diagnostics")
 local entities = require("entities")
 local inventory = require("inventory")
 local research = require("research")
+local world = require("world")
 
 local M = {}
 
@@ -87,6 +88,15 @@ local function character_snapshot(character)
     }
 end
 
+local function is_factory_entity(entity)
+    if not (entity and entity.valid) or entity.type == "character" then return false end
+    if entity.type == "entity-ghost" or entity.type == "tile-ghost" then return true end
+    local prototype_ok, items_to_place = pcall(function()
+        return entity.prototype.items_to_place_this
+    end)
+    return prototype_ok and items_to_place ~= nil and #items_to_place > 0
+end
+
 function M.snapshot(character)
     if not (character and character.valid) then
         return {success = false, error = "no character; spawn first"}
@@ -98,12 +108,13 @@ function M.snapshot(character)
     local counts_by_type = {}
     local statuses = {}
     local mining_drills = {}
+    local mining_targets = {}
     local power_networks_by_id = {}
     local entity_count = 0
     local min_x, min_y, max_x, max_y = nil, nil, nil, nil
 
     for _, entity in pairs(found) do
-        if entity.valid and entity.type ~= "character" then
+        if is_factory_entity(entity) then
             entity_count = entity_count + 1
             counts_by_name[entity.name] = (counts_by_name[entity.name] or 0) + 1
             counts_by_type[entity.type] = (counts_by_type[entity.type] or 0) + 1
@@ -119,6 +130,12 @@ function M.snapshot(character)
 
             if entity.type == "mining-drill" then
                 local target_ok, target = pcall(function() return entity.mining_target end)
+                if target_ok and target and target.valid then
+                    table.insert(mining_targets, {
+                        name = target.name,
+                        position = position_table(target.position),
+                    })
+                end
                 table.insert(mining_drills, {
                     unit_number = entity.unit_number,
                     name = entity.name,
@@ -151,6 +168,10 @@ function M.snapshot(character)
     min_y = min_y or origin.y - 32
     max_x = max_x or origin.x + 32
     max_y = max_y or origin.y + 32
+    local factory_bounds = {
+        left_top = {x = min_x, y = min_y},
+        right_bottom = {x = max_x, y = max_y},
+    }
 
     table.sort(mining_drills, function(a, b)
         if a.name ~= b.name then return a.name < b.name end
@@ -179,6 +200,11 @@ function M.snapshot(character)
         max_y + margin,
         25
     )
+    local strategic = world.strategic_summary(
+        surface,
+        factory_bounds,
+        mining_targets
+    )
 
     return {
         tick = game.tick,
@@ -186,11 +212,10 @@ function M.snapshot(character)
         character = character_snapshot(character),
         research = research.get_research_status(character),
         production = compact_production(surface.name, force),
+        world = strategic.world,
+        expansion = strategic.expansion,
         factory = {
-            bounds = {
-                left_top = {x = min_x, y = min_y},
-                right_bottom = {x = max_x, y = max_y},
-            },
+            bounds = factory_bounds,
             entity_count = entity_count,
             entities_by_name = sorted_counts(counts_by_name),
             entities_by_type = sorted_counts(counts_by_type),

@@ -453,6 +453,23 @@ local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local s = c.surface
 local furnace = s.create_entity{name = 'stone-furnace', position = {15.5, 0.5}, force = c.force}
 s.create_entity{name = 'transport-belt', position = {18.5, 0.5}, direction = defines.direction.east, force = c.force}
+s.request_to_generate_chunks({320, 0}, 1)
+s.force_generate_chunk_requests()
+for _, resource in pairs(s.find_entities_filtered{type = 'resource', area = {{312, -8}, {332, 10}}}) do
+    resource.destroy()
+end
+local resource_tiles = {}
+for x = 320, 322 do
+    for y = 0, 2 do
+        table.insert(resource_tiles, {name = 'grass-1', position = {x, y}})
+    end
+end
+s.set_tiles(resource_tiles)
+for x = 320, 322 do
+    for y = 0, 2 do
+        s.create_entity{name = 'iron-ore', position = {x + 0.5, y + 0.5}, amount = 1000000}
+    end
+end
 rcon.print(helpers.table_to_json({furnace_unit = furnace.unit_number}))
 ")"
 FURNACE_UNIT="$(jq -r '.furnace_unit' <<<"$SURFACE_FIXTURE")"
@@ -461,8 +478,26 @@ assert_json "snapshot and blocker scan use the NPC surface" "$SNAPSHOT" \
     --argjson unit "$FURNACE_UNIT" \
     '.surface == "buddy-live-regression"
      and .factory.entity_count > 0
+     and all(.factory.entities_by_name[]; .name != "fulgoran-ruin-attractor")
      and .factory.blockers.scanned_entities > 0
-     and any(.factory.blockers.blockers[]?; .unit_number == $unit)'
+     and any(.factory.blockers.blockers[]?; .unit_number == $unit)
+     and .world.generated_chunk_count > 0
+     and .world.generated_bounds.left_top.x <= 320
+     and .world.generated_bounds.right_bottom.x > 320
+     and .expansion.discovery_scope == "all_generated_chunks"
+     and .expansion.minimum_factory_clearance == 32
+     and .expansion.candidate_limit == 12
+     and (.expansion.resource_candidates | length) <= .expansion.candidate_limit
+     and any(.expansion.resource_candidates[]?;
+         .name == "iron-ore"
+         and .center.x == 321.5
+         and .center.y == 1.5
+         and .total_amount == 9000000
+         and .distance_from_factory > 250
+         and .rank >= 1
+         and .direction == "east"
+         and .currently_mined == false
+         and (.selection_reasons | index("richest_external_sample")) != null)'
 
 # Unit lookup must work beyond the former +/-500 scan boundary, including for
 # prototypes that Factorio does not expose through get_entity_by_unit_number.
