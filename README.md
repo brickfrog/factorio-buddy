@@ -33,6 +33,15 @@ character, and starts the model/tool loop. Ctrl+C stops both the NPC and the
 server. New games use Factorio's peaceful mode, so enemy bases do not attack
 unless provoked.
 
+New games default to map seed `2590060468`, a
+[community-recommended Factorio 2.0 seed](https://www.reddit.com/r/factorio/comments/1jmwklg/best_starting_seed_i_have_found_so_far/)
+published with fully default settings, separated starting ores, useful water,
+and room to explore. It has also been previewed locally with this repository's
+Factorio 2.0.77, Space Age, Buddy mod, and map-generation settings. Set
+`FACTORIO_MAP_SEED` in `.env` or pass `--map-seed` directly to choose another
+seed. The seed is used only while creating a save; `just resume` never changes
+the existing world's seed.
+
 Use `just resume` to continue the existing isolated Buddy world. Use `just npc`
 if Factorio is already running with RCON and the mod installed.
 

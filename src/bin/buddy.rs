@@ -37,6 +37,7 @@ const AUTONOMY_DIRECTIVE: &str = "Autonomy tick: re-evaluate the whole factory f
 // Factorio's 20-second default.
 const MANAGED_CLIENT_DROP_THRESHOLD_SECONDS: u64 = 86_400;
 const PROVIDER_LIMIT_RETRY_SECONDS: u64 = 300;
+const DEFAULT_MAP_SEED: u32 = 2_590_060_468;
 const PROVIDER_LIMIT_MESSAGE: &str =
     "Claude is temporarily unavailable because the subscription usage limit was reached. Buddy will retry automatically; your Factorio game is still running.";
 
@@ -82,6 +83,10 @@ struct Args {
     /// Recreate the local save before starting the server.
     #[arg(long, requires = "start_server")]
     fresh: bool,
+
+    /// Map seed used when creating a new managed save. Ignored when resuming one.
+    #[arg(long, default_value_t = DEFAULT_MAP_SEED, env = "FACTORIO_MAP_SEED")]
+    map_seed: u32,
 
     #[arg(long, env = "FACTORIO_BIN")]
     factorio_bin: Option<PathBuf>,
@@ -998,7 +1003,7 @@ async fn start_local_server(args: &mut Args) -> Result<LocalServer> {
         true,
     )?;
     if !save.exists() {
-        info!(save = %save.display(), "creating Factorio save");
+        info!(save = %save.display(), seed = args.map_seed, "creating Factorio save");
         let status = Command::new(&factorio)
             .arg("--config")
             .arg(&config)
@@ -1008,6 +1013,8 @@ async fn start_local_server(args: &mut Args) -> Result<LocalServer> {
             .arg(&save)
             .arg("--map-gen-settings")
             .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/map-gen.json"))
+            .arg("--map-gen-seed")
+            .arg(args.map_seed.to_string())
             .status()
             .await?;
         if !status.success() {
@@ -2077,7 +2084,7 @@ mod tests {
     }
 
     #[test]
-    fn default_new_game_map_uses_peaceful_mode() {
+    fn default_new_game_map_uses_peaceful_mode_and_published_seed() {
         let settings: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/configs/map-gen.json"
@@ -2090,6 +2097,14 @@ mod tests {
             Some(true),
             "just play must create peaceful default maps"
         );
+        assert_eq!(
+            settings.get("seed").and_then(|value| value.as_u64()),
+            Some(u64::from(DEFAULT_MAP_SEED)),
+            "the checked-in map settings should document the default new-game seed"
+        );
+
+        let overridden = Args::try_parse_from(["buddy", "--map-seed", "42"]).unwrap();
+        assert_eq!(overridden.map_seed, 42);
     }
 
     #[test]
