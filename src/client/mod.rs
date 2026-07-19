@@ -567,6 +567,26 @@ impl FactorioClient {
         resource_name: &str,
         from: Position,
     ) -> Result<ResourcePatch> {
+        let report = self
+            .find_nearest_resource_report(resource_name, from, None)
+            .await?;
+        let Some(resource) = report.get("resource") else {
+            let guidance = report
+                .get("guidance")
+                .and_then(Value::as_str)
+                .unwrap_or("No matching resource exists in generated chunks");
+            bail!("{guidance}");
+        };
+        Ok(serde_json::from_value(resource.clone())?)
+    }
+
+    /// Find a resource globally in generated chunks, optionally exploring nearby terrain.
+    pub async fn find_nearest_resource_report(
+        &mut self,
+        resource_name: &str,
+        from: Position,
+        explore_radius: Option<u32>,
+    ) -> Result<Value> {
         let response = self
             .call_remote(
                 "find_nearest_resource",
@@ -574,12 +594,13 @@ impl FactorioClient {
                     json!(resource_name),
                     json!(from.x),
                     json!(from.y),
+                    explore_radius.map_or(Value::Null, |radius| json!(radius)),
                     json!(self.agent_id.as_str()),
                 ],
             )
             .await?;
-        let resource: ResourcePatch = serde_json::from_str(&response)?;
-        Ok(resource)
+        ensure_lua_success(&response)?;
+        Ok(serde_json::from_str(&response)?)
     }
 
     // --- Tile Queries ---

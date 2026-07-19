@@ -39,7 +39,7 @@ pub const FACTORIO_MCP_TOOLS: &[FactorioToolMetadata] = &[
     tool("render_map", false, true, false),
     tool("debug_wedged_state", false, true, false),
     tool("get_resources", false, true, false),
-    tool("find_nearest_resource", false, true, false),
+    tool("find_nearest_resource", true, false, false),
     tool("get_character", false, true, false),
     tool("can_stand_at", false, true, false),
     tool("is_player_blocked", false, true, false),

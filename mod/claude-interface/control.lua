@@ -2423,9 +2423,9 @@ local api = {
         return json_remote_call("find_resources", world.find_resources, character and character.surface or nil, x1, y1, x2, y2, resource_type)
     end,
 
-    find_nearest_resource = function(resource_name, from_x, from_y, agent_id)
+    find_nearest_resource = function(resource_name, from_x, from_y, explore_radius, agent_id)
         local character = scoped_character(agent_id)
-        return json_remote_call("find_nearest_resource", world.find_nearest_resource, character and character.surface or nil, resource_name, from_x, from_y)
+        return json_remote_call("find_nearest_resource", world.find_nearest_resource, character and character.surface or nil, resource_name, from_x, from_y, explore_radius)
     end,
 
     get_tiles = function(x1, y1, x2, y2, agent_id)

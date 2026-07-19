@@ -2379,6 +2379,74 @@ else
         "observed $TOOLS_SCHEMA_BYTES bytes"
 fi
 
+# Resource discovery must see every already-generated chunk, report absence as
+# normal structured data, and generate bounded nearby terrain only on explicit
+# request. The distant chunk is part of this disposable test surface.
+RESOURCE_DISCOVERY_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+for _, resource in pairs(s.find_entities_filtered{name = 'crude-oil'}) do
+    resource.destroy()
+end
+for _, resource in pairs(s.find_entities_filtered{name = 'uranium-ore'}) do
+    resource.destroy()
+end
+local oil = s.create_entity{
+    name = 'crude-oil', position = {600.5, 600.5}, amount = 100000
+}
+local chunks = 0
+for _ in s.get_chunks() do chunks = chunks + 1 end
+rcon.print(helpers.table_to_json({
+    oil_created = oil ~= nil,
+    oil_x = oil and oil.position.x or nil,
+    oil_y = oil and oil.position.y or nil,
+    generated_chunks = chunks,
+}))
+")"
+require_json "resource discovery fixture has one patch beyond the old 200-tile ceiling" \
+    "$RESOURCE_DISCOVERY_FIXTURE" \
+    '.oil_created == true and .oil_x == 600.5 and .oil_y == 600.5'
+
+DISTANT_RESOURCE="$(mcp_tool find_nearest_resource \
+    '{"resource_type":"crude-oil","x":0,"y":0}')"
+DISTANT_RESOURCE_PAYLOAD="$(tool_payload "$DISTANT_RESOURCE")"
+require_json "resource discovery searches all generated chunks without walking" \
+    "$DISTANT_RESOURCE_PAYLOAD" \
+    '.success == true
+     and .found == true
+     and .resource.name == "crude-oil"
+     and .resource.center.x == 600.5
+     and .resource.center.y == 600.5
+     and .distance > 800
+     and .search.scope == "all_generated_chunks"
+     and .search.generated_chunks_added == 0'
+
+MISSING_RESOURCE="$(mcp_tool find_nearest_resource \
+    '{"resource_type":"uranium-ore","x":0,"y":0}')"
+MISSING_RESOURCE_PAYLOAD="$(tool_payload "$MISSING_RESOURCE")"
+assert_json "missing resource is a normal structured tool result" \
+    "$MISSING_RESOURCE" '.result.isError != true'
+require_json "missing resource distinguishes generated-surface absence from serde failure" \
+    "$MISSING_RESOURCE_PAYLOAD" \
+    '.success == true
+     and .found == false
+     and .resource_name == "uranium-ore"
+     and .search.scope == "all_generated_chunks"
+     and (.guidance | contains("Set explore_radius"))'
+
+EXPLORED_RESOURCE="$(mcp_tool find_nearest_resource \
+    '{"resource_type":"uranium-ore","x":900,"y":0,"explore_radius":32}')"
+EXPLORED_RESOURCE_PAYLOAD="$(tool_payload "$EXPLORED_RESOURCE")"
+require_json "explicit resource exploration generates and searches a bounded area" \
+    "$EXPLORED_RESOURCE_PAYLOAD" \
+    '.success == true
+     and (.found | type) == "boolean"
+     and .search.scope == "generated_area"
+     and .search.explore_radius == 32
+     and .search.generated_chunks_after > .search.generated_chunks_before
+     and .search.generated_chunks_added > 0
+     and .search.max_explore_radius == 512'
+
 # A two-tile walk is real movement, not an already-arrived near no-op. The
 # response and the authoritative character position must agree.
 SHORT_WALK_FIXTURE="$(raw_lua "

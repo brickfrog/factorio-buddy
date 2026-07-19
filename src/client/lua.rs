@@ -214,6 +214,7 @@ impl LuaCommand {
                 Self::lua_string_arg(resource_name),
                 from.x.to_string(),
                 from.y.to_string(),
+                "nil".to_string(),
             ],
             "Run just sync/resume so the updated claude-interface mod is loaded before finding resources.",
         )

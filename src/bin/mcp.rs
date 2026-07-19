@@ -4111,6 +4111,8 @@ pub struct FindNearestResourceParams {
     pub x: Option<f64>,
     /// Y coordinate to search from (default: character position)
     pub y: Option<f64>,
+    /// Generate and search nearby terrain, up to 512 tiles
+    pub explore_radius: Option<u32>,
 }
 
 /// Parameters for position-based tools
@@ -8233,9 +8235,7 @@ impl FactorioMcp {
 
     /// Find the nearest resource patch of a specific type.
     #[tool(
-        description = "Find the nearest resource patch (ore, oil) of a specific type from a position. \
-        Returns the patch center, total amount, tile count, and bounding box. Searches within 200 tiles. \
-        Use this to locate resources for mining operations."
+        description = "Find a resource across all generated chunks. Set explore_radius to generate and search nearby terrain."
     )]
     async fn find_nearest_resource(
         &self,
@@ -8261,26 +8261,13 @@ impl FactorioMcp {
         };
 
         let result = match client
-            .find_nearest_resource(&params.resource_type, from)
+            .find_nearest_resource_report(&params.resource_type, from, params.explore_radius)
             .await
         {
-            Ok(resource) => {
-                let bb = &resource.bounding_box;
-                let info = serde_json::json!({
-                    "name": resource.name,
-                    "center_x": resource.center.x,
-                    "center_y": resource.center.y,
-                    "total_amount": resource.total_amount,
-                    "tile_count": resource.tile_count,
-                    "bounding_box": {
-                        "left_top": { "x": bb.left_top.x, "y": bb.left_top.y },
-                        "right_bottom": { "x": bb.right_bottom.x, "y": bb.right_bottom.y }
-                    },
-                    "distance": ((resource.center.x - from.x).powi(2) + (resource.center.y - from.y).powi(2)).sqrt(),
-                });
-                serde_json::to_string_pretty(&info).unwrap_or_else(|e| format!("Error: {}", e))
+            Ok(report) => {
+                serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("Error: {}", e))
             }
-            Err(e) => format!("No {} found within 200 tiles: {}", params.resource_type, e),
+            Err(e) => format!("Error: {}", e),
         };
         self.with_player_messages(result).await
     }

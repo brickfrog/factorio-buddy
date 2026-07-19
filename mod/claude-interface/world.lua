@@ -99,16 +99,54 @@ function M.find_resources(surface, x1, y1, x2, y2, resource_type)
     return aggregate_resource_patches(resources)
 end
 
-function M.find_nearest_resource(surface, resource_name, from_x, from_y)
+local MAX_RESOURCE_EXPLORE_RADIUS = 512
+
+local function generated_chunk_count(surface)
+    local count = 0
+    for _ in surface.get_chunks() do count = count + 1 end
+    return count
+end
+
+function M.find_nearest_resource(surface, resource_name, from_x, from_y, explore_radius)
     if not surface then return {error = "agent surface not found"} end
+    if explore_radius ~= nil then
+        if type(explore_radius) ~= "number"
+            or explore_radius < 1
+            or explore_radius > MAX_RESOURCE_EXPLORE_RADIUS
+        then
+            return {
+                error = "explore_radius must be between 1 and "
+                    .. MAX_RESOURCE_EXPLORE_RADIUS,
+                error_kind = "invalid_explore_radius",
+            }
+        end
+    end
+
+    local chunks_before = generated_chunk_count(surface)
+    local search_area = nil
+    if explore_radius then
+        surface.request_to_generate_chunks(
+            {from_x, from_y},
+            math.ceil(explore_radius / 32)
+        )
+        surface.force_generate_chunk_requests()
+        search_area = area_table(
+            from_x - explore_radius,
+            from_y - explore_radius,
+            from_x + explore_radius,
+            from_y + explore_radius
+        )
+    end
+    local chunks_after = generated_chunk_count(surface)
+
     local nearest = nil
     local nearest_dist = math.huge
-    local resources = surface.find_entities_filtered{
+    local filters = {
         type = "resource",
         name = resource_name,
-        position = {from_x, from_y},
-        radius = 200,
     }
+    if search_area then filters.area = search_area end
+    local resources = surface.find_entities_filtered(filters)
 
     for _, resource in pairs(resources) do
         local dx = resource.position.x - from_x
@@ -120,7 +158,27 @@ function M.find_nearest_resource(surface, resource_name, from_x, from_y)
         end
     end
 
-    if not nearest then return nil end
+    local search = {
+        scope = explore_radius and "generated_area" or "all_generated_chunks",
+        origin = {x = from_x, y = from_y},
+        explore_radius = explore_radius,
+        generated_chunks_before = chunks_before,
+        generated_chunks_after = chunks_after,
+        generated_chunks_added = chunks_after - chunks_before,
+        max_explore_radius = MAX_RESOURCE_EXPLORE_RADIUS,
+    }
+
+    if not nearest then
+        return {
+            success = true,
+            found = false,
+            resource_name = resource_name,
+            search = search,
+            guidance = explore_radius
+                and "No matching resource was generated in the explored area. Try another origin or radius."
+                or "No matching resource exists in generated chunks. Set explore_radius to generate and search nearby terrain.",
+        }
+    end
 
     local patch_resources = surface.find_entities_filtered{
         type = "resource",
@@ -135,10 +193,22 @@ function M.find_nearest_resource(surface, resource_name, from_x, from_y)
             and nearest.position.y >= patch.bounding_box.left_top.y
             and nearest.position.y <= patch.bounding_box.right_bottom.y
         then
-            return patch
+            local dx = patch.center.x - from_x
+            local dy = patch.center.y - from_y
+            return {
+                success = true,
+                found = true,
+                resource_name = resource_name,
+                resource = patch,
+                distance = math.sqrt(dx * dx + dy * dy),
+                search = search,
+            }
         end
     end
-    return nil
+    return {
+        error = "nearest resource could not be aggregated into a patch",
+        error_kind = "resource_patch_aggregation_failed",
+    }
 end
 
 local function tile_summary(tile, x, y)

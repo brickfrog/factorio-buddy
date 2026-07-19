@@ -36,7 +36,7 @@
     "find_entities": {"args": ["x1", "y1", "x2", "y2", "entity_type", "name", "agent_id"], "returns": "json"},
     "find_entity_placements": {"args": ["agent_id", "entity_name", "center_x", "center_y", "radius", "limit"], "returns": "json"},
     "find_nearest_minable": {"args": ["agent_id", "entity_name", "radius"], "returns": "json"},
-    "find_nearest_resource": {"args": ["resource_name", "from_x", "from_y", "agent_id"], "returns": "json"},
+    "find_nearest_resource": {"args": ["resource_name", "from_x", "from_y", "explore_radius", "agent_id"], "returns": "json"},
     "find_power_issues": {"args": ["x", "y", "radius", "agent_id"], "returns": "json"},
     "find_resources": {"args": ["x1", "y1", "x2", "y2", "resource_type", "agent_id"], "returns": "json"},
     "get_alerts": {"args": ["x", "y", "radius", "agent_id"], "returns": "json"},

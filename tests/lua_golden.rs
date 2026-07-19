@@ -1844,7 +1844,7 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
         "get_entity = function(unit_number)",
         "get_entity_drop_position = function(unit_number)",
         "find_resources = function(x1, y1, x2, y2, resource_type, agent_id)",
-        "find_nearest_resource = function(resource_name, from_x, from_y, agent_id)",
+        "find_nearest_resource = function(resource_name, from_x, from_y, explore_radius, agent_id)",
         "get_tiles = function(x1, y1, x2, y2, agent_id)",
         "get_tile = function(x, y, agent_id)",
     ] {
@@ -1889,6 +1889,12 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
         "local function aggregate_resource_patches",
         "function M.find_resources",
         "function M.find_nearest_resource",
+        "local MAX_RESOURCE_EXPLORE_RADIUS = 512",
+        "for _ in surface.get_chunks() do count = count + 1 end",
+        "surface.request_to_generate_chunks(",
+        "surface.force_generate_chunk_requests()",
+        "scope = explore_radius and \"generated_area\" or \"all_generated_chunks\"",
+        "found = false",
         "function M.get_tiles",
         "function M.get_tile",
     ] {
@@ -1897,6 +1903,10 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
             "world.lua should include {required:?}"
         );
     }
+    assert!(
+        !world_lua.contains("radius = 200"),
+        "find_nearest_resource must not retain the hidden 200-tile discovery ceiling"
+    );
 }
 
 #[test]
