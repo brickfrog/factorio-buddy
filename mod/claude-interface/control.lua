@@ -8,6 +8,7 @@ local autonomy = require("autonomy")
 local characters = require("characters")
 local crafting = require("crafting")
 local crafting_accounting = require("crafting_accounting")
+local evaluation = require("evaluation")
 local diagnostics = require("diagnostics")
 local entities = require("entities")
 local json_response = require("json_response")
@@ -47,10 +48,6 @@ local function init_storage()
     storage.blueprints = storage.blueprints or {}
     -- Map markers for agent characters (chart tag references)
     storage.agent_tags = storage.agent_tags or {}
-    -- In-game chat captured for the bridge. Registered in the MOD (not the
-    -- level script) so every peer has an identical handler set and clients can
-    -- join — runtime-injected level-script handlers break MP ("not multiplayer safe").
-    storage.chat_messages = storage.chat_messages or {}
 end
 
 -- Ensure per-agent message tables exist for a player
@@ -1127,15 +1124,53 @@ local function find_minable_at(surface, character, x, y, radius)
     return nil
 end
 
-local function mining_failure(character, error)
+local MAX_MINE_COUNT = 1000
+
+local function mining_failure(character, error, error_kind, extra)
     local inv = character and character.valid and character.get_main_inventory() or nil
-    return {
-        success = false,
-        mined_count = 0,
-        picked_up = 0,
-        inventory = inventory_contents(inv),
-        error = error,
-    }
+    local result = extra or {}
+    result.success = false
+    result.mined_count = 0
+    result.picked_up = 0
+    result.inventory = inventory_contents(inv)
+    result.error = error
+    result.error_kind = error_kind
+    return result
+end
+
+-- Why a mining/pickup step made no progress. A full inventory is a real
+-- player-visible condition, not an empty tile. mine_entity(target, false)
+-- refuses unless the WHOLE product set fits (a tree yields 4 wood, a huge
+-- rock dozens of stone and coal), so test every item product at its full
+-- count together in a scratch copy of the inventory, not one unit each.
+local function mining_blocked_reason(inv, target)
+    local products_ok, products = pcall(function()
+        return target.prototype.mineable_properties.products
+    end)
+    if not (products_ok and products) then return "mine_failed" end
+    local item_products = {}
+    for _, product in pairs(products) do
+        local amount = product.amount or product.amount_max or 1
+        if product.type == "item" and amount > 0 then
+            table.insert(item_products, {name = product.name, count = math.ceil(amount)})
+        end
+    end
+    if #item_products == 0 then return "mine_failed" end
+
+    local scratch = game.create_inventory(#inv)
+    local fits_ok, all_fit = pcall(function()
+        for index = 1, #inv do
+            local stack = inv[index]
+            if stack.valid_for_read then scratch[index].set_stack(stack) end
+        end
+        for _, product in ipairs(item_products) do
+            if scratch.insert(product) < product.count then return false end
+        end
+        return true
+    end)
+    scratch.destroy()
+    if fits_ok and not all_fit then return "inventory_full" end
+    return "mine_failed"
 end
 
 local function start_mining_impl(agent_id, x, y)
@@ -1197,13 +1232,27 @@ end
 local function mine_at_impl(agent_id, x, y, count, radius)
     local character = find_factorioctl_character(agent_id)
     if not (character and character.valid) then
-        return mining_failure(nil, "no character for agent " .. tostring(agent_id) .. "; spawn first")
+        return mining_failure(nil, "no character for agent " .. tostring(agent_id) .. "; spawn first", "no_character")
+    end
+    local count_error = inventory.validate_count(count, MAX_MINE_COUNT, "choose_bounded_mining_count")
+    if count_error then
+        count_error.mined_count = 0
+        count_error.picked_up = 0
+        count_error.inventory = inventory_contents(character.get_main_inventory())
+        return count_error
+    end
+    if not (inventory.finite_number(x) and inventory.finite_number(y)) then
+        return mining_failure(character, "x and y must be finite numbers", "invalid_position")
+    end
+    if radius ~= nil and not inventory.finite_number(radius) then
+        return mining_failure(character, "radius must be a finite number", "invalid_radius")
     end
 
     local inv = character.get_main_inventory()
     local before_count = inventory_item_total(inv)
     local mined = 0
     local picked_up = 0
+    local stop_reason = nil
     local surface = character.surface
     -- mine_at is deliberately point-targeted. Never let a caller turn it into
     -- an area deconstruction primitive that can catch nearby infrastructure.
@@ -1220,7 +1269,12 @@ local function mine_at_impl(agent_id, x, y, count, radius)
         if #items_on_ground > 0 then
             local reach_error = characters.require_entity_reach(character, items_on_ground[1])
             if reach_error then return reach_error end
-            picked_up = picked_up + pick_up_item_entity(character, inv, items_on_ground[1])
+            local inserted = pick_up_item_entity(character, inv, items_on_ground[1])
+            if inserted <= 0 then
+                stop_reason = "inventory_full"
+                break
+            end
+            picked_up = picked_up + inserted
         else
             local target = find_minable_at(surface, character, x, y, search_radius)
             if not target then break end
@@ -1230,13 +1284,18 @@ local function mine_at_impl(agent_id, x, y, count, radius)
             if target.type == "resource" then
                 target_amount_before = target.amount
             end
-            character.mine_entity(target, true)
+            -- force=false: like a player, refuse to mine what cannot fit
+            -- instead of spilling the products on the ground. Progress is
+            -- measured from the world: for resources mine_entity reports
+            -- false even when it mined one unit, because the entity remains.
+            character.mine_entity(target, false)
             local iteration_after_count = inventory_item_total(inv)
             local inventory_progress = iteration_after_count > iteration_before_count
             local resource_progress = target.valid and target_amount_before and target.amount < target_amount_before
             if inventory_progress or resource_progress then
                 mined = mined + 1
             else
+                if target.valid then stop_reason = mining_blocked_reason(inv, target) end
                 break
             end
         end
@@ -1252,9 +1311,19 @@ local function mine_at_impl(agent_id, x, y, count, radius)
         mined_entities = mined,
         picked_up = picked_up,
         inventory = items,
+        stop_reason = stop_reason,
     }
     if not success then
-        result.error = "No loose item or natural minable entity at exact position; use remove_entity with a unit number for placed infrastructure"
+        if stop_reason == "inventory_full" then
+            result.error_kind = "inventory_full"
+            result.error = "Character inventory is full; nothing was mined or picked up"
+        elseif stop_reason == "mine_failed" then
+            result.error_kind = "mine_failed"
+            result.error = "Factorio refused to mine the target at this position"
+        else
+            result.error_kind = "nothing_to_mine"
+            result.error = "No loose item or natural minable entity at exact position; use remove_entity with a unit number for placed infrastructure"
+        end
     end
     return result
 end
@@ -1299,8 +1368,10 @@ end
 local function mine_nearest_impl(agent_id, entity_name, count)
     local character = find_factorioctl_character(agent_id)
     if not (character and character.valid) then
-        return mining_failure(nil, "no character for agent " .. tostring(agent_id) .. "; spawn first")
+        return mining_failure(nil, "no character for agent " .. tostring(agent_id) .. "; spawn first", "no_character")
     end
+    local count_error = inventory.validate_count(count, MAX_MINE_COUNT, "choose_bounded_mining_count")
+    if count_error then return count_error end
 
     local mined = 0
     for _ = 1, count do
@@ -1310,7 +1381,7 @@ local function mine_nearest_impl(agent_id, entity_name, count)
         if not target then break end
         local reach_error = characters.require_entity_reach(character, target)
         if reach_error then return reach_error end
-        if character.mine_entity(target, true) then
+        if character.mine_entity(target, false) then
             mined = mined + 1
         else
             break
@@ -1875,9 +1946,8 @@ local function insert_items_impl(agent_id, unit_number, item, count, inventory_t
         return {error = "Character has no inventory"}
     end
 
-    if type(count) ~= "number" or count <= 0 then
-        return {error = "Count must be a positive number"}
-    end
+    local count_error = inventory.validate_count(count, nil, "choose_positive_integer_count")
+    if count_error then return count_error end
 
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
@@ -1944,15 +2014,23 @@ local function insert_items_impl(agent_id, unit_number, item, count, inventory_t
     }
 end
 
+local function action_failure(error_kind, message, extra)
+    local result = extra or {}
+    result.success = false
+    result.error_kind = error_kind
+    result.error = message
+    return result
+end
+
 local function extract_items_impl(agent_id, unit_number, item, count, inventory_type)
     local character = find_factorioctl_character(agent_id)
     if not (character and character.valid) then
-        return {error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
+        return action_failure("no_character", "no character for agent " .. tostring(agent_id) .. "; spawn first")
     end
 
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
-        return {error = "Entity not found"}
+        return action_failure("entity_not_found", "Entity not found", {unit_number = unit_number})
     end
 
     local reach_error = characters.require_entity_reach(character, entity)
@@ -1960,80 +2038,267 @@ local function extract_items_impl(agent_id, unit_number, item, count, inventory_
 
     local inv = entity.get_inventory(inventory_define_for(inventory_type, "chest"))
     if not inv then
-        return {error = "Entity has no such inventory"}
+        return action_failure("no_such_inventory", "Entity has no such inventory", {
+            entity = entity.name,
+            inventory_type = inventory_type,
+        })
     end
 
     local player_inv = character.get_main_inventory()
     if not player_inv then
-        return {error = "Character has no inventory"}
+        return action_failure("no_character_inventory", "Character has no inventory")
     end
+
+    local count_error = inventory.validate_count(count, nil, "choose_positive_integer_count")
+    if count_error then return count_error end
 
     local available = inv.get_item_count(item)
     local to_extract = math.min(count, available)
     if to_extract == 0 then
-        return {extracted = 0, available = available, item = item}
+        return {success = true, item = item, requested = count, extracted = 0, available = available}
     end
 
     local removed = inv.remove{name = item, count = to_extract}
     local inserted = player_inv.insert{name = item, count = removed}
+    local restored = 0
+    local spilled = 0
+    local unrecovered = 0
     if inserted < removed then
-        inv.insert{name = item, count = removed - inserted}
+        restored = inv.insert{name = item, count = removed - inserted}
+        if inserted + restored < removed then
+            local transfer = inventory.give_or_spill(nil, entity.surface, entity.position, {
+                name = item,
+                count = removed - inserted - restored,
+            })
+            spilled = transfer.spilled
+            unrecovered = transfer.unrecovered
+        end
     end
 
-    return {extracted = inserted, available = available}
+    -- Every removed item is accounted for: in the character (extracted), put
+    -- back into the source (restored), or on the ground at the source (spilled).
+    local result = {
+        success = true,
+        item = item,
+        requested = count,
+        available = available,
+        removed = removed,
+        extracted = inserted,
+        restored = restored,
+        spilled = spilled,
+        unrecovered = unrecovered,
+    }
+    if unrecovered > 0 then
+        return action_failure("item_conservation_failure", "extracted items could not be stored, restored or spilled", result)
+    end
+    if inserted == 0 then
+        return action_failure("inventory_full", "Character inventory has no room for " .. tostring(item), result)
+    end
+    return result
+end
+
+local RECIPE_ENTITY_TYPES = {
+    ["assembling-machine"] = true,
+    ["rocket-silo"] = true,
+}
+
+-- Whether `recipe` can be crafted in any of `categories` (a set keyed by
+-- category name). LuaRecipe.has_category also honours additional_categories
+-- and survives the removal of LuaRecipe.category; the category field is only
+-- a fallback for runtimes that lack has_category.
+local function recipe_fits_categories(recipe, categories)
+    for category, _ in pairs(categories) do
+        local ok, has = pcall(function() return recipe.has_category(category) end)
+        if not ok then
+            local category_ok, recipe_category = pcall(function() return recipe.category end)
+            has = category_ok and recipe_category == category
+        end
+        if has then return true end
+    end
+    return false
+end
+
+local function recipe_categories(recipe)
+    local result = {}
+    local category_ok, category = pcall(function() return recipe.category end)
+    if category_ok and category then table.insert(result, category) end
+    local extra_ok, extra = pcall(function() return recipe.additional_categories end)
+    if extra_ok and type(extra) == "table" then
+        for _, name in pairs(extra) do table.insert(result, name) end
+    end
+    return result
+end
+
+-- Validate that the agent's force could legitimately choose `recipe_name` on
+-- this machine. Returns nil when valid, otherwise a structured failure. Runs
+-- before any mutation so rejected requests never unload the machine.
+local function validate_recipe_choice(character, entity, recipe_name)
+    if type(recipe_name) ~= "string" then
+        return action_failure("invalid_recipe", "recipe must be a recipe name, an empty string, or null", {
+            requested_recipe = tostring(recipe_name),
+        })
+    end
+    local recipe = character.force.recipes[recipe_name]
+    if not recipe then
+        return action_failure("unknown_recipe", "unknown recipe: " .. recipe_name, {requested_recipe = recipe_name})
+    end
+    if not recipe.enabled then
+        return action_failure("recipe_disabled", "recipe is not unlocked for this force: " .. recipe_name, {
+            requested_recipe = recipe_name,
+            action_needed = "research_or_choose_enabled_recipe",
+        })
+    end
+    local prototype = entity.prototype
+    local categories = prototype.crafting_categories or {}
+    if not recipe_fits_categories(recipe, categories) then
+        local accepted = {}
+        for category, _ in pairs(categories) do table.insert(accepted, category) end
+        table.sort(accepted)
+        return action_failure("recipe_incompatible", "recipe " .. recipe_name .. " cannot be crafted by " .. entity.name, {
+            requested_recipe = recipe_name,
+            recipe_categories = recipe_categories(recipe),
+            entity_crafting_categories = accepted,
+        })
+    end
+    local fixed_ok, fixed_recipe = pcall(function() return prototype.fixed_recipe end)
+    if fixed_ok and fixed_recipe and fixed_recipe ~= recipe_name then
+        return action_failure("recipe_fixed", entity.name .. " has the fixed recipe " .. tostring(fixed_recipe), {
+            requested_recipe = recipe_name,
+            fixed_recipe = fixed_recipe,
+        })
+    end
+    return nil
+end
+
+-- JSON null arrives as Lua nil. Keep empty-string compatibility at the
+-- public tool boundary, but never pass an empty recipe name to Factorio:
+-- clearing a crafting machine is explicitly set_recipe(nil).
+local function requested_recipe_name(recipe)
+    if recipe == "" then return nil end
+    return recipe
+end
+
+-- Everything set_recipe checks except reach, with no side effects. Returns
+-- nil when the machine may take `requested_recipe` (nil = clear).
+local function recipe_request_error(character, entity, requested_recipe)
+    if not RECIPE_ENTITY_TYPES[entity.type] then
+        return action_failure("recipe_unsupported_entity", "Entity cannot have recipes", {
+            entity = entity.name,
+            type = entity.type,
+        })
+    end
+    if requested_recipe ~= nil then
+        return validate_recipe_choice(character, entity, requested_recipe)
+    end
+    return nil
+end
+
+-- Read-only preflight for set_recipe. Callers run it before walking the
+-- character to the machine so a rejected recipe never moves the character.
+local function check_recipe_choice_impl(agent_id, unit_number, recipe)
+    local character = find_factorioctl_character(agent_id)
+    if not (character and character.valid) then
+        return action_failure("no_character", "no character for agent " .. tostring(agent_id) .. "; spawn first")
+    end
+    local entity = entities.find_by_unit_number(unit_number)
+    if not entity then
+        return action_failure("entity_not_found", "Entity not found", {unit_number = unit_number})
+    end
+    local requested_recipe = requested_recipe_name(recipe)
+    local invalid = recipe_request_error(character, entity, requested_recipe)
+    if invalid then return invalid end
+    local current = entity.get_recipe()
+    return {
+        success = true,
+        unit_number = entity.unit_number,
+        entity = entity.name,
+        recipe = requested_recipe,
+        cleared = requested_recipe == nil,
+        current_recipe = current and current.name or nil,
+    }
 end
 
 local function set_recipe_impl(agent_id, unit_number, recipe)
     local character = find_factorioctl_character(agent_id)
     if not (character and character.valid) then
-        return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
+        return action_failure("no_character", "no character for agent " .. tostring(agent_id) .. "; spawn first")
     end
     local entity = entities.find_by_unit_number(unit_number)
     if not entity then
-        return {error = "Entity not found"}
+        return action_failure("entity_not_found", "Entity not found", {unit_number = unit_number})
     end
-
 
     local reach_error = characters.require_entity_reach(character, entity)
     if reach_error then return reach_error end
 
-    if not entity.set_recipe then
-        return {error = "Entity cannot have recipes"}
-    end
-
-    -- JSON null arrives as Lua nil. Keep empty-string compatibility at the
-    -- public tool boundary, but never pass an empty recipe name to Factorio:
-    -- clearing a crafting machine is explicitly set_recipe(nil).
-    local requested_recipe = recipe
-    if requested_recipe == "" then requested_recipe = nil end
-    local ok, set_error = pcall(function()
-        entity.set_recipe(requested_recipe)
-    end)
-    if not ok then
-        return {success = false, error = tostring(set_error)}
-    end
-
-    local current = entity.get_recipe and entity.get_recipe() or nil
-    if requested_recipe == nil then
-        if current ~= nil then
-            return {
-                success = false,
-                error = "Could not clear recipe",
-                current_recipe = current.name,
-            }
-        end
-        return {success = true, cleared = true, recipe = nil}
-    end
-    if not current or current.name ~= requested_recipe then
+    local requested_recipe = requested_recipe_name(recipe)
+    local invalid = recipe_request_error(character, entity, requested_recipe)
+    if invalid then return invalid end
+    local previous, previous_quality = entity.get_recipe()
+    local previous_name = previous and previous.name or nil
+    local previous_quality_name = previous_quality and previous_quality.name or nil
+    if previous_name == requested_recipe and (requested_recipe == nil or previous_quality_name == "normal") then
+        -- Re-selecting the current recipe is a no-op for a player; calling
+        -- Factorio would unload in-progress ingredients for no reason.
         return {
-            success = false,
-            error = "Could not set recipe (unknown or incompatible recipe)",
-            requested_recipe = requested_recipe,
-            current_recipe = current and current.name or nil,
+            success = true,
+            cleared = requested_recipe == nil,
+            recipe = requested_recipe,
+            previous_recipe = previous_name,
+            previous_recipe_quality = previous_quality_name,
+            unchanged = true,
+            returned_items = {},
         }
     end
 
-    return {success = true, cleared = false, recipe = current.name}
+    -- LuaEntity.set_recipe removes the machine's ingredients/products and
+    -- returns them as ItemWithQualityCount[]; the caller owns those items.
+    local ok, returned_or_error = pcall(function() return entity.set_recipe(requested_recipe) end)
+    if not ok then
+        return action_failure("set_recipe_failed", tostring(returned_or_error), {requested_recipe = requested_recipe})
+    end
+
+    local character_inventory = character.get_main_inventory()
+    local returned_items = {}
+    local unrecovered = 0
+    for _, item in pairs(returned_or_error or {}) do
+        local transfer = inventory.give_or_spill(
+            character_inventory,
+            entity.surface,
+            entity.position,
+            {name = item.name, quality = inventory.quality_name(item), count = item.count}
+        )
+        unrecovered = unrecovered + transfer.unrecovered
+        table.insert(returned_items, transfer)
+    end
+
+    local current = entity.get_recipe()
+    local result = {
+        previous_recipe = previous_name,
+        previous_recipe_quality = previous_quality_name,
+        returned_items = returned_items,
+    }
+    if unrecovered > 0 then
+        return action_failure("item_conservation_failure", "returned machine items could not be stored or spilled", result)
+    end
+    if requested_recipe == nil then
+        if current ~= nil then
+            result.current_recipe = current.name
+            return action_failure("recipe_not_cleared", "Could not clear recipe", result)
+        end
+        result.success = true
+        result.cleared = true
+        return result
+    end
+    if not current or current.name ~= requested_recipe then
+        result.requested_recipe = requested_recipe
+        result.current_recipe = current and current.name or nil
+        return action_failure("recipe_not_set", "Could not set recipe", result)
+    end
+    result.success = true
+    result.cleared = false
+    result.recipe = current.name
+    return result
 end
 
 local function get_entity_recipe_impl(unit_number)
@@ -2291,17 +2556,6 @@ local api = {
     -- Report whether an agent has an active deterministic walk target
     has_walk_target = function(agent_id)
         return storage.walk_targets ~= nil and storage.walk_targets[agent_id] ~= nil
-    end,
-
-    chat_capture_status = function()
-        return helpers.table_to_json({success = true, registered = true})
-    end,
-
-    -- Return and clear captured chat messages as a JSON string (bridge polls this)
-    get_chat_messages = function()
-        local msgs = storage.chat_messages or {}
-        storage.chat_messages = {}
-        return helpers.table_to_json(msgs)
     end,
 
     -- Get character entity (safe from any context, uses synced mod storage)
@@ -2622,12 +2876,21 @@ local api = {
         return json_remote_call("rollback_burner_bootstrap", inventory_actions.rollback_burner_bootstrap, agent_id, snapshot, feeder_unit_number)
     end,
 
+    burner_fuel_levels = function(agent_id, x, y, radius)
+        return json_remote_call("burner_fuel_levels", inventory_actions.burner_fuel_levels, agent_id, x, y, radius)
+    end,
+
     collect_from_chest = function(agent_id, unit_number, item, count)
         return json_remote_call("collect_from_chest", inventory_actions.collect_from_chest, agent_id, unit_number, item, count)
     end,
 
     set_recipe = function(agent_id, unit_number, recipe)
         return json_remote_call("set_recipe", set_recipe_impl, agent_id, unit_number, recipe)
+    end,
+
+    -- Read-only set_recipe preflight (no reach requirement, no mutation).
+    check_recipe_choice = function(agent_id, unit_number, recipe)
+        return json_remote_call("check_recipe_choice", check_recipe_choice_impl, agent_id, unit_number, recipe)
     end,
 
     get_entity_recipe = function(unit_number)
@@ -2676,6 +2939,10 @@ local api = {
         return json_remote_call("is_tech_researched", research.is_tech_researched, scoped_character(agent_id), tech_name)
     end,
 
+    launch_rocket = function(agent_id, unit_number)
+        return json_remote_call("launch_rocket", research.launch_rocket, scoped_character(agent_id), unit_number)
+    end,
+
     production_statistics = function(surface_name, agent_id)
         local character = scoped_character(agent_id)
         local scoped_surface = surface_name or (character and character.surface.name or nil)
@@ -2685,6 +2952,11 @@ local api = {
     autonomy_snapshot = function(agent_id)
         local character = find_factorioctl_character(agent_id)
         return json_remote_call("autonomy_snapshot", autonomy.snapshot, character)
+    end,
+
+    -- Read-only trial evaluation sample around the agent (contract C2).
+    evaluation_sample = function(agent_id, radius)
+        return json_remote_call("evaluation_sample", evaluation.sample, agent_id, radius)
     end,
 
     -- Get character position (read-only, safe from any context)
@@ -2721,6 +2993,38 @@ local api = {
 
 remote.add_interface("claude_interface", api)
 
+-- Upper bound on positional remote arguments; the widest remote takes 9.
+local MAX_DISPATCH_ARGS = 32
+
+-- Decode one `{fn, args, n}` envelope, run the remote and serialize its
+-- result. Returns the reply text, or nil when the remote returned nil.
+local function dispatch_claude_request(parameter)
+    local ok, request = pcall(helpers.json_to_table, parameter or "")
+    if not ok or type(request) ~= "table" or type(request.fn) ~= "string" then
+        return json_response.error("bad_request", "expected {fn, args, n}")
+    end
+    local handler = api[request.fn]
+    if not handler then
+        return json_response.error("unknown_function", request.fn, {
+            action_needed = "sync_or_restart_mod",
+        })
+    end
+    local args = request.args or {}
+    if type(args) ~= "table" then
+        return json_response.error("bad_request", "args must be an array")
+    end
+    local n = request.n
+    if n == nil then n = #args end
+    if type(n) ~= "number" or n ~= math.floor(n) or n < 0 or n > MAX_DISPATCH_ARGS then
+        return json_response.error("bad_request", "n must be an integer from 0 to " .. MAX_DISPATCH_ARGS)
+    end
+    local results = { pcall(handler, table.unpack(args, 1, n)) }
+    if not results[1] then
+        return json_response.error("lua_error", tostring(results[2]))
+    end
+    return json_response.encode_result(request.fn, results[2])
+end
+
 commands.add_command("claude", "claude-interface dispatch", function(cmd)
     if cmd.player_index ~= nil then
         local player = game.get_player(cmd.player_index)
@@ -2729,30 +3033,13 @@ commands.add_command("claude", "claude-interface dispatch", function(cmd)
         end
         return
     end
-    local ok, request = pcall(helpers.json_to_table, cmd.parameter or "")
-    if not ok or type(request) ~= "table" or type(request.fn) ~= "string" then
-        rcon.print(json_response.error("bad_request", "expected {fn, args, n}"))
-        return
+    -- Nothing a request contains may raise out of a command handler: an
+    -- uncaught error here stops the whole headless server.
+    local ok, reply = pcall(dispatch_claude_request, cmd.parameter)
+    if not ok then
+        reply = json_response.error("lua_error", tostring(reply))
     end
-    local handler = api[request.fn]
-    if not handler then
-        rcon.print(json_response.error("unknown_function", request.fn, {
-            action_needed = "sync_or_restart_mod",
-        }))
-        return
-    end
-    local args = request.args or {}
-    if type(args) ~= "table" then
-        rcon.print(json_response.error("bad_request", "args must be an array"))
-        return
-    end
-    local n = request.n or #args
-    local results = { pcall(handler, table.unpack(args, 1, n)) }
-    if not results[1] then
-        rcon.print(json_response.error("lua_error", tostring(results[2])))
-        return
-    end
-    if results[2] ~= nil then rcon.print(results[2]) end
+    if reply ~= nil then rcon.print(reply) end
 end)
 
 -- ============================================================
@@ -2782,6 +3069,10 @@ script.on_configuration_changed(function(data)
             end
         end
     end
+
+    -- Chat reaches Buddy only through the JSONL bridge; drop the retired
+    -- in-save chat buffer that older versions accumulated.
+    storage.chat_messages = nil
 
     init_storage()
 
@@ -2823,19 +3114,10 @@ end)
 -- Capture in-game chat for the bridge (registered in the mod -> MP-safe)
 script.on_event(defines.events.on_console_chat, function(event)
     if not event.message then return end
-    storage.chat_messages = storage.chat_messages or {}
     local player_name = "console"
     if event.player_index then
         local p = game.get_player(event.player_index)
         if p then player_name = p.name end
-    end
-    table.insert(storage.chat_messages, {
-        player = player_name,
-        message = event.message,
-        tick = event.tick,
-    })
-    while #storage.chat_messages > MAX_MESSAGES do
-        table.remove(storage.chat_messages, 1)
     end
     local target_agent = event.player_index and get_active_agent(event.player_index) or "all"
     write_bridge_message(

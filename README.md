@@ -57,6 +57,48 @@ BUDDY_HEARTBEAT_SECONDS=60 just play
 
 Set `BUDDY_HEARTBEAT_SECONDS=0` or run `just chat` for chat-only operation.
 
+Chat from players always comes first. A new message preempts an autonomous turn
+but never cancels another player's request: player requests run in arrival
+order, and each one gets exactly one final reply. When a turn is cancelled,
+Buddy stops Claude and its MCP server before any new turn starts. The next
+prompt names the tool calls whose outcome is unknown, so the model inspects the
+world before it acts. Buddy never repeats those calls automatically. If a
+resumed Claude session turns out to be missing, Buddy retries the turn once in a
+fresh session only when the failed attempt made no tool calls; otherwise the
+turn fails and the next turn gets the outcome-unknown note.
+
+Other runtime options (each flag also has an environment variable):
+
+| Flag | Environment | Default | Purpose |
+|---|---|---|---|
+| `--model` | `MODEL` | `claude-opus-5-5` | Claude model passed to Claude Code |
+| `--issue-project-root` | `BUDDY_ISSUE_PROJECT_ROOT` | this repository | Beads tracker that receives `file_issue` calls |
+| `--max-autonomous-turns` | `BUDDY_MAX_AUTONOMOUS_TURNS` | `0` (unlimited) | Stop starting autonomous turns after N; the server keeps running |
+| `--autonomy-deadline-seconds` | `BUDDY_AUTONOMY_DEADLINE_SECONDS` | `0` (unlimited) | Stop autonomy after S seconds online; cancels the turn that is running at that time |
+| `--evidence-log` | `BUDDY_EVIDENCE_LOG` | none | Append JSONL evidence for each turn, tool outcome, decision, and budget event |
+| `--decision-mode` | `BUDDY_DECISION_MODE` | `off` | Experimental fuel-maintenance decision: `off`, `deterministic`, `jev-shadow`, `jev` |
+
+Buddy keeps the last 8 tool outcomes in memory and adds a summary of them to the
+next autonomy prompt. If one call fails 3 times within those 8 outcomes with the
+same arguments and the same error, and the same call has not succeeded since,
+the summary tells the model to inspect the world and make a new plan. Other
+calls in between (such as inspections) do not reset the count. It does not
+block the call.
+
+`--decision-mode` is an experiment and is not for production use. Before an
+autonomous turn, Buddy can do one dry run of `repair_fuel_sustainability`. Then
+it chooses one of two actions: run that controller, or give control back to
+Opus. Opus always takes the first turn, and at most one maintenance action runs
+between Opus turns. `jev-shadow` records the Jev decision only and never changes
+the world. `jev` runs the repair only if Jev returns a valid answer with
+confidence of 0.90 or more, and the new dry run must give the same preview
+again. Jev's choice must also be its highest-probability option. After a repair
+runs, Buddy compares the transaction the controller actually executed with the
+approved preview; a different one is logged as `transaction_changed` and control
+goes back to Opus. A consumer whose repair failed is skipped until the next
+Opus turn completes. The two Jev modes require `TYPESAFE_API_KEY`.
+`BUDDY_JEV_BUDGET_USD` (default `5`) sets the spending cap.
+
 ## Persona
 
 Buddy's built-in system prompt owns the gameplay, tooling, verification, and

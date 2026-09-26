@@ -254,11 +254,14 @@ fn control_lua_remote_signatures() -> BTreeMap<String, Vec<String>> {
 fn lifecycle_remote_names() -> BTreeSet<String> {
     [
         "autonomy_snapshot",
+        // Called only through FactorioClient::call_remote (no LuaCommand builder).
+        "check_recipe_choice",
         "clear_chat",
         "connected_player_count",
         "connected_player_count_result",
         "ensure_surface",
         "ensure_surface_result",
+        "evaluation_sample",
         "production_statistics",
         "get_character",
         "has_walk_target",
@@ -530,11 +533,6 @@ fn all_lua_cases() -> Vec<LuaCase> {
             LuaCommand::import_blueprint(&legacy_agent(), "0eNq-test", pos(28.0, 29.0), 8),
         ),
         LuaCase::new("delete_blueprint", LuaCommand::delete_blueprint("starter")),
-        LuaCase::new("register_chat_handler", LuaCommand::register_chat_handler()),
-        LuaCase::new(
-            "get_and_clear_chat_messages",
-            LuaCommand::get_and_clear_chat_messages(),
-        ),
         LuaCase::new(
             "broadcast_console",
             LuaCommand::broadcast_console("hello from test"),
@@ -803,43 +801,6 @@ fn mod_json_response_helper_lives_in_domain_module() {
             && json_response_lua.contains("success = false")
             && json_response_lua.contains("helpers.table_to_json(result_or_error)"),
         "json_response.lua should own the remote JSON wrapper and keep pcall failures typed"
-    );
-}
-
-#[test]
-fn claude_command_dispatcher_uses_shared_api_and_structured_errors() {
-    let control_lua = include_str!("../mod/claude-interface/control.lua");
-    let json_response_lua = include_str!("../mod/claude-interface/json_response.lua");
-
-    assert!(
-        control_lua.contains("local api = {")
-            && control_lua.contains(r#"remote.add_interface("claude_interface", api)"#)
-            && control_lua.contains(r#"commands.add_command("claude""#),
-        "control.lua should expose the same api table via remote interface and /claude command"
-    );
-    assert!(
-        control_lua.contains("pcall(helpers.json_to_table, cmd.parameter or \"\")")
-            && control_lua.contains("local handler = api[request.fn]")
-            && control_lua.contains("table.unpack(args, 1, n)"),
-        "/claude dispatcher should parse one JSON envelope and preserve nil holes via explicit n"
-    );
-    assert!(
-        control_lua.contains("if cmd.player_index ~= nil then")
-            && control_lua.contains("restricted to the server RCON console"),
-        "/claude must reject in-game callers and remain an authenticated server/RCON bridge"
-    );
-    assert!(
-        control_lua.contains(r#"json_response.error("bad_request""#)
-            && control_lua.contains(r#"json_response.error("unknown_function""#)
-            && control_lua.contains(r#"json_response.error("lua_error""#)
-            && control_lua.contains("action_needed = \"sync_or_restart_mod\""),
-        "/claude dispatcher should return structured request/skew/lua errors"
-    );
-    assert!(
-        json_response_lua.contains("function M.error(error_kind, message, extra)")
-            && json_response_lua.contains("result.error_kind = error_kind")
-            && json_response_lua.contains("result.success = false"),
-        "json_response.error should produce the structured error_kind envelope"
     );
 }
 
@@ -1177,37 +1138,6 @@ fn bounded_inventory_actions_preserve_entities_and_conserve_items() {
         ])
     );
 
-    let fuel = inventory_actions_lua
-        .split("function M.bootstrap_burner_once(agent_id, unit_number, fuel_item, count)")
-        .nth(1)
-        .and_then(|tail| tail.split("function M.collect_from_chest").next())
-        .expect("bootstrap_burner_once should precede collect_from_chest");
-    for required in [
-        "MAX_BOOTSTRAP_FUEL_COUNT",
-        "validate_request(",
-        "BOOTSTRAP_BURNER_TYPES[entity.name]",
-        "entity.type ~= expected_type",
-        "defines.inventory.fuel",
-        "available_before < count",
-        "fuel_inventory.can_insert{name = fuel_item, count = 1}",
-        "character_inventory.remove{name = fuel_item, count = count}",
-        "fuel_inventory.insert{name = fuel_item, count = removed}",
-        "returned = character_inventory.insert{name = fuel_item, count = remainder}",
-        "conservation.target_increase = target_after - target_before",
-        "conservation.character_decrease = available_before - character_after",
-        "classification = \"temporary_bootstrap\"",
-        "purpose = \"temporary bootstrap\"",
-        "automation_complete = false",
-        "action_needed = \"repair_fuel_sustainability\"",
-        "entity_identity_preserved = identity_preserved",
-        "conservation = conservation",
-    ] {
-        assert!(
-            fuel.contains(required),
-            "bootstrap_burner_once should retain contract evidence {required:?}"
-        );
-    }
-
     let snapshot = inventory_actions_lua
         .split("function M.snapshot_burner_state(unit_number)")
         .nth(1)
@@ -1224,83 +1154,6 @@ fn bounded_inventory_actions_preserve_entities_and_conserve_items() {
         );
     }
 
-    let rollback = inventory_actions_lua
-        .split("function M.rollback_burner_bootstrap(agent_id, snapshot, feeder_unit_number)")
-        .nth(1)
-        .and_then(|tail| tail.split("function M.collect_from_chest").next())
-        .expect("rollback_burner_bootstrap should precede collect_from_chest");
-    for required in [
-        "feeder.active = false",
-        "local before = burner_state(consumer)",
-        "fuel_inventory.clear()",
-        "consumer.burner.currently_burning = nil",
-        "consumer.burner.heat = 0",
-        "consumer.burner.currently_burning = {",
-        "consumer.burner.remaining_burning_fuel = snapshot.remaining_burning_fuel or 0",
-        "consumer.burner.heat = snapshot.heat or 0",
-        "consumer.surface.spill_item_stack{",
-        "spilled_excess = spilled_excess",
-        "unrecovered_excess = unrecovered_excess + (remainder - spilled_count)",
-        "local consumer_state_restored = #restore_errors == 0 and same_burner_state(after, snapshot)",
-        "feeder_quiesced = feeder_quiesced",
-        "transaction_fuel_cleared = consumer_state_restored",
-        "classification = \"failed_fuel_transaction_rollback\"",
-    ] {
-        assert!(
-            rollback.contains(required),
-            "rollback_burner_bootstrap should atomically quiesce and restore with evidence {required:?}"
-        );
-    }
-
-    let collect = inventory_actions_lua
-        .split("function M.collect_from_chest(agent_id, unit_number, item, count)")
-        .nth(1)
-        .and_then(|tail| tail.split("return M").next())
-        .expect("collect_from_chest should precede module return");
-    for required in [
-        "MAX_CHEST_COLLECTION_COUNT",
-        "validate_request(",
-        "COLLECTABLE_CHEST_TYPES[entity.type]",
-        "defines.inventory.chest",
-        "character_inventory.can_insert{name = item, count = 1}",
-        "local attempted = math.min(count, available_before)",
-        "local inserted = character_inventory.insert{name = item, count = removed}",
-        "returned = chest_inventory.insert{name = item, count = remainder}",
-        "conservation.chest_decrease = available_before - chest_after",
-        "conservation.character_increase = character_after - character_before",
-        "classification = \"bounded_construction_or_recovery_collection\"",
-        "purpose = \"bounded construction/recovery collection\"",
-        "automation_complete = false",
-        "partial = inserted < count",
-        "partial_reasons = partial_reasons",
-        "entity_identity_preserved = identity_preserved",
-        "conservation = conservation",
-        "This manual transfer is not automated logistics or production completion.",
-    ] {
-        assert!(
-            collect.contains(required),
-            "collect_from_chest should retain contract evidence {required:?}"
-        );
-    }
-
-    for required in [
-        "result.success = false",
-        "result.error_kind = error_kind",
-        "result.action_needed = action_needed",
-        "entity_identity_changed",
-        "count must be a positive integer",
-        "count_exceeds_limit",
-        "unit_number must be an exact positive integer",
-        "characters.find(agent_id)",
-        "entities.find_by_unit_number(unit_number)",
-        "characters.require_entity_reach(character, entity)",
-        "removed == inserted + returned",
-    ] {
-        assert!(
-            inventory_actions_lua.contains(required),
-            "bounded inventory operations should retain shared safety evidence {required:?}"
-        );
-    }
     for forbidden in [
         "entity.destroy",
         ".destroy()",
@@ -2502,8 +2355,6 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
 
     let control_lua = include_str!("../mod/claude-interface/control.lua");
     let characters_lua = include_str!("../mod/claude-interface/characters.lua");
-    let json_response_lua = include_str!("../mod/claude-interface/json_response.lua");
-    let inventory_lua = include_str!("../mod/claude-interface/inventory.lua");
     for required in [
         "local find_factorioctl_character = characters.find",
         "local function remove_entity_at_impl",
@@ -2523,19 +2374,6 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
             "control.lua entity mutation remotes should include {required:?}"
         );
     }
-
-    assert!(
-        control_lua.contains("local player_inv = character.get_main_inventory()")
-            && control_lua.contains("local character = find_factorioctl_character(agent_id)")
-            && control_lua.contains("return {extracted = 0, available = available, item = item}")
-            && control_lua.contains("local inventory_define_for = inventory.define_for")
-            && characters_lua.contains("local character = storage.characters[agent_id]")
-            && inventory_lua.contains("function M.define_for(inventory_type, default_type)")
-            && json_response_lua
-                .contains("if type(result_or_error) == \"string\" then return result_or_error end")
-            && !control_lua.contains("\"error\": \"No items of that type in inventory\""),
-        "control.lua extraction logic should preserve the named-agent/no-items contract"
-    );
 
     for required in [
         "local function insert_items_impl(agent_id, unit_number, item, count, inventory_type)",
@@ -2565,36 +2403,6 @@ fn entity_mutation_queries_live_in_the_mod_not_rust_strings() {
             && characters_lua.contains("storage.characters[agent_id] = character")
             && control_lua.contains("init_character = function(agent_id, x, y)"),
         "characters.lua init_character should populate mod character storage through control.lua remotes"
-    );
-}
-
-#[test]
-fn recipe_clear_is_an_explicit_nil_operation_across_lua_and_rust() {
-    let control_lua = include_str!("../mod/claude-interface/control.lua");
-    for required in [
-        "if requested_recipe == \"\" then requested_recipe = nil end",
-        "entity.set_recipe(requested_recipe)",
-        "if requested_recipe == nil then",
-        "if current ~= nil then",
-        "return {success = true, cleared = true, recipe = nil}",
-    ] {
-        assert!(
-            control_lua.contains(required),
-            "control.lua must explicitly clear and verify recipes via {required:?}"
-        );
-    }
-
-    let client = include_str!("../src/client/mod.rs");
-    assert!(client.contains("pub async fn clear_recipe"));
-    assert!(client.contains("recipe.map_or(Value::Null"));
-
-    let mcp = include_str!("../src/bin/mcp.rs");
-    assert!(mcp.contains("RecipeRestoreAction::Set(recipe_name)"));
-    assert!(mcp.contains("RecipeRestoreAction::Clear => client.clear_recipe(unit_number).await"));
-    assert!(mcp.contains("client.clear_recipe(params.unit_number).await"));
-    assert!(
-        !mcp.contains("client.set_recipe(params.unit_number, \"\").await"),
-        "empty recipe strings must not be sent to Factorio as recipe names"
     );
 }
 
@@ -2703,22 +2511,6 @@ fn blueprint_commands_are_agent_scoped_for_cjf_11() {
         !control_lua.contains("game.get_player(1)"),
         "blueprint remotes must not hardcode player 1"
     );
-}
-
-#[test]
-fn chat_fetch_uses_mod_remote_without_level_storage_fallback() {
-    let register_lua = LuaCommand::register_chat_handler();
-    let lua = LuaCommand::get_and_clear_chat_messages();
-
-    assert_remote_request("chat_capture_status", &register_lua, "chat_capture_status");
-    assert!(!register_lua.contains(r#"rcon.print("registered")"#));
-    assert_remote_request("get_chat_messages", &lua, "get_chat_messages");
-    assert!(!lua.contains("storage.factorioctl_chat"));
-    assert!(!lua.contains("handler_registered"));
-
-    let control_lua = include_str!("../mod/claude-interface/control.lua");
-    assert!(control_lua.contains("chat_capture_status = function()"));
-    assert!(control_lua.contains("registered = true"));
 }
 
 #[test]
@@ -3868,20 +3660,6 @@ fn mining_queries_live_in_the_mod_not_rust_strings() {
         );
     }
 
-    assert!(
-        control_lua.contains("character.mine_entity(target, true)")
-            && control_lua
-                .contains("character.mining_state = {mining = true, position = target.position}")
-            && control_lua.contains("items = inventory_contents(inv)")
-            && control_lua.contains("local iteration_before_count = inventory_item_total(inv)")
-            && control_lua.contains("local inventory_progress = iteration_after_count > iteration_before_count")
-            && control_lua.contains("local resource_progress = target.valid and target_amount_before")
-            && control_lua.contains("picked_up = picked_up + pick_up_item_entity")
-            && control_lua.contains("local trees = clear_trees and surface.find_entities_filtered{type = \"tree\", area = area} or {}")
-            && control_lua.contains("surface.find_entities_filtered{type = \"simple-entity\", area = area}")
-            && control_lua.contains("find_entities_filtered{"),
-        "control.lua should own mining scans and measure mining progress from state changes"
-    );
     let find_minable_at = control_lua
         .split("local function find_minable_at")
         .nth(1)

@@ -131,6 +131,15 @@ pub struct MineResult {
     #[serde(default)]
     pub error: Option<String>,
 
+    /// Machine-readable failure class from the mod (e.g. `inventory_full`,
+    /// `count_exceeds_limit`, `out_of_reach`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+
+    /// Why a partially successful mining loop stopped early, if it did
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+
     /// Current inventory after mining
     #[serde(default, deserialize_with = "super::deserialize_lua_empty_vec")]
     pub inventory: Vec<InventoryItem>,

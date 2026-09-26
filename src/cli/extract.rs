@@ -26,12 +26,23 @@ pub struct ExtractCommand {
 pub async fn execute(cmd: ExtractCommand, conn: &ResolvedConnectionArgs) -> Result<()> {
     let mut client = conn.connect_client().await?;
 
-    let extracted = client
+    let result = client
         .extract_items(cmd.from, &cmd.item, cmd.count, &cmd.inventory)
         .await?;
+    let field = |name: &str| {
+        result
+            .get(name)
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    };
     println!(
-        "Extracted {} {} from entity #{} ({})",
-        extracted, cmd.item, cmd.from, cmd.inventory
+        "Extracted {} {} from entity #{} ({}); restored {}, spilled {}",
+        field("extracted"),
+        cmd.item,
+        cmd.from,
+        cmd.inventory,
+        field("restored"),
+        field("spilled")
     );
 
     client.close().await?;

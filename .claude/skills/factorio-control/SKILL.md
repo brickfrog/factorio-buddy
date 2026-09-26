@@ -34,7 +34,9 @@ tool can inspect the current game state.
    placing new ones. Search near the base, near known water, and near any
    partially built power plant. If relevant entities exist, inspect and repair
    their connections first; only place a duplicate after verifying the existing
-   entity cannot be reused.
+   entity cannot be reused. For a first plant, `build_steam_power` finds water
+   (`find_nearest_resource` with `resource_type: "water"` also does), crafts
+   the parts, places them and fuels the boiler in one call.
 
 5. Verify what changed.
    After placing or changing production, call `verify_production` or the
@@ -52,7 +54,12 @@ tool can inspect the current game state.
    `execute_edge_miner` to derive a workable drill output; a Factorio-buildable
    output tile remains usable even when that tile also contains ore.
 
-7. Build durable automation instead of repeating manual cycles.
+7. Follow the tech ladder, then build durable automation.
+   The autonomy snapshot's `progression` block names the next Factorio 2.0
+   milestone (50 iron plates unlock steam power, 10 copper plates unlock
+   electronics, crafting a lab unlocks red science). Until electricity and
+   research run, bounded hand-fuelling with `bootstrap_burner_once` (up to 50)
+   is correct; do not stall there on belt fuel feeds. After that:
    Manual `insert_items`, `extract_items`, `craft`, `hand_feed_furnace`, and
    `feed_lab_from_inventory` are bootstrap or recovery actions, not finished
    factory work. If the same ingredient, fuel, plate, or science-pack transfer

@@ -168,13 +168,16 @@ cleanup() {
 
     local scenario
     local pid
-    for scenario in \
-        "$TEST_ROOT"/clean \
-        "$TEST_ROOT"/no-player-autonomy \
-        "$TEST_ROOT"/provider-limit \
-        "$TEST_ROOT"/server-death; do
+    for scenario in "$TEST_ROOT"/*/; do
+        scenario="${scenario%/}"
         if pid="$(find_owned_server_pid "$scenario" "$RCON_PORT" 2>/dev/null)"; then
             kill -KILL "$pid" 2>/dev/null || true
+        fi
+        # Fake-Claude grandchildren are only ours; never touch other PIDs.
+        if [[ -f "$scenario/claude-invocations.grandchild" ]]; then
+            while IFS= read -r pid; do
+                [[ "$pid" =~ ^[0-9]+$ ]] && kill -KILL "$pid" 2>/dev/null || true
+            done < "$scenario/claude-invocations.grandchild"
         fi
     done
 
@@ -206,6 +209,191 @@ done
 (( RCON_PORT != GAME_PORT )) || fail "RCON and game test ports must differ"
 assert_ports_unused
 
+BUDDY_EXTRA_ARGS=()
+BUDDY_EXTRA_ENV=()
+
+# Optional comma-separated filter for the newer scenarios, e.g.
+# BUDDY_RUNTIME_SCENARIOS=human-fifo,stale-session. Empty runs everything.
+want() {
+    [[ -z "${BUDDY_RUNTIME_SCENARIOS:-}" ]] && return 0
+    [[ ",$BUDDY_RUNTIME_SCENARIOS," == *",$1,"* ]]
+}
+
+# Every fake records its observed argv (model, --resume) and prompt, so the
+# assertions check what Buddy actually launched rather than source text.
+write_fake_claude() {
+    local fixture="$1"
+    cat <<'PRELUDE'
+#!/usr/bin/env bash
+state="$FAKE_CLAUDE_STATE"
+model=""
+resume=no
+previous=""
+for argument in "$@"; do
+    [[ "$previous" == "--model" ]] && model="$argument"
+    [[ "$argument" == "--resume" ]] && resume=yes
+    previous="$argument"
+done
+prompt="${!#}"
+printf 'invoke\n' >> "$state"
+printf 'argv model=%s resume=%s\n' "$model" "$resume" >> "$state.args"
+printf '%s\n----\n' "$prompt" >> "$state.prompts"
+result() {
+    printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"%s"}\n' "$1" "${2:-runtime-fake-session}"
+}
+PRELUDE
+    case "$fixture" in
+        success)
+            printf '%s\n' 'result "runtime fake reply"'
+            ;;
+        provider-limit)
+            cat <<'BODY'
+if [[ "$resume" == yes ]]; then
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"wedged-provider-session"}'
+    printf '%s\n' '{"type":"system","subtype":"status","status":"compacting","session_id":"wedged-provider-session"}'
+    sleep 120
+    exit 0
+fi
+printf '%s\n' '{"type":"result","subtype":"error","is_error":true,"result":"API Error: Request rejected (429) - Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-07-20 01:09:22","session_id":"wedged-provider-session"}'
+BODY
+            ;;
+        human-fifo)
+            cat <<'BODY'
+case "$prompt" in
+    *request-A*) sleep 6; printf 'finished request-A\n' >> "$state.done"; result "reply-A" ;;
+    *request-B*) printf 'finished request-B\n' >> "$state.done"; result "reply-B" ;;
+    *) result "autonomy reply" ;;
+esac
+BODY
+            ;;
+        limit-queue)
+            cat <<'BODY'
+case "$prompt" in
+    *request-A*)
+        sleep 5
+        # Exact result shape Claude Code 2.1.281 emitted when the subscription
+        # session window ran out during the model trials.
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You'"'"'ve hit your session limit · resets 4am (America/New_York)","session_id":"limit-session"}'
+        ;;
+    *) result "unexpected turn" ;;
+esac
+BODY
+            ;;
+        stale-session)
+            cat <<'BODY'
+if [[ "$resume" == yes ]]; then
+    printf 'No conversation found with session ID: runtime-fake-session\n' >&2
+    exit 1
+fi
+result "fresh reply"
+BODY
+            ;;
+        stale-after-tool)
+            cat <<'BODY'
+if [[ "$resume" == yes ]]; then
+    # The resumed attempt runs a tool, then reports the session missing.
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_stale_1","name":"mcp__factorio__place_entity","input":{"name":"stone-furnace","x":5,"y":6}}]}}'
+    printf 'No conversation found with session ID: runtime-fake-session\n' >&2
+    exit 1
+fi
+note=no
+[[ "$prompt" == *"OUTCOME UNKNOWN"* && "$prompt" == *"place_entity"* ]] && note=yes
+printf 'fresh note=%s\n' "$note" >> "$state.args"
+result "fresh reply"
+BODY
+            ;;
+        interrupt)
+            cat <<'BODY'
+if [[ "$prompt" == *"Autonomy tick"* ]]; then
+    # Stand-in for Claude's MCP server: a grandchild in the same group.
+    sleep 300 &
+    printf '%s\n' "$!" >> "$state.grandchild"
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_fake_1","name":"mcp__factorio__place_entity","input":{"name":"stone-furnace","x":3,"y":4}}]}}'
+    sleep 300
+    exit 0
+fi
+alive=no
+while IFS= read -r pid; do
+    if [[ -r "/proc/$pid/stat" ]] && [[ "$(awk '{ print $3 }' "/proc/$pid/stat")" != "Z" ]]; then
+        alive=yes
+    fi
+done < <(cat "$state.grandchild" 2>/dev/null)
+note=no
+[[ "$prompt" == *"OUTCOME UNKNOWN"* && "$prompt" == *"place_entity"* ]] && note=yes
+printf 'human grandchild_alive=%s note=%s\n' "$alive" "$note" >> "$state.args"
+result "human reply"
+BODY
+            ;;
+        *)
+            fail "unknown Claude fixture: $fixture"
+            ;;
+    esac
+}
+
+inbox_for() {
+    local run_directory
+    run_directory="$(find "$1/write-data/managed-runs" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    [[ -n "$run_directory" ]] || fail "managed run directory is missing under $1"
+    mkdir -p "$run_directory/script-output/claude-chat"
+    printf '%s\n' "$run_directory/script-output/claude-chat/input.jsonl"
+}
+
+send_chat() {
+    local inbox="$1"
+    local id="$2"
+    local message="$3"
+    printf '{"id":%s,"message":"%s","player_index":0,"target_agent":"runtime-live"}\n' \
+        "$id" "$message" >> "$inbox"
+}
+
+wait_for_file_line() {
+    local pid="$1"
+    local file="$2"
+    local pattern="$3"
+    local timeout_seconds="$4"
+    wait_for_log "$pid" "$file" "$pattern" "$timeout_seconds"
+}
+
+stop_buddy() {
+    local scenario_root="$1"
+    local label="$2"
+    kill -TERM "$CURRENT_BUDDY_PID"
+    wait_for_process_stop "$CURRENT_BUDDY_PID" 75 \
+        || fail "$label Buddy did not shut down cleanly"
+    set +e
+    wait "$CURRENT_BUDDY_PID"
+    local status=$?
+    set -e
+    CURRENT_BUDDY_PID=""
+    CURRENT_SERVER_PID=""
+    (( status == 0 )) || fail "$label Buddy exited with status $status"
+    assert_no_owned_server "$scenario_root" \
+        || fail "$label left an owned Factorio process or listener"
+    BUDDY_EXTRA_ARGS=()
+    BUDDY_EXTRA_ENV=()
+}
+
+assert_no_player_joined() {
+    local factorio_log
+    factorio_log="$(find "$1/write-data/managed-runs" -name factorio-current.log -type f -print -quit)"
+    [[ -f "$factorio_log" ]] || fail "Factorio log is missing under $1"
+    if grep -Fq "processed PlayerJoinGame" "$factorio_log"; then
+        fail "$1 unexpectedly had a connected player"
+    fi
+}
+
+# MCP servers spawned by Buddy's maintenance client for this test's RCON port.
+owned_mcp_pids() {
+    local proc
+    for proc in /proc/[0-9]*; do
+        [[ -r "$proc/cmdline" && -r "$proc/environ" ]] || continue
+        [[ "$(tr '\0' '\n' < "$proc/cmdline" | head -n 1)" == "$MCP_BIN" ]] || continue
+        if tr '\0' '\n' < "$proc/environ" | grep -Fxq "FACTORIO_RCON_PORT=$RCON_PORT"; then
+            printf '%s\n' "${proc##*/}"
+        fi
+    done
+}
+
 start_buddy() {
     local scenario_name="$1"
     local mode="${2:-fresh}"
@@ -222,29 +410,7 @@ start_buddy() {
     mkdir -p "$scenario/bin" "$scenario/home/.factorio/mods" "$scenario/write-data"
     printf 'isolated-home\n' > "$scenario/home/.factorio/mods/runtime-test-sentinel"
     cp -a "$ROOT/mod/claude-interface" "$scenario/home/.factorio/mods/"
-    if [[ "$claude_fixture" == "success" ]]; then
-        printf '%s\n' \
-            '#!/usr/bin/env bash' \
-            'printf '\''invoke\n'\'' >> "$FAKE_CLAUDE_STATE"' \
-            'printf '\''%s\n'\'' '\''{"type":"result","subtype":"success","is_error":false,"result":"runtime fake reply","session_id":"runtime-fake-session"}'\''' \
-            > "$scenario/bin/claude"
-    elif [[ "$claude_fixture" == "provider-limit" ]]; then
-        printf '%s\n' \
-            '#!/usr/bin/env bash' \
-            'printf '\''invoke\n'\'' >> "$FAKE_CLAUDE_STATE"' \
-            'for argument in "$@"; do' \
-            '    if [[ "$argument" == "--resume" ]]; then' \
-            '        printf '\''%s\n'\'' '\''{"type":"system","subtype":"init","session_id":"wedged-provider-session"}'\''' \
-            '        printf '\''%s\n'\'' '\''{"type":"system","subtype":"status","status":"compacting","session_id":"wedged-provider-session"}'\''' \
-            '        sleep 120' \
-            '        exit 0' \
-            '    fi' \
-            'done' \
-            'printf '\''%s\n'\'' '\''{"type":"result","subtype":"error","is_error":true,"result":"API Error: Request rejected (429) - Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-07-20 01:09:22","session_id":"wedged-provider-session"}'\''' \
-            > "$scenario/bin/claude"
-    else
-        fail "unknown Claude fixture: $claude_fixture"
-    fi
+    write_fake_claude "$claude_fixture" > "$scenario/bin/claude"
     chmod +x "$scenario/bin/claude"
 
     env \
@@ -259,6 +425,7 @@ start_buddy() {
         FAKE_CLAUDE_STATE="$scenario/claude-invocations" \
         BUDDY_HEARTBEAT_SECONDS="$heartbeat_seconds" \
         RUST_LOG=info \
+        "${BUDDY_EXTRA_ENV[@]}" \
         "$BUDDY_BIN" \
             --start-server \
             "${fresh_args[@]}" \
@@ -271,6 +438,8 @@ start_buddy() {
             --write-data "$scenario/write-data" \
             --save "$scenario/save.zip" \
             --mcp-bin "$MCP_BIN" \
+            --evidence-log "$scenario/evidence.jsonl" \
+            "${BUDDY_EXTRA_ARGS[@]}" \
             > "$log" 2>&1 &
     CURRENT_BUDDY_PID=$!
 
@@ -403,6 +572,9 @@ NO_PLAYER_FACTORIO_LOG="$(find "$NO_PLAYER_ROOT/write-data/managed-runs" -name f
 if grep -Fq "processed PlayerJoinGame" "$NO_PLAYER_FACTORIO_LOG"; then
     fail "no-player autonomy fixture unexpectedly had a multiplayer client"
 fi
+grep -Fxq "argv model=claude-opus-5-5 resume=no" "$NO_PLAYER_ROOT/claude-invocations.args" \
+    || fail "Buddy did not launch Claude with the default claude-opus-5-5 model"
+pass "Buddy launches Claude with --model claude-opus-5-5 by default"
 kill -TERM "$CURRENT_BUDDY_PID"
 wait_for_process_stop "$CURRENT_BUDDY_PID" 75 \
     || fail "no-player autonomy Buddy did not shut down cleanly"
@@ -521,5 +693,248 @@ jq -e '.version == 2 and .clean_shutdown == true' \
     "$DEATH_ROOT/save.zip.buddy-owner.json" >/dev/null \
     || fail "resumed clean shutdown was not recorded"
 pass "unclean resume ignores autosaves outside the primary save's owned run"
+
+# Human requests are FIFO: B arriving while A runs must neither cancel A nor
+# be lost; each gets exactly one terminal response, A before B.
+if want human-fifo; then
+    assert_ports_unused
+    start_buddy human-fifo fresh 0 human-fifo
+    FIFO_ROOT="$TEST_ROOT/human-fifo"
+    FIFO_LOG="$FIFO_ROOT/buddy-fresh.log"
+    FIFO_INBOX="$(inbox_for "$FIFO_ROOT")"
+    send_chat "$FIFO_INBOX" 1 "request-A"
+    wait_for_file_line "$CURRENT_BUDDY_PID" "$FIFO_ROOT/claude-invocations.prompts" "request-A" 10 \
+        || fail "request A never reached Claude"
+    send_chat "$FIFO_INBOX" 2 "request-B"
+    wait_for_log "$CURRENT_BUDDY_PID" "$FIFO_LOG" 'text="reply-B"' 30 \
+        || fail "request B never received a terminal response"
+    grep -Fxq "finished request-A" "$FIFO_ROOT/claude-invocations.done" \
+        || fail "request A was cancelled by request B"
+    (( "$(grep -c 'text="reply-A"' "$FIFO_LOG")" == 1 )) || fail "request A did not get exactly one response"
+    (( "$(grep -c 'text="reply-B"' "$FIFO_LOG")" == 1 )) || fail "request B did not get exactly one response"
+    A_LINE="$(grep -n 'text="reply-A"' "$FIFO_LOG" | cut -d: -f1)"
+    B_LINE="$(grep -n 'text="reply-B"' "$FIFO_LOG" | cut -d: -f1)"
+    (( A_LINE < B_LINE )) || fail "human responses were delivered out of order"
+    if grep -Fq "cancelling active Claude turn" "$FIFO_LOG"; then
+        fail "a human turn was cancelled by another human message"
+    fi
+    (( "$(grep -c '^invoke$' "$FIFO_ROOT/claude-invocations")" == 2 )) \
+        || fail "human FIFO replayed or dropped a turn"
+    stop_buddy "$FIFO_ROOT" "human-fifo"
+    pass "human requests run FIFO without cancelling each other"
+fi
+
+# A provider limit hit while humans are queued answers every queued request.
+if want limit-queue; then
+    assert_ports_unused
+    start_buddy limit-queue fresh 0 limit-queue
+    QUEUE_ROOT="$TEST_ROOT/limit-queue"
+    QUEUE_LOG="$QUEUE_ROOT/buddy-fresh.log"
+    QUEUE_INBOX="$(inbox_for "$QUEUE_ROOT")"
+    send_chat "$QUEUE_INBOX" 1 "request-A"
+    wait_for_file_line "$CURRENT_BUDDY_PID" "$QUEUE_ROOT/claude-invocations.prompts" "request-A" 10 \
+        || fail "limit request A never reached Claude"
+    send_chat "$QUEUE_INBOX" 2 "request-B"
+    send_chat "$QUEUE_INBOX" 3 "request-C"
+    wait_for_log "$CURRENT_BUDDY_PID" "$QUEUE_LOG" \
+        "Claude provider usage limit active; pausing autonomous turns" 30 \
+        || fail "limit-queue fixture never hit the provider limit"
+    sleep 1
+    LIMIT_RESPONSES="$(grep -c 'response delivered to Factorio.*subscription usage limit' "$QUEUE_LOG" || true)"
+    (( LIMIT_RESPONSES == 3 )) \
+        || fail "expected 3 provider-limit responses (A plus queued B and C), saw $LIMIT_RESPONSES"
+    (( "$(grep -c 'provider_limit_queued_response' "$QUEUE_LOG")" == 2 )) \
+        || fail "queued requests were not individually answered"
+    (( "$(grep -c '^invoke$' "$QUEUE_ROOT/claude-invocations")" == 1 )) \
+        || fail "queued requests busy-looped into Claude during the limit"
+    process_active "$CURRENT_SERVER_PID" || fail "provider limit stopped the server"
+    stop_buddy "$QUEUE_ROOT" "limit-queue"
+    pass "provider limit answers every queued human request once"
+fi
+
+# A resumed session that fails only on stderr is retried once, fresh.
+if want stale-session; then
+    assert_ports_unused
+    start_buddy stale-session fresh 0 stale-session
+    STALE_ROOT="$TEST_ROOT/stale-session"
+    STALE_LOG="$STALE_ROOT/buddy-fresh.log"
+    STALE_INBOX="$(inbox_for "$STALE_ROOT")"
+    send_chat "$STALE_INBOX" 1 "first"
+    wait_for_log "$CURRENT_BUDDY_PID" "$STALE_LOG" "Claude turn finished kind=Human succeeded=true" 20 \
+        || fail "stale-session first turn failed"
+    send_chat "$STALE_INBOX" 2 "second"
+    wait_for_log "$CURRENT_BUDDY_PID" "$STALE_LOG" 'Claude turn finished kind=Human succeeded=true' 20 || true
+    sleep 3
+    mapfile -t STALE_ARGS < "$STALE_ROOT/claude-invocations.args"
+    (( ${#STALE_ARGS[@]} == 3 )) \
+        || fail "expected exactly 3 Claude launches (fresh, stale resume, one fresh retry); saw ${#STALE_ARGS[@]}"
+    [[ "${STALE_ARGS[1]}" == *"resume=yes"* && "${STALE_ARGS[2]}" == *"resume=no"* ]] \
+        || fail "stale session was not retried exactly once without --resume"
+    (( "$(grep -c 'Claude turn finished kind=Human succeeded=true' "$STALE_LOG")" == 2 )) \
+        || fail "second human turn did not succeed after the fresh-session retry"
+    if grep -Fq 'text="Agent error' "$STALE_LOG"; then
+        fail "stale session surfaced an Agent error instead of retrying"
+    fi
+    stop_buddy "$STALE_ROOT" "stale-session"
+    pass "stderr-only invalid session triggers one fresh-session retry"
+fi
+
+# An invalid session reported after a tool already ran must not replay the
+# prompt; the turn fails and the next turn carries the outcome-unknown note.
+if want stale-after-tool; then
+    assert_ports_unused
+    start_buddy stale-after-tool fresh 0 stale-after-tool
+    SAT_ROOT="$TEST_ROOT/stale-after-tool"
+    SAT_LOG="$SAT_ROOT/buddy-fresh.log"
+    SAT_INBOX="$(inbox_for "$SAT_ROOT")"
+    send_chat "$SAT_INBOX" 1 "first"
+    wait_for_log "$CURRENT_BUDDY_PID" "$SAT_LOG" "Claude turn finished kind=Human succeeded=true" 20 \
+        || fail "stale-after-tool first turn failed"
+    send_chat "$SAT_INBOX" 2 "second"
+    wait_for_log "$CURRENT_BUDDY_PID" "$SAT_LOG" "Claude turn finished kind=Human succeeded=false" 20 \
+        || fail "resumed turn with a tool call was not failed"
+    grep -Fq "session_reset_without_retry" "$SAT_LOG" \
+        || fail "session reset after a tool call was not reported"
+    send_chat "$SAT_INBOX" 3 "third"
+    wait_for_log "$CURRENT_BUDDY_PID" "$SAT_ROOT/claude-invocations.args" "fresh note=yes" 20 \
+        || fail "turn after the unreplayed failure lacked the outcome-unknown note"
+    mapfile -t SAT_ARGS < <(grep '^argv' "$SAT_ROOT/claude-invocations.args")
+    (( ${#SAT_ARGS[@]} == 3 )) \
+        || fail "expected 3 launches (fresh, failed resume, next fresh turn) with no replay; saw ${#SAT_ARGS[@]}"
+    [[ "${SAT_ARGS[1]}" == *"resume=yes"* && "${SAT_ARGS[2]}" == *"resume=no"* ]] \
+        || fail "failed resume was replayed or the next turn resumed the dead session"
+    stop_buddy "$SAT_ROOT" "stale-after-tool"
+    pass "invalid session after a tool call fails the turn without replaying it"
+fi
+
+# Chat preempting autonomy terminates the whole Claude process tree before
+# the human turn starts, and the human prompt carries an outcome-unknown note.
+if want interrupt; then
+    assert_ports_unused
+    start_buddy interrupt fresh 1 interrupt
+    INT_ROOT="$TEST_ROOT/interrupt"
+    INT_LOG="$INT_ROOT/buddy-fresh.log"
+    INT_INBOX="$(inbox_for "$INT_ROOT")"
+    wait_for_file_line "$CURRENT_BUDDY_PID" "$INT_ROOT/claude-invocations.grandchild" "" 20 || true
+    wait_for_log "$CURRENT_BUDDY_PID" "$INT_LOG" "mcp__factorio__place_entity" 20 \
+        || fail "interrupt fixture never started its tool call"
+    send_chat "$INT_INBOX" 1 "hello"
+    wait_for_log "$CURRENT_BUDDY_PID" "$INT_ROOT/claude-invocations.args" "human grandchild_alive=" 20 \
+        || fail "human turn after interruption never started"
+    grep -Fq "human grandchild_alive=no" "$INT_ROOT/claude-invocations.args" \
+        || fail "cancelled autonomy left its grandchild running when the next turn started"
+    grep -Fq "note=yes" "$INT_ROOT/claude-invocations.args" \
+        || fail "next prompt lacked the outcome-unknown note for the interrupted tool"
+    jq -e 'select(.event == "interrupted_tool" and .tool == "place_entity")' \
+        "$INT_ROOT/evidence.jsonl" >/dev/null || fail "interrupted_tool evidence missing"
+    jq -e 'select(.event == "turn_finished" and .kind == "autonomy" and .cancelled == true)' \
+        "$INT_ROOT/evidence.jsonl" >/dev/null || fail "cancelled autonomy turn_finished evidence missing"
+    stop_buddy "$INT_ROOT" "interrupt"
+    while IFS= read -r pid; do
+        if [[ -r "/proc/$pid/stat" ]] && [[ "$(awk '{ print $3 }' "/proc/$pid/stat")" != "Z" ]]; then
+            fail "fake MCP grandchild $pid survived Buddy shutdown"
+        fi
+    done < "$INT_ROOT/claude-invocations.grandchild"
+    pass "interruption reaps the Claude process tree and reports outcome-unknown tools"
+fi
+
+# Turn budget: after N autonomous turns Buddy idles but keeps the server up.
+if want budget; then
+    assert_ports_unused
+    BUDDY_EXTRA_ARGS=(--max-autonomous-turns 2)
+    start_buddy budget fresh 1 success
+    BUDGET_ROOT="$TEST_ROOT/budget"
+    BUDGET_LOG="$BUDGET_ROOT/buddy-fresh.log"
+    wait_for_log "$CURRENT_BUDDY_PID" "$BUDGET_LOG" "autonomy_budget_exhausted" 30 \
+        || fail "autonomy turn budget was never reported exhausted"
+    sleep 4
+    (( "$(grep -c '^invoke$' "$BUDGET_ROOT/claude-invocations")" == 2 )) \
+        || fail "Buddy started autonomy beyond --max-autonomous-turns"
+    process_active "$CURRENT_SERVER_PID" || fail "budget exhaustion stopped the server"
+    jq -e 'select(.event == "autonomy_budget_exhausted" and .reason == "max_autonomous_turns" and .autonomous_turns == 2)' \
+        "$BUDGET_ROOT/evidence.jsonl" >/dev/null || fail "budget evidence missing"
+    (( "$(jq -c 'select(.event == "turn_finished" and .kind == "autonomy" and .succeeded == true)' "$BUDGET_ROOT/evidence.jsonl" | wc -l)" == 2 )) \
+        || fail "evidence does not record exactly two successful autonomy turns"
+    assert_no_player_joined "$BUDGET_ROOT"
+    stop_buddy "$BUDGET_ROOT" "budget"
+    pass "autonomous turn budget idles Buddy with the server alive and zero players"
+fi
+
+# Deadline: an autonomy turn still running at the deadline is cancelled with
+# the same process-tree cleanup.
+if want deadline; then
+    assert_ports_unused
+    BUDDY_EXTRA_ARGS=(--autonomy-deadline-seconds 5)
+    start_buddy deadline fresh 1 interrupt
+    DEADLINE_ROOT="$TEST_ROOT/deadline"
+    DEADLINE_LOG="$DEADLINE_ROOT/buddy-fresh.log"
+    wait_for_log "$CURRENT_BUDDY_PID" "$DEADLINE_LOG" "reason=\"autonomy_deadline\"" 30 \
+        || wait_for_log "$CURRENT_BUDDY_PID" "$DEADLINE_LOG" "reason=autonomy_deadline" 5 \
+        || fail "autonomy deadline was never reported"
+    wait_for_log "$CURRENT_BUDDY_PID" "$DEADLINE_LOG" "process_group_reaped" 10 \
+        || fail "deadline cancellation did not reap the Claude process group"
+    sleep 3
+    while IFS= read -r pid; do
+        if [[ -r "/proc/$pid/stat" ]] && [[ "$(awk '{ print $3 }' "/proc/$pid/stat")" != "Z" ]]; then
+            fail "deadline cancellation left grandchild $pid running"
+        fi
+    done < "$DEADLINE_ROOT/claude-invocations.grandchild"
+    (( "$(grep -c '^invoke$' "$DEADLINE_ROOT/claude-invocations")" == 1 )) \
+        || fail "Buddy started autonomy after its deadline"
+    process_active "$CURRENT_SERVER_PID" || fail "deadline stopped the server"
+    stop_buddy "$DEADLINE_ROOT" "deadline"
+    pass "autonomy deadline cancels the running turn and idles with the server alive"
+fi
+
+# Jev modes require credentials before anything starts.
+if want jev-credentials; then
+    assert_ports_unused
+    CRED_ROOT="$TEST_ROOT/jev-credentials"
+    mkdir -p "$CRED_ROOT/home"
+    set +e
+    timeout --signal=KILL 10s env -u TYPESAFE_API_KEY HOME="$CRED_ROOT/home" \
+        "$BUDDY_BIN" --start-server --fresh --agent runtime-live \
+        --rcon-port "$RCON_PORT" --game-port "$GAME_PORT" \
+        --factorio-bin "$FACTORIO_BIN" --write-data "$CRED_ROOT/write-data" \
+        --save "$CRED_ROOT/save.zip" --mcp-bin "$MCP_BIN" --decision-mode jev \
+        > "$CRED_ROOT/buddy.log" 2>&1
+    CRED_STATUS=$?
+    set -e
+    (( CRED_STATUS != 0 && CRED_STATUS != 137 )) || fail "jev mode without a credential did not fail fast"
+    grep -Fq "requires the TYPESAFE_API_KEY" "$CRED_ROOT/buddy.log" \
+        || fail "missing-credential failure lacked a clear diagnostic"
+    [[ ! -e "$CRED_ROOT/save.zip" ]] || fail "missing-credential startup created a save"
+    assert_ports_unused
+    pass "jev decision modes fail fast without TYPESAFE_API_KEY"
+fi
+
+# Maintenance runs through the real MCP binary. With no ready fuel repair in a
+# fresh world, deterministic and jev-shadow must decline without mutating,
+# never call Jev, reap their MCP child, and return to Opus.
+for MODE in deterministic jev-shadow; do
+    want "decision-$MODE" || continue
+    assert_ports_unused
+    BUDDY_EXTRA_ARGS=(--decision-mode "$MODE" --max-autonomous-turns 2)
+    BUDDY_EXTRA_ENV=(TYPESAFE_API_KEY=fake-test-key TYPESAFE_API_URL=http://127.0.0.1:9/unreachable)
+    start_buddy "decision-$MODE" fresh 1 success
+    DEC_ROOT="$TEST_ROOT/decision-$MODE"
+    DEC_LOG="$DEC_ROOT/buddy-fresh.log"
+    wait_for_log "$CURRENT_BUDDY_PID" "$DEC_LOG" "autonomy_budget_exhausted" 90 \
+        || fail "$MODE maintenance cycle never completed"
+    jq -e --arg mode "$MODE" 'select(.event == "decision" and .mode == $mode and .eligible == false and .preview == null and .input_tokens == null and .latency_ms == null)' \
+        "$DEC_ROOT/evidence.jsonl" >/dev/null || fail "$MODE did not record an ineligible nonmutating decision without a Jev latency"
+    jq -e 'select(.event == "turn_finished" and .kind == "maintenance" and .cancelled == false and .succeeded == null)' \
+        "$DEC_ROOT/evidence.jsonl" >/dev/null || fail "$MODE maintenance turn without a repair was not recorded as not executed"
+    if jq -e 'select(.event == "maintenance_result")' "$DEC_ROOT/evidence.jsonl" >/dev/null; then
+        fail "$MODE executed a maintenance repair without a ready preview"
+    fi
+    jq -c '[.event, .kind] | select(.[0] == "turn_finished")' "$DEC_ROOT/evidence.jsonl" \
+        > "$DEC_ROOT/turn-order.jsonl"
+    [[ "$(tr -d '\n' < "$DEC_ROOT/turn-order.jsonl")" == '["turn_finished","autonomy"]["turn_finished","maintenance"]["turn_finished","autonomy"]' ]] \
+        || fail "$MODE did not run Opus, one maintenance check, then Opus: $(tr -d '\n' < "$DEC_ROOT/turn-order.jsonl")"
+    [[ -z "$(owned_mcp_pids)" ]] || fail "$MODE left its maintenance MCP server running"
+    stop_buddy "$DEC_ROOT" "decision-$MODE"
+    pass "$MODE maintenance declines without a ready repair and reaps its MCP child"
+done
 
 printf 'Buddy managed-runtime live regression passed.\n'

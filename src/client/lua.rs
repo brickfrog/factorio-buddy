@@ -946,6 +946,20 @@ impl LuaCommand {
         )
     }
 
+    /// Read the agent force's burner machines and fuel counts near a point.
+    pub fn burner_fuel_levels(agent_id: &AgentId, center: Position, radius: u32) -> String {
+        Self::claude_interface_json_call(
+            "burner_fuel_levels",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                center.x.to_string(),
+                center.y.to_string(),
+                radius.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before reading burner fuel.",
+        )
+    }
+
     /// Extract items from an entity's inventory into the player's inventory
     pub fn extract_items(
         agent_id: &AgentId,
@@ -1114,27 +1128,6 @@ impl LuaCommand {
         )
     }
 
-    /// Compatibility shim. Chat capture is registered by the claude-interface
-    /// MOD's on_console_chat handler (control.lua), NOT by injecting a handler
-    /// into the level script over RCON.
-    pub fn register_chat_handler() -> String {
-        Self::claude_interface_json_call(
-            "chat_capture_status",
-            &[],
-            "Run just sync/resume so the updated claude-interface mod is loaded before reading player messages.",
-        )
-    }
-
-    /// Get and clear pending chat messages. Reads from the mod's chat buffer via
-    /// the remote interface (MP-safe).
-    pub fn get_and_clear_chat_messages() -> String {
-        Self::claude_interface_json_call(
-            "get_chat_messages",
-            &[],
-            "Run just sync/resume so the updated claude-interface mod is loaded before reading player messages.",
-        )
-    }
-
     // --- Research Commands ---
 
     /// Get overall research status
@@ -1191,6 +1184,18 @@ impl LuaCommand {
             "is_tech_researched",
             &[Self::lua_string_arg(tech_name)],
             "Run just sync/resume so the updated claude-interface mod is loaded before checking research state.",
+        )
+    }
+
+    /// Launch a ready rocket from one of the agent force's silos.
+    pub fn launch_rocket(agent_id: &AgentId, unit_number: Option<u32>) -> String {
+        Self::claude_interface_json_call(
+            "launch_rocket",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                unit_number.map_or_else(|| "nil".to_string(), |unit| unit.to_string()),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before launching a rocket.",
         )
     }
 
@@ -1398,33 +1403,6 @@ mod tests {
             .as_array()
             .expect("request args should be an array");
         assert_eq!(request["n"].as_u64(), Some(args.len() as u64));
-    }
-
-    #[test]
-    fn register_chat_handler_injects_no_level_script_event_handler() {
-        // MP-safety: chat capture lives in the mod (control.lua on_console_chat),
-        // NOT a runtime-injected level-script handler. register_chat_handler must
-        // never emit script.on_event, or joining clients are refused with
-        // "mod event handlers are not identical ... level".
-        let lua = LuaCommand::register_chat_handler();
-        assert_remote_request(&lua, "chat_capture_status");
-        assert!(!lua.contains(r#"rcon.print("registered")"#));
-        assert!(!lua.contains("script.on_event"));
-        assert!(!lua.contains("on_console_chat"));
-    }
-
-    #[test]
-    fn get_and_clear_chat_messages_reads_via_mod_remote() {
-        let lua = LuaCommand::get_and_clear_chat_messages();
-        assert_remote_request(&lua, "get_chat_messages");
-        for line in lua.lines() {
-            if let Some(idx) = line.find("--") {
-                assert!(
-                    line[..idx].trim().is_empty(),
-                    "inline -- comment after code: {line}"
-                );
-            }
-        }
     }
 
     #[test]

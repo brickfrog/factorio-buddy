@@ -4,7 +4,7 @@ pub mod lua;
 pub mod rcon;
 pub mod server;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
@@ -25,6 +25,8 @@ use rcon::RconClient;
 pub const DEFAULT_CRAFTING_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Default delay between character crafting queue observations.
 pub const DEFAULT_CRAFTING_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Collision-map padding for the second, wider A* attempt.
+const WIDE_PATHFIND_PADDING: f64 = 48.0;
 
 type CraftingQueueFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CraftingQueueSnapshot>> + Send + 'a>>;
@@ -211,19 +213,142 @@ where
     }
 }
 
+/// A semantic failure reported by a `claude_interface` remote
+/// (`success:false` and/or a non-empty `error`), with the full structured
+/// payload retained so callers can inspect `error_kind` and evidence fields.
+#[derive(Debug, Clone)]
+pub struct LuaRemoteError {
+    pub error: String,
+    pub error_kind: Option<String>,
+    pub payload: Value,
+}
+
+impl std::fmt::Display for LuaRemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)?;
+        if let Some(kind) = &self.error_kind {
+            write!(f, " (error_kind: {kind})")?;
+        }
+        if let Value::Object(map) = &self.payload {
+            let mut details = map
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "success" | "error" | "error_kind"))
+                .peekable();
+            if details.peek().is_some() {
+                f.write_str("; details: {")?;
+                for (index, (key, value)) in details.enumerate() {
+                    if index > 0 {
+                        f.write_str(",")?;
+                    }
+                    write!(f, "{key:?}:{value}")?;
+                }
+                f.write_str("}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LuaRemoteError {}
+
+/// Classify a parsed remote reply the same way MCP does: an object with
+/// `success:false` or a non-empty string `error` is a semantic failure.
+fn lua_remote_error(value: &Value) -> Option<LuaRemoteError> {
+    let object = value.as_object()?;
+    let error = object
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|error| !error.is_empty());
+    let failed = object.get("success").and_then(Value::as_bool) == Some(false);
+    if error.is_none() && !failed {
+        return None;
+    }
+    Some(LuaRemoteError {
+        error: error
+            .unwrap_or("Factorio remote reported failure without an error message")
+            .to_string(),
+        error_kind: object
+            .get("error_kind")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        payload: value.clone(),
+    })
+}
+
+fn parse_lua_value(response: &str, expected: &str) -> Result<Value> {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        bail!("Factorio returned an empty reply where {expected} was required");
+    }
+    serde_json::from_str(trimmed).with_context(|| {
+        format!("Factorio returned malformed JSON where {expected} was required: {trimmed}")
+    })
+}
+
 /// Deserialize a `helpers.table_to_json` array response into a `Vec<T>`.
 ///
 /// Factorio encodes an *empty* Lua table as the JSON object `{}` rather than an
-/// array `[]` (Lua can't tell the two apart), so any query that finds nothing
-/// returns `{}` and a plain `serde_json::from_str::<Vec<T>>` blows up with
-/// `invalid type: map, expected a sequence`. Treat `{}`/empty as an empty vec;
-/// anything else deserializes normally.
+/// array `[]` (Lua can't tell the two apart), so `{}` is an empty vec. A
+/// structured remote failure keeps its `error`/`error_kind`; an empty or
+/// malformed reply is an error, never an empty observation.
 fn parse_lua_array<T: serde::de::DeserializeOwned>(response: &str) -> Result<Vec<T>> {
-    let trimmed = response.trim();
-    if trimmed.is_empty() || trimmed == "{}" {
+    let value = parse_lua_value(response, "a JSON array")?;
+    if value.is_array() {
+        return Ok(serde_json::from_value(value)?);
+    }
+    if value.as_object().is_some_and(|map| map.is_empty()) {
         return Ok(Vec::new());
     }
-    Ok(serde_json::from_str(trimmed)?)
+    match lua_remote_error(&value) {
+        Some(error) => Err(error.into()),
+        None => bail!("Factorio returned {value} where a JSON array was required"),
+    }
+}
+
+/// Deserialize a structured remote result, surfacing a semantic failure as a
+/// [`LuaRemoteError`] instead of a substring match or a deserialization error.
+fn parse_lua_result<T: serde::de::DeserializeOwned>(response: &str) -> Result<T> {
+    let value = parse_lua_value(response, "a JSON result")?;
+    if let Some(error) = lua_remote_error(&value) {
+        return Err(error.into());
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+/// Per-call ceiling on `mine_at` iterations; the mod enforces the same bound.
+pub const MAX_MINE_COUNT: u32 = 1000;
+
+/// Reject an operation count before any side effect (including walking),
+/// with the same structured `invalid_count` / `count_exceeds_limit` failure
+/// the mod's `inventory.validate_count` returns. Never clamps.
+fn validate_operation_count(count: u32, maximum: Option<u32>, action_needed: &str) -> Result<()> {
+    let (error_kind, error) = if count == 0 {
+        (
+            "invalid_count",
+            "count must be a positive integer".to_string(),
+        )
+    } else if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
+        (
+            "count_exceeds_limit",
+            format!("count exceeds the bounded operation limit of {maximum}"),
+        )
+    } else {
+        return Ok(());
+    };
+    let payload = json!({
+        "success": false,
+        "error_kind": error_kind,
+        "error": error,
+        "action_needed": action_needed,
+        "requested_count": count,
+        "maximum_count": maximum,
+    });
+    Err(LuaRemoteError {
+        error,
+        error_kind: Some(error_kind.to_string()),
+        payload,
+    }
+    .into())
 }
 
 /// High-level client for interacting with Factorio
@@ -753,15 +878,7 @@ impl FactorioClient {
                 ],
             )
             .await?;
-        if response.contains("\"error\"") {
-            #[derive(serde::Deserialize)]
-            struct ErrorResponse {
-                error: String,
-            }
-            let err: ErrorResponse = serde_json::from_str(&response)?;
-            anyhow::bail!("{}", err.error);
-        }
-        let result: crate::world::NativeBlueprintExport = serde_json::from_str(&response)?;
+        let result: crate::world::NativeBlueprintExport = parse_lua_result(&response)?;
         Ok(result)
     }
 
@@ -976,8 +1093,10 @@ impl FactorioClient {
     // --- Mining ---
 
     /// Mine a natural entity or pick up loose items at an exact position.
-    /// Walks to the target first if needed.
+    /// Walks to the target first if needed. The count bound is checked before
+    /// the walk so a rejected request never moves the character.
     pub async fn mine_at(&mut self, position: Position, count: u32) -> Result<MineResult> {
+        validate_operation_count(count, Some(MAX_MINE_COUNT), "choose_bounded_mining_count")?;
         self.approach_position(position, "resource").await?;
 
         let response = self
@@ -1040,6 +1159,8 @@ impl FactorioClient {
             success: items_gained > 0,
             mined_count: items_gained,
             error: None,
+            error_kind: None,
+            stop_reason: None,
             inventory: inv_after.items,
         })
     }
@@ -1568,16 +1689,7 @@ impl FactorioClient {
                 ],
             )
             .await?;
-        // Check for error response
-        if response.contains("\"error\"") {
-            #[derive(serde::Deserialize)]
-            struct ErrorResponse {
-                error: String,
-            }
-            let err: ErrorResponse = serde_json::from_str(&response)?;
-            anyhow::bail!("{}", err.error);
-        }
-        let entity: Entity = serde_json::from_str(&response)?;
+        let entity: Entity = parse_lua_result(&response)?;
         Ok(entity)
     }
 
@@ -1837,15 +1949,7 @@ impl FactorioClient {
                 ],
             )
             .await?;
-        if response.contains("\"error\"") {
-            #[derive(serde::Deserialize)]
-            struct ErrorResponse {
-                error: String,
-            }
-            let err: ErrorResponse = serde_json::from_str(&response)?;
-            anyhow::bail!("{}", err.error);
-        }
-        let entity: Entity = serde_json::from_str(&response)?;
+        let entity: Entity = parse_lua_result(&response)?;
         Ok(entity)
     }
 
@@ -2015,6 +2119,37 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
+    /// Burner machines of the agent force near a point, with their fuel counts.
+    pub async fn burner_fuel_levels(
+        &mut self,
+        center: Position,
+        radius: u32,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .call_remote(
+                "burner_fuel_levels",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(center.x),
+                    json!(center.y),
+                    json!(radius),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Launch a ready rocket from one of the agent force's silos.
+    pub async fn launch_rocket(&mut self, unit_number: Option<u32>) -> Result<serde_json::Value> {
+        let response = self
+            .call_remote(
+                "launch_rocket",
+                &[json!(self.agent_id.as_str()), json!(unit_number)],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     /// Collect bounded construction or recovery stock from an existing chest.
     pub async fn collect_from_chest(
         &mut self,
@@ -2037,14 +2172,19 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
-    /// Extract items from an entity into player inventory
+    /// Extract items from an entity into the character inventory.
+    ///
+    /// Returns the mod's conservation evidence (`extracted`, `restored`,
+    /// `spilled`, `available`, ...). Failures keep `error_kind` and payload as
+    /// a [`LuaRemoteError`]; the count is checked before walking.
     pub async fn extract_items(
         &mut self,
         unit_number: u32,
         item: &str,
         count: u32,
         inventory_type: &str,
-    ) -> Result<u32> {
+    ) -> Result<Value> {
+        validate_operation_count(count, None, "choose_positive_integer_count")?;
         self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
@@ -2058,39 +2198,37 @@ impl FactorioClient {
                 ],
             )
             .await?;
-
-        #[derive(serde::Deserialize)]
-        struct ExtractResult {
-            extracted: Option<u32>,
-            #[allow(dead_code)]
-            available: Option<u32>,
-            error: Option<String>,
-        }
-
-        let result: ExtractResult = serde_json::from_str(&response)?;
-        if let Some(err) = result.error {
-            if result.extracted.unwrap_or(0) == 0 {
-                anyhow::bail!(err);
-            }
-        }
-        Ok(result.extracted.unwrap_or(0))
+        parse_lua_result(&response)
     }
 
-    async fn set_recipe_value(&mut self, unit_number: u32, recipe: Option<&str>) -> Result<()> {
-        self.approach_entity(unit_number).await?;
+    /// Validate the recipe read-only, walk into reach, then set it. The mod
+    /// reports `previous_recipe` and every item the machine unloaded
+    /// (`returned_items[{name,quality,count,inserted,spilled,unrecovered}]`).
+    async fn set_recipe_value(&mut self, unit_number: u32, recipe: Option<&str>) -> Result<Value> {
         let recipe = recipe.map_or(Value::Null, |name| json!(name));
+        let preflight = self
+            .call_remote(
+                "check_recipe_choice",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    recipe.clone(),
+                ],
+            )
+            .await?;
+        parse_lua_result::<Value>(&preflight)?;
+        self.approach_entity(unit_number).await?;
         let response = self
             .call_remote(
                 "set_recipe",
                 &[json!(self.agent_id.as_str()), json!(unit_number), recipe],
             )
             .await?;
-        ensure_lua_success(&response)?;
-        Ok(())
+        parse_lua_result(&response)
     }
 
     /// Set recipe on an assembling machine.
-    pub async fn set_recipe(&mut self, unit_number: u32, recipe: &str) -> Result<()> {
+    pub async fn set_recipe(&mut self, unit_number: u32, recipe: &str) -> Result<Value> {
         if recipe.is_empty() {
             self.clear_recipe(unit_number).await
         } else {
@@ -2100,7 +2238,7 @@ impl FactorioClient {
 
     /// Clear the recipe on an assembling machine using a JSON null/Lua nil
     /// recipe argument. An empty recipe name is not a valid Factorio recipe.
-    pub async fn clear_recipe(&mut self, unit_number: u32) -> Result<()> {
+    pub async fn clear_recipe(&mut self, unit_number: u32) -> Result<Value> {
         self.set_recipe_value(unit_number, None).await
     }
 
@@ -2191,16 +2329,7 @@ impl FactorioClient {
                 ],
             )
             .await?;
-        // Check for error response
-        if response.contains("\"error\"") {
-            #[derive(serde::Deserialize)]
-            struct ErrorResponse {
-                error: String,
-            }
-            let err: ErrorResponse = serde_json::from_str(&response)?;
-            anyhow::bail!("{}", err.error);
-        }
-        let entity: Entity = serde_json::from_str(&response)?;
+        let entity: Entity = parse_lua_result(&response)?;
         Ok(entity)
     }
 
@@ -2342,6 +2471,17 @@ impl FactorioClient {
         )
     }
 
+    /// Walk (A* with a straight-walk fallback) until `target` is within the
+    /// character's native build reach.
+    pub async fn approach_build_position(&mut self, target: Position) -> Result<()> {
+        self.approach_position(target, "build").await
+    }
+
+    /// Walk until `target` is within the character's (shorter) mining reach.
+    pub async fn approach_mining_position(&mut self, target: Position) -> Result<()> {
+        self.approach_position(target, "resource").await
+    }
+
     async fn approach_position(&mut self, target: Position, reach_kind: &str) -> Result<()> {
         let initial = self.get_position_reach_status(target, reach_kind).await?;
         if !initial.success {
@@ -2362,10 +2502,26 @@ impl FactorioClient {
                 anyhow::anyhow!("position reach response omitted a usable max_distance")
             })?;
         let physical_arrival_distance = initial.walk_arrival_distance.unwrap_or(0.0).max(0.0);
-        let walk = self
+        // The first attempt's reason is superseded by the retry's.
+        let _ = self
             .walk_to_pathfind_with_tolerance(target, 16, max_distance, physical_arrival_distance)
             .await;
-        let final_status = self.get_position_reach_status(target, reach_kind).await?;
+        let mut final_status = self.get_position_reach_status(target, reach_kind).await?;
+        if final_status.success && final_status.reachable {
+            return Ok(());
+        }
+        // A walk that ends at the edge of reach (or falls back to a straight
+        // walk that stops early) is retried once toward a goal well inside
+        // reach, over the wide collision window.
+        let walk = self
+            .walk_to_pathfind_with_tolerance(
+                target,
+                WIDE_PATHFIND_PADDING as u32,
+                max_distance * 0.6,
+                physical_arrival_distance,
+            )
+            .await;
+        final_status = self.get_position_reach_status(target, reach_kind).await?;
         if final_status.success && final_status.reachable {
             return Ok(());
         }
@@ -2459,47 +2615,56 @@ impl FactorioClient {
         let start_grid = GridPos::from_position(&start_pos);
         let end_grid = GridPos::from_position(&target);
 
-        // Build collision map for the area
-        let padding = search_radius as f64;
-        let area = Area {
-            left_top: Position {
-                x: start_pos.x.min(target.x) - padding,
-                y: start_pos.y.min(target.y) - padding,
-            },
-            right_bottom: Position {
-                x: start_pos.x.max(target.x) + padding,
-                y: start_pos.y.max(target.y) + padding,
-            },
-        };
+        // A grown base can wall off every route inside a tight window, so a
+        // failed search is retried once over a wider collision map before the
+        // straight-walk fallback.
+        let mut attempt_padding = search_radius as f64;
+        let (path_result, path_goal) = loop {
+            let padding = attempt_padding;
+            let area = Area {
+                left_top: Position {
+                    x: start_pos.x.min(target.x) - padding,
+                    y: start_pos.y.min(target.y) - padding,
+                },
+                right_bottom: Position {
+                    x: start_pos.x.max(target.x) + padding,
+                    y: start_pos.y.max(target.y) + padding,
+                },
+            };
 
-        let collision_map = self.build_collision_map(area).await?;
+            let collision_map = self.build_collision_map(area).await?;
 
-        // Exact navigation has one exact goal. Interaction movement instead
-        // pathfinds to any walkable standing tile inside the authoritative
-        // Factorio reach radius, because an entity's center is normally
-        // collision-blocked by the entity itself.
-        let (path_result, path_goal) = if final_tolerance > 0.0 {
-            let candidate_radius = final_tolerance.min(padding).ceil().max(1.0) as i32;
-            let safe_goal_radius = (final_tolerance - physical_arrival_distance).max(0.0);
-            let mut goals = HashSet::new();
-            for x in end_grid.x - candidate_radius..=end_grid.x + candidate_radius {
-                for y in end_grid.y - candidate_radius..=end_grid.y + candidate_radius {
-                    let candidate = GridPos::new(x, y);
-                    if candidate.to_position().distance(&target) <= safe_goal_radius
-                        && collision_map.is_walkable(&candidate)
-                    {
-                        goals.insert(candidate);
+            // Exact navigation has one exact goal. Interaction movement instead
+            // pathfinds to any walkable standing tile inside the authoritative
+            // Factorio reach radius, because an entity's center is normally
+            // collision-blocked by the entity itself.
+            let found = if final_tolerance > 0.0 {
+                let candidate_radius = final_tolerance.min(padding).ceil().max(1.0) as i32;
+                let safe_goal_radius = (final_tolerance - physical_arrival_distance).max(0.0);
+                let mut goals = HashSet::new();
+                for x in end_grid.x - candidate_radius..=end_grid.x + candidate_radius {
+                    for y in end_grid.y - candidate_radius..=end_grid.y + candidate_radius {
+                        let candidate = GridPos::new(x, y);
+                        if candidate.to_position().distance(&target) <= safe_goal_radius
+                            && collision_map.is_walkable(&candidate)
+                        {
+                            goals.insert(candidate);
+                        }
                     }
                 }
+                let result = find_walk_path_to_any(start_grid, &goals, &collision_map);
+                let goal = result.path.last().copied().unwrap_or(end_grid);
+                (result, goal)
+            } else {
+                (
+                    find_walk_path(start_grid, end_grid, &collision_map),
+                    end_grid,
+                )
+            };
+            if found.0.success || attempt_padding >= WIDE_PATHFIND_PADDING {
+                break found;
             }
-            let result = find_walk_path_to_any(start_grid, &goals, &collision_map);
-            let goal = result.path.last().copied().unwrap_or(end_grid);
-            (result, goal)
-        } else {
-            (
-                find_walk_path(start_grid, end_grid, &collision_map),
-                end_grid,
-            )
+            attempt_padding = WIDE_PATHFIND_PADDING;
         };
 
         if !path_result.success {
@@ -3222,11 +3387,44 @@ mod tests {
     fn empty_lua_table_deserializes_as_empty_vec() {
         // helpers.table_to_json({}) returns "{}" (object), not "[]". The situation
         // report and every find_* query relied on this NOT exploding.
-        for response in ["{}", " {} ", ""] {
+        for response in ["{}", " {} "] {
             let parsed = parse_lua_array::<Surface>(response)
                 .expect("empty Lua table must yield an empty vec, not an error");
             assert!(parsed.is_empty());
         }
+    }
+
+    #[test]
+    fn missing_or_malformed_array_replies_are_errors_not_empty_observations() {
+        for response in ["", "  ", "null", "not json", r#"{"unexpected":1}"#] {
+            assert!(
+                parse_lua_array::<Surface>(response).is_err(),
+                "{response:?} must not become an empty observation"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_failures_keep_their_semantic_fields() {
+        let error = parse_lua_array::<Entity>(r#"{"error":"agent surface not found"}"#)
+            .expect_err("an error object is not an empty array");
+        assert!(error.to_string().contains("agent surface not found"));
+
+        let error = parse_lua_result::<Entity>(
+            r#"{"success":false,"error":"Cannot place entity here","error_kind":"blocked","blockers":[{"name":"wooden-chest"}]}"#,
+        )
+        .expect_err("placement failure must be an error");
+        let remote = error
+            .downcast_ref::<LuaRemoteError>()
+            .expect("placement failure keeps its structured payload");
+        assert_eq!(remote.error_kind.as_deref(), Some("blocked"));
+        assert_eq!(remote.payload["blockers"][0]["name"], "wooden-chest");
+        let text = error.to_string();
+        assert!(text.contains("Cannot place entity here") && text.contains("wooden-chest"));
+
+        let error = parse_lua_result::<Entity>(r#"{"success":false}"#)
+            .expect_err("success:false without a message is still a failure");
+        assert!(error.downcast_ref::<LuaRemoteError>().is_some());
     }
 
     #[test]

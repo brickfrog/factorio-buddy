@@ -321,6 +321,86 @@ function M.strategic_summary(surface, factory_bounds, mining_targets)
     }
 end
 
+-- Offshore-pump-compatible water tile names that exist in this game.
+local function water_tile_names()
+    local names = {}
+    for _, name in ipairs({"water", "deepwater", "water-green", "deepwater-green"}) do
+        if prototypes.tile[name] then names[#names + 1] = name end
+    end
+    return names
+end
+
+-- Water is a tile, not a resource entity. Search expanding squares around the
+-- origin so the nearest shoreline wins without scanning the whole surface.
+local function find_nearest_water(surface, from_x, from_y, explore_radius)
+    local max_radius = explore_radius or 256
+    local chunks_before = generated_chunk_count(surface)
+    if explore_radius then
+        surface.request_to_generate_chunks({from_x, from_y}, math.ceil(explore_radius / 32))
+        surface.force_generate_chunk_requests()
+    end
+    local names = water_tile_names()
+    local nearest, nearest_dist = nil, math.huge
+    local radius = math.min(32, max_radius)
+    while true do
+        local tiles = surface.find_tiles_filtered{
+            area = area_table(from_x - radius, from_y - radius, from_x + radius, from_y + radius),
+            name = names,
+        }
+        for _, tile in pairs(tiles) do
+            local dx = tile.position.x + 0.5 - from_x
+            local dy = tile.position.y + 0.5 - from_y
+            local dist = dx * dx + dy * dy
+            if dist < nearest_dist then
+                nearest, nearest_dist = tile.position, dist
+            end
+        end
+        -- A hit inside the square can still be beaten by one just outside the
+        -- inscribed circle only when it lies in a corner; accept that bounded
+        -- error rather than rescanning.
+        if nearest or radius >= max_radius then break end
+        radius = math.min(radius * 2, max_radius)
+    end
+    local chunks_after = generated_chunk_count(surface)
+    local search = {
+        scope = "tile_square",
+        origin = {x = from_x, y = from_y},
+        searched_radius = radius,
+        explore_radius = explore_radius,
+        generated_chunks_added = chunks_after - chunks_before,
+    }
+    if not nearest then
+        return {
+            success = true,
+            found = false,
+            resource_name = "water",
+            search = search,
+            guidance = "No water tiles within the searched square. Set explore_radius (up to "
+                .. MAX_RESOURCE_EXPLORE_RADIUS .. ") or search from another origin.",
+        }
+    end
+    local x, y = nearest.x + 0.5, nearest.y + 0.5
+    local nearby = surface.count_tiles_filtered{
+        area = area_table(x - 8, y - 8, x + 8, y + 8),
+        name = names,
+    }
+    return {
+        success = true,
+        found = true,
+        resource_name = "water",
+        water_tile = {x = x, y = y},
+        water_tiles_within_8 = nearby,
+        distance = math.sqrt(nearest_dist),
+        search = search,
+        steam_power_water_box = {
+            water_x1 = math.floor(x - 12), water_y1 = math.floor(y - 12),
+            water_x2 = math.ceil(x + 12), water_y2 = math.ceil(y + 12),
+        },
+        guidance = "water_tile is the nearest water tile, not a checked pump site. Pass steam_power_water_box to build_steam_power or plan_steam_power, which check offshore-pump placement (build_steam_power widens an automatic box once).",
+    }
+end
+M.find_nearest_water = find_nearest_water
+
 function M.find_nearest_resource(surface, resource_name, from_x, from_y, explore_radius)
     if not surface then return {error = "agent surface not found"} end
     if explore_radius ~= nil then
@@ -334,6 +414,9 @@ function M.find_nearest_resource(surface, resource_name, from_x, from_y, explore
                 error_kind = "invalid_explore_radius",
             }
         end
+    end
+    if resource_name == "water" then
+        return find_nearest_water(surface, from_x, from_y, explore_radius)
     end
 
     local chunks_before = generated_chunk_count(surface)

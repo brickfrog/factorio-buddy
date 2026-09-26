@@ -378,11 +378,16 @@ function M.require_entity_reach(character, entity)
     local ok, reachable = pcall(function() return character.can_reach_entity(entity) end)
     if ok and reachable == true then return nil end
     local distance = position_distance(character, entity.position.x, entity.position.y)
+    -- Factorio checks resources against the resource reach, not the general
+    -- interaction reach; report the limit that actually applied.
+    local max_distance = entity.type == "resource"
+        and reach_limit(character, "resource")
+        or (character.reach_distance or 0)
     return out_of_reach(
         character,
         entity.position,
         distance,
-        character.reach_distance or 0,
+        max_distance,
         entity.unit_number
     )
 end
@@ -640,6 +645,18 @@ function M.set_walk_target(agent_id, x, y, arrival_distance)
         return {
             success = false,
             error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
+        }
+    end
+
+    -- Reject malformed coordinates before any walk state is stored: the
+    -- on_tick walker does arithmetic on them every tick.
+    if not (inventory.finite_number(x) and inventory.finite_number(y)) then
+        return {
+            success = false,
+            error_kind = "invalid_walk_target",
+            error = "walk target x and y must be finite numbers",
+            x = type(x) == "number" and tostring(x) or x,
+            y = type(y) == "number" and tostring(y) or y,
         }
     end
 

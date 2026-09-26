@@ -4,17 +4,23 @@ local inventory = require("inventory")
 
 local M = {}
 
-local MAX_BOOTSTRAP_FUEL_COUNT = 10
+local MAX_BOOTSTRAP_FUEL_COUNT = 50
 local MAX_CHEST_COLLECTION_COUNT = 1000
 
+-- Burner entities a character may prime with fuel by hand. Each must also
+-- have a burner (checked at call time), so electric variants are rejected.
 local BOOTSTRAP_BURNER_TYPES = {
-    ["burner-inserter"] = "inserter",
-    ["burner-mining-drill"] = "mining-drill",
+    ["inserter"] = true,
+    ["mining-drill"] = true,
+    ["furnace"] = true,
+    ["boiler"] = true,
 }
 
-local COLLECTABLE_CHEST_TYPES = {
-    ["container"] = true,
-    ["logistic-container"] = true,
+-- Entity type -> the inventory a character may collect from.
+local COLLECTABLE_INVENTORIES = {
+    ["container"] = defines.inventory.chest,
+    ["logistic-container"] = defines.inventory.chest,
+    ["furnace"] = defines.inventory.furnace_result,
 }
 
 local function fail(error_kind, message, action_needed, extra)
@@ -40,31 +46,7 @@ local function target_summary(entity)
     }
 end
 
-local function validate_count(count, maximum, action_needed)
-    if type(count) ~= "number"
-        or count ~= count
-        or count == math.huge
-        or count == -math.huge
-        or count <= 0
-        or count ~= math.floor(count)
-    then
-        return fail(
-            "invalid_count",
-            "count must be a positive integer",
-            action_needed,
-            {requested_count = count, maximum_count = maximum}
-        )
-    end
-    if count > maximum then
-        return fail(
-            "count_exceeds_limit",
-            "count exceeds the bounded operation limit of " .. tostring(maximum),
-            action_needed,
-            {requested_count = count, maximum_count = maximum}
-        )
-    end
-    return nil
-end
+local validate_count = inventory.validate_count
 
 local function validate_request(agent_id, unit_number, item, count, maximum, retry_action)
     local count_error = validate_count(count, maximum, retry_action)
@@ -235,6 +217,35 @@ local function same_burner_state(left, right)
     return true
 end
 
+-- Read-only: the agent force's burner inserters, drills, furnaces and boilers
+-- within `radius` of (x, y), with their current fuel item count.
+function M.burner_fuel_levels(agent_id, x, y, radius)
+    local character = characters.find(agent_id)
+    if not (character and character.valid) then
+        return fail("no_character", "no character for agent " .. tostring(agent_id) .. "; spawn first", "spawn_character")
+    end
+    if type(x) ~= "number" or type(y) ~= "number" or x ~= x or y ~= y
+        or type(radius) ~= "number" or radius < 1 or radius > 128 then
+        return fail("invalid_area", "x, y must be finite and radius 1-128", "retry_with_valid_area")
+    end
+    local burners = {}
+    for _, entity in pairs(character.surface.find_entities_filtered{
+        position = {x, y}, radius = radius, force = character.force,
+        type = {"inserter", "mining-drill", "furnace", "boiler"},
+    }) do
+        if entity.burner then
+            local fuel = entity.get_fuel_inventory()
+            burners[#burners + 1] = {
+                unit_number = entity.unit_number,
+                name = entity.name,
+                position = position_table(entity.position),
+                fuel = fuel and fuel.get_item_count() or 0,
+            }
+        end
+    end
+    return {success = true, burners = burners}
+end
+
 function M.bootstrap_burner_once(agent_id, unit_number, fuel_item, count)
     local character_inventory, entity, request_error = validate_request(
         agent_id,
@@ -246,13 +257,12 @@ function M.bootstrap_burner_once(agent_id, unit_number, fuel_item, count)
     )
     if request_error then return request_error end
 
-    local expected_type = BOOTSTRAP_BURNER_TYPES[entity.name]
-    if expected_type == nil or entity.type ~= expected_type then
+    if not BOOTSTRAP_BURNER_TYPES[entity.type] or not entity.burner then
         return fail(
             "wrong_entity_type",
-            "bootstrap_burner_once accepts only burner-mining-drill or burner-inserter",
+            "bootstrap_burner_once accepts only burner inserters, burner mining drills, burner furnaces and boilers",
             "choose_existing_burner_entity",
-            {target = target_summary(entity), allowed_entities = {"burner-mining-drill", "burner-inserter"}}
+            {target = target_summary(entity), allowed_types = {"inserter", "mining-drill", "furnace", "boiler"}}
         )
     end
 
@@ -513,40 +523,15 @@ function M.rollback_burner_bootstrap(agent_id, snapshot, feeder_unit_number)
     local spilled_excess = 0
     local unrecovered_excess = 0
     for _, item in ipairs(excess) do
-        local returned = character_inventory.insert{
-            name = item.name,
-            quality = item.quality or "normal",
-            count = item.count,
-        }
-        returned_excess = returned_excess + returned
-        local remainder = item.count - returned
-        if remainder > 0 then
-            local spilled = consumer.surface.spill_item_stack{
-                position = consumer.position,
-                stack = {
-                    name = item.name,
-                    quality = item.quality or "normal",
-                    count = remainder,
-                },
-                enable_looted = false,
-                force = consumer.force,
-                allow_belts = false,
-                use_start_position_on_failure = true,
-                drop_full_stack = true,
-            }
-            local spilled_count = 0
-            for _, entity in pairs(spilled or {}) do
-                local stack = entity and entity.valid and entity.stack or nil
-                if stack and stack.valid_for_read
-                    and stack.name == item.name
-                    and (inventory.quality_name(stack) or "normal") == (item.quality or "normal")
-                then
-                    spilled_count = spilled_count + stack.count
-                end
-            end
-            spilled_excess = spilled_excess + spilled_count
-            unrecovered_excess = unrecovered_excess + (remainder - spilled_count)
-        end
+        local transfer = inventory.give_or_spill(
+            character_inventory,
+            consumer.surface,
+            consumer.position,
+            item
+        )
+        returned_excess = returned_excess + transfer.inserted
+        spilled_excess = spilled_excess + transfer.spilled
+        unrecovered_excess = unrecovered_excess + transfer.unrecovered
     end
 
     local after = burner_state(consumer)
@@ -585,16 +570,17 @@ function M.collect_from_chest(agent_id, unit_number, item, count)
     )
     if request_error then return request_error end
 
-    if COLLECTABLE_CHEST_TYPES[entity.type] ~= true then
+    local inventory_id = COLLECTABLE_INVENTORIES[entity.type]
+    if inventory_id == nil then
         return fail(
             "wrong_entity_type",
-            "collect_from_chest accepts only container or logistic-container entities",
+            "collect_from_chest accepts only chests and furnace output",
             "choose_existing_chest",
-            {target = target_summary(entity), allowed_types = {"container", "logistic-container"}}
+            {target = target_summary(entity), allowed_types = {"container", "logistic-container", "furnace"}}
         )
     end
 
-    local chest_inventory = entity.get_inventory(defines.inventory.chest)
+    local chest_inventory = entity.get_inventory(inventory_id)
     if not chest_inventory then
         return fail(
             "missing_chest_inventory",

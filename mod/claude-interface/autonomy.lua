@@ -97,6 +97,351 @@ local function is_factory_entity(entity)
     return prototype_ok and items_to_place ~= nil and #items_to_place > 0
 end
 
+-- Below this many fuel items a burner drill/furnace is reported as running dry.
+local LOW_BURNER_FUEL = 5
+
+local function tech_done(force, name)
+    local tech = force.technologies[name]
+    return tech ~= nil and tech.researched
+end
+
+local function produced_count(force, surface, item)
+    local ok, count = pcall(function()
+        return force.get_item_production_statistics(surface).get_input_count(item)
+    end)
+    return ok and count or 0
+end
+
+-- Units of `name` (an item, or a fluid when `fluid` is true) the force
+-- produced on `surface` in the last ten minutes.
+local function made_last_ten_minutes(force, surface, name, fluid)
+    local ok, count = pcall(function()
+        local stats = fluid and force.get_fluid_production_statistics(surface)
+            or force.get_item_production_statistics(surface)
+        return stats.get_flow_count{
+            name = name,
+            category = "input",
+            precision_index = defines.flow_precision_index.ten_minutes,
+            count = true,
+        }
+    end)
+    return ok and math.floor(count or 0) or 0
+end
+
+-- The ingredients behind `item` that were not made in the last ten minutes,
+-- following only the unmade ones (up to three recipe levels), each with its
+-- recipe depth below `item`. Fluids are reported but not expanded: their
+-- recipes (oil processing) have several outputs.
+local function missing_supply_chain(force, surface, facts, item)
+    local chain, listed = {}, {[item] = true}
+    local function visit(name, depth)
+        local recipe = prototypes.recipe[name]
+        for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
+            local is_fluid = ingredient.type == "fluid"
+            if not listed[ingredient.name]
+                and made_last_ten_minutes(force, surface, ingredient.name, is_fluid) == 0
+            then
+                listed[ingredient.name] = true
+                chain[#chain + 1] = {
+                    name = ingredient.name,
+                    fluid = is_fluid or nil,
+                    needed_by = name,
+                    depth = depth,
+                    assemblers = facts.recipe_assemblers[ingredient.name] or 0,
+                }
+                if not is_fluid and depth < 3 then visit(ingredient.name, depth + 1) end
+            end
+        end
+    end
+    visit(item, 1)
+    return chain
+end
+
+-- Unresearched technologies on the way to rocket-silo, prerequisites first,
+-- and the ones whose prerequisites are all researched.
+local function rocket_path(force, surface, facts)
+    local target = force.technologies["rocket-silo"]
+    if not target then return nil end
+    local needed, seen = {}, {}
+    local function visit(tech)
+        if seen[tech.name] then return end
+        seen[tech.name] = true
+        if tech.researched then return end
+        for _, prerequisite in pairs(tech.prerequisites) do visit(prerequisite) end
+        needed[#needed + 1] = tech
+    end
+    visit(target)
+    local ready = {}
+    for _, tech in ipairs(needed) do
+        local all_done = true
+        for _, prerequisite in pairs(tech.prerequisites) do
+            if not prerequisite.researched then all_done = false break end
+        end
+        if all_done then ready[#ready + 1] = tech end
+    end
+    local function cost(tech)
+        local ok, units = pcall(function() return tech.research_unit_count end)
+        return (ok and units or 0) * math.max(1, #tech.research_unit_ingredients)
+    end
+    table.sort(ready, function(a, b)
+        local ca, cb = cost(a), cost(b)
+        if ca ~= cb then return ca < cb end
+        return a.name < b.name
+    end)
+    local next_techs, packs, pack_order = {}, {}, {}
+    for index, tech in ipairs(ready) do
+        local trigger = tech.prototype.research_trigger
+        local entry = {name = tech.name}
+        if trigger then
+            entry.trigger = trigger
+        else
+            entry.units = tech.research_unit_count
+            entry.packs = {}
+            for _, ingredient in pairs(tech.research_unit_ingredients) do
+                entry.packs[#entry.packs + 1] = ingredient.name
+                if not packs[ingredient.name] then
+                    packs[ingredient.name] = {
+                        name = ingredient.name,
+                        assemblers = facts.recipe_assemblers[ingredient.name] or 0,
+                        made_last_10_min = made_last_ten_minutes(force, surface, ingredient.name),
+                        first_needed_by = tech.name,
+                    }
+                    pack_order[#pack_order + 1] = ingredient.name
+                end
+            end
+        end
+        if index <= 5 then next_techs[#next_techs + 1] = entry end
+    end
+    local pack_list = {}
+    local bottleneck = nil
+    for _, name in ipairs(pack_order) do
+        local pack = packs[name]
+        if pack.made_last_10_min == 0 then
+            local missing = missing_supply_chain(force, surface, facts, name)
+            pack.missing_inputs = missing[1] and missing or nil
+            local recipe = prototypes.recipe[name]
+            pack.ingredients_made_last_10_min = {}
+            for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
+                pack.ingredients_made_last_10_min[ingredient.name] =
+                    made_last_ten_minutes(force, surface, ingredient.name, ingredient.type == "fluid")
+            end
+        end
+        pack_list[#pack_list + 1] = pack
+        if not bottleneck or pack.made_last_10_min < bottleneck.made_last_10_min then
+            bottleneck = pack
+        end
+    end
+    -- True when no ready technology can progress on packs made recently:
+    -- queueing more then only spends packs on whatever is off this path.
+    local all_next_stalled = #ready > 0
+    for _, tech in ipairs(ready) do
+        local stalled = false
+        if not tech.prototype.research_trigger then
+            for _, ingredient in pairs(tech.research_unit_ingredients) do
+                if packs[ingredient.name].made_last_10_min == 0 then stalled = true break end
+            end
+        end
+        if not stalled then all_next_stalled = false break end
+    end
+    return {
+        techs_remaining = #needed,
+        researchable_now = next_techs,
+        science_packs_needed = pack_list,
+        slowest_pack = bottleneck and bottleneck.name or nil,
+        all_next_stalled = all_next_stalled,
+        labs = facts.labs,
+    }
+end
+
+-- Code-computed tech-progression ladder for the early game. Each rung names
+-- one observed gap and the controller that closes it; the model still
+-- chooses, but no longer has to rediscover the Factorio 2.0 trigger tree.
+local function progression(surface, force, facts, character)
+    local iron = produced_count(force, surface, "iron-plate")
+    local copper = produced_count(force, surface, "copper-plate")
+    local current = force.current_research
+    local state = {
+        iron_plates_made = iron,
+        copper_plates_made = copper,
+        steam_power_unlocked = tech_done(force, "steam-power"),
+        electronics_unlocked = tech_done(force, "electronics"),
+        red_science_unlocked = tech_done(force, "automation-science-pack"),
+        automation_researched = tech_done(force, "automation"),
+        current_research = current and current.name or nil,
+        steam_engines = facts.steam_engines,
+        steam_engines_working = facts.steam_engines_working,
+        boilers = facts.boilers,
+        boiler_fuel_min = facts.boiler_fuel_min,
+        labs = facts.labs,
+        labs_powered = facts.labs_powered,
+        labs_working = facts.labs_working,
+        red_science_assemblers = facts.red_science_assemblers,
+        burner_machines = facts.burner_machines,
+        low_fuel_burner_machines = facts.low_fuel_count,
+        rocket_silos = facts.rocket_silos or 0,
+        rocket_parts = facts.rocket_parts,
+        rockets_launched = force.rockets_launched,
+    }
+    local path = rocket_path(force, surface, facts)
+    state.rocket_path = path
+    local unautomated, stalled = nil, nil
+    for _, pack in ipairs(path and path.science_packs_needed or {}) do
+        if pack.assemblers == 0 then unautomated = unautomated or pack
+        elseif pack.made_last_10_min == 0 then stalled = stalled or pack end
+    end
+    local goal, how
+    local silo_prototype = prototypes.entity["rocket-silo"]
+    local parts_required = silo_prototype and silo_prototype.rocket_parts_required or 50
+    if force.rockets_launched > 0 then
+        goal = "A rocket has been launched (" .. force.rockets_launched .. " so far). Keep the factory running and launch again when the next rocket is ready."
+        how = "Keep rocket parts flowing to the silo and call launch_rocket whenever a rocket is ready."
+    elseif tech_done(force, "rocket-silo") and (facts.rocket_silos or 0) == 0 then
+        local recipe = prototypes.recipe["rocket-silo"]
+        -- Stock the agent can craft from: its own inventory plus the force's chests.
+        local stock = {}
+        local function add_stock(inventory)
+            if not inventory then return end
+            for _, item in pairs(inventory.get_contents()) do
+                stock[item.name] = (stock[item.name] or 0) + item.count
+            end
+        end
+        if character and character.valid then add_stock(character.get_main_inventory()) end
+        for _, chest in pairs(surface.find_entities_filtered{type = "container", force = force}) do
+            add_stock(chest.get_inventory(defines.inventory.chest))
+        end
+        local needs = {}
+        for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
+            needs[#needs + 1] = ingredient.amount .. " " .. ingredient.name .. " (have "
+                .. (stock[ingredient.name] or 0) .. ", " .. made_last_ten_minutes(force, surface, ingredient.name) .. " made in 10 min)"
+        end
+        goal = "Build a rocket silo (rocket-silo is researched)."
+        how = "Craft rocket-silo from " .. table.concat(needs, ", ")
+            .. ". For each ingredient short of the amount, build or extend its assembler line (and its inputs) and collect the output into chests; "
+            .. "then craft the silo and place it (9x9) with build_layout inside the power network, leaving room for inserters on its sides."
+    elseif tech_done(force, "rocket-silo") and facts.rocket_ready then
+        goal = "Launch the rocket: the silo's rocket is ready."
+        how = "Call launch_rocket. Space Age silos never launch on their own."
+    elseif tech_done(force, "rocket-silo") then
+        local recipe = prototypes.recipe["rocket-part"]
+        local inputs = {}
+        for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
+            inputs[#inputs + 1] = ingredient.name .. " (" .. made_last_ten_minutes(force, surface, ingredient.name) .. " made in 10 min)"
+        end
+        goal = "Fill the rocket silo: " .. (facts.rocket_parts or 0) .. "/" .. parts_required .. " rocket parts."
+        how = "Each rocket part needs " .. table.concat(inputs, ", ")
+            .. ". Automate the scarcest with build_layout (assemblers, chemical plants, their inputs and power) and feed all three into the silo with inserters; the silo builds the parts itself. Then launch_rocket."
+    elseif not state.steam_power_unlocked then
+        goal = "Smelt 50 iron plates to unlock steam-power (" .. iron .. "/50 made)."
+        how = "mine_at stone and coal, place stone furnaces fed by burner drills on iron ore (execute_direct_smelter / execute_edge_miner), and hand-fuel them with bootstrap_burner_once (up to 50 coal each). Hand-smelting with bootstrap_smelting_once also counts. Do not build belt fuel feeds yet."
+    elseif not state.electronics_unlocked then
+        goal = "Smelt 10 copper plates to unlock electronics (" .. copper .. "/10 made)."
+        how = "Put a burner drill + stone furnace on copper ore, or hand-smelt copper ore with bootstrap_smelting_once."
+    elseif facts.steam_engines == 0 then
+        goal = "Build steam power."
+        how = "build_steam_power with target_x/target_y where the lab and assemblers will go (near the plate smelters). It finds water and crafts the parts (phase crafted), then a second call with the same arguments places and fuels everything. Have about 50 iron plates, 15 copper plates, 5 stone and 5 wood (mine one tree) in inventory first."
+    elseif facts.labs == 0 then
+        goal = "Craft and place a lab inside the power network (crafting the first lab unlocks automation-science-pack)."
+        how = "craft lab (10 circuits, 10 gears, 4 belts: about 36 iron and 15 copper plates), then place_entity it next to the pole at build_steam_power's power_target."
+    elseif facts.labs_powered == 0 then
+        goal = "Connect the lab to electricity."
+        how = "Place small-electric-poles from the nearest pole to the lab (each covers a 5x5 area, wire reach 7.5)."
+    elseif not state.automation_researched then
+        goal = state.current_research and "Automation research is running; grow plate production while it finishes."
+            or "Start researching automation."
+        how = "Hand-craft automation-science-pack, feed_lab_from_inventory, start_research automation. Meanwhile add burner drills/furnaces on iron and copper and keep every burner machine and the boiler fuelled (up to 50 coal)."
+    elseif unautomated then
+        goal = "Automate " .. unautomated.name .. " (needed by " .. unautomated.first_needed_by .. ") and deliver it to the labs."
+        how = "Design a compact block and place it with build_layout: assemblers for the pack and its intermediates, inserters between them, belts from the plate lines, poles, and an inserter or belt into a lab. Then connect plates, verify_production, and keep research queued."
+    elseif stalled then
+        local deepest = nil
+        for _, input in ipairs(stalled.missing_inputs or {}) do
+            if not deepest or input.depth > deepest.depth then deepest = input end
+        end
+        goal = "Get " .. stalled.name .. " made: " .. stalled.assemblers .. " assembler(s) have it set but none was made in 10 minutes."
+        how = deepest
+            and ("The missing link is " .. deepest.name .. (deepest.fluid and " (fluid)" or "") .. ", needed by " .. deepest.needed_by
+                .. " (see science_packs_needed missing_inputs). Build or feed the machines that make it, connect them with belts, inserters or pipes, then verify_production up the chain.")
+            or ("Every ingredient was made recently, so the shortest one or its delivery is the gap: compare science_packs_needed ingredients_made_last_10_min against the recipe, "
+                .. "then raise the smallest supply or connect the idle producers to the " .. stalled.name .. " assembler with inserters or belts, and verify_production.")
+    elseif state.current_research == nil and path and path.researchable_now[1] then
+        goal = "Start the next research toward rocket-silo: " .. path.researchable_now[1].name .. "."
+        how = "start_research it (trigger technologies need their trigger instead). Keep labs supplied."
+    else
+        -- The pack most idle labs lack is the real limit; flow counts alone
+        -- favour a pack whose assemblers are merely blocked by full labs.
+        local limit, limit_labs = path and path.slowest_pack, 0
+        for pack, count in pairs(facts.lab_missing_packs or {}) do
+            if count > limit_labs or (count == limit_labs and pack < limit) then limit, limit_labs = pack, count end
+        end
+        goal = "Scale science throughput toward rocket-silo (" .. (path and path.techs_remaining or 0) .. " technologies left)."
+        how = "Research speed is set by the scarcest pack"
+            .. (limit and (": " .. limit .. (limit_labs > 0 and (" (" .. limit_labs .. " idle labs lack it)") or " (see science_packs_needed made_last_10_min)")) or "")
+            .. ". Add assemblers for it and its intermediates, the plate and power supply they need, with build_layout, and deliver it to every lab; replace hand-fed fuel with belts or electric machines."
+    end
+    local warnings = {}
+    if facts.boilers > 0 and (facts.boiler_fuel_min or 0) < 10 then
+        warnings[#warnings + 1] = "A boiler has under 10 fuel: top it up with refuel_burners, then belt coal to it with an inserter so power never stops."
+    end
+    if facts.low_fuel_count > 0 then
+        local units = {}
+        for _, unit in ipairs(facts.low_fuel_units) do
+            units[#units + 1] = unit.name .. " " .. tostring(unit.unit_number) .. " (" .. unit.fuel .. ")"
+        end
+        warnings[#warnings + 1] = facts.low_fuel_count .. " burner drills/furnaces have under "
+            .. LOW_BURNER_FUEL .. " fuel and will stop: " .. table.concat(units, ", ")
+            .. ". Top them all up with one refuel_burners call, then feed coal automatically."
+    end
+    local queue_ok, queue = pcall(function() return force.research_queue end)
+    local queued = queue_ok and queue and #queue or (state.current_research and 1 or 0)
+    state.research_queue_length = queued
+    if path and path.all_next_stalled and path.slowest_pack then
+        warnings[#warnings + 1] = "Every researchable rocket-path technology needs " .. path.slowest_pack
+            .. ", which was not made in the last 10 minutes. Research off rocket_path only spends packs; get "
+            .. path.slowest_pack .. " made first."
+    elseif facts.labs > 0 and state.steam_power_unlocked and queued < 3 and path and path.researchable_now[1] then
+        warnings[#warnings + 1] = "Only " .. queued .. " technologies are queued; labs go idle when the queue empties while you are away. "
+            .. "Queue at least 3 with start_research, taking them from rocket_path.researchable_now (a technology whose prerequisites are queued ahead of it may be queued too)."
+    end
+    state.output_blocked_machines = facts.output_blocked
+    state.starved_assemblers = facts.starved_assemblers
+    local labs_starved = facts.labs_powered > facts.labs_working
+    state.lab_missing_packs = facts.lab_missing_packs
+    local lacked, delivery_gap = {}, {}
+    for pack, count in pairs(facts.lab_missing_packs or {}) do
+        lacked[#lacked + 1] = pack .. " (" .. count .. " labs)"
+        if (facts.full_science_packs or {})[pack] then delivery_gap[#delivery_gap + 1] = pack end
+    end
+    table.sort(lacked)
+    table.sort(delivery_gap)
+    -- Once rocket-silo is researched, research speed no longer gates the goal.
+    if lacked[1] and not tech_done(force, "rocket-silo") then
+        local text = "Idle labs lack " .. table.concat(lacked, ", ") .. ". "
+        if delivery_gap[1] then
+            text = text .. "Assemblers of " .. table.concat(delivery_gap, ", ")
+                .. " are full, so those packs are made but not delivered: chain them to every lab with inserters or a belt (build_layout, route_belt, build_lab_feed). "
+        end
+        if #delivery_gap < #lacked then
+            text = text .. "For a lacked pack whose assemblers are not full, supply is the limit: add assemblers and their inputs for it before adding labs or other packs."
+        end
+        warnings[#warnings + 1] = text
+    elseif (facts.full_science_assemblers or 0) > 0 and labs_starved and not tech_done(force, "rocket-silo") then
+        warnings[#warnings + 1] = facts.full_science_assemblers .. " science assemblers are full while labs lack packs: "
+            .. "the packs are not reaching the labs. Connect each science assembler to the labs with an inserter chain or belt (build_layout, route_belt, build_lab_feed)."
+    end
+    if facts.output_blocked >= 2 and facts.starved_assemblers >= 1 then
+        warnings[#warnings + 1] = facts.output_blocked .. " machines are blocked with full output while "
+            .. facts.starved_assemblers .. " assemblers lack ingredients: production and consumers are not connected. "
+            .. "Carry items from the full machines to the starved assemblers with output inserters and belts (route_belt, build_layout) instead of moving them by hand."
+    end
+    if facts.labs_powered > 0 and facts.labs_working == 0 and state.current_research ~= nil then
+        warnings[#warnings + 1] = "Research is queued but no lab is working: check lab science packs and power."
+    end
+    state.next_goal = goal
+    state.how = how
+    state.warnings = warnings
+    return state
+end
+
 function M.snapshot(character)
     if not (character and character.valid) then
         return {success = false, error = "no character; spawn first"}
@@ -111,6 +456,14 @@ function M.snapshot(character)
     local mining_targets = {}
     local power_networks_by_id = {}
     local entity_count = 0
+    local facts = {
+        steam_engines = 0, steam_engines_working = 0,
+        boilers = 0, boiler_fuel_min = nil,
+        labs = 0, labs_powered = 0, labs_working = 0,
+        assemblers = 0, red_science_assemblers = 0, recipe_assemblers = {},
+        burner_machines = 0, low_fuel_units = {}, low_fuel_count = 0,
+        output_blocked = 0, starved_assemblers = 0,
+    }
     local min_x, min_y, max_x, max_y = nil, nil, nil, nil
 
     for _, entity in pairs(found) do
@@ -118,8 +471,35 @@ function M.snapshot(character)
             entity_count = entity_count + 1
             counts_by_name[entity.name] = (counts_by_name[entity.name] or 0) + 1
             counts_by_type[entity.type] = (counts_by_type[entity.type] or 0) + 1
+            if (entity.type == "mining-drill" or entity.type == "furnace") and entity.burner then
+                facts.burner_machines = facts.burner_machines + 1
+                local fuel_ok, fuel = pcall(function() return entity.get_fuel_inventory().get_item_count() end)
+                if fuel_ok and fuel < LOW_BURNER_FUEL then
+                    facts.low_fuel_count = facts.low_fuel_count + 1
+                    if #facts.low_fuel_units < 12 then
+                        facts.low_fuel_units[#facts.low_fuel_units + 1] = {
+                            unit_number = entity.unit_number, name = entity.name, fuel = fuel,
+                        }
+                    end
+                end
+            end
 
             local status = entity_status(entity)
+            if status == "full_output" or status == "waiting_for_space_in_destination" then
+                if entity.type == "furnace" or entity.type == "mining-drill" or entity.type == "assembling-machine" then
+                    facts.output_blocked = facts.output_blocked + 1
+                end
+                if entity.type == "assembling-machine" then
+                    local recipe_ok, recipe = pcall(function() return entity.get_recipe() end)
+                    if recipe_ok and recipe and recipe.name:find("science%-pack$") then
+                        facts.full_science_assemblers = (facts.full_science_assemblers or 0) + 1
+                        facts.full_science_packs = facts.full_science_packs or {}
+                        facts.full_science_packs[recipe.name] = true
+                    end
+                end
+            elseif status == "item_ingredient_shortage" and entity.type == "assembling-machine" then
+                facts.starved_assemblers = facts.starved_assemblers + 1
+            end
             if status then statuses[status] = (statuses[status] or 0) + 1 end
 
             local x, y = entity.position.x, entity.position.y
@@ -144,6 +524,49 @@ function M.snapshot(character)
                     energy_source = energy_source(entity),
                     status = status,
                 })
+            elseif entity.type == "generator" then
+                facts.steam_engines = facts.steam_engines + 1
+                if status == "working" then facts.steam_engines_working = facts.steam_engines_working + 1 end
+            elseif entity.type == "boiler" then
+                facts.boilers = facts.boilers + 1
+                local fuel_ok, fuel = pcall(function() return entity.get_fuel_inventory().get_item_count() end)
+                if fuel_ok and fuel then
+                    facts.boiler_fuel_min = facts.boiler_fuel_min and math.min(facts.boiler_fuel_min, fuel) or fuel
+                end
+            elseif entity.type == "lab" then
+                facts.labs = facts.labs + 1
+                if status ~= "no_power" then facts.labs_powered = facts.labs_powered + 1 end
+                if status == "working" then facts.labs_working = facts.labs_working + 1 end
+                if status == "missing_science_packs" then
+                    -- Which packs of the current research this idle lab lacks.
+                    local research = entity.force.current_research
+                    local inventory = entity.get_inventory(defines.inventory.lab_input)
+                    if research and inventory then
+                        facts.lab_missing_packs = facts.lab_missing_packs or {}
+                        for _, ingredient in pairs(research.research_unit_ingredients) do
+                            if inventory.get_item_count(ingredient.name) == 0 then
+                                facts.lab_missing_packs[ingredient.name] = (facts.lab_missing_packs[ingredient.name] or 0) + 1
+                            end
+                        end
+                    end
+                end
+            elseif entity.type == "assembling-machine" then
+                facts.assemblers = facts.assemblers + 1
+                local recipe_ok, recipe = pcall(function() return entity.get_recipe() end)
+                if recipe_ok and recipe then
+                    facts.recipe_assemblers[recipe.name] = (facts.recipe_assemblers[recipe.name] or 0) + 1
+                    if recipe.name == "automation-science-pack" then
+                        facts.red_science_assemblers = facts.red_science_assemblers + 1
+                    end
+                end
+            elseif entity.type == "rocket-silo" then
+                facts.rocket_silos = (facts.rocket_silos or 0) + 1
+                local parts_ok, parts = pcall(function() return entity.rocket_parts end)
+                local ready_ok, ready = pcall(function()
+                    return entity.rocket_silo_status == defines.rocket_silo_status.rocket_ready
+                end)
+                if parts_ok and parts and parts > (facts.rocket_parts or -1) then facts.rocket_parts = parts end
+                if ready_ok and ready then facts.rocket_ready = true end
             elseif entity.type == "electric-pole" then
                 local network_ok, network_id = pcall(function()
                     return entity.electric_network_id
@@ -212,6 +635,7 @@ function M.snapshot(character)
         character = character_snapshot(character),
         research = research.get_research_status(character),
         production = compact_production(surface.name, force),
+        progression = progression(surface, force, facts, character),
         world = strategic.world,
         expansion = strategic.expansion,
         factory = {

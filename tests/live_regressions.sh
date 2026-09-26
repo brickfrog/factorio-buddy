@@ -132,12 +132,15 @@ rcon_connection_count() {
 }
 
 stop_mcp() {
+    # Redirect the group, not `exec`: `exec {fd}>&- 2>/dev/null` would
+    # permanently send the rest of this script's stderr (every FAIL line) to
+    # /dev/null.
     if [[ -n "$MCP_IN_FD" ]]; then
-        exec {MCP_IN_FD}>&- 2>/dev/null || true
+        { exec {MCP_IN_FD}>&-; } 2>/dev/null || true
         MCP_IN_FD=""
     fi
     if [[ -n "$MCP_OUT_FD" ]]; then
-        exec {MCP_OUT_FD}<&- 2>/dev/null || true
+        { exec {MCP_OUT_FD}<&-; } 2>/dev/null || true
         MCP_OUT_FD=""
     fi
     if [[ -n "$MCP_PID" ]]; then
@@ -148,21 +151,28 @@ stop_mcp() {
 }
 trap stop_mcp EXIT
 
+# Default per-response wait. Individual calls with a measured longer bound
+# pass their own timeout as the last argument of mcp_send/mcp_tool.
+MCP_READ_TIMEOUT_SECONDS=20
+
 mcp_read_id() {
     local wanted="$1"
+    local timeout="${2:-$MCP_READ_TIMEOUT_SECONDS}"
     local line
-    while IFS= read -r -t 20 -u "$MCP_OUT_FD" line; do
+    while IFS= read -r -t "$timeout" -u "$MCP_OUT_FD" line; do
         if jq -e --argjson wanted "$wanted" '.id == $wanted' >/dev/null 2>&1 <<<"$line"; then
             printf '%s\n' "$line"
             return 0
         fi
     done
+    printf 'ERROR: no MCP response for request id %s within %ss\n' "$wanted" "$timeout" >&2
     return 1
 }
 
 mcp_send() {
     local method="$1"
     local params="$2"
+    local timeout="${3:-$MCP_READ_TIMEOUT_SECONDS}"
     local id="$MCP_NEXT_ID"
     MCP_NEXT_ID=$((MCP_NEXT_ID + 1))
     jq -cn \
@@ -171,7 +181,7 @@ mcp_send() {
         --argjson params "$params" \
         '{jsonrpc:"2.0", id:$id, method:$method, params:$params}' \
         >&"$MCP_IN_FD"
-    mcp_read_id "$id"
+    mcp_read_id "$id" "$timeout"
 }
 
 mcp_notify() {
@@ -187,12 +197,13 @@ mcp_notify() {
 mcp_tool() {
     local tool="$1"
     local arguments="$2"
+    local timeout="${3:-$MCP_READ_TIMEOUT_SECONDS}"
     mcp_send tools/call "$(jq -cn --arg name "$tool" --argjson arguments "$arguments" \
-        '{name:$name, arguments:$arguments}')"
+        '{name:$name, arguments:$arguments}')" "$timeout"
 }
 
 tool_payload() {
-    jq -r '.result.content[0].text | split("\n\n--- Player Messages ---")[0]' <<<"$1"
+    jq -r '.result.content[0].text' <<<"$1"
 }
 
 beads_issue_snapshot() (
@@ -228,6 +239,1095 @@ start_mcp() {
     mcp_notify notifications/initialized '{}'
 }
 
+# ------------------------------------------------------------------------------
+# Gameplay correctness probes (plan section 4 rows 1-5 and contract C2).
+#
+# The probes use their own surface, force and two NPCs so they never disturb
+# the main regression agent, its research or its force production statistics.
+# Raw Lua only builds fixtures and independently reads the world back; every
+# behavior under test goes through the shipped `/claude` dispatcher (or the
+# Rust CLI for the client-side parsing probes).
+#
+# LIVE_ONLY=gameplay-probes runs only these probes (right after raw-Lua
+# fixtures are enabled); otherwise they run at the end of the full suite.
+# GAMEPLAY_PROBES="<section> ..." selects sections; sections that can hang or
+# crash an unfixed server run last. GAMEPLAY_PROBE_ARTIFACTS=<dir> keeps every
+# fixture, reply and before/after world state.
+# ------------------------------------------------------------------------------
+GP_AGENT="gameplay-probe"
+GP_AGENT_B="gameplay-probe-b"
+GP_FORCE="gameplay-probe"
+GP_ARTIFACTS="${GAMEPLAY_PROBE_ARTIFACTS:-}"
+GP_SERVER_ALIVE=1
+GP_SECTIONS_DEFAULT="set_recipe mine_transfer tool_evidence error_semantics affordances evaluation_sample liveness_walk liveness_dispatch liveness_mine"
+
+# Lua fixture/assertion prelude: item totals by name|quality across one
+# entity's inventories, the probe NPC and loose items on the probe surface.
+GP_LUA_PRELUDE="
+local function gp_char(agent) return remote.call('claude_interface', 'get_character', agent or '$GP_AGENT') end
+local function gp_add(bucket, name, quality, count) local key = name .. '|' .. (quality or 'normal'); bucket[key] = (bucket[key] or 0) + count end
+local function gp_add_inventory(bucket, inv) if not inv then return end for _, item in pairs(inv.get_contents()) do gp_add(bucket, item.name, item.quality, item.count) end end
+local function gp_find(unit)
+    if not unit then return nil end
+    for _, entity in pairs(game.surfaces['buddy-gameplay-probe'].find_entities_filtered{area = {{-60, -60}, {60, 60}}}) do
+        if entity.unit_number == unit then return entity end
+    end
+    for _, entity in pairs(game.surfaces['nauvis'].find_entities_filtered{position = {320, 320}, radius = 96}) do
+        if entity.unit_number == unit then return entity end
+    end
+    return nil
+end
+local function gp_state(unit)
+    local surface = game.surfaces['buddy-gameplay-probe']
+    local state = {machine = {}, npc = {}, ground = {}, ground_marked = 0}
+    local entity = gp_find(unit)
+    if entity and entity.valid then
+        state.entity = entity.name
+        for index = 1, entity.get_max_inventory_index() do gp_add_inventory(state.machine, entity.get_inventory(index)) end
+        if entity.type == 'assembling-machine' then
+            local recipe, quality = entity.get_recipe()
+            state.recipe = recipe and recipe.name or nil
+            state.recipe_quality = quality and quality.name or nil
+        end
+    end
+    gp_add_inventory(state.npc, gp_char().get_main_inventory())
+    state.position = {x = gp_char().position.x, y = gp_char().position.y}
+    for _, ground in pairs(surface.find_entities_filtered{type = 'item-entity', position = {0, 0}, radius = 48}) do
+        gp_add(state.ground, ground.stack.name, ground.stack.quality.name, ground.stack.count)
+        if ground.to_be_deconstructed() then state.ground_marked = state.ground_marked + 1 end
+    end
+    local ore = surface.find_entities_filtered{name = 'iron-ore', position = {1.5, 1.5}, radius = 0.5}[1]
+    state.ore_amount = ore and ore.amount or 0
+    return state
+end
+"
+
+gp_record() {
+    local section="$1" label="$2"
+    shift 2
+    [[ -n "$GP_ARTIFACTS" ]] || return 0
+    mkdir -p "$GP_ARTIFACTS"
+    {
+        printf '== %s\n' "$label"
+        printf '%s\n' "$@"
+    } >>"$GP_ARTIFACTS/$section.log"
+}
+
+gp_measure() {
+    printf '  MEASURE: %s\n' "$1"
+    gp_record measurements "$1" "${2:-}"
+}
+
+# Send one command over a fresh RCON connection and print the raw reply.
+# Exit status 2 means Factorio did not answer before the timeout.
+claude_dispatch() {
+    python3 - "$RCON_HOST" "$RCON_PORT" "$RCON_PASSWORD" "${CLAUDE_DISPATCH_TIMEOUT:-15}" "$1" <<'PY'
+import socket, struct, sys
+host, port, password, timeout, command = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4]), sys.argv[5]
+try:
+    sock = socket.create_connection((host, port), timeout=timeout)
+
+    def send(request_id, kind, body):
+        data = body.encode()
+        sock.sendall(struct.pack("<iii", len(data) + 10, request_id, kind) + data + b"\0\0")
+
+    def exact(size):
+        data = b""
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise EOFError("RCON connection closed")
+            data += chunk
+        return data
+
+    def receive():
+        (size,) = struct.unpack("<i", exact(4))
+        packet = exact(size)
+        request_id, kind = struct.unpack("<ii", packet[:8])
+        return request_id, kind, packet[8:-2].decode(errors="replace")
+
+    send(1, 3, password)
+    while True:
+        request_id, kind, _ = receive()
+        if request_id == -1:
+            sys.exit("RCON authentication failed")
+        if request_id == 1 and kind == 2:
+            break
+    send(2, 2, command)
+    while True:
+        request_id, kind, body = receive()
+        if request_id == 2:
+            sys.stdout.write(body)
+            break
+except (socket.timeout, TimeoutError, ConnectionError, EOFError) as error:
+    sys.stderr.write(f"RCON failure: {error}\n")
+    sys.exit(2)
+PY
+}
+
+# Call one claude_interface remote through the `/claude` JSON dispatcher.
+claude_call() {
+    claude_dispatch "/claude $(jq -cn --arg fn "$1" --argjson args "$2" '{fn:$fn, args:$args, n:($args | length)}')"
+}
+
+gp_tick() {
+    claude_dispatch '/claude {"fn":"get_tick","args":[],"n":0}' 2>/dev/null | jq -r '.tick // -1' 2>/dev/null || printf -- '-1\n'
+}
+
+gp_alive() {
+    local first second
+    first="$(gp_tick)"
+    sleep 0.25
+    second="$(gp_tick)"
+    [[ "$first" =~ ^[0-9]+$ && "$second" =~ ^[0-9]+$ ]] && (( second > first ))
+}
+
+gp_require_alive() {
+    if gp_alive; then
+        pass "Factorio keeps simulating after $1"
+    else
+        fail "Factorio keeps simulating after $1" "server stopped answering or ticking"
+        GP_SERVER_ALIVE=0
+        return 1
+    fi
+}
+
+gp_wait_ticks() {
+    local start now deadline=$((SECONDS + 60))
+    start="$(gp_tick)"
+    while (( SECONDS < deadline )); do
+        now="$(gp_tick)"
+        if (( now >= start + $1 )); then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+gp_lua() {
+    raw_lua "$GP_LUA_PRELUDE $1" 2>&1 || true
+}
+
+gp_state() {
+    gp_lua "rcon.print(helpers.table_to_json(gp_state(${1:-nil})))"
+}
+
+# Sum of one name|quality key across machine + NPC + ground.
+gp_total() {
+    jq -r --arg key "$2" 'def obj: if type == "object" then . else {} end;
+        ((.machine | obj)[$key] // 0) + ((.npc | obj)[$key] // 0) + ((.ground | obj)[$key] // 0)' \
+        <<<"$1" 2>/dev/null || printf 'invalid\n'
+}
+
+gp_assert_conserved() {
+    local description="$1" before="$2" after="$3" key b a detail="" ok=1
+    shift 3
+    for key in "$@"; do
+        b="$(gp_total "$before" "$key")"
+        a="$(gp_total "$after" "$key")"
+        detail+="$key before=$b after=$a; "
+        if [[ "$b" == invalid || "$b" == 0 || "$b" != "$a" ]]; then ok=0; fi
+    done
+    if (( ok )); then pass "$description"; else fail "$description" "$detail"; fi
+}
+
+gp_assert_unchanged() {
+    if jq -en --argjson b "$2" --argjson a "$3" 'def obj: if type == "object" then . else {} end;
+        def norm: {entity, machine: (.machine | obj), npc: (.npc | obj), ground: (.ground | obj), recipe, recipe_quality, ore_amount};
+        ($b | norm) == ($a | norm)' >/dev/null 2>&1; then
+        pass "$1"
+    else
+        fail "$1" "before=$2 after=$3"
+    fi
+}
+
+gp_setup() {
+    local setup
+    setup="$(raw_lua "
+local name = 'buddy-gameplay-probe'
+for _, agent in pairs({'$GP_AGENT', '$GP_AGENT_B'}) do
+    local old = remote.call('claude_interface', 'get_character', agent)
+    if old and old.valid then old.destroy() end
+end
+local surface = game.surfaces[name] or game.create_surface(name, {peaceful_mode = true})
+surface.request_to_generate_chunks({0, 0}, 3)
+surface.force_generate_chunk_requests()
+local tiles = {}
+for x = -48, 48 do for y = -48, 48 do tiles[#tiles + 1] = {name = 'landfill', position = {x, y}} end end
+surface.set_tiles(tiles, true)
+for _, entity in pairs(surface.find_entities_filtered{area = {{-48, -48}, {49, 49}}}) do entity.destroy() end
+local force = game.forces['$GP_FORCE'] or game.create_force('$GP_FORCE')
+force.recipes['iron-gear-wheel'].enabled = true
+force.recipes['copper-cable'].enabled = true
+local placed = {}
+for index, agent in pairs({'$GP_AGENT', '$GP_AGENT_B'}) do
+    local status = helpers.json_to_table(remote.call('claude_interface', 'pre_place_character_result', agent, name, 0))
+    local character = remote.call('claude_interface', 'get_character', agent)
+    character.force = force
+    character.teleport(index == 1 and {0, 0} or {-20, 0})
+    placed[agent] = {status = status.status, unit = character.unit_number, surface = character.surface.name, force = character.force.name}
+end
+rcon.print(helpers.table_to_json(placed))
+" 2>&1 || true)"
+    gp_record setup "setup" "$setup"
+    require_json "gameplay probe NPCs are isolated on their own surface and force" "$setup" \
+        --arg a "$GP_AGENT" --arg b "$GP_AGENT_B" \
+        '.[$a].surface == "buddy-gameplay-probe" and .[$b].surface == "buddy-gameplay-probe"
+         and .[$a].force == "gameplay-probe" and .[$a].unit != .[$b].unit'
+}
+
+# ---- Row 1: set_recipe item conservation and pre-mutation validation ----
+gp_recipe_fixture() {
+    local recipe="$1" quality="$2" input_item="$3" input_quality="$4" input_count="$5" output_count="$6" npc_mode="$7"
+    gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{2, -2}, {8, 4}}}) do entity.destroy() end
+for _, ground in pairs(surface.find_entities_filtered{type = 'item-entity'}) do ground.destroy() end
+gp_char().teleport({0, 0})
+local machine = surface.create_entity{name = 'assembling-machine-2', position = {4.5, 0.5}, force = '$GP_FORCE'}
+machine.set_recipe('$recipe', '$quality')
+local input = machine.get_inventory(defines.inventory.assembling_machine_input).insert{name = '$input_item', quality = '$input_quality', count = $input_count}
+local output = 0
+if $output_count > 0 then output = machine.get_inventory(defines.inventory.assembling_machine_output).insert{name = 'iron-gear-wheel', count = $output_count} end
+local inventory = gp_char().get_main_inventory()
+inventory.clear()
+if '$npc_mode' == 'full' then
+    for slot = 1, #inventory do inventory[slot].set_stack{name = 'stone', count = 50} end
+else
+    inventory.insert{name = 'stone', count = 5}
+end
+rcon.print(helpers.table_to_json({unit = machine.unit_number, input = input, output = output, free_slots = inventory.count_empty_stacks()}))
+"
+}
+
+gp_recipe_call() {
+    local unit="$1" recipe_json="$2"
+    claude_call set_recipe "$(jq -cn --arg agent "$GP_AGENT" --argjson unit "$unit" --argjson recipe "$recipe_json" \
+        '[$agent, $unit, $recipe]')" 2>&1 || true
+}
+
+gp_probe_set_recipe() {
+    local fixture unit before reply after disabled
+
+    fixture="$(gp_recipe_fixture iron-gear-wheel normal iron-plate normal 100 10 room)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_recipe_call "$unit" '"copper-cable"')"
+    after="$(gp_state "$unit")"
+    gp_record set_recipe "change loaded recipe, room in NPC inventory" "$fixture" "$before" "$reply" "$after"
+    assert_json "set_recipe changes a loaded assembler recipe" "$reply" '.success == true and .recipe == "copper-cable"'
+    assert_json "set_recipe change is observed on the machine" "$after" '.recipe == "copper-cable"'
+    gp_assert_conserved "set_recipe change conserves returned ingredients and products" \
+        "$before" "$after" 'iron-plate|normal' 'iron-gear-wheel|normal'
+
+    fixture="$(gp_recipe_fixture iron-gear-wheel normal iron-plate normal 100 10 full)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_recipe_call "$unit" '"copper-cable"')"
+    after="$(gp_state "$unit")"
+    gp_record set_recipe "change loaded recipe, full NPC inventory" "$fixture" "$before" "$reply" "$after"
+    assert_json "set_recipe with a full NPC inventory still changes the recipe" "$reply" '.success == true'
+    gp_assert_conserved "set_recipe with a full NPC inventory spills instead of deleting returned items" \
+        "$before" "$after" 'iron-plate|normal' 'iron-gear-wheel|normal' 'stone|normal'
+    assert_json "items spilled by set_recipe are not marked for deconstruction" "$after" \
+        '((.ground | if type == "object" then . else {} end)["iron-plate|normal"] // 0) == 100 and .ground_marked == 0'
+
+    fixture="$(gp_recipe_fixture copper-cable normal copper-plate normal 50 0 room)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_recipe_call "$unit" 'null')"
+    after="$(gp_state "$unit")"
+    gp_record set_recipe "clear loaded recipe with null" "$fixture" "$before" "$reply" "$after"
+    assert_json "set_recipe null clears the recipe" "$reply" '.success == true and .cleared == true'
+    assert_json "cleared recipe is observed on the machine" "$after" '.recipe == null'
+    gp_assert_conserved "set_recipe clear conserves the loaded ingredients" "$before" "$after" 'copper-plate|normal'
+
+    fixture="$(gp_recipe_fixture copper-cable normal copper-plate normal 20 0 room)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_recipe_call "$unit" '""')"
+    after="$(gp_state "$unit")"
+    gp_record set_recipe "clear loaded recipe with empty string" "$fixture" "$before" "$reply" "$after"
+    assert_json "set_recipe empty string keeps the documented clear behavior" "$reply" '.success == true and .cleared == true'
+    gp_assert_conserved "set_recipe empty-string clear conserves the loaded ingredients" "$before" "$after" 'copper-plate|normal'
+
+    fixture="$(gp_recipe_fixture iron-gear-wheel uncommon iron-plate uncommon 10 0 room)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_recipe_call "$unit" '"copper-cable"')"
+    after="$(gp_state "$unit")"
+    gp_record set_recipe "change uncommon-quality recipe" "$fixture" "$before" "$reply" "$after"
+    assert_json "uncommon-quality fixture loaded quality ingredients" "$fixture" '.input == 10'
+    gp_assert_conserved "set_recipe conserves returned items with their quality" "$before" "$after" 'iron-plate|uncommon'
+
+    disabled="$(gp_lua "
+local machine = prototypes.entity['assembling-machine-2']
+local found = ''
+for name, recipe in pairs(game.forces['$GP_FORCE'].recipes) do
+    if not recipe.enabled and not recipe.hidden and machine.crafting_categories[recipe.category] then found = name break end
+end
+rcon.print(found)
+")"
+    gp_measure "observed disabled assembler-compatible recipe on the probe force: ${disabled:-none}"
+    local rejected
+    for rejected in "$disabled" iron-plate no-such-recipe; do
+        [[ -n "$rejected" ]] || continue
+        fixture="$(gp_recipe_fixture iron-gear-wheel normal iron-plate normal 20 0 room)"
+        unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+        before="$(gp_state "$unit")"
+        reply="$(gp_recipe_call "$unit" "$(jq -cn --arg recipe "$rejected" '$recipe')")"
+        after="$(gp_state "$unit")"
+        gp_record set_recipe "reject $rejected" "$fixture" "$before" "$reply" "$after"
+        assert_json "set_recipe rejects unavailable or incompatible recipe $rejected" "$reply" \
+            '.success == false and (.error | type) == "string"'
+        gp_assert_unchanged "rejected set_recipe $rejected leaves machine, NPC and ground untouched" "$before" "$after"
+    done
+
+    fixture="$(gp_recipe_fixture iron-gear-wheel normal iron-plate normal 20 0 room)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_recipe_call "$unit" '"iron-gear-wheel"')"
+    after="$(gp_state "$unit")"
+    gp_record set_recipe "re-set current recipe" "$fixture" "$before" "$reply" "$after"
+    assert_json "re-setting the current recipe succeeds" "$reply" '.success == true and .recipe == "iron-gear-wheel"'
+    gp_assert_unchanged "re-setting the current recipe does not unload the machine" "$before" "$after"
+}
+
+# ---- Row 2: mining and manual transfer count boundaries ----
+gp_mine_fixture() {
+    gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{-1, -1}, {3, 3}}}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+for _, ground in pairs(surface.find_entities_filtered{type = 'item-entity'}) do ground.destroy() end
+surface.create_entity{name = 'iron-ore', position = {1.5, 1.5}, amount = 5000}
+gp_char().teleport({0, 0})
+local inventory = gp_char().get_main_inventory()
+inventory.clear()
+if '$1' == 'full' then for slot = 1, #inventory do inventory[slot].set_stack{name = 'stone', count = 50} end end
+rcon.print('ok')
+" >/dev/null
+}
+
+gp_mine_call() {
+    claude_call mine_at "$(jq -cn --arg agent "$GP_AGENT" --argjson count "$1" '[$agent, 1.5, 1.5, $count, 0.5]')" 2>&1 || true
+}
+
+# A natural entity with several item products at (1.5, 1.5) and an NPC
+# inventory with room for one unit of each product but not for all of them:
+# `tree` = one wood kind, one slot short of the yield; `rock` = two item kinds
+# (stone is full) with a single empty slot.
+gp_natural_fixture() {
+    gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{-1, -1}, {5, 5}}}) do
+    if entity.type ~= 'character' then entity.destroy() end
+end
+for _, ground in pairs(surface.find_entities_filtered{type = 'item-entity'}) do ground.destroy() end
+local wanted = '$1'
+local chosen, products
+local entity_type = wanted == 'tree' and 'tree' or 'simple-entity'
+for name, proto in pairs(prototypes.get_entity_filtered{{filter = 'type', type = entity_type}}) do
+    local mineable = proto.mineable_properties
+    local items = {}
+    for _, product in pairs(mineable and mineable.minable and mineable.products or {}) do
+        if product.type == 'item' then table.insert(items, product) end
+    end
+    local amount = items[1] and (items[1].amount or items[1].amount_max or 0) or 0
+    if (wanted == 'tree' and #items == 1 and amount >= 2 and items[1].name ~= 'stone')
+        or (wanted == 'rock' and #items >= 2 and items[1].name ~= items[2].name) then
+        chosen, products = name, items
+        break
+    end
+end
+if not chosen then rcon.print(helpers.table_to_json({error = 'no ' .. wanted .. ' prototype'})) return end
+surface.create_entity{name = chosen, position = {1.5, 1.5}}
+gp_char().teleport({0, 0})
+local inventory = gp_char().get_main_inventory()
+inventory.clear()
+for slot = 1, #inventory do inventory[slot].set_stack{name = 'stone', count = 50} end
+if wanted == 'tree' then
+    inventory[#inventory].set_stack{name = products[1].name, count = prototypes.item[products[1].name].stack_size - 1}
+else
+    inventory[#inventory].clear()
+end
+local partial_room = true
+for _, product in pairs(products) do
+    if not inventory.can_insert{name = product.name, count = 1} then partial_room = false end
+end
+rcon.print(helpers.table_to_json({name = chosen, free_slots = inventory.count_empty_stacks(), partial_room = partial_room}))
+"
+}
+
+gp_chest_fixture() {
+    local chest_mode="$1" npc_mode="$2"
+    gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{-4, -1}, {-1, 2}}}) do entity.destroy() end
+for _, ground in pairs(surface.find_entities_filtered{type = 'item-entity'}) do ground.destroy() end
+gp_char().teleport({0, 0})
+local chest = surface.create_entity{name = 'wooden-chest', position = {-2.5, 0.5}, force = '$GP_FORCE'}
+local chest_inventory = chest.get_inventory(defines.inventory.chest)
+if '$chest_mode' == 'full' then
+    for slot = 1, #chest_inventory do chest_inventory[slot].set_stack{name = 'stone', count = 50} end
+else
+    chest_inventory.insert{name = 'iron-plate', count = 20}
+end
+local inventory = gp_char().get_main_inventory()
+inventory.clear()
+if '$npc_mode' == 'full' then
+    for slot = 1, #inventory do inventory[slot].set_stack{name = 'stone', count = 50} end
+else
+    inventory.insert{name = 'iron-plate', count = 20}
+end
+rcon.print(chest.unit_number)
+"
+}
+
+gp_transfer_call() {
+    local remote="$1" unit="$2" count="$3" args
+    if [[ "$remote" == collect_from_chest ]]; then
+        args="$(jq -cn --arg agent "$GP_AGENT" --argjson unit "$unit" --argjson count "$count" '[$agent, $unit, "iron-plate", $count]')"
+    else
+        args="$(jq -cn --arg agent "$GP_AGENT" --argjson unit "$unit" --argjson count "$count" '[$agent, $unit, "iron-plate", $count, "chest"]')"
+    fi
+    claude_call "$remote" "$args" 2>&1 || true
+}
+
+gp_probe_mine_transfer() {
+    local count before reply after unit remote
+
+    for count in 0 -3 2.5 '"abc"' null 1001; do
+        gp_mine_fixture room
+        before="$(gp_state)"
+        reply="$(gp_mine_call "$count")"
+        after="$(gp_state)"
+        gp_record mine_transfer "mine_at count $count" "$before" "$reply" "$after"
+        assert_json "mine_at rejects count $count before mining" "$reply" \
+            '.success == false and (.error_kind == "invalid_count" or .error_kind == "count_exceeds_limit")'
+        gp_assert_unchanged "rejected mine_at count $count leaves resource and inventory untouched" "$before" "$after"
+    done
+
+    for count in 3 1000; do
+        gp_mine_fixture room
+        before="$(gp_state)"
+        reply="$(gp_mine_call "$count")"
+        after="$(gp_state)"
+        gp_record mine_transfer "mine_at count $count" "$before" "$reply" "$after"
+        assert_json "mine_at accepts bounded count $count" "$reply" '.success == true'
+        assert_json "mine_at count $count moves exactly the mined ore from resource to NPC" "$after" \
+            --argjson before "$before" --argjson count "$count" \
+            '($before.ore_amount - .ore_amount) == $count
+             and ((.npc["iron-ore|normal"] // 0) - (($before.npc | if type == "object" then . else {} end)["iron-ore|normal"] // 0)) == $count
+             and ((.ground | if type == "object" then . else {} end)["iron-ore|normal"] // 0) == 0'
+    done
+
+    gp_mine_fixture full
+    before="$(gp_state)"
+    reply="$(gp_mine_call 5)"
+    after="$(gp_state)"
+    gp_record mine_transfer "mine_at with full inventory" "$before" "$reply" "$after"
+    assert_json "mine_at with a full inventory reports inventory_full" "$reply" \
+        '.success == false and .error_kind == "inventory_full"'
+    gp_assert_unchanged "mine_at with a full inventory neither depletes the resource nor spills ore" "$before" "$after"
+
+    # Multi-unit products: a tree yields several wood and a rock several items
+    # of two kinds. mine_entity refuses unless the whole product set fits, so
+    # room for one unit (tree) or one item kind (rock) is still inventory_full.
+    local kind fixture present_after
+    for kind in tree rock; do
+        fixture="$(gp_natural_fixture "$kind")"
+        before="$(gp_state)"
+        reply="$(gp_mine_call 1)"
+        after="$(gp_state)"
+        present_after="$(gp_lua "rcon.print(#game.surfaces['buddy-gameplay-probe'].find_entities_filtered{name = '$(jq -r '.name // "none"' <<<"$fixture" 2>/dev/null)', position = {1.5, 1.5}, radius = 0.5})")"
+        gp_record mine_transfer "mine_at multi-product $kind without room for all products" "$fixture" "$before" "$reply" "$after" "present_after=$present_after"
+        assert_json "multi-product $kind fixture leaves room for only part of the products" "$fixture" \
+            '(.name | type) == "string" and .free_slots <= 1 and .partial_room == true'
+        assert_json "mine_at $kind without room for every product reports inventory_full" "$reply" \
+            '.success == false and .error_kind == "inventory_full"'
+        gp_assert_unchanged "mine_at $kind refused for room leaves inventory and ground untouched" "$before" "$after"
+        if [[ "$present_after" == 1 ]]; then
+            pass "mine_at $kind refused for room leaves the $kind in place"
+        else
+            fail "mine_at $kind refused for room leaves the $kind in place" "present_after=$present_after"
+        fi
+    done
+
+    for remote in insert_items extract_items collect_from_chest; do
+        for count in 0 -5 2.5 '"abc"' null; do
+            unit="$(gp_chest_fixture plates plates)"
+            before="$(gp_state "$unit")"
+            reply="$(gp_transfer_call "$remote" "$unit" "$count")"
+            after="$(gp_state "$unit")"
+            gp_record mine_transfer "$remote count $count" "$before" "$reply" "$after"
+            assert_json "$remote rejects count $count" "$reply" '(.error | type) == "string" and .error != ""'
+            gp_assert_unchanged "rejected $remote count $count moves no items" "$before" "$after"
+        done
+        unit="$(gp_chest_fixture plates plates)"
+        before="$(gp_state "$unit")"
+        reply="$(gp_transfer_call "$remote" "$unit" 1000000000)"
+        after="$(gp_state "$unit")"
+        gp_record mine_transfer "$remote oversized count" "$before" "$reply" "$after"
+        gp_measure "$remote with count 1e9: $(jq -c '{success, error_kind, error, extracted, inserted, removed, requested_count, maximum_count}' <<<"$reply" 2>/dev/null || printf '%s' "$reply")"
+        gp_assert_conserved "$remote with an oversized count conserves plates" "$before" "$after" 'iron-plate|normal'
+    done
+
+    unit="$(gp_chest_fixture plates full)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_transfer_call extract_items "$unit" 10)"
+    after="$(gp_state "$unit")"
+    gp_record mine_transfer "extract_items into full NPC inventory" "$before" "$reply" "$after"
+    gp_assert_conserved "extract_items into a full NPC inventory conserves plates and stone" \
+        "$before" "$after" 'iron-plate|normal' 'stone|normal'
+
+    unit="$(gp_chest_fixture full plates)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_transfer_call insert_items "$unit" 10)"
+    after="$(gp_state "$unit")"
+    gp_record mine_transfer "insert_items into full chest" "$before" "$reply" "$after"
+    assert_json "insert_items into a full chest reports failure" "$reply" '(.error | type) == "string"'
+    gp_assert_conserved "insert_items into a full chest conserves plates and stone" \
+        "$before" "$after" 'iron-plate|normal' 'stone|normal'
+}
+
+# ---- Model-facing evidence and validate-before-walk ----
+# One tools/call from a short-lived MCP server bound to `agent` (the suite's
+# coprocess MCP is bound to the main regression agent). Prints the tool text.
+gp_mcp_tool() {
+    FACTORIO_RCON_HOST="$RCON_HOST" FACTORIO_RCON_PORT="$RCON_PORT" \
+    FACTORIO_RCON_PASSWORD="$RCON_PASSWORD" FACTORIO_AGENT_ID="$1" \
+        python3 - "$MCP_BIN" "$2" "$3" "${4:-90}" 2>&1 <<'PY' || true
+import json, os, select, subprocess, sys, time
+binary, tool, arguments, timeout = sys.argv[1], sys.argv[2], json.loads(sys.argv[3]), float(sys.argv[4])
+proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+buffer = b""
+
+def send(message):
+    proc.stdin.write((json.dumps(message) + "\n").encode())
+    proc.stdin.flush()
+
+def receive(wanted, deadline):
+    global buffer
+    while True:
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if message.get("id") == wanted:
+                return message
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([proc.stdout], [], [], remaining)[0]:
+            return None
+        chunk = os.read(proc.stdout.fileno(), 65536)
+        if not chunk:
+            return None
+        buffer += chunk
+
+try:
+    deadline = time.monotonic() + timeout
+    send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-03-26", "capabilities": {},
+        "clientInfo": {"name": "gameplay-probe", "version": "1"}}})
+    if receive(1, deadline) is None:
+        sys.exit("MCP did not initialize")
+    send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+    send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+          "params": {"name": tool, "arguments": arguments}})
+    reply = receive(2, deadline)
+    if reply is None:
+        sys.exit("no MCP tool response within %ss" % timeout)
+    content = (reply.get("result") or {}).get("content") or [{}]
+    sys.stdout.write(content[0].get("text", json.dumps(reply)))
+finally:
+    proc.stdin.close()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+PY
+}
+
+# Out-of-reach probes stand at (-15, 12): clear ground, out of reach of the
+# machine, chest and ore fixtures, and away from agent B at (-20, 0).
+gp_teleport() {
+    gp_lua "gp_char().teleport({$1, $2}) rcon.print('ok')" >/dev/null
+}
+
+gp_probe_tool_evidence() {
+    local fixture unit before reply after output status recipe count
+
+    # set_recipe returns where every unloaded item went (model surface = MCP).
+    fixture="$(gp_recipe_fixture iron-gear-wheel normal iron-plate normal 100 10 full)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_mcp_tool "$GP_AGENT" set_recipe "$(jq -cn --argjson unit "${unit:-0}" '{unit_number:$unit, recipe:"copper-cable"}')")"
+    after="$(gp_state "$unit")"
+    gp_record tool_evidence "MCP set_recipe, full NPC inventory" "$fixture" "$before" "$reply" "$after"
+    assert_json "MCP set_recipe reports the previous recipe and every spilled item" "$reply" \
+        '.success == true and .recipe == "copper-cable" and .previous_recipe == "iron-gear-wheel"
+         and ([.returned_items[] | select(.name == "iron-plate")][0] | .count == 100 and .inserted == 0 and .spilled == 100 and .unrecovered == 0)
+         and ([.returned_items[] | select(.name == "iron-gear-wheel")][0] | .count == 10 and .spilled == 10)'
+    assert_json "MCP set_recipe spilled counts match the items that appeared on the ground" "$after" \
+        --argjson before "$before" --argjson reply "${reply:-null}" \
+        'def obj: if type == "object" then . else {} end;
+         . as $after
+         | ($reply.returned_items | length) > 0
+           and all($reply.returned_items[];
+               (($after.ground | obj)["\(.name)|\(.quality)"] // 0)
+               - (($before.ground | obj)["\(.name)|\(.quality)"] // 0) == .spilled)'
+
+    fixture="$(gp_recipe_fixture iron-gear-wheel normal iron-plate normal 100 10 room)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    before="$(gp_state "$unit")"
+    reply="$(gp_mcp_tool "$GP_AGENT" set_recipe "$(jq -cn --argjson unit "${unit:-0}" '{unit_number:$unit, recipe:""}')")"
+    after="$(gp_state "$unit")"
+    gp_record tool_evidence "MCP set_recipe clear, room in NPC inventory" "$fixture" "$before" "$reply" "$after"
+    assert_json "MCP set_recipe clear reports the items returned to the character" "$reply" \
+        --argjson before "$before" --argjson after "$after" \
+        '.success == true and .cleared == true and .previous_recipe == "iron-gear-wheel"
+         and ([.returned_items[] | select(.name == "iron-plate")][0] | .inserted == 100 and .spilled == 0)
+         and (($after.npc["iron-plate|normal"] // 0) - (($before.npc | if type == "object" then . else {} end)["iron-plate|normal"] // 0)) == 100'
+
+    # Rejected recipes are refused before the character walks to the machine.
+    for recipe in no-such-recipe iron-plate; do
+        fixture="$(gp_recipe_fixture iron-gear-wheel normal iron-plate normal 20 0 room)"
+        unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+        gp_teleport -15 12
+        before="$(gp_state "$unit")"
+        reply="$(gp_mcp_tool "$GP_AGENT" set_recipe "$(jq -cn --argjson unit "${unit:-0}" --arg recipe "$recipe" '{unit_number:$unit, recipe:$recipe}')")"
+        after="$(gp_state "$unit")"
+        gp_record tool_evidence "MCP set_recipe $recipe on a machine out of reach" "$fixture" "$before" "$reply" "$after"
+        assert_json "MCP set_recipe rejects $recipe with a structured error_kind" "$reply" \
+            '.success == false and (.error_kind == "unknown_recipe" or (.error_kind == "recipe_incompatible" and (.recipe_categories | length) > 0))'
+        assert_json "rejected set_recipe $recipe does not walk the character" "$after" \
+            --argjson before "$before" '.position == $before.position'
+        gp_assert_unchanged "rejected set_recipe $recipe leaves machine, NPC and ground untouched" "$before" "$after"
+    done
+
+    # The read-only preflight itself never changes the world.
+    fixture="$(gp_recipe_fixture iron-gear-wheel normal iron-plate normal 20 0 room)"
+    unit="$(jq -r '.unit' <<<"$fixture" 2>/dev/null || true)"
+    gp_teleport -15 12
+    before="$(gp_state "$unit")"
+    reply="$(claude_call check_recipe_choice "$(jq -cn --arg agent "$GP_AGENT" --argjson unit "${unit:-0}" '[$agent, $unit, "copper-cable"]')" 2>&1 || true)"
+    after="$(gp_state "$unit")"
+    gp_record tool_evidence "check_recipe_choice preflight" "$before" "$reply" "$after"
+    assert_json "check_recipe_choice accepts a valid recipe without reach" "$reply" \
+        '.success == true and .recipe == "copper-cable" and .current_recipe == "iron-gear-wheel"'
+    gp_assert_unchanged "check_recipe_choice leaves the loaded machine untouched" "$before" "$after"
+    assert_json "check_recipe_choice does not move the character" "$after" --argjson before "$before" '.position == $before.position'
+
+    # mine_at counts outside 1..1000 are refused before the walk.
+    for count in 0 5000; do
+        gp_mine_fixture room
+        gp_teleport -15 12
+        before="$(gp_state)"
+        reply="$(gp_mcp_tool "$GP_AGENT" mine_at "$(jq -cn --argjson count "$count" '{x:1.5, y:1.5, count:$count}')")"
+        after="$(gp_state)"
+        gp_record tool_evidence "MCP mine_at count $count out of reach" "$before" "$reply" "$after"
+        assert_json "MCP mine_at rejects count $count with a structured error_kind" "$reply" \
+            '.success == false and (.error_kind == "invalid_count" or .error_kind == "count_exceeds_limit") and .maximum_count == 1000'
+        assert_json "rejected mine_at count $count does not walk the character" "$after" \
+            --argjson before "$before" '.position == $before.position'
+        gp_assert_unchanged "rejected mine_at count $count leaves resource and inventory untouched" "$before" "$after"
+    done
+
+    # extract_items (CLI; hidden from the model): count 0 is refused before
+    # the walk, and a full character inventory reports where the items went.
+    unit="$(gp_chest_fixture plates plates)"
+    gp_teleport -15 12
+    before="$(gp_state "$unit")"
+    status=0
+    output="$("${CLI[@]}" --agent-id "$GP_AGENT" extract iron-plate --from "$unit" --count 0 2>&1)" || status=$?
+    after="$(gp_state "$unit")"
+    gp_record tool_evidence "CLI extract count 0 out of reach (exit $status)" "$before" "$output" "$after"
+    if (( status != 0 )) && [[ "$output" == *"invalid_count"* ]]; then
+        pass "extract count 0 is a structured invalid_count failure"
+    else
+        fail "extract count 0 is a structured invalid_count failure" "exit=$status output=$output"
+    fi
+    assert_json "rejected extract does not walk the character" "$after" --argjson before "$before" '.position == $before.position'
+    gp_assert_unchanged "rejected extract moves no items" "$before" "$after"
+
+    unit="$(gp_chest_fixture plates full)"
+    before="$(gp_state "$unit")"
+    status=0
+    output="$("${CLI[@]}" --agent-id "$GP_AGENT" extract iron-plate --from "$unit" --count 10 2>&1)" || status=$?
+    after="$(gp_state "$unit")"
+    gp_record tool_evidence "CLI extract into a full inventory (exit $status)" "$before" "$output" "$after"
+    if (( status != 0 )) && [[ "$output" == *"inventory_full"* && "$output" == *'"restored":10'* && "$output" == *'"spilled":0'* ]]; then
+        pass "extract into a full inventory reports inventory_full with restored/spilled evidence"
+    else
+        fail "extract into a full inventory reports inventory_full with restored/spilled evidence" "exit=$status output=$output"
+    fi
+    gp_assert_unchanged "extract into a full inventory puts every plate back" "$before" "$after"
+
+    unit="$(gp_chest_fixture plates room)"
+    status=0
+    output="$("${CLI[@]}" --agent-id "$GP_AGENT" extract iron-plate --from "$unit" --count 10 2>&1)" || status=$?
+    gp_record tool_evidence "CLI extract success (exit $status)" "$output"
+    if (( status == 0 )) && [[ "$output" == *"Extracted 10 iron-plate"*"restored 0, spilled 0"* ]]; then
+        pass "extract reports extracted/restored/spilled counts"
+    else
+        fail "extract reports extracted/restored/spilled counts" "exit=$status output=$output"
+    fi
+    gp_teleport 0 0
+}
+
+# ---- Row 3: semantic error information survives Lua and Rust parsing ----
+gp_probe_error_semantics() {
+    local output status reply fixture unit before after
+
+    status=0
+    output="$("${CLI[@]}" --agent-id gameplay-probe-missing get entities --area 0,0,4,4 2>&1)" || status=$?
+    gp_record error_semantics "CLI find_entities for missing agent (exit $status)" "$output"
+    if (( status != 0 )) && [[ "$output" == *"agent surface not found"* && "$output" != *"invalid type"* ]]; then
+        pass "client array parsing reports the Lua error for a missing agent"
+    else
+        fail "client array parsing reports the Lua error for a missing agent" "exit=$status output=$output"
+    fi
+
+    gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{5, 5}, {9, 9}}}) do entity.destroy() end
+surface.create_entity{name = 'wooden-chest', position = {6.5, 6.5}, force = '$GP_FORCE'}
+gp_char().teleport({0, 0})
+gp_char().get_main_inventory().clear()
+gp_char().get_main_inventory().insert{name = 'stone-furnace', count = 1}
+rcon.print('ok')
+" >/dev/null
+    status=0
+    output="$("${CLI[@]}" --agent-id "$GP_AGENT" place stone-furnace --at 6,6 2>&1)" || status=$?
+    gp_record error_semantics "CLI blocked place_entity (exit $status)" "$output"
+    if (( status != 0 )) && [[ "$output" == *"Cannot place entity here"* && "$output" == *"wooden-chest"* ]]; then
+        pass "client placement errors keep the structured blocker evidence"
+    else
+        fail "client placement errors keep the structured blocker evidence" "exit=$status output=$output"
+    fi
+
+    reply="$(claude_call set_recipe "$(jq -cn --arg agent "$GP_AGENT" '[$agent, 987654321, "copper-cable"]')" 2>&1 || true)"
+    gp_record error_semantics "set_recipe missing entity" "$reply"
+    assert_json "set_recipe on a missing entity is a structured failure" "$reply" \
+        '.success == false and .error_kind == "entity_not_found"'
+
+    fixture="$(gp_lua "
+local nauvis = game.surfaces['nauvis']
+local position = nauvis.find_non_colliding_position('assembling-machine-2', {320, 320}, 64, 1)
+local machine = nauvis.create_entity{name = 'assembling-machine-2', position = position, force = '$GP_FORCE'}
+machine.set_recipe('iron-gear-wheel')
+machine.get_inventory(defines.inventory.assembling_machine_input).insert{name = 'iron-plate', count = 20}
+rcon.print(machine.unit_number)
+")"
+    unit="$fixture"
+    before="$(gp_state "$unit")"
+    reply="$(gp_recipe_call "$unit" '"copper-cable"')"
+    after="$(gp_state "$unit")"
+    gp_record error_semantics "set_recipe on another surface" "$before" "$reply" "$after"
+    assert_json "set_recipe on another surface reports wrong_surface" "$reply" \
+        '.success == false and .error_kind == "wrong_surface"'
+    gp_assert_unchanged "set_recipe on another surface leaves that machine untouched" "$before" "$after"
+    gp_lua "local e = gp_find($unit); if e then e.destroy() end rcon.print('ok')" >/dev/null
+
+    gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{3, 3}, {6, 6}}}) do if entity.type ~= 'character' then entity.destroy() end end
+surface.create_entity{name = 'iron-ore', position = {4.5, 4.5}, amount = 100}
+gp_char().teleport({0, 0})
+gp_char().get_main_inventory().clear()
+rcon.print('ok')
+" >/dev/null
+    reply="$(claude_call mine_at "$(jq -cn --arg agent "$GP_AGENT" '[$agent, 4.5, 4.5, 1, 0.5]')" 2>&1 || true)"
+    gp_record error_semantics "mine_at beyond resource reach" "$reply"
+    assert_json "out-of-reach mining reports a distance beyond the reported limit" "$reply" \
+        '.success == false and .error_kind == "out_of_reach" and .distance > .max_distance'
+
+    for remote in mine_at set_recipe evaluation_sample; do
+        case "$remote" in
+            mine_at) reply="$(claude_call mine_at '["gameplay-probe-missing", 1.5, 1.5, 1, 0.5]' 2>&1 || true)" ;;
+            set_recipe) reply="$(claude_call set_recipe '["gameplay-probe-missing", 1, "copper-cable"]' 2>&1 || true)" ;;
+            evaluation_sample) reply="$(claude_call evaluation_sample '["gameplay-probe-missing", 64]' 2>&1 || true)" ;;
+        esac
+        gp_record error_semantics "$remote missing agent" "$reply"
+        assert_json "$remote for a missing agent is a structured failure" "$reply" \
+            '.success == false and (.error | type) == "string"'
+    done
+}
+
+# ---- Row 5: measured affordances; assertions only for documented contracts ----
+gp_probe_affordances() {
+    local reply status_reply b_before b_after chest before after placed
+
+    gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{-8, -16}, {8, -2}}}) do if entity.type ~= 'character' then entity.destroy() end end
+for x = -6, 6 do surface.create_entity{name = 'stone-wall', position = {x + 0.5, -7.5}, force = '$GP_FORCE'} end
+gp_char().teleport({0.5, 0.5})
+gp_char('$GP_AGENT_B').get_main_inventory().clear()
+gp_char('$GP_AGENT_B').get_main_inventory().insert{name = 'coal', count = 7}
+rcon.print('ok')
+" >/dev/null
+    b_before="$(gp_lua "local b = gp_char('$GP_AGENT_B') rcon.print(helpers.table_to_json({unit = b.unit_number, x = b.position.x, y = b.position.y, coal = b.get_main_inventory().get_item_count('coal')}))")"
+    reply="$(claude_call set_walk_target "$(jq -cn --arg agent "$GP_AGENT" '[$agent, 0.5, -13.5, null]')" 2>&1 || true)"
+    local walk_id deadline=$((SECONDS + 25))
+    walk_id="$(jq -r '.walk_id // empty' <<<"$reply" 2>/dev/null || true)"
+    status_reply="$reply"
+    while (( SECONDS < deadline )); do
+        sleep 1
+        status_reply="$(claude_call get_walk_status "$(jq -cn --arg agent "$GP_AGENT" --argjson id "${walk_id:-null}" '[$agent, $id]')" 2>&1 || true)"
+        [[ "$(jq -r '.active' <<<"$status_reply" 2>/dev/null)" == false ]] && break
+    done
+    if [[ "$(jq -r '.active' <<<"$status_reply" 2>/dev/null)" == true ]]; then
+        claude_call clear_walk_target "$(jq -cn --arg agent "$GP_AGENT" --argjson id "${walk_id:-null}" '[$agent, $id]')" >/dev/null 2>&1 || true
+    fi
+    gp_record affordances "walk through wall" "$reply" "$status_reply"
+    gp_measure "straight walk into a wall: $(jq -c '{active, arrived, reason, final_position, remaining_distance}' <<<"$status_reply" 2>/dev/null || printf '%s' "$status_reply")"
+    assert_json "walk receipt through an obstacle is truthful about arrival" "$status_reply" \
+        '(.arrived == true and .remaining_distance <= .arrival_distance)
+         or (.arrived == false and .reason != "arrived")'
+
+    b_after="$(gp_lua "local b = gp_char('$GP_AGENT_B') rcon.print(helpers.table_to_json({unit = b.unit_number, x = b.position.x, y = b.position.y, coal = b.get_main_inventory().get_item_count('coal')}))")"
+    gp_record affordances "agent B before/after agent A walk" "$b_before" "$b_after"
+    if [[ -n "$b_before" && "$b_before" == "$b_after" ]]; then
+        pass "acting as one probe agent leaves the second agent's character and inventory untouched"
+    else
+        fail "acting as one probe agent leaves the second agent's character and inventory untouched" "before=$b_before after=$b_after"
+    fi
+    reply="$(claude_call character_inventory "$(jq -cn --arg agent "$GP_AGENT_B" '[$agent]')" 2>&1 || true)"
+    gp_record affordances "agent B inventory" "$reply"
+    assert_json "character_inventory is bound to the requested agent" "$reply" \
+        '[(.items // .inventory // [])[] | select(.name == "coal") | .count] | add == 7'
+    gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, wall in pairs(surface.find_entities_filtered{name = 'stone-wall'}) do wall.destroy() end
+gp_char().teleport({0, 0})
+rcon.print('ok')
+" >/dev/null
+
+    reply="$(gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+surface.request_to_generate_chunks({800, 800}, 0)
+surface.force_generate_chunk_requests()
+for _, entity in pairs(surface.find_entities_filtered{area = {{790, 790}, {810, 810}}}) do entity.destroy() end
+surface.create_entity{name = 'iron-chest', position = {800.5, 800.5}, force = 'neutral'}
+rcon.print(helpers.table_to_json({charted = game.forces['$GP_FORCE'].is_chunk_charted(surface, {25, 25})}))
+")"
+    local found
+    found="$(claude_call find_entities "$(jq -cn --arg agent "$GP_AGENT" '[796, 796, 804, 804, null, "iron-chest", $agent]')" 2>&1 || true)"
+    gp_record affordances "uncharted observation" "$reply" "$found"
+    gp_measure "find_entities in a chunk the probe force has not charted ($reply) returned $(jq -c '[.[]? | .name]' <<<"$found" 2>/dev/null || printf '%s' "$found")"
+
+    chest="$(gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{-6, -5}, {-3, -2}}}) do if entity.type ~= 'character' then entity.destroy() end end
+local chest = surface.create_entity{name = 'wooden-chest', position = {-4.5, -3.5}, force = 'player'}
+chest.get_inventory(defines.inventory.chest).insert{name = 'iron-plate', count = 10}
+gp_char().get_main_inventory().clear()
+rcon.print(chest.unit_number)
+")"
+    before="$(gp_state "$chest")"
+    reply="$(gp_transfer_call extract_items "$chest" 5)"
+    after="$(gp_state "$chest")"
+    gp_record affordances "extract from player-force chest" "$before" "$reply" "$after"
+    gp_measure "probe-force NPC extract_items from a player-force chest: $(jq -c '{success, error_kind, error, extracted}' <<<"$reply" 2>/dev/null || printf '%s' "$reply")"
+    gp_assert_conserved "foreign-force extraction conserves items whatever the policy" "$before" "$after" 'iron-plate|normal'
+
+    placed="$(gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{4, -8}, {9, -3}}}) do if entity.type ~= 'character' then entity.destroy() end end
+gp_char().teleport({0, 0})
+gp_char().get_main_inventory().clear()
+gp_char().get_main_inventory().insert{name = 'rail', count = 2}
+rcon.print('ok')
+")"
+    local rail_item rail_entity rails
+    rail_item="$(claude_call place_entity "$(jq -cn --arg agent "$GP_AGENT" '[$agent, "rail", 6, -5, 0]')" 2>&1 || true)"
+    rail_entity="$(claude_call place_entity "$(jq -cn --arg agent "$GP_AGENT" '[$agent, "straight-rail", 6, -5, 0]')" 2>&1 || true)"
+    rails="$(gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+rcon.print(helpers.table_to_json({entities = #surface.find_entities_filtered{area = {{3, -9}, {10, -2}}, type = {'straight-rail', 'curved-rail-a', 'curved-rail-b', 'half-diagonal-rail'}}, items = gp_char().get_main_inventory().get_item_count('rail')}))
+")"
+    gp_record affordances "item/entity name mismatch" "$placed" "$rail_item" "$rail_entity" "$rails"
+    gp_measure "place_entity with item name 'rail': $(jq -c '{success, error}' <<<"$rail_item" 2>/dev/null || printf '%s' "$rail_item"); with entity name 'straight-rail': $(jq -c '{success, error, name}' <<<"$rail_entity" 2>/dev/null || printf '%s' "$rail_entity"); world $rails"
+    assert_json "rail placement attempts conserve rail items and entities" "$rails" '(.entities + .items) == 2'
+}
+
+# ---- C2: evaluation_sample ----
+gp_probe_evaluation_sample() {
+    local fixture first second readback furnace idle idle_readback clamp_low clamp_high missing direct
+
+    fixture="$(gp_lua "
+local surface = game.surfaces['buddy-gameplay-probe']
+for _, entity in pairs(surface.find_entities_filtered{area = {{-12, 2}, {-2, 12}}}) do if entity.type ~= 'character' then entity.destroy() end end
+for _, entity in pairs(surface.find_entities_filtered{area = {{-12, -10}, {-6, -4}}}) do if entity.type ~= 'character' then entity.destroy() end end
+gp_char().teleport({0, 0})
+gp_char().get_main_inventory().clear()
+gp_char().get_main_inventory().insert{name = 'wood', count = 3}
+local furnace = surface.create_entity{name = 'stone-furnace', position = {-6, 6}, force = '$GP_FORCE'}
+furnace.get_inventory(defines.inventory.fuel).insert{name = 'coal', count = 10}
+furnace.get_inventory(defines.inventory.furnace_source).insert{name = 'iron-ore', count = 50}
+local lab = surface.create_entity{name = 'lab', position = {-8.5, -6.5}, force = '$GP_FORCE'}
+lab.get_inventory(defines.inventory.lab_input).insert{name = 'automation-science-pack', count = 5}
+local idle = surface.create_entity{name = 'stone-furnace', position = {-10, 6}, force = '$GP_FORCE'}
+idle.get_inventory(defines.inventory.fuel).insert{name = 'coal', count = 5}
+idle.get_inventory(defines.inventory.furnace_source).insert{name = 'iron-ore', count = 1}
+rcon.print(helpers.table_to_json({furnace = furnace.unit_number, idle = idle.unit_number, lab = lab.unit_number}))
+")"
+    furnace="$(jq -r '.furnace' <<<"$fixture" 2>/dev/null || true)"
+    idle="$(jq -r '.idle' <<<"$fixture" 2>/dev/null || true)"
+    gp_wait_ticks 240 || true
+    first="$(claude_call evaluation_sample "$(jq -cn --arg agent "$GP_AGENT" '[$agent, 64]')" 2>&1 || true)"
+    gp_wait_ticks 600 || true
+    second="$(claude_call evaluation_sample "$(jq -cn --arg agent "$GP_AGENT" '[$agent, 64]')" 2>&1 || true)"
+    readback="$(gp_lua "
+local furnace = gp_find($furnace)
+local stats = game.forces['$GP_FORCE'].get_item_production_statistics(game.surfaces['buddy-gameplay-probe'])
+rcon.print(helpers.table_to_json({tick = game.tick, products_finished = furnace.products_finished, iron_plate_input = stats.get_input_count('iron-plate')}))
+")"
+    idle_readback="$(gp_lua "
+local idle = gp_find($idle)
+local recipe = idle.get_recipe()
+local previous = idle.previous_recipe
+local previous_name = previous and (type(previous.name) == 'string' and previous.name or previous.name.name) or nil
+rcon.print(helpers.table_to_json({recipe = recipe and recipe.name or 'none', previous_recipe = previous_name or 'none', products_finished = idle.products_finished}))
+")"
+    gp_record evaluation_sample "idle furnace readback" "$idle_readback"
+    assert_json "idle furnace fixture smelted its ore and now has no current recipe" "$idle_readback" \
+        '.recipe == "none" and .previous_recipe == "iron-plate" and .products_finished == 1'
+    assert_json "evaluation_sample reports an idle furnace's last recipe only as previous_recipe" "$second" \
+        --argjson unit "${idle:-0}" \
+        '[.machines[] | select(.unit_number == $unit)][0] | .recipe == null and .previous_recipe == "iron-plate"'
+    gp_record evaluation_sample "samples" "$fixture" "$first" "$second" "$readback"
+    assert_json "evaluation_sample returns a read-only structured sample" "$first" \
+        '.success == true and (.tick | type) == "number" and .surface == "buddy-gameplay-probe"
+         and .connected_players == 0 and (.research.progress | type) == "number"
+         and (.research.researched_count | type) == "number" and (.research.current == null or (.research.current | type) == "string")'
+    assert_json "evaluation_sample reports the agent character and inventory" "$first" \
+        '.character.position.x == 0 and .character.position.y == 0 and .character.inventory.wood == 3'
+    assert_json "evaluation_sample reports the fueled furnace with recipe, fuel and counters" "$second" \
+        --argjson unit "${furnace:-0}" \
+        '[.machines[] | select(.unit_number == $unit)][0]
+         | .name == "stone-furnace" and .type == "furnace" and .recipe == "iron-plate"
+           and .fuel.coal > 0 and (.products_finished | type) == "number" and (.status | type) == "string"'
+    assert_json "furnace products_finished increases across samples 600 ticks apart" "$second" \
+        --argjson first "$first" --argjson unit "${furnace:-0}" \
+        '(.tick - $first.tick) >= 600
+         and ([.machines[] | select(.unit_number == $unit)][0].products_finished
+              > [$first.machines[] | select(.unit_number == $unit)][0].products_finished)'
+    assert_json "force item production counts the smelted plates" "$second" \
+        --argjson first "$first" \
+        '.force_item_production["iron-plate"].input_count > ($first.force_item_production["iron-plate"].input_count // 0)'
+    assert_json "evaluation_sample counters agree with an independent readback" "$readback" \
+        --argjson second "$second" --argjson unit "${furnace:-0}" \
+        '. as $raw
+         | [$second.machines[] | select(.unit_number == $unit)][0].products_finished as $sampled
+         | $raw.products_finished >= $sampled and ($raw.products_finished - $sampled) <= 3
+           and $raw.iron_plate_input >= $second.force_item_production["iron-plate"].input_count'
+    assert_json "evaluation_sample reports labs and entity counts" "$second" \
+        '([.labs[] | select(.inventory["automation-science-pack"] == 5)] | length) == 1
+         and .entity_counts["stone-furnace"] >= 1 and .entity_counts.lab >= 1'
+
+    clamp_low="$(claude_call evaluation_sample "$(jq -cn --arg agent "$GP_AGENT" '[$agent, 1]')" 2>&1 || true)"
+    clamp_high="$(claude_call evaluation_sample "$(jq -cn --arg agent "$GP_AGENT" '[$agent, 100000]')" 2>&1 || true)"
+    missing="$(claude_call evaluation_sample '["gameplay-probe-missing", null]' 2>&1 || true)"
+    direct="$(gp_lua "rcon.print(remote.call('claude_interface', 'evaluation_sample', '$GP_AGENT', nil))")"
+    gp_record evaluation_sample "radius clamps, missing agent, direct remote" "$clamp_low" "$clamp_high" "$missing" "$direct"
+    assert_json "evaluation_sample clamps small radii to 16" "$clamp_low" '.success == true and .radius == 16'
+    assert_json "evaluation_sample clamps large radii to 512" "$clamp_high" '.success == true and .radius == 512'
+    assert_json "evaluation_sample for a missing agent is a structured error" "$missing" \
+        '.success == false and .error_kind == "no_character" and (.error | type) == "string"'
+    assert_json "evaluation_sample is callable as a direct remote with the default radius" "$direct" \
+        '.success == true and .radius == 128'
+}
+
+# ---- Row 4 and hang probes: run last because unfixed code can stop the server ----
+gp_probe_liveness_walk() {
+    local args reply status_reply
+    for args in '"abc", 0' 'null, 0' '0, null' '1e999, 0' '-1e999, 0'; do
+        reply="$(claude_dispatch "/claude {\"fn\":\"set_walk_target\",\"args\":[\"$GP_AGENT\", $args, null],\"n\":4}" 2>&1 || true)"
+        gp_record liveness "set_walk_target $args" "$reply"
+        assert_json "set_walk_target rejects malformed coordinates ($args)" "$reply" \
+            '.success == false and (.error_kind == "invalid_walk_target" or .error_kind == "bad_request")'
+        gp_require_alive "set_walk_target($args)" || return 0
+        status_reply="$(claude_call get_walk_status "$(jq -cn --arg agent "$GP_AGENT" '[$agent, null]')" 2>&1 || true)"
+        assert_json "malformed set_walk_target stores no walk state ($args)" "$status_reply" '.active == false'
+    done
+}
+
+gp_probe_liveness_dispatch() {
+    local request reply name
+    for request in \
+        '{"fn":"get_tick","args":[],"n":1000000000}' \
+        '{"fn":"get_tick","args":[],"n":"many"}' \
+        '{"fn":"get_tick","args":[],"n":-1}' \
+        '{"fn":"get_tick","args":{"a":1}}' \
+        '[1,2,3]'; do
+        reply="$(claude_dispatch "/claude $request" 2>&1 || true)"
+        gp_record liveness "dispatch $request" "$reply"
+        assert_json "malformed dispatcher envelope gets a structured reply ($request)" "$reply" \
+            '(.success == false and (.error_kind | type) == "string") or (.tick | type) == "number"'
+        gp_require_alive "dispatcher envelope $request" || return 0
+    done
+    for name in get_character has_walk_target connected_player_count ensure_surface live_state_line get_character_pos; do
+        case "$name" in
+            ensure_surface) request='["buddy-gameplay-probe"]' ;;
+            connected_player_count) request='[]' ;;
+            *) request="$(jq -cn --arg agent "$GP_AGENT" '[$agent]')" ;;
+        esac
+        reply="$(claude_call "$name" "$request" 2>&1 || true)"
+        gp_record liveness "dispatch non-string remote $name" "$reply"
+        gp_measure "/claude $name replied: $reply"
+        gp_require_alive "dispatching $name, whose remote returns a non-JSON Lua value" || return 0
+    done
+    reply="$(claude_call get_character "$(jq -cn --arg agent "$GP_AGENT" '[$agent]')" 2>&1 || true)"
+    assert_json "an unserializable remote result is a structured dispatcher error" "$reply" \
+        '.success == false and .error_kind == "unserializable_result"'
+    reply="$(claude_call has_walk_target "$(jq -cn --arg agent "$GP_AGENT" '[$agent]')" 2>&1 || true)"
+    assert_json "boolean remote results keep their wire type" "$reply" 'type == "boolean"'
+    reply="$(claude_call connected_player_count '[]' 2>&1 || true)"
+    assert_json "numeric remote results keep their wire type" "$reply" '. == 0'
+}
+
+gp_probe_liveness_mine() {
+    local before reply after started elapsed
+    gp_mine_fixture full
+    gp_lua "game.surfaces['buddy-gameplay-probe'].spill_item_stack{position = {1.5, 1.5}, stack = {name = 'iron-ore', count = 1}} rcon.print('ok')" >/dev/null
+    before="$(gp_state)"
+    started=$SECONDS
+    reply="$(CLAUDE_DISPATCH_TIMEOUT=20 claude_dispatch "/claude {\"fn\":\"mine_at\",\"args\":[\"$GP_AGENT\",1.5,1.5,1e308,0.5],\"n\":5}" 2>&1 || true)"
+    elapsed=$((SECONDS - started))
+    gp_record liveness "mine_at count 1e308 with full inventory and loose ore (${elapsed}s)" "$reply"
+    assert_json "mine_at rejects an unbounded count immediately" "$reply" \
+        '.success == false and .error_kind == "count_exceeds_limit"'
+    gp_require_alive "mine_at with count 1e308" || return 0
+    reply="$(gp_mine_call 1000)"
+    after="$(gp_state)"
+    gp_record liveness "mine_at count 1000 with full inventory and loose ore" "$before" "$reply" "$after"
+    assert_json "full-inventory pickup stops instead of spinning" "$reply" \
+        '.success == false and .error_kind == "inventory_full"'
+    gp_assert_unchanged "full-inventory pickup leaves the loose ore and resource untouched" "$before" "$after"
+}
+
+run_gameplay_probes() {
+    printf '\n=== gameplay correctness probes ===\n'
+    if ! command -v python3 >/dev/null 2>&1; then
+        fail "gameplay probes require python3 for direct /claude dispatcher calls"
+        return 0
+    fi
+    gp_setup || return 0
+    local section
+    for section in ${GAMEPLAY_PROBES:-$GP_SECTIONS_DEFAULT}; do
+        if (( ! GP_SERVER_ALIVE )); then
+            fail "gameplay probe $section skipped" "the isolated server stopped responding in an earlier probe"
+            continue
+        fi
+        printf '\n--- gameplay probe: %s ---\n' "$section"
+        "gp_probe_$section"
+    done
+}
+
 printf '=== live Factorio safety regressions ===\n'
 
 if [[ ! -x "$CLI_BIN" || ! -x "$MCP_BIN" ]]; then
@@ -247,6 +1347,15 @@ if ! "${CLI[@]}" get tick >/dev/null 2>&1; then
     exit 1
 fi
 enable_raw_lua_for_fixtures
+
+if [[ "${LIVE_ONLY:-}" == "gameplay-probes" ]]; then
+    run_gameplay_probes
+    printf '\n=== live regression summary ===\n'
+    printf '  Passed: %d\n' "$PASSED"
+    printf '  Failed: %d\n' "$FAILED"
+    (( FAILED == 0 )) || exit 1
+    exit 0
+fi
 
 # Build a clean test surface and an independent NPC. Raw Lua is fixture setup;
 # the lifecycle behavior under test goes through the shipped mod remote.
@@ -1042,7 +2151,11 @@ require_json "cold coal dry-run leaves the disposable world untouched" "$COLD_CO
      and .character_inserters == 1'
 
 COLD_COAL_EXEC_ARGS="$(jq -c '.dry_run = false' <<<"$COLD_COAL_ARGS")"
-COLD_COAL_EXEC="$(mcp_tool repair_fuel_sustainability "$COLD_COAL_EXEC_ARGS")"
+# Measured at ~23 s at game speed 1: ~13 s real-time character walk from the
+# collision fixture (~85 tiles) to the drill, up to 840 ticks of delivery
+# observation, and a 180-tick production window. 90 s bounds that worst case
+# with margin; the default 20 s aborted this correct call.
+COLD_COAL_EXEC="$(mcp_tool repair_fuel_sustainability "$COLD_COAL_EXEC_ARGS" 90)"
 COLD_COAL_EXEC_PAYLOAD="$(tool_payload "$COLD_COAL_EXEC")"
 assert_json "cold coal repair executes through one high-level controller call" "$COLD_COAL_EXEC" \
     '(.result.isError // false) == false'
@@ -2392,20 +3505,20 @@ TOOLS="$(mcp_send tools/list '{}')"
 EXPECTED_TOOLS="$(printf '%s\n' \
     analyze_inserters analyze_item_flow bootstrap_burner_once bootstrap_smelting_once \
     build_assembler_feed build_assembler_output build_automation_science \
-    build_lab_feed build_recipe_assembler_cell collect_from_chest configure_inserter craft diagnose_factory_blockers \
+    build_lab_feed build_layout build_recipe_assembler_cell build_steam_power collect_from_chest configure_inserter craft diagnose_factory_blockers \
     diagnose_steam_power execute_direct_smelter execute_edge_miner \
     execute_entity_placement_near extend_power_to feed_lab_from_inventory file_issue \
     find_nearest_resource \
     get_available_research get_belt_lane_contents get_entities get_entity_inventory \
     get_machine_belt_positions get_power_status get_recipe get_recipes_for_item \
-    get_research_status mine_at place_entity plan_automation_science \
+    get_research_status launch_rocket mine_at place_entity plan_automation_science \
     plan_machine_output plan_recipe_assembler_cell plan_steam_power \
-    production_statistics remove_entity render_map repair_fuel_sustainability \
+    production_statistics refuel_burners remove_entity render_map repair_fuel_sustainability \
     rotate_entity route_belt set_recipe situation_report start_research unstuck \
     verify_production wait_for_crafting walk_to | jq -Rsc 'split("\n")[:-1] | sort')"
-assert_json "model receives the exact 49-tool gameplay surface" "$TOOLS" \
+assert_json "model receives the exact gameplay tool surface" "$TOOLS" \
     --argjson expected "$EXPECTED_TOOLS" \
-    '([.result.tools[].name] | sort) == $expected and (.result.tools | length) == 49'
+    '([.result.tools[].name] | sort) == $expected'
 TOOLS_SCHEMA_BYTES="$(jq -c '.result.tools' <<<"$TOOLS" | wc -c)"
 if (( TOOLS_SCHEMA_BYTES <= 61440 )); then
     pass "model tool schema stays below 60 KiB"
@@ -5087,6 +6200,9 @@ local placed = helpers.json_to_table(remote.call(
 ))
 local assembler = placed.unit_number and s.find_entity('assembling-machine-1', {50.5, 20.5}) or nil
 if not assembler then error('failed to create registered assembler fixture') end
+-- A machine can only hold a recipe its force has unlocked in normal play;
+-- Space Age starts copper-cable locked behind a trigger technology.
+c.force.recipes['copper-cable'].enabled = true
 assembler.set_recipe('copper-cable')
 c.teleport({50.5, 16.5})
 rcon.print(helpers.table_to_json({unit_number = assembler.unit_number}))
@@ -5234,7 +6350,7 @@ assert_json "bootstrap collection honors output_count independently of source_co
      and .furnace.unit_number == $unit
      and ((.actions | map(select(.operation == "collect_furnace_output")) | first) as $collect
         | $collect.requested_count == 39
-          and $collect.result == 39
+          and $collect.result.extracted == 39 and $collect.result.spilled == 0
           and $collect.success == true)'
 
 BANKED_FURNACE_WORLD="$(raw_lua "
@@ -5325,14 +6441,14 @@ assert_json "entity inventory inspection discovers mixed contents without guesse
 
 OVER_CAP_FUEL="$(mcp_tool bootstrap_burner_once "$(jq -cn \
     --argjson unit "$BOOTSTRAP_DRILL_UNIT" \
-    '{unit_number:$unit, fuel_item:"coal", count:11}')")"
+    '{unit_number:$unit, fuel_item:"coal", count:51}')")"
 OVER_CAP_FUEL_PAYLOAD="$(tool_payload "$OVER_CAP_FUEL")"
 assert_json "burner bootstrap rejects fuel requests above its hard cap" "$OVER_CAP_FUEL" \
     '.result.isError == true'
 assert_json "over-cap burner rejection is structured" "$OVER_CAP_FUEL_PAYLOAD" \
     '.success == false
      and .error_kind == "count_exceeds_limit"
-     and .maximum_count == 10'
+     and .maximum_count == 50'
 OVER_CAP_FUEL_WORLD="$(raw_lua "
 local s = game.surfaces['buddy-live-regression']
 local drill
@@ -6091,6 +7207,472 @@ else
     fail "one MCP process reuses one RCON connection" \
         "observed $RCON_DELTA new connections for one MCP session"
 fi
+
+# === McpServer: chat ingress, mutation serialization, per-unit production ===
+# Fixture setup and independent readback use trusted raw Lua; every behavior
+# under test goes through the model-facing MCP server in a fresh process.
+stop_mcp
+start_mcp
+
+mcps_send_call() {
+    jq -cn --argjson id "$1" --arg name "$2" --argjson arguments "$3" \
+        '{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:$name, arguments:$arguments}}' \
+        >&"$MCP_IN_FD"
+}
+
+# Print the responses for the given ids in the order the server sent them.
+mcps_collect() {
+    local -a remaining=("$@")
+    local line id index
+    while (( ${#remaining[@]} > 0 )); do
+        if ! IFS= read -r -t 90 -u "$MCP_OUT_FD" line; then
+            printf 'ERROR: missing MCP responses for ids %s\n' "${remaining[*]}" >&2
+            return 1
+        fi
+        id="$(jq -r '.id // empty' <<<"$line" 2>/dev/null || true)"
+        for index in "${!remaining[@]}"; do
+            if [[ "${remaining[$index]}" == "$id" ]]; then
+                printf '%s\n' "$line"
+                unset 'remaining[index]'
+            fi
+        done
+        remaining=("${remaining[@]}")
+    done
+}
+
+# Console chat reaches Buddy once, through the mod JSONL inbox only; MCP tool
+# results never carry chat text.
+MCPS_CHAT_TOKEN="mcp-server-chat-$BASHPID-$RANDOM"
+send_console_chat "$MCPS_CHAT_TOKEN"
+MCPS_CHAT_COUNT=0
+for _ in $(seq 1 20); do
+    MCPS_CHAT_COUNT="$(grep -cF "\"message\":\"$MCPS_CHAT_TOKEN\"" "$SCRIPT_OUTPUT/claude-chat/input.jsonl" 2>/dev/null || true)"
+    (( MCPS_CHAT_COUNT > 0 )) && break
+    sleep 0.1
+done
+sleep 0.5
+MCPS_CHAT_COUNT="$(grep -cF "\"message\":\"$MCPS_CHAT_TOKEN\"" "$SCRIPT_OUTPUT/claude-chat/input.jsonl" 2>/dev/null || true)"
+if [[ "$MCPS_CHAT_COUNT" == "1" ]]; then
+    pass "console chat reaches the Buddy JSONL inbox exactly once"
+else
+    fail "console chat reaches the Buddy JSONL inbox exactly once" "observed $MCPS_CHAT_COUNT records"
+fi
+MCPS_AFTER_CHAT="$(mcp_tool get_research_status '{}')"
+assert_json "MCP tool results never append player chat" "$MCPS_AFTER_CHAT" \
+    --arg token "$MCPS_CHAT_TOKEN" \
+    '(.result.content[0].text | contains($token) | not)
+     and (.result.content[0].text | contains("Player Messages") | not)'
+
+MCPS_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+s.request_to_generate_chunks({-600, 600}, 2)
+s.force_generate_chunk_requests()
+local area = {{-650, 585}, {-549, 616}}
+local tiles = {}
+for x = -650, -550 do
+    for y = 585, 615 do
+        tiles[#tiles + 1] = {name = 'landfill', position = {x, y}}
+    end
+end
+s.set_tiles(tiles, true)
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+for _, e in pairs(s.find_entities_filtered{area = area}) do
+    if e ~= c then e.destroy() end
+end
+for x = -602, -601 do
+    for y = 607, 608 do
+        s.create_entity{name = 'iron-ore', position = {x + 0.5, y + 0.5}, amount = 100000}
+    end
+end
+c.teleport({-600.5, 600.5}, s)
+c.get_main_inventory().insert{name = 'wooden-chest', count = 1}
+local function furnace(x, fuel)
+    local f = s.create_entity{name = 'stone-furnace', position = {x, 606}, force = c.force}
+    f.get_inventory(defines.inventory.furnace_source).insert{name = 'iron-ore', count = 50}
+    if fuel > 0 then f.get_fuel_inventory().insert{name = 'coal', count = fuel} end
+    return f
+end
+local progressing = furnace(-612, 20)
+local stalled = furnace(-608, 0)
+local transient = furnace(-630, 20)
+local drill = s.create_entity{name = 'burner-mining-drill', position = {-601, 608}, force = c.force}
+drill.get_fuel_inventory().insert{name = 'coal', count = 20}
+rcon.print(helpers.table_to_json({
+    progressing = progressing.unit_number,
+    stalled = stalled.unit_number,
+    transient = transient.unit_number,
+    drill = drill.unit_number,
+}))
+")"
+require_json "McpServer fixture creates three furnaces and one drill" "$MCPS_FIXTURE" \
+    '([.progressing, .stalled, .transient, .drill] | map(type) | unique) == ["number"]'
+MCPS_PROGRESSING="$(jq '.progressing' <<<"$MCPS_FIXTURE")"
+MCPS_STALLED="$(jq '.stalled' <<<"$MCPS_FIXTURE")"
+MCPS_TRANSIENT="$(jq '.transient' <<<"$MCPS_FIXTURE")"
+MCPS_DRILL="$(jq '.drill' <<<"$MCPS_FIXTURE")"
+sleep 0.5
+
+# Furnace A finishes a plate inside the 60-tick window beside stalled B: the
+# area verdict may pass, but A's progress never proves B.
+raw_lua "
+for _, e in pairs(game.surfaces['buddy-live-regression'].find_entities_filtered{name = 'stone-furnace', area = {{-640, 600}, {-600, 612}}}) do
+    if e.unit_number == $MCPS_PROGRESSING then
+        local recipe = e.get_recipe() or prototypes.recipe['iron-plate']
+        local ticks = recipe.energy * 60 / e.crafting_speed
+        e.crafting_progress = 1 - 25 / ticks
+    end
+end
+" >/dev/null
+MCPS_STALLED_VERIFY="$(mcp_tool verify_production "{\"x\":-610,\"y\":606,\"radius\":6,\"unit_number\":$MCPS_STALLED}")"
+assert_json "verify_production never proves a stalled unit with a neighbor's progress" \
+    "$(tool_payload "$MCPS_STALLED_VERIFY")" \
+    --argjson a "$MCPS_PROGRESSING" --argjson b "$MCPS_STALLED" \
+    '.success == false
+     and .success_scope == "target_unit"
+     and .proof == "target_not_producing"
+     and .target.unit_number == $b
+     and .target.currently_working == false
+     and .target.sustained_progress == false
+     and (.progressed_units | index($a)) != null
+     and any(.units[]; .unit_number == $a and .sustained_progress == true and .benchmark_grade == true)'
+MCPS_AREA_VERIFY="$(mcp_tool verify_production '{"x":-610,"y":606,"radius":6}')"
+assert_json "area verify_production reports its any-producer scope" "$(tool_payload "$MCPS_AREA_VERIFY")" \
+    --argjson a "$MCPS_PROGRESSING" \
+    '.success == true
+     and .success_scope == "any_producer_in_area"
+     and (.working_units | index($a)) != null'
+
+# Furnace B works at the first sample and is stopped before the second:
+# currently_working reflects only the final sample and nothing finished.
+raw_lua "
+for _, e in pairs(game.surfaces['buddy-live-regression'].find_entities_filtered{name = 'stone-furnace', area = {{-640, 600}, {-600, 612}}}) do
+    if e.unit_number == $MCPS_TRANSIENT then e.crafting_progress = 0 end
+end
+" >/dev/null
+MCPS_TRANSIENT_ID="$MCP_NEXT_ID"
+MCP_NEXT_ID=$((MCP_NEXT_ID + 1))
+mcps_send_call "$MCPS_TRANSIENT_ID" verify_production \
+    "{\"x\":-630,\"y\":606,\"radius\":3,\"unit_number\":$MCPS_TRANSIENT}"
+sleep 0.4
+raw_lua "
+for _, e in pairs(game.surfaces['buddy-live-regression'].find_entities_filtered{name = 'stone-furnace', area = {{-640, 600}, {-600, 612}}}) do
+    if e.unit_number == $MCPS_TRANSIENT then
+        e.get_fuel_inventory().clear()
+        e.get_inventory(defines.inventory.furnace_source).clear()
+        e.burner.currently_burning = nil
+        e.burner.remaining_burning_fuel = 0
+        e.crafting_progress = 0
+        e.burner.heat = 0
+    end
+end
+" >/dev/null
+MCPS_TRANSIENT_VERIFY="$(mcp_read_id "$MCPS_TRANSIENT_ID")"
+assert_json "a transiently working unit is current status only, not sustained progress" \
+    "$(tool_payload "$MCPS_TRANSIENT_VERIFY")" \
+    --argjson b "$MCPS_TRANSIENT" \
+    '.success == false
+     and .proof == "target_not_producing"
+     and .target.unit_number == $b
+     and .target.status_before == "working"
+     and .target.currently_working == false
+     and .target.sustained_progress == false
+     and .target.benchmark_grade == false'
+
+MCPS_DRILL_VERIFY="$(mcp_tool verify_production "{\"x\":-601,\"y\":608,\"radius\":3,\"unit_number\":$MCPS_DRILL}")"
+assert_json "a working drill keeps explicit status-only evidence that is not benchmark-grade" \
+    "$(tool_payload "$MCPS_DRILL_VERIFY")" \
+    --argjson d "$MCPS_DRILL" \
+    '.success == true
+     and .proof == "currently_working"
+     and .target.unit_number == $d
+     and .target.evidence == "status_only"
+     and .target.sustained_progress == null
+     and .target.benchmark_grade == false'
+
+# Overlapping requests in one MCP process: a 30-tile walk (A), a placement
+# that is only within reach of A's destination (B), and an observation (C).
+# Interleaved, B is evaluated mid-walk and rejected as out of reach; serialized,
+# B runs after A arrives. The observation is not blocked by either mutation.
+MCPS_WALK_ID="$MCP_NEXT_ID"
+MCPS_PLACE_ID=$((MCP_NEXT_ID + 1))
+MCPS_OBSERVE_ID=$((MCP_NEXT_ID + 2))
+MCP_NEXT_ID=$((MCP_NEXT_ID + 3))
+mcps_send_call "$MCPS_WALK_ID" walk_to '{"x":-570.5,"y":600.5}'
+sleep 0.2
+mcps_send_call "$MCPS_PLACE_ID" place_entity \
+    '{"entity_name":"wooden-chest","x":-566.5,"y":600.5,"direction":"north"}'
+sleep 0.1
+mcps_send_call "$MCPS_OBSERVE_ID" get_entities '{"x":-610,"y":606,"radius":12}'
+# Collect in this shell: bash does not pass coprocess descriptors to pipeline
+# subshells.
+MCPS_OVERLAP_FILE="$(mktemp)"
+mcps_collect "$MCPS_WALK_ID" "$MCPS_PLACE_ID" "$MCPS_OBSERVE_ID" >"$MCPS_OVERLAP_FILE" || true
+MCPS_OVERLAP="$(jq -sc '.' "$MCPS_OVERLAP_FILE")"
+rm -f "$MCPS_OVERLAP_FILE"
+assert_json "overlapping mutations are serialized while observations stay concurrent" "$MCPS_OVERLAP" \
+    --argjson walk "$MCPS_WALK_ID" --argjson place "$MCPS_PLACE_ID" --argjson observe "$MCPS_OBSERVE_ID" \
+    '(map(.id)) as $order
+     | ($order | index($observe)) < ($order | index($walk))
+       and ($order | index($walk)) < ($order | index($place))
+       and all(.[]; (.result.isError // false) == false)'
+assert_json "the serialized walk arrives before the placement is evaluated" "$MCPS_OVERLAP" \
+    --argjson walk "$MCPS_WALK_ID" \
+    '(.[] | select(.id == $walk) | .result.content[0].text | fromjson) as $w
+     | $w.arrived == true'
+MCPS_OVERLAP_WORLD="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+rcon.print(helpers.table_to_json({
+    chests = s.count_entities_filtered{name = 'wooden-chest', position = {-566.5, 600.5}, radius = 0.2},
+    carried = c.get_main_inventory().get_item_count('wooden-chest'),
+    walking = remote.call('claude_interface', 'has_walk_target', '$AGENT_ID'),
+}))
+")"
+assert_json "serialized placement leaves exactly the requested chest" "$MCPS_OVERLAP_WORLD" \
+    '.chests == 1 and .carried == 0 and .walking == false'
+run_gameplay_probes
+
+# build_steam_power: a crafting failure (no wood for poles) must leave the
+# world unchanged, and with wood the same call crafts, places and fuels a
+# plant whose engine joins an electric network. Recipes are enabled directly
+# (lab fixture only) and restored afterwards.
+SP_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+for _, e in pairs(s.find_entities_filtered{area = {{870, 870}, {950, 930}}}) do
+    if e.type ~= 'character' then e.destroy() end
+end
+local tiles = {}
+for x = 870, 950 do for y = 870, 930 do
+    tiles[#tiles + 1] = {name = (x < 890) and 'water' or 'grass-1', position = {x, y}}
+end end
+s.set_tiles(tiles)
+local f = game.forces.player
+storage.sp_recipes = {}
+for _, r in pairs({'pipe', 'offshore-pump', 'boiler', 'steam-engine', 'small-electric-pole', 'copper-cable', 'electronic-circuit'}) do
+    storage.sp_recipes[r] = f.recipes[r].enabled
+    f.recipes[r].enabled = true
+end
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+c.teleport({900.5, 900.5}, s)
+local inv = c.get_main_inventory()
+inv.clear()
+inv.insert{name = 'iron-plate', count = 100}
+inv.insert{name = 'copper-plate', count = 30}
+inv.insert{name = 'stone', count = 10}
+inv.insert{name = 'coal', count = 30}
+rcon.print(helpers.table_to_json({ok = true}))
+")"
+require_json "steam power fixture has water and materials" "$SP_FIXTURE" '.ok == true'
+sp_world() {
+    raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local area = {{870, 870}, {950, 930}}
+local boiler = s.find_entities_filtered{area = area, name = 'boiler'}[1]
+local engine = s.find_entities_filtered{area = area, name = 'steam-engine'}[1]
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+rcon.print(helpers.table_to_json({
+    pumps = s.count_entities_filtered{area = area, name = 'offshore-pump'},
+    boilers = s.count_entities_filtered{area = area, name = 'boiler'},
+    engines = s.count_entities_filtered{area = area, name = 'steam-engine'},
+    poles = s.count_entities_filtered{area = area, name = 'small-electric-pole'},
+    boiler_coal = boiler and boiler.get_fuel_inventory().get_item_count('coal') or -1,
+    engine_networked = engine ~= nil and engine.electric_network_id ~= nil,
+    carried_coal = c.get_main_inventory().get_item_count('coal'),
+}))
+"
+}
+SP_ARGS='{"target_x":920,"target_y":900,"water_x1":880,"water_y1":880,"water_x2":889,"water_y2":920}'
+SP_NO_WOOD="$(tool_payload "$(mcp_tool build_steam_power "$SP_ARGS")")"
+assert_json "steam power without wood fails before placing anything" "$SP_NO_WOOD" \
+    '.success == false and .error_kind == "craft_failed" and .item == "small-electric-pole"'
+assert_json "a steam power crafting failure leaves the world unchanged" "$(sp_world)" \
+    '.pumps == 0 and .boilers == 0 and .engines == 0 and .poles == 0 and .carried_coal == 30'
+raw_lua "remote.call('claude_interface', 'get_character', '$AGENT_ID').get_main_inventory().insert{name = 'wood', count = 10}" >/dev/null
+SP_CRAFTED="$(tool_payload "$(mcp_tool build_steam_power "$SP_ARGS")")"
+assert_json "steam power crafts only what is still missing, then stops before placing" "$SP_CRAFTED" \
+    '.success == true and .phase == "crafted" and ([.crafted[].item] == ["small-electric-pole"])'
+assert_json "the crafting call placed nothing" "$(sp_world)" '.pumps == 0 and .boilers == 0 and .engines == 0 and .poles == 0'
+SP_BUILT="$(tool_payload "$(mcp_tool build_steam_power "$SP_ARGS")")"
+assert_json "with every part in hand the next call places and fuels the plant" "$SP_BUILT" \
+    '.success == true and .phase == "placed" and .boiler_fueled == true and (.crafted | length) == 0'
+assert_json "the built plant is fuelled from inventory and its engine is networked" "$(sp_world)" \
+    '.pumps == 1 and .boilers == 1 and .engines == 1 and .poles > 0
+     and .boiler_coal > 0 and .boiler_coal <= 20 and .carried_coal == 10 and .engine_networked == true'
+raw_lua "local f = game.forces.player for r, enabled in pairs(storage.sp_recipes) do f.recipes[r].enabled = enabled end storage.sp_recipes = nil" >/dev/null
+
+# Hand fuelling covers burner furnaces (and boilers) but never an electric
+# furnace, and furnace output can be collected. Every transfer is checked
+# against the world, not the reply.
+BF_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local stone = s.create_entity{name = 'stone-furnace', position = {935, 925}, force = 'player'}
+local electric = s.create_entity{name = 'electric-furnace', position = {940.5, 925.5}, force = 'player'}
+stone.get_inventory(defines.inventory.furnace_result).insert{name = 'iron-plate', count = 5}
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+c.teleport({937.5, 928.5}, s)
+local inv = c.get_main_inventory()
+inv.remove{name = 'coal', count = inv.get_item_count('coal')}
+inv.remove{name = 'iron-plate', count = inv.get_item_count('iron-plate')}
+inv.insert{name = 'coal', count = 20}
+rcon.print(helpers.table_to_json({stone = stone.unit_number, electric = electric.unit_number}))
+")"
+require_json "burner/electric furnace fixture exists" "$BF_FIXTURE" '(.stone | type) == "number" and (.electric | type) == "number"'
+BF_STONE="$(jq -r '.stone' <<<"$BF_FIXTURE")"
+BF_ELECTRIC="$(jq -r '.electric' <<<"$BF_FIXTURE")"
+bf_world() {
+    raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local stone = s.find_entities_filtered{name = 'stone-furnace', position = {935, 925}, radius = 0.6}[1]
+local electric = s.find_entities_filtered{name = 'electric-furnace', position = {940.5, 925.5}, radius = 0.6}[1]
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local inv = c.get_main_inventory()
+rcon.print(helpers.table_to_json({
+    stone_coal = stone.get_fuel_inventory().get_item_count('coal'),
+    stone_plates = stone.get_inventory(defines.inventory.furnace_result).get_item_count('iron-plate'),
+    electric_valid = electric ~= nil and electric.valid,
+    carried_coal = inv.get_item_count('coal'),
+    carried_plates = inv.get_item_count('iron-plate'),
+}))
+"
+}
+assert_json "an electric furnace is refused as a burner target" \
+    "$(tool_payload "$(mcp_tool bootstrap_burner_once "{\"unit_number\":$BF_ELECTRIC,\"fuel_item\":\"coal\",\"count\":5}")")" \
+    '.success == false and .error_kind == "wrong_entity_type"'
+assert_json "the refused fuel stays with the character" "$(bf_world)" '.carried_coal == 20 and .electric_valid == true'
+assert_json "a stone furnace accepts a bounded fuel buffer" \
+    "$(tool_payload "$(mcp_tool bootstrap_burner_once "{\"unit_number\":$BF_STONE,\"fuel_item\":\"coal\",\"count\":15}")")" \
+    '.success == true and .inserted == 15'
+assert_json "furnace fuel moved exactly from the character" "$(bf_world)" '.stone_coal == 15 and .carried_coal == 5'
+assert_json "furnace output is collected up to what it holds" \
+    "$(tool_payload "$(mcp_tool collect_from_chest "{\"unit_number\":$BF_STONE,\"item\":\"iron-plate\",\"count\":50}")")" \
+    '.success == true'
+assert_json "collected plates left the furnace and reached the character" "$(bf_world)" '.stone_plates == 0 and .carried_plates == 5'
+
+# refuel_burners tops up every burner in the area from inventory, nearest
+# first; fuel moves exactly and nothing is placed or removed.
+RB_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+for _, p in pairs({{960, 900}, {962, 900}, {964, 900}}) do
+    s.create_entity{name = 'stone-furnace', position = p, force = 'player'}
+end
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+c.teleport({962.5, 903.5}, s)
+local inv = c.get_main_inventory()
+inv.remove{name = 'coal', count = inv.get_item_count('coal')}
+inv.insert{name = 'coal', count = 25}
+rcon.print(helpers.table_to_json({ok = true}))
+")"
+require_json "refuel fixture exists" "$RB_FIXTURE" '.ok == true'
+rb_world() {
+    raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local total = 0
+for _, f in pairs(s.find_entities_filtered{name = 'stone-furnace', area = {{959, 899}, {965, 901}}}) do
+    total = total + f.get_fuel_inventory().get_item_count('coal')
+end
+rcon.print(helpers.table_to_json({furnaces = s.count_entities_filtered{name = 'stone-furnace', area = {{959, 899}, {965, 901}}},
+    furnace_coal = total, carried = remote.call('claude_interface', 'get_character', '$AGENT_ID').get_main_inventory().get_item_count('coal')}))
+"
+}
+assert_json "refuel_burners stops when the inventory runs out" \
+    "$(tool_payload "$(mcp_tool refuel_burners '{"x":962,"y":900,"radius":4,"target":10}')")" \
+    '.stop_reason == "out_of_fuel" and (.fueled | length) == 3 and (.failed | length) == 0'
+assert_json "refuel fuel is conserved and nothing was placed or removed" "$(rb_world)" \
+    '.furnaces == 3 and .furnace_coal == 25 and .carried == 0'
+
+# launch_rocket refuses a silo without a ready rocket, launches a ready one,
+# and the force's launch counter rises when the flight ends. Space Age silos
+# never launch on their own, so this is the only way the agent can launch.
+LR_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local silo = s.create_entity{name = 'rocket-silo', position = {1000.5, 900.5}, force = 'player'}
+s.create_entity{name = 'electric-energy-interface', position = {1008, 900}, force = 'player'}
+s.create_entity{name = 'substation', position = {1006, 900}, force = 'player'}
+rcon.print(helpers.table_to_json({ok = silo ~= nil and silo.valid, unit = silo and silo.unit_number,
+    launched = game.forces.player.rockets_launched}))
+")"
+require_json "rocket silo fixture exists" "$LR_FIXTURE" '.ok == true'
+LR_UNIT="$(jq -r '.unit' <<<"$LR_FIXTURE")"
+LR_BEFORE="$(jq -r '.launched' <<<"$LR_FIXTURE")"
+assert_json "launch_rocket refuses a silo whose rocket is not built" \
+    "$(tool_payload "$(mcp_tool launch_rocket "{\"unit_number\":$LR_UNIT}")")" \
+    --argjson unit "$LR_UNIT" \
+    '.success == false and .error_kind == "rocket_not_ready" and any(.silos[]; .unit_number == $unit and .rocket_parts == 0)'
+raw_lua "local silo = game.surfaces['buddy-live-regression'].find_entities_filtered{name = 'rocket-silo', position = {1000.5, 900.5}}[1]; silo.rocket_parts = silo.prototype.rocket_parts_required; rcon.print('ok')" >/dev/null
+lr_status() {
+    raw_lua "local st = {} for k, v in pairs(defines.rocket_silo_status) do st[v] = k end
+rcon.print(helpers.table_to_json({status = st[game.surfaces['buddy-live-regression'].find_entities_filtered{name = 'rocket-silo', position = {1000.5, 900.5}}[1].rocket_silo_status], launched = game.forces.player.rockets_launched}))"
+}
+for _ in $(seq 1 60); do
+    [[ "$(lr_status | jq -r '.status')" == "rocket_ready" ]] && break
+    sleep 1
+done
+assert_json "a full, powered silo readies its rocket but does not launch it" "$(lr_status)" \
+    --argjson before "$LR_BEFORE" '.status == "rocket_ready" and .launched == $before'
+assert_json "launch_rocket launches the ready rocket" \
+    "$(tool_payload "$(mcp_tool launch_rocket '{}')")" \
+    --argjson unit "$LR_UNIT" '.success == true and .silo_unit_number == $unit'
+for _ in $(seq 1 60); do
+    [[ "$(lr_status | jq -r '.launched')" -gt "$LR_BEFORE" ]] && break
+    sleep 1
+done
+assert_json "the force's rockets_launched rises by one after the flight" "$(lr_status)" \
+    --argjson before "$LR_BEFORE" '.launched == $before + 1'
+
+# build_layout: a layout whose last entity collides removes everything the
+# call placed; the same layout without the collision is built, and a repeat
+# call keeps the identical entities instead of placing duplicates.
+raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({933.5, 914.5}, game.surfaces['buddy-live-regression']); local inv = c.get_main_inventory(); inv.insert{name = 'wooden-chest', count = 6}" >/dev/null
+BL_BAD='{"origin_x":930.5,"origin_y":910.5,"entities":[{"name":"wooden-chest","dx":0,"dy":0},{"name":"wooden-chest","dx":1,"dy":0},{"name":"wooden-chest","dx":1,"dy":0}]}'
+BL_GOOD='{"origin_x":930.5,"origin_y":910.5,"entities":[{"name":"wooden-chest","dx":0,"dy":0},{"name":"wooden-chest","dx":1,"dy":0}]}'
+bl_chests() {
+    raw_lua "rcon.print(helpers.table_to_json({chests = game.surfaces['buddy-live-regression'].count_entities_filtered{name = 'wooden-chest', area = {{929, 909}, {933, 912}}}}))"
+}
+assert_json "a colliding layout entity fails the call" "$(tool_payload "$(mcp_tool build_layout "$BL_BAD")")" \
+    '.success == false and .error_kind == "placement_failed" and .index == 2'
+assert_json "a failed layout removes what it placed" "$(bl_chests)" '.chests == 0'
+assert_json "a valid layout is placed" "$(tool_payload "$(mcp_tool build_layout "$BL_GOOD")")" \
+    '.success == true and (.placed_units | length) == 2'
+assert_json "a repeated layout keeps identical entities" "$(tool_payload "$(mcp_tool build_layout "$BL_GOOD")")" \
+    '.success == true and (.placed_units | length) == 0 and .already_built == 2'
+assert_json "the layout exists exactly once" "$(bl_chests)" '.chests == 2'
+
+# A tree standing on ore inside the footprint is mined by identity: the tree
+# goes, the ore under it keeps its amount, and the chest is placed.
+BL_TREE_FIXTURE="$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+s.create_entity{name = 'iron-ore', position = {940.5, 910.5}, amount = 500}
+local tree = s.create_entity{name = 'tree-01', position = {940.5, 910.5}}
+rcon.print(helpers.table_to_json({tree = tree ~= nil}))
+")"
+require_json "tree-on-ore fixture exists" "$BL_TREE_FIXTURE" '.tree == true'
+BL_TREE="$(tool_payload "$(mcp_tool build_layout '{"origin_x":940.5,"origin_y":910.5,"entities":[{"name":"wooden-chest","dx":0,"dy":0}]}')")"
+assert_json "a layout over a tree on ore clears the tree and places the chest" "$BL_TREE" \
+    '.success == true and .obstacles_mined >= 1 and (.placed_units | length) == 1'
+assert_json "clearing the tree leaves the ore under it untouched" "$(raw_lua "
+local s = game.surfaces['buddy-live-regression']
+local ore = s.find_entities_filtered{name = 'iron-ore', position = {940.5, 910.5}, radius = 0.1}[1]
+rcon.print(helpers.table_to_json({trees = s.count_entities_filtered{type = 'tree', position = {940.5, 910.5}, radius = 1.5}, ore = ore and ore.amount or -1}))
+")" '.trees == 0 and .ore == 500'
+
+# An assembler placed without a recipe ignores its direction; build_layout
+# turns it the requested way once a fluid recipe is set.
+raw_lua "local f = game.forces.player; f.recipes['rocket-fuel'].enabled = true
+local s = game.surfaces['buddy-live-regression']
+s.request_to_generate_chunks({1030, 910}, 1); s.force_generate_chunk_requests()
+local tiles = {}
+for x = 1024, 1037 do for y = 904, 917 do tiles[#tiles + 1] = {name = 'landfill', position = {x, y}} end end
+s.set_tiles(tiles, true)
+for _, e in pairs(s.find_entities_filtered{area = {{1024, 904}, {1038, 918}}}) do if e.type ~= 'character' then e.destroy() end end
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID'); c.teleport({1030.5, 914.5}, s)
+c.get_main_inventory().insert{name = 'assembling-machine-2', count = 1}; rcon.print('ok')" >/dev/null
+assert_json "a fluid-recipe assembler is set and turned as requested" \
+    "$(tool_payload "$(mcp_tool build_layout '{"origin_x":1030.5,"origin_y":910.5,"entities":[{"name":"assembling-machine-2","dx":0,"dy":0,"direction":"west","recipe":"rocket-fuel"}]}')")" \
+    '.success == true and .recipes[0].direction_applied == true'
+assert_json "the assembler faces west with its recipe" "$(raw_lua "
+local a = game.surfaces['buddy-live-regression'].find_entities_filtered{name = 'assembling-machine-2', position = {1030.5, 910.5}, radius = 0.6}[1]
+rcon.print(helpers.table_to_json({direction = a and a.direction or -1, recipe = a and a.get_recipe() and a.get_recipe().name or ''}))
+")" '.direction == 12 and .recipe == "rocket-fuel"'
 
 stop_mcp
 

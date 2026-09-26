@@ -533,8 +533,15 @@ function M.start_research(character, tech_name)
         return {success = false, error = "Technology not enabled"}
     end
 
+    -- A prerequisite already in the research queue will finish first, so
+    -- Factorio accepts the dependent technology behind it.
+    local queued = {}
+    local queue_ok, queue = pcall(function() return force.research_queue end)
+    if queue_ok and queue then
+        for _, entry in pairs(queue) do queued[entry.name] = true end
+    end
     for _, prereq in pairs(tech.prerequisites) do
-        if not prereq.researched then
+        if not prereq.researched and not queued[prereq.name] then
             return {success = false, error = "Prerequisites not met: " .. prereq.name}
         end
     end
@@ -590,7 +597,11 @@ function M.start_research(character, tech_name)
                 powered = powered_labs,
                 missing_packs = missing_packs,
             },
-            message = "Research queued. Build and automate any missing lab power or science delivery while it waits.",
+            queue_length = (function()
+                local ok, q = pcall(function() return force.research_queue end)
+                return ok and q and #q or nil
+            end)(),
+            message = "Research queued. Keep at least 3 technologies queued so labs never idle, and automate any missing lab power or science delivery.",
         }
     end
 
@@ -606,6 +617,64 @@ function M.is_tech_researched(character, tech_name)
         return {researched = false, error = "Technology not found"}
     end
     return {researched = tech.researched == true}
+end
+
+-- Launch the rocket of one of the agent force's silos on the character's
+-- surface. With `unit_number` nil, the first silo whose rocket is ready is
+-- used. The rocket only leaves once the silo reports rocket_ready; the
+-- force's rockets_launched counter rises when the flight ends (~20 s later).
+function M.launch_rocket(character, unit_number)
+    if not (character and character.valid) then
+        return {success = false, error_kind = "no_character", error = "no character for this agent; spawn first"}
+    end
+    if unit_number ~= nil and type(unit_number) ~= "number" then
+        return {success = false, error_kind = "invalid_unit_number", error = "unit_number must be a number or omitted"}
+    end
+    local status_names = {}
+    for name, value in pairs(defines.rocket_silo_status) do status_names[value] = name end
+    local silos = character.surface.find_entities_filtered{type = "rocket-silo", force = character.force}
+    local summaries, chosen = {}, nil
+    for _, silo in pairs(silos) do
+        local status = status_names[silo.rocket_silo_status] or "unknown"
+        summaries[#summaries + 1] = {
+            unit_number = silo.unit_number,
+            position = pos_table(silo.position),
+            status = status,
+            rocket_parts = silo.rocket_parts,
+        }
+        if (unit_number == nil or silo.unit_number == unit_number)
+            and status == "rocket_ready" and not chosen then
+            chosen = silo
+        end
+    end
+    local launched_before = character.force.rockets_launched
+    if not chosen then
+        return {
+            success = false,
+            error_kind = #silos == 0 and "no_rocket_silo" or "rocket_not_ready",
+            error = #silos == 0 and "the force has no rocket silo on this surface"
+                or "no matching silo has a ready rocket; a rocket needs the silo's full rocket_parts and power, then about 20 s to rise",
+            silos = summaries,
+            rockets_launched = launched_before,
+        }
+    end
+    local ok, launched = pcall(function() return chosen.launch_rocket() end)
+    if not (ok and launched) then
+        return {
+            success = false,
+            error_kind = "launch_refused",
+            error = ok and "the silo refused to launch" or tostring(launched),
+            silos = summaries,
+            rockets_launched = launched_before,
+        }
+    end
+    return {
+        success = true,
+        silo_unit_number = chosen.unit_number,
+        status = status_names[chosen.rocket_silo_status] or "unknown",
+        rockets_launched_before = launched_before,
+        note = "The rocket is in flight; the force's rockets_launched rises when it reaches orbit (about 20 s).",
+    }
 end
 
 return M

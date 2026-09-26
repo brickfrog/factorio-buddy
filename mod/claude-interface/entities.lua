@@ -642,6 +642,12 @@ coal_upstream_proof = function(surface, force, entity, state)
                 if same_tile(output, entity.position) then
                     local proof = coal_upstream_proof(surface, force, upstream, state)
                     if proof.certified then
+                        -- A belt hop nests the proof of the belt it came from. On a
+                        -- long belt this nested one level per tile (200 levels
+                        -- observed), which broke the JSON parser's recursion
+                        -- limit. Consecutive belt hops therefore point straight
+                        -- at the proof below the belt run; hops still counts
+                        -- every tile.
                         return finish({
                             certified = true,
                             live = coal_count > 0 and proof.producer_operational == true,
@@ -650,7 +656,8 @@ coal_upstream_proof = function(surface, force, entity, state)
                             producer_operational = proof.producer_operational == true,
                             via_unit_number = upstream.unit_number,
                             hops = (proof.hops or 0) + 1,
-                            upstream_proof = proof,
+                            belt_hop = true,
+                            upstream_proof = proof.belt_hop and proof.upstream_proof or proof,
                         })
                     end
                 end
