@@ -6,6 +6,7 @@
 -- mutates the world.
 local characters = require("characters")
 local inventory = require("inventory")
+local space = require("space")
 
 local M = {}
 
@@ -118,9 +119,17 @@ function M.sample(agent_id, radius)
     if not (character and character.valid) then
         return failure("no_character", "no character for agent " .. tostring(agent_id) .. "; spawn first")
     end
-    local surface = character.surface
     local force = character.force
+    -- Away from home (a platform or another planet), keep measuring Nauvis
+    -- around its silo so trials still see the home factory.
+    local surface = space.home_surface(character)
     local origin = character.position
+    local sampled_away = nil
+    if surface ~= character.surface then
+        local silo = surface.find_entities_filtered{type = "rocket-silo", force = force, limit = 1}[1]
+        origin = silo and silo.position or {x = 0, y = 0}
+        sampled_away = true
+    end
     local effective_radius = clamp_radius(radius)
 
     local machines = {}
@@ -184,12 +193,15 @@ function M.sample(agent_id, radius)
         success = true,
         tick = game.tick,
         surface = surface.name,
+        sampled_away_from_character = sampled_away,
         radius = effective_radius,
         connected_players = #game.connected_players,
         character = {
-            position = {x = origin.x, y = origin.y},
+            surface = character.surface.name,
+            position = {x = character.position.x, y = character.position.y},
             inventory = counts(character.get_main_inventory()),
         },
+        space = space.summary(force, character),
         research = research_state(force),
         machines = machine_rows,
         machines_total = #machines,

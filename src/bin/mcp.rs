@@ -3562,7 +3562,7 @@ mod tests {
             .expect("serialize tool schemas")
             .len();
         assert!(
-            schema_bytes <= 60 * 1024,
+            schema_bytes <= 72 * 1024,
             "model tool schemas grew to {schema_bytes} bytes"
         );
 
@@ -8070,6 +8070,143 @@ pub struct BuildLayoutParams {
     pub dry_run: bool,
 }
 
+/// Robot logistics query.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RobotLogisticsParams {
+    /// Surface name (nauvis, vulcanus, platform-1); omit for yours.
+    pub surface: Option<String>,
+}
+
+/// Ghost layout.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlaceGhostsParams {
+    /// Surface name; omit for yours.
+    pub surface: Option<String>,
+    pub origin_x: f64,
+    pub origin_y: f64,
+    /// Same format as build_layout, max 200.
+    #[serde(default)]
+    pub entities: Vec<LayoutEntity>,
+    /// Tile ghosts (e.g. space-platform-foundation), max 400.
+    #[serde(default)]
+    pub tiles: Vec<GhostTile>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Tile ghost.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GhostTile {
+    pub name: String,
+    pub dx: i32,
+    pub dy: i32,
+}
+
+/// Space platform action.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SpacePlatformParams {
+    /// status, create, ship, unship, request, jettison, schedule, board or land.
+    pub action: String,
+    /// Platform name (create: optional new name).
+    pub platform: Option<String>,
+    /// ship: items from your inventory; unship: queued items to take back (empty = all); request: landing-pad requests (count = minimum); jettison: hub items to throw away.
+    #[serde(default)]
+    pub items: Vec<ItemCount>,
+    /// schedule: planet names in order; empty = stay.
+    #[serde(default)]
+    pub stops: Vec<String>,
+    /// land: spot to land near.
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+}
+
+/// Item stack.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ItemCount {
+    pub name: String,
+    pub count: u32,
+}
+
+const MAX_GHOST_TILES: usize = 400;
+
+/// Validate a ghost layout the way `build_layout_transaction` does and turn
+/// it into the mod's `{name, dx, dy, direction, recipe}` / `{name, dx, dy}`
+/// arrays. Errors are ready-to-return tool payloads.
+fn place_ghosts_request(
+    params: &PlaceGhostsParams,
+) -> Result<(serde_json::Value, serde_json::Value), serde_json::Value> {
+    let fail = |kind: &str, error: String, extra: serde_json::Value| {
+        steam_power_failure(kind, error, extra)
+    };
+    if params.entities.is_empty() && params.tiles.is_empty() {
+        return Err(fail(
+            "invalid_layout",
+            "give at least one entity or tile".to_string(),
+            serde_json::json!({}),
+        ));
+    }
+    if params.entities.len() > MAX_LAYOUT_ENTITIES || params.tiles.len() > MAX_GHOST_TILES {
+        return Err(fail(
+            "invalid_layout",
+            format!("at most {MAX_LAYOUT_ENTITIES} entities and {MAX_GHOST_TILES} tiles"),
+            serde_json::json!({"entities": params.entities.len(), "tiles": params.tiles.len()}),
+        ));
+    }
+    if !(params.origin_x.is_finite() && params.origin_y.is_finite()) {
+        return Err(fail(
+            "invalid_layout",
+            "origin_x and origin_y must be finite".to_string(),
+            serde_json::json!({}),
+        ));
+    }
+    let mut entities = Vec::with_capacity(params.entities.len());
+    for (index, entity) in params.entities.iter().enumerate() {
+        let direction = if entity.direction.is_empty() {
+            Direction::North
+        } else {
+            match Direction::parse(&entity.direction) {
+                Some(direction) => direction,
+                None => {
+                    return Err(fail(
+                        "invalid_direction",
+                        format!("entity {index}: invalid direction {:?}", entity.direction),
+                        serde_json::json!({"index": index}),
+                    ))
+                }
+            }
+        };
+        if !(entity.dx.is_finite() && entity.dy.is_finite()) || entity.name.is_empty() {
+            return Err(fail(
+                "invalid_layout",
+                format!("entity {index} needs a name and finite dx/dy"),
+                serde_json::json!({"index": index}),
+            ));
+        }
+        entities.push(serde_json::json!({
+            "name": entity.name,
+            "dx": entity.dx,
+            "dy": entity.dy,
+            "direction": direction.to_factorio(),
+            "recipe": entity.recipe,
+        }));
+    }
+    let mut tiles = Vec::with_capacity(params.tiles.len());
+    for (index, tile) in params.tiles.iter().enumerate() {
+        if tile.name.is_empty() {
+            return Err(fail(
+                "invalid_layout",
+                format!("tile {index} needs a name"),
+                serde_json::json!({"index": index}),
+            ));
+        }
+        tiles.push(serde_json::json!({"name": tile.name, "dx": tile.dx, "dy": tile.dy}));
+    }
+    Ok((
+        serde_json::Value::Array(entities),
+        serde_json::Value::Array(tiles),
+    ))
+}
+
 /// Parameters for dry-run steam-power repair planning.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RepairSteamPowerParams {
@@ -8423,6 +8560,7 @@ const OBSERVATION_TOOLS: &[&str] = &[
     "plan_steam_power",
     "production_statistics",
     "render_map",
+    "robot_logistics",
     "situation_report",
     "verify_production",
 ];
@@ -8507,6 +8645,7 @@ const MODEL_VISIBLE_TOOLS: &[&str] = &[
     "launch_rocket",
     "mine_at",
     "place_entity",
+    "place_ghosts",
     "plan_automation_science",
     "plan_machine_output",
     "plan_recipe_assembler_cell",
@@ -8516,10 +8655,12 @@ const MODEL_VISIBLE_TOOLS: &[&str] = &[
     "remove_entity",
     "render_map",
     "repair_fuel_sustainability",
+    "robot_logistics",
     "rotate_entity",
     "route_belt",
     "set_recipe",
     "situation_report",
+    "space_platform",
     "start_research",
     "unstuck",
     "verify_production",
@@ -8618,6 +8759,25 @@ fn sanitize_model_payload(value: &mut serde_json::Value) {
 fn model_safe_payload(mut value: serde_json::Value) -> serde_json::Value {
     sanitize_model_payload(&mut value);
     value
+}
+
+/// Keep the first `keep` entries of a top-level array field of a JSON object
+/// and record how many were dropped in `<field>_omitted`. Non-JSON text and
+/// short arrays pass through unchanged.
+fn cap_json_array(text: String, field: &str, keep: usize) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return text;
+    };
+    let Some(array) = value.get_mut(field).and_then(|v| v.as_array_mut()) else {
+        return text;
+    };
+    if array.len() <= keep {
+        return text;
+    }
+    let omitted = array.len() - keep;
+    array.truncate(keep);
+    value[format!("{field}_omitted")] = serde_json::json!(omitted);
+    value.to_string()
 }
 
 fn model_safe_json_text(text: String) -> String {
@@ -9952,8 +10112,15 @@ impl FactorioMcp {
             Ok(entities) => match client.get_belt_lane_contents(area).await {
                 Ok(belt_contents) => {
                     let report = analyze_item_flow(&entities, &belt_contents.belts, source, target);
-                    serde_json::to_string_pretty(&report)
-                        .unwrap_or_else(|e| format!("Error: {}", e))
+                    let text =
+                        serde_json::to_string(&report).unwrap_or_else(|e| format!("Error: {}", e));
+                    let text = cap_json_array(text, "reachable_belts", 40);
+                    let text = cap_json_array(text, "items_on_path", 40);
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(value) => serde_json::to_string_pretty(&value)
+                            .unwrap_or_else(|e| format!("Error: {}", e)),
+                        Err(_) => text,
+                    }
                 }
                 Err(e) => format!("Error: reading belt contents: {}", e),
             },
@@ -17377,7 +17544,7 @@ impl FactorioMcp {
             )
             .await
         {
-            Ok(result) => model_safe_json_text(result),
+            Ok(result) => model_safe_json_text(cap_json_array(result, "entities", 40)),
             Err(e) => format!("Error: {}", e),
         };
         result
@@ -17443,6 +17610,108 @@ impl FactorioMcp {
             }
             Err(e) => format!("Error: {}", e),
         }
+    }
+
+    /// Robot logistics on any surface.
+    #[tool(
+        description = "Robots, roboports, ghosts and the items ghosts still lack on any surface (default: yours). On a platform: hub stock and build queue."
+    )]
+    async fn robot_logistics(
+        &self,
+        Parameters(params): Parameters<RobotLogisticsParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return format!("Error: {}", e),
+        };
+        match client.robot_logistics(params.surface.as_deref()).await {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    /// Place ghosts for robots or a platform hub.
+    #[tool(
+        description = "Build without walking: place ghosts on any surface (default yours) for robots or a platform hub to build. Planet ghosts must be in roboport construction range; platforms build from hub stock (add space-platform-foundation tiles to grow). Marks trees/rocks for removal. All-or-nothing; reports items the builders lack."
+    )]
+    async fn place_ghosts(&self, Parameters(params): Parameters<PlaceGhostsParams>) -> String {
+        let (entities, tiles) = match place_ghosts_request(&params) {
+            Ok(request) => request,
+            Err(failure) => {
+                return serde_json::to_string_pretty(&failure)
+                    .unwrap_or_else(|e| format!("Error: {}", e))
+            }
+        };
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return format!("Error: {}", e),
+        };
+        match client
+            .place_ghosts(
+                params.surface.as_deref(),
+                Position::new(params.origin_x, params.origin_y),
+                &entities,
+                &tiles,
+                params.dry_run,
+            )
+            .await
+        {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    /// Create, supply, fly, board and land space platforms.
+    #[tool(
+        description = "Space platforms. status; create (needs rocket-silo); ship items from your inventory beside a silo: they leave by themselves with each ready rocket, 1 t per rocket, items the platform's ghosts lack first (a new platform needs its starter pack first); unship takes queued cargo back; request items on the landing pads here; jettison hub items overboard (lost); schedule planet stops; board (ride a ready rocket up, empty cargo); land (drop from the hub to the planet below)."
+    )]
+    async fn space_platform(&self, Parameters(params): Parameters<SpacePlatformParams>) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return format!("Error: {}", e),
+        };
+        let items = serde_json::json!(params.items);
+        let stops = serde_json::json!(params.stops);
+        let (action, platform) = (params.action.as_str(), params.platform.as_deref());
+        let first = match client
+            .space_platform(action, platform, &items, &stops, params.x, params.y)
+            .await
+        {
+            Ok(value) => value,
+            Err(e) => return format!("Error: {}", e),
+        };
+        // A silo out of reach: walk to it once and retry.
+        let silo = if first.get("error_kind").and_then(|kind| kind.as_str()) == Some("out_of_reach")
+        {
+            first
+                .get("silo_unit_number")
+                .and_then(|unit| unit.as_u64())
+                .and_then(|unit| u32::try_from(unit).ok())
+        } else {
+            None
+        };
+        let result = match silo {
+            Some(unit) => match client.approach_entity(unit).await {
+                Ok(()) => match client
+                    .space_platform(action, platform, &items, &stops, params.x, params.y)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(e) => return format!("Error: {}", e),
+                },
+                Err(e) => {
+                    let mut first = first;
+                    first["approach_error"] = serde_json::json!(e.to_string());
+                    first
+                }
+            },
+            None => first,
+        };
+        serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("Error: {}", e))
     }
 
     /// Build a model-designed layout in one call.

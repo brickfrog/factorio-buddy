@@ -38,7 +38,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are an autonomous AI teammate inside a Factorio game. Use the Factorio MCP tools to observe and play the game through your own character. Act on player requests immediately. When idle, inspect the real game state and make concrete progress toward a functioning automated factory. Prioritize self-sustaining automation: build production chains that continuously gather, transport, process, and deliver resources without your character manually moving items. Use hand-crafting and manual item transfers only for bounded bootstrap or recovery (bounded hand-fuelling of burner machines is part of the bootstrap until electricity and research run), then replace them with automated production; never treat hand-feeding as completion. Build belts as complete source-to-destination routes with route_belt or a higher-level automation controller; do not improvise disconnected one-tile belt fragments. Treat live resource patches as future extraction capacity, not forbidden terrain. Resource overlap is advisory, not a placement veto: prefer clear land for large permanent processing, storage, or power blocks when practical, but temporary bootstrap structures and compact transport, power, or fluid connections may cross or occupy resource tiles. Do not refuse useful automation or build a wasteful detour solely because an otherwise valid placement touches ore. Only extraction machinery is resource-category constrained; place mining drills or pumpjacks only where they are compatible. Use execute_edge_miner to derive a workable drill output, and accept a Factorio-buildable output tile even when it contains ore. Prefer dedicated item belts or deliberate lane separation; never assume a branch is pure because one sampled tile currently shows one item. Before tapping any belt that may carry multiple products, inspect its exact lanes; configure the receiving inserter's whitelist when one consumer must accept only specific items, but do not mistake a filtered inserter for a pure upstream belt. Treat planner output as an executable contract: when a plan returns exact mutation arguments, execute those exact arguments without substituting a search or approximate mutation. After a compound mutation, inspect the resulting state and correct or remove failed partial work before proceeding. Never claim an action succeeded unless a tool result confirms it. Keep final chat replies concise because they render in a small in-game panel. Your Factorio tools are exposed with the mcp__factorio__ prefix (for example mcp__factorio__situation_report); snapshots and tool results name them without the prefix, so always call the prefixed name.";
 
-const AUTONOMY_DIRECTIVE: &str = "Autonomy tick: re-evaluate the factory from the authoritative snapshot below before acting; choose from current evidence, not from the previous turn's focus. snapshot.progression is the code-computed tech ladder (Factorio 2.0 trigger tree: 50 iron plates unlock steam power, 10 copper plates unlock electronics, crafting a lab unlocks red science). Unless a player request or a progression warning comes first, spend this turn closing progression.next_goal, using progression.how as the starting method. Reaching electricity and running research beats perfecting burner-era logistics: bounded hand-fuelling with bootstrap_burner_once (up to 50) and hand-crafting are correct until research runs, so do not build belt fuel feeds for burner machines before then. The long-term goal is launching a rocket; progression.rocket_path lists the remaining technologies and which science packs still lack assemblers. Prefer one-call controllers over long chains of place_entity calls: build_steam_power for power, and build_layout for any block you design yourself (smelter rows, science blocks, later oil and the silo). Stay near the existing smelters unless a needed resource is missing there. If a subsystem is healthy, leave it running; do not poll it or wait on it. Queue research only from progression.rocket_path.researchable_now unless a technology is needed for a concrete build now, and keep at least 3 technologies queued so the labs never idle while you are away, unless a progression warning says every path technology waits on an unmade pack: then make that pack instead of queueing other research. Turns are cut after 300 s and interrupted tools become outcome-unknown, so end the turn after about 25 tool calls or once next_goal is done; the next autonomy tick continues. Take concrete action and verify the result; do not merely describe a plan.";
+const AUTONOMY_DIRECTIVE: &str = "Autonomy tick: re-evaluate the factory from the authoritative snapshot below before acting; choose from current evidence, not from the previous turn's focus. snapshot.progression is the code-computed tech ladder (Factorio 2.0 trigger tree: 50 iron plates unlock steam power, 10 copper plates unlock electronics, crafting a lab unlocks red science). Unless a player request or a progression warning comes first, spend this turn closing progression.next_goal, using progression.how as the starting method. Reaching electricity and running research beats perfecting burner-era logistics: bounded hand-fuelling with bootstrap_burner_once (up to 50) and hand-crafting are correct until research runs, so do not build belt fuel feeds for burner machines before then. The long-term goal is launching a rocket; progression.rocket_path lists the remaining technologies and which science packs still lack assemblers. Prefer one-call controllers over long chains of place_entity calls: build_steam_power for power, and build_layout for any block you design yourself (smelter rows, science blocks, later oil and the silo). Stay near the existing smelters unless a needed resource is missing there. If a subsystem is healthy, leave it running; do not poll it or wait on it. Queue research only from the researchable_now of progression.space_path (or rocket_path before rocket-silo) unless a technology is needed for a concrete build now, and keep at least 3 technologies queued so the labs never idle while you are away, unless a progression warning says every path technology waits on an unmade pack: then make that pack instead of queueing other research. Turns are cut after 300 s and interrupted tools become outcome-unknown, so end the turn after about 25 tool calls or once next_goal is done; the next autonomy tick continues. Take concrete action and verify the result; do not merely describe a plan. After the first rocket, progression continues into Space Age: robots build ghosts placed with place_ghosts on any covered surface, robot_logistics shows what they lack, and space_platform creates, supplies, flies, boards and lands; you are one character, so while you are away run Nauvis through its robots.";
 
 // The managed server is local and returning players replace stale peers. Keep
 // a temporarily starved background client connected instead of dropping it at
@@ -2731,6 +2731,17 @@ fn start_turn(
     }
 }
 
+/// Delay before the next autonomy turn after `idle` consecutive turns without
+/// a tool call: 6, 12 and at most 18 heartbeats, capped at 180 s, and never
+/// shorter than one heartbeat.
+fn idle_autonomy_backoff(heartbeat: Duration, idle: u32) -> Duration {
+    if idle == 0 {
+        return heartbeat;
+    }
+    let backoff = (heartbeat * 6 * idle.min(3)).min(Duration::from_secs(180));
+    heartbeat.max(backoff)
+}
+
 fn record_turn_finished(rt: &Runtime, turn: &ActiveTurn, completion: Option<&TurnCompletion>) {
     let (tool_calls, tool_errors) = rt.shared.turn_counts();
     rt.shared.evidence.record(
@@ -2860,6 +2871,10 @@ async fn run_buddy(
     timer.tick().await;
     let heartbeat = Duration::from_secs(args.heartbeat_seconds.max(1));
     let mut next_autonomy = Instant::now() + heartbeat;
+    // Consecutive autonomy turns that made no tool call: the model chose to
+    // wait (a rocket filling, a craft running). Back off instead of spending
+    // the turn budget on ten-second "still waiting" turns.
+    let mut idle_autonomy_turns: u32 = 0;
     let mut session_id = None;
     let mut provider_retry_at = None;
     let mut pending: VecDeque<TurnRequest> = VecDeque::new();
@@ -2919,6 +2934,7 @@ async fn run_buddy(
             }, if active.is_some() => {
                 let turn = active.take().expect("completed active turn");
                 let kind = turn.kind;
+                let (turn_calls, _) = rt.shared.turn_counts();
                 match completion {
                     Ok(completion) => {
                         record_turn_finished(&rt, &turn, Some(&completion));
@@ -2992,7 +3008,13 @@ async fn run_buddy(
                         warn!(?kind, %error, "Claude turn task failed");
                     }
                 }
-                next_autonomy = Instant::now() + heartbeat;
+                let delay = if kind == TurnKind::Autonomy {
+                    idle_autonomy_turns = if turn_calls == 0 { idle_autonomy_turns + 1 } else { 0 };
+                    idle_autonomy_backoff(heartbeat, idle_autonomy_turns)
+                } else {
+                    heartbeat
+                };
+                next_autonomy = Instant::now() + delay;
             }
             _ = timer.tick() => {
                 if let Some(server) = local_server.as_mut() {
@@ -3185,6 +3207,33 @@ mod tests {
     use super::*;
 
     const RUN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn idle_autonomy_turns_back_off_and_cap() {
+        let heartbeat = Duration::from_secs(10);
+        assert_eq!(idle_autonomy_backoff(heartbeat, 0), heartbeat);
+        assert_eq!(idle_autonomy_backoff(heartbeat, 1), Duration::from_secs(60));
+        assert_eq!(
+            idle_autonomy_backoff(heartbeat, 2),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            idle_autonomy_backoff(heartbeat, 3),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            idle_autonomy_backoff(heartbeat, 40),
+            Duration::from_secs(180)
+        );
+        // Short heartbeats back off proportionally.
+        let fast = Duration::from_secs(1);
+        assert_eq!(idle_autonomy_backoff(fast, 1), Duration::from_secs(6));
+        assert_eq!(idle_autonomy_backoff(fast, 5), Duration::from_secs(18));
+        // A heartbeat longer than the backoff is never shortened.
+        let slow = Duration::from_secs(300);
+        assert_eq!(idle_autonomy_backoff(slow, 1), slow);
+    }
+
     const RUN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn write_owner(

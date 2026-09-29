@@ -2,6 +2,7 @@ local diagnostics = require("diagnostics")
 local entities = require("entities")
 local inventory = require("inventory")
 local research = require("research")
+local space = require("space")
 local world = require("world")
 
 local M = {}
@@ -157,10 +158,29 @@ local function missing_supply_chain(force, surface, facts, item)
     return chain
 end
 
--- Unresearched technologies on the way to rocket-silo, prerequisites first,
--- and the ones whose prerequisites are all researched.
-local function rocket_path(force, surface, facts)
-    local target = force.technologies["rocket-silo"]
+-- Assemblers set to `recipe` at home plus on every space platform.
+local function recipe_machines(facts, recipe)
+    local count = facts.recipe_assemblers[recipe] or 0
+    for _, platform in ipairs(facts.space and facts.space.platforms or {}) do
+        count = count + ((platform.recipes or {})[recipe] or 0)
+    end
+    return count
+end
+
+-- Units of `item` made in ten minutes at home plus on every space platform.
+local function made_with_platforms(force, surface, facts, item)
+    local count = made_last_ten_minutes(force, surface, item)
+    for _, platform in ipairs(facts.space and facts.space.platforms or {}) do
+        local platform_surface = platform.surface and game.get_surface(platform.surface)
+        if platform_surface then count = count + made_last_ten_minutes(force, platform_surface, item) end
+    end
+    return count
+end
+
+-- Unresearched technologies on the way to `target_name`, prerequisites
+-- first, and the ones whose prerequisites are all researched.
+local function tech_path(force, surface, facts, target_name)
+    local target = force.technologies[target_name]
     if not target then return nil end
     local needed, seen = {}, {}
     local function visit(tech)
@@ -202,8 +222,8 @@ local function rocket_path(force, surface, facts)
                 if not packs[ingredient.name] then
                     packs[ingredient.name] = {
                         name = ingredient.name,
-                        assemblers = facts.recipe_assemblers[ingredient.name] or 0,
-                        made_last_10_min = made_last_ten_minutes(force, surface, ingredient.name),
+                        assemblers = recipe_machines(facts, ingredient.name),
+                        made_last_10_min = made_with_platforms(force, surface, facts, ingredient.name),
                         first_needed_by = tech.name,
                     }
                     pack_order[#pack_order + 1] = ingredient.name
@@ -244,6 +264,7 @@ local function rocket_path(force, surface, facts)
         if not stalled then all_next_stalled = false break end
     end
     return {
+        target = target_name,
         techs_remaining = #needed,
         researchable_now = next_techs,
         science_packs_needed = pack_list,
@@ -251,6 +272,121 @@ local function rocket_path(force, surface, facts)
         all_next_stalled = all_next_stalled,
         labs = facts.labs,
     }
+end
+
+-- "<recipe>: <amount> <ingredient>, ... -> <amount> <product>, ..." read
+-- from the prototype, so rung text never drifts from the game data.
+local function recipe_text(name)
+    local recipe = prototypes.recipe[name]
+    if not recipe then return name .. ": (no recipe)" end
+    local function list(entries)
+        local parts = {}
+        for _, entry in pairs(entries or {}) do
+            local amount = entry.amount
+            if not amount and entry.amount_min and entry.amount_max then
+                amount = entry.amount_min == entry.amount_max and entry.amount_min
+                    or (entry.amount_min .. "-" .. entry.amount_max)
+            end
+            local text = tostring(amount or 1) .. " " .. entry.name
+            if entry.probability and entry.probability < 1 then
+                text = text .. " (" .. math.floor(entry.probability * 100 + 0.5) .. "%)"
+            end
+            parts[#parts + 1] = text
+        end
+        return table.concat(parts, ", ")
+    end
+    return name .. ": " .. list(recipe.ingredients) .. " -> " .. list(recipe.products)
+end
+
+-- Rungs for a character away from home: on a platform or on Vulcanus.
+local function travel_rung(S, character)
+    local char_surface = character.surface.name
+    if char_surface == "vulcanus" then
+        return "You are on Vulcanus.",
+            "Build power and a roboport from what you carried (build_layout). Nauvis runs without you: check it with robot_logistics surface=nauvis, fix it with place_ghosts surface=nauvis."
+    end
+    if not S.character_on_platform then return nil end
+    local here = nil
+    for _, platform in ipairs(S.platforms) do
+        if platform.name == S.character_on_platform then here = platform end
+    end
+    here = here or {}
+    if here.space_location == "vulcanus" then
+        return "Land on Vulcanus.", "space_platform action=land."
+    end
+    if here.space_location == nil then
+        return "Flying to " .. tostring((here.stops or {})[1] or "the next stop") .. ".",
+            "Watch space_platform action=status (ammo, fuel, damaged_tiles); keep Nauvis running with robot_logistics / place_ghosts surface=nauvis."
+    end
+    if S.vulcanus_unlocked then
+        return "Set course for Vulcanus.", "space_platform action=schedule stops=[\"vulcanus\"]."
+    end
+    return nil
+end
+
+-- Space Age rungs after the first rocket, up to boarding for Vulcanus. Nil
+-- when the generic research rungs (on space_path) are the right next step.
+local function space_rung(facts)
+    local S = facts.space
+    local P = S.platforms[1]
+    local vulcanus_found = S.techs.planet_discovery_vulcanus
+    if not S.techs.construction_robotics then
+        return "Research construction-robotics: robots build for you, even while you are away.",
+            "start_research construction-robotics; meanwhile craft roboports, construction and logistic robots."
+    end
+    if (facts.roboports or 0) == 0 then
+        return "Build a roboport network at home.",
+            "Place a roboport in the power network with build_layout, place robots beside it with place_entity (a placed robot flies into the roboport), and a storage-chest in range. From now on build at home with place_ghosts; check with robot_logistics."
+    end
+    if S.home_logistics.construction_robots < 10 then
+        return "Give the home network at least 10 construction robots (" .. S.home_logistics.construction_robots .. " now).",
+            "Craft them and place them with place_entity."
+    end
+    if not P then
+        return "Create a space platform.",
+            recipe_text("space-platform-starter-pack") .. ". Craft it (build lines for the inputs), then space_platform action=create and action=ship the starter pack beside a silo; it leaves with the next ready rocket. Creating it completes the space-platform research."
+    end
+    if P.state == "waiting_for_starter_pack" then
+        return "Ship the starter pack to " .. P.name .. ".",
+            recipe_text("space-platform-starter-pack") .. ". space_platform action=ship items=[{name:\"space-platform-starter-pack\",count:1}] beside a silo; it leaves with the next ready rocket."
+    end
+    if P.state == "starter_pack_on_the_way" then
+        return "The starter pack is on its way to " .. P.name .. " (about 30 s).",
+            "Meanwhile craft platform parts: asteroid collectors, crushers, solar panels, an electric furnace, an assembler, inserters, belts."
+    end
+    if not vulcanus_found and ((P.recipes or {})["space-science-pack"] or 0) == 0 then
+        return "Make space science on " .. P.name .. ".",
+            recipe_text("space-science-pack") .. ", made only at zero gravity. On the platform: asteroid collectors at the foundation edge, crushers ("
+            .. recipe_text("metallic-asteroid-crushing") .. "; " .. recipe_text("carbonic-asteroid-crushing") .. "; " .. recipe_text("oxide-asteroid-crushing")
+            .. "), an electric furnace for iron plate, an assembler on space-science-pack, inserters from and into the hub, solar panels. Ship the parts (action=ship), then lay them out with place_ghosts surface="
+            .. tostring(P.surface) .. " (add space-platform-foundation tiles to grow it)."
+    end
+    if not vulcanus_found and S.landing_pads == 0 then
+        return "Build a cargo landing pad at home near the labs.",
+            "build_layout; then space_platform action=request items=[{name:\"space-science-pack\",count:100}]."
+    end
+    if not vulcanus_found then
+        local requested = false
+        for _, name in ipairs(S.landing_pad_requests) do
+            if name == "space-science-pack" then requested = true end
+        end
+        if not requested then
+            return "Request space science on the landing pad.",
+                "space_platform action=request items=[{name:\"space-science-pack\",count:100}]. Platforms in orbit drop requested items on their own."
+        end
+        return nil
+    end
+    if (P.thrusters or 0) == 0 then
+        return "Make " .. P.name .. " fly: thrusters.",
+            recipe_text("thruster") .. "; " .. recipe_text("thruster-fuel") .. "; " .. recipe_text("thruster-oxidizer") .. "; " .. recipe_text("ice-melting")
+            .. ". Build thrusters at the back edge, fed by pipes from chemical plants on the platform; place with place_ghosts surface=" .. tostring(P.surface) .. "."
+    end
+    if (P.turrets or 0) == 0 then
+        return "Arm " .. P.name .. " before leaving.",
+            "Asteroids break unarmed platforms: gun turrets on the front edge, fed firearm-magazine by inserters from a belt out of the hub. Ship magazines."
+    end
+    return "Board " .. P.name .. " for Vulcanus.",
+        "Carry what you need to start there (roboport, robots, steam/solar power, drills, furnaces, belts, inserters, poles). Stand by a silo with a ready rocket and empty cargo, then space_platform action=board."
 end
 
 -- Code-computed tech-progression ladder for the early game. Each rung names
@@ -282,19 +418,25 @@ local function progression(surface, force, facts, character)
         rocket_parts = facts.rocket_parts,
         rockets_launched = force.rockets_launched,
     }
-    local path = rocket_path(force, surface, facts)
-    state.rocket_path = path
+    state.rocket_path = tech_path(force, surface, facts, "rocket-silo")
+    if tech_done(force, "rocket-silo") then
+        state.space_path = tech_path(force, surface, facts, "planet-discovery-vulcanus")
+    end
+    local path = state.space_path or state.rocket_path
+    local path_field = state.space_path and "progression.space_path" or "progression.rocket_path"
+    local path_target = path and path.target or "rocket-silo"
     local unautomated, stalled = nil, nil
     for _, pack in ipairs(path and path.science_packs_needed or {}) do
         if pack.assemblers == 0 then unautomated = unautomated or pack
         elseif pack.made_last_10_min == 0 then stalled = stalled or pack end
     end
-    local goal, how
+    local goal, how = travel_rung(facts.space, character)
+    local space_goal, space_how = nil, nil
+    if not goal and force.rockets_launched > 0 then space_goal, space_how = space_rung(facts) end
     local silo_prototype = prototypes.entity["rocket-silo"]
     local parts_required = silo_prototype and silo_prototype.rocket_parts_required or 50
-    if force.rockets_launched > 0 then
-        goal = "A rocket has been launched (" .. force.rockets_launched .. " so far). Keep the factory running and launch again when the next rocket is ready."
-        how = "Keep rocket parts flowing to the silo and call launch_rocket whenever a rocket is ready."
+    if goal then
+        -- Away from home: the travel rung decides.
     elseif tech_done(force, "rocket-silo") and (facts.rocket_silos or 0) == 0 then
         local recipe = prototypes.recipe["rocket-silo"]
         -- Stock the agent can craft from: its own inventory plus the force's chests.
@@ -318,10 +460,10 @@ local function progression(surface, force, facts, character)
         how = "Craft rocket-silo from " .. table.concat(needs, ", ")
             .. ". For each ingredient short of the amount, build or extend its assembler line (and its inputs) and collect the output into chests; "
             .. "then craft the silo and place it (9x9) with build_layout inside the power network, leaving room for inserters on its sides."
-    elseif tech_done(force, "rocket-silo") and facts.rocket_ready then
+    elseif force.rockets_launched == 0 and tech_done(force, "rocket-silo") and facts.rocket_ready then
         goal = "Launch the rocket: the silo's rocket is ready."
         how = "Call launch_rocket. Space Age silos never launch on their own."
-    elseif tech_done(force, "rocket-silo") then
+    elseif force.rockets_launched == 0 and tech_done(force, "rocket-silo") then
         local recipe = prototypes.recipe["rocket-part"]
         local inputs = {}
         for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
@@ -330,6 +472,8 @@ local function progression(surface, force, facts, character)
         goal = "Fill the rocket silo: " .. (facts.rocket_parts or 0) .. "/" .. parts_required .. " rocket parts."
         how = "Each rocket part needs " .. table.concat(inputs, ", ")
             .. ". Automate the scarcest with build_layout (assemblers, chemical plants, their inputs and power) and feed all three into the silo with inserters; the silo builds the parts itself. Then launch_rocket."
+    elseif space_goal then
+        goal, how = space_goal, space_how
     elseif not state.steam_power_unlocked then
         goal = "Smelt 50 iron plates to unlock steam-power (" .. iron .. "/50 made)."
         how = "mine_at stone and coal, place stone furnaces fed by burner drills on iron ore (execute_direct_smelter / execute_edge_miner), and hand-fuel them with bootstrap_burner_once (up to 50 coal each). Hand-smelting with bootstrap_smelting_once also counts. Do not build belt fuel feeds yet."
@@ -364,7 +508,7 @@ local function progression(surface, force, facts, character)
             or ("Every ingredient was made recently, so the shortest one or its delivery is the gap: compare science_packs_needed ingredients_made_last_10_min against the recipe, "
                 .. "then raise the smallest supply or connect the idle producers to the " .. stalled.name .. " assembler with inserters or belts, and verify_production.")
     elseif state.current_research == nil and path and path.researchable_now[1] then
-        goal = "Start the next research toward rocket-silo: " .. path.researchable_now[1].name .. "."
+        goal = "Start the next research toward " .. path_target .. ": " .. path.researchable_now[1].name .. "."
         how = "start_research it (trigger technologies need their trigger instead). Keep labs supplied."
     else
         -- The pack most idle labs lack is the real limit; flow counts alone
@@ -373,7 +517,7 @@ local function progression(surface, force, facts, character)
         for pack, count in pairs(facts.lab_missing_packs or {}) do
             if count > limit_labs or (count == limit_labs and pack < limit) then limit, limit_labs = pack, count end
         end
-        goal = "Scale science throughput toward rocket-silo (" .. (path and path.techs_remaining or 0) .. " technologies left)."
+        goal = "Scale science throughput toward " .. path_target .. " (" .. (path and path.techs_remaining or 0) .. " technologies left)."
         how = "Research speed is set by the scarcest pack"
             .. (limit and (": " .. limit .. (limit_labs > 0 and (" (" .. limit_labs .. " idle labs lack it)") or " (see science_packs_needed made_last_10_min)")) or "")
             .. ". Add assemblers for it and its intermediates, the plate and power supply they need, with build_layout, and deliver it to every lab; replace hand-fed fuel with belts or electric machines."
@@ -395,12 +539,13 @@ local function progression(surface, force, facts, character)
     local queued = queue_ok and queue and #queue or (state.current_research and 1 or 0)
     state.research_queue_length = queued
     if path and path.all_next_stalled and path.slowest_pack then
-        warnings[#warnings + 1] = "Every researchable rocket-path technology needs " .. path.slowest_pack
-            .. ", which was not made in the last 10 minutes. Research off rocket_path only spends packs; get "
+        warnings[#warnings + 1] = "Every researchable technology toward " .. path_target .. " needs " .. path.slowest_pack
+            .. ", which was not made in the last 10 minutes. Research off " .. path_field .. " only spends packs; get "
             .. path.slowest_pack .. " made first."
     elseif facts.labs > 0 and state.steam_power_unlocked and queued < 3 and path and path.researchable_now[1] then
         warnings[#warnings + 1] = "Only " .. queued .. " technologies are queued; labs go idle when the queue empties while you are away. "
-            .. "Queue at least 3 with start_research, taking them from rocket_path.researchable_now (a technology whose prerequisites are queued ahead of it may be queued too)."
+            .. "Queue at least 3 with start_research, taking them from the active path's researchable_now (" .. path_field
+            .. ".researchable_now; space_path once rocket-silo is researched; a technology whose prerequisites are queued ahead of it may be queued too)."
     end
     state.output_blocked_machines = facts.output_blocked
     state.starved_assemblers = facts.starved_assemblers
@@ -436,6 +581,55 @@ local function progression(surface, force, facts, character)
     if facts.labs_powered > 0 and facts.labs_working == 0 and state.current_research ~= nil then
         warnings[#warnings + 1] = "Research is queued but no lab is working: check lab science packs and power."
     end
+    local S = facts.space
+    if S.home_logistics.uncovered_ghosts > 0 then
+        warnings[#warnings + 1] = S.home_logistics.uncovered_ghosts
+            .. " ghosts at home are outside roboport range and will never be built: extend the roboport network or remove them."
+    end
+    if S.home_logistics.missing_items[1] then
+        local lacking = {}
+        for _, item in ipairs(S.home_logistics.missing_items) do
+            lacking[#lacking + 1] = item.name .. " x" .. (item.needed - item.available)
+        end
+        warnings[#warnings + 1] = "Robots at home lack " .. table.concat(lacking, ", ")
+            .. " for placed ghosts: stock them in a storage chest in the network."
+    end
+    for _, platform in ipairs(S.platforms) do
+        if (platform.damaged_tiles or 0) > 0 then
+            warnings[#warnings + 1] = platform.name .. " has " .. platform.damaged_tiles .. " damaged tiles: add turrets and repair packs."
+        end
+        if platform.hub_free_slots == 0 then
+            warnings[#warnings + 1] = platform.name .. "'s hub is full (" .. tostring(platform.hub_slots)
+                .. " slots): its collectors and crushers stop and rocket cargo cannot be delivered. Jettison what it cannot use soon (space_platform action=jettison: uncrushed chunks, surplus iron-ore or ice), then ship what unblocks it (space-platform-foundation, the missing machines)."
+        end
+        local uncrushed = {}
+        for _, item in ipairs(platform.hub_items or {}) do
+            local kind = item.name:match("^(.+)%-asteroid%-chunk$")
+            if kind and item.count > 0 and not (platform.recipes or {})[kind .. "-asteroid-crushing"] then
+                uncrushed[#uncrushed + 1] = item.name .. " x" .. item.count .. " (needs a crusher on " .. kind .. "-asteroid-crushing)"
+            end
+        end
+        if #uncrushed > 0 then
+            warnings[#warnings + 1] = platform.name .. " collects chunks no crusher uses and they fill its hub: "
+                .. table.concat(uncrushed, ", ") .. ". Add those crushers with place_ghosts or jettison the chunks."
+        end
+        if platform.stranded_ghosts and platform.stranded_ghosts[1] then
+            warnings[#warnings + 1] = platform.name .. " has ghosts over empty space that the hub will never build: "
+                .. table.concat(platform.stranded_ghosts, ", ")
+                .. ". Place them again with place_ghosts including space-platform-foundation tiles under them (that replaces the old ghost)."
+        end
+        if platform.ghosts_missing_items and platform.ghosts_missing_items[1] then
+            local lacking = {}
+            for _, item in ipairs(platform.ghosts_missing_items) do
+                lacking[#lacking + 1] = item.name .. " x" .. (item.needed - item.available)
+            end
+            warnings[#warnings + 1] = platform.name .. "'s hub lacks " .. table.concat(lacking, ", ")
+                .. " for its ghosts: ship them (space_platform action=ship)."
+        end
+    end
+    if S.landing_pad_free_slots == 0 then
+        warnings[#warnings + 1] = "The landing pad at home is full, so nothing more lands there (space science included): take items out with inserters, and drop requests for bulk items such as iron-ore or asteroid chunks (space_platform action=request with only what you need)."
+    end
     state.next_goal = goal
     state.how = how
     state.warnings = warnings
@@ -446,7 +640,9 @@ function M.snapshot(character)
     if not (character and character.valid) then
         return {success = false, error = "no character; spawn first"}
     end
-    local surface = character.surface
+    -- The factory, production and progression describe home (Nauvis)
+    -- wherever the character is.
+    local surface = space.home_surface(character)
     local force = character.force
     local found = surface.find_entities_filtered{force = force}
     local counts_by_name = {}
@@ -567,6 +763,8 @@ function M.snapshot(character)
                 end)
                 if parts_ok and parts and parts > (facts.rocket_parts or -1) then facts.rocket_parts = parts end
                 if ready_ok and ready then facts.rocket_ready = true end
+            elseif entity.type == "roboport" then
+                facts.roboports = (facts.roboports or 0) + 1
             elseif entity.type == "electric-pole" then
                 local network_ok, network_id = pcall(function()
                     return entity.electric_network_id
@@ -629,9 +827,12 @@ function M.snapshot(character)
         mining_targets
     )
 
+    facts.space = space.summary(force, character)
     return {
         tick = game.tick,
         surface = surface.name,
+        character_surface = character.surface.name,
+        space = facts.space,
         character = character_snapshot(character),
         research = research.get_research_status(character),
         production = compact_production(surface.name, force),

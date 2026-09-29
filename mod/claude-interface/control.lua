@@ -21,6 +21,7 @@ local placement = require("placement")
 local power = require("power")
 local recipes = require("recipes")
 local research = require("research")
+local space = require("space")
 local transport = require("transport")
 local world = require("world")
 local find_factorioctl_character = characters.find
@@ -2943,6 +2944,18 @@ local api = {
         return json_remote_call("launch_rocket", research.launch_rocket, scoped_character(agent_id), unit_number)
     end,
 
+    robot_logistics = function(agent_id, surface_name)
+        return json_remote_call("robot_logistics", space.robot_logistics, agent_id, surface_name)
+    end,
+
+    place_ghosts = function(agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run)
+        return json_remote_call("place_ghosts", space.place_ghosts, agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run)
+    end,
+
+    space_platform = function(agent_id, action, platform_name, items, stops, x, y)
+        return json_remote_call("space_platform", space.space_platform, agent_id, action, platform_name, items, stops, x, y)
+    end,
+
     production_statistics = function(surface_name, agent_id)
         local character = scoped_character(agent_id)
         local scoped_surface = surface_name or (character and character.surface.name or nil)
@@ -3047,6 +3060,11 @@ end)
 -- ============================================================
 
 script.on_init(init_storage)
+
+-- Queued space shipments ride each ready rocket.
+script.on_nth_tick(60, function()
+    space.process_shipments()
+end)
 
 -- Process RCON queue and walk states every tick
 script.on_event(defines.events.on_tick, function(event)

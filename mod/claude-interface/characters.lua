@@ -647,6 +647,13 @@ function M.set_walk_target(agent_id, x, y, arrival_distance)
             error = "no character for agent " .. tostring(agent_id) .. "; spawn first",
         }
     end
+    if character.surface.platform then
+        return {
+            success = false,
+            error_kind = "on_space_platform",
+            error = "characters cannot walk on a space platform; build here with place_ghosts (the hub builds from its inventory) or leave with space_platform action=land",
+        }
+    end
 
     -- Reject malformed coordinates before any walk state is stored: the
     -- on_tick walker does arithmetic on them every tick.

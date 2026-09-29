@@ -3511,19 +3511,19 @@ EXPECTED_TOOLS="$(printf '%s\n' \
     find_nearest_resource \
     get_available_research get_belt_lane_contents get_entities get_entity_inventory \
     get_machine_belt_positions get_power_status get_recipe get_recipes_for_item \
-    get_research_status launch_rocket mine_at place_entity plan_automation_science \
+    get_research_status launch_rocket mine_at place_entity place_ghosts plan_automation_science \
     plan_machine_output plan_recipe_assembler_cell plan_steam_power \
     production_statistics refuel_burners remove_entity render_map repair_fuel_sustainability \
-    rotate_entity route_belt set_recipe situation_report start_research unstuck \
+    robot_logistics rotate_entity route_belt set_recipe situation_report space_platform start_research unstuck \
     verify_production wait_for_crafting walk_to | jq -Rsc 'split("\n")[:-1] | sort')"
 assert_json "model receives the exact gameplay tool surface" "$TOOLS" \
     --argjson expected "$EXPECTED_TOOLS" \
     '([.result.tools[].name] | sort) == $expected'
 TOOLS_SCHEMA_BYTES="$(jq -c '.result.tools' <<<"$TOOLS" | wc -c)"
-if (( TOOLS_SCHEMA_BYTES <= 61440 )); then
-    pass "model tool schema stays below 60 KiB"
+if (( TOOLS_SCHEMA_BYTES <= 73728 )); then
+    pass "model tool schema stays below 72 KiB"
 else
-    fail "model tool schema stays below 60 KiB" \
+    fail "model tool schema stays below 72 KiB" \
         "observed $TOOLS_SCHEMA_BYTES bytes"
 fi
 
@@ -7673,6 +7673,217 @@ assert_json "the assembler faces west with its recipe" "$(raw_lua "
 local a = game.surfaces['buddy-live-regression'].find_entities_filtered{name = 'assembling-machine-2', position = {1030.5, 910.5}, radius = 0.6}[1]
 rcon.print(helpers.table_to_json({direction = a and a.direction or -1, recipe = a and a.get_recipe() and a.get_recipe().name or ''}))
 ")" '.direction == 12 and .recipe == "rocket-fuel"'
+
+# Space Age for one character, on a powered Nauvis site at (2000.5, 2000.5):
+# robots build ghosts only inside roboport range, report what they lack, and
+# the character ships to, boards, builds on and lands from a space platform.
+SA_FIXTURE="$(raw_lua "
+local s = game.surfaces.nauvis
+local f = game.forces.player
+s.request_to_generate_chunks({2000, 2000}, 2); s.force_generate_chunk_requests()
+local tiles = {}
+for x = 1960, 2040 do for y = 1960, 2040 do tiles[#tiles + 1] = {name = 'landfill', position = {x, y}} end end
+s.set_tiles(tiles, true)
+for _, e in pairs(s.find_entities_filtered{area = {{1960, 1960}, {2041, 2041}}}) do if e.type ~= 'character' then e.destroy() end end
+local eei = s.create_entity{name = 'electric-energy-interface', position = {2020, 2020}, force = f}
+eei.power_production = 1e9; eei.electric_buffer_size = 1e10
+for _, p in pairs({{1986, 1986}, {2000, 1986}, {2014, 1986}, {1986, 2000}, {2014, 2000}, {1986, 2014}, {2000, 2014}, {2014, 2014}}) do
+    s.create_entity{name = 'substation', position = p, force = f}
+end
+local lab = s.create_entity{name = 'lab', position = {1992.5, 2008.5}, force = f}
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+c.teleport({2000.5, 2000.5}, s)
+rcon.print(helpers.table_to_json({ok = eei ~= nil and lab ~= nil and c.surface.name == 'nauvis'}))
+")"
+require_json "powered Nauvis site fixture exists" "$SA_FIXTURE" '.ok == true'
+assert_json "place_ghosts refuses positions outside roboport range" \
+    "$(tool_payload "$(mcp_tool place_ghosts '{"origin_x":2000.5,"origin_y":2000.5,"entities":[{"name":"iron-chest","dx":5,"dy":0}]}')")" \
+    '.success == false and .error_kind == "no_construction_coverage"'
+raw_lua "local s = game.surfaces.nauvis; local f = game.forces.player
+local rp = s.create_entity{name = 'roboport', position = {2000, 2010}, force = f}
+rp.insert{name = 'construction-robot', count = 5}
+local chest = s.create_entity{name = 'storage-chest', position = {2005.5, 2010.5}, force = f}
+chest.insert{name = 'iron-chest', count = 5}; chest.insert{name = 'assembling-machine-2', count = 1}
+rcon.print('ok')" >/dev/null
+assert_json "place_ghosts places covered ghosts and sets the assembler recipe" \
+    "$(tool_payload "$(mcp_tool place_ghosts '{"origin_x":2000.5,"origin_y":2000.5,"entities":[{"name":"iron-chest","dx":5,"dy":0},{"name":"assembling-machine-2","dx":-5,"dy":0,"recipe":"iron-gear-wheel"}]}')")" \
+    '.success == true and .placed == 2 and all(.recipes[]; .recipe_set)'
+sa_built() {
+    raw_lua "local s = game.surfaces.nauvis
+local a = s.find_entities_filtered{name = 'assembling-machine-2', position = {1995.5, 2000.5}, radius = 0.6}[1]
+rcon.print(helpers.table_to_json({chest = s.count_entities_filtered{name = 'iron-chest', position = {2005.5, 2000.5}, radius = 0.6},
+    recipe = a and a.get_recipe() and a.get_recipe().name or ''}))"
+}
+for _ in $(seq 1 60); do
+    [[ "$(sa_built | jq -r '.chest == 1 and .recipe == "iron-gear-wheel"')" == "true" ]] && break
+    sleep 1
+done
+assert_json "robots build the ghosts with the assembler recipe" "$(sa_built)" \
+    '.chest == 1 and .recipe == "iron-gear-wheel"'
+tool_payload "$(mcp_tool place_ghosts '{"origin_x":2000.5,"origin_y":2000.5,"entities":[{"name":"steel-chest","dx":5,"dy":3}]}')" >/dev/null
+assert_json "robot_logistics reports robots and the item a ghost lacks" \
+    "$(tool_payload "$(mcp_tool robot_logistics '{}')")" \
+    '.success == true and .construction_robots >= 5 and any(.missing_items[]; .name == "steel-chest")'
+
+raw_lua "local s = game.surfaces.nauvis; local f = game.forces.player
+f.technologies['rocket-silo'].researched = true
+local silo = s.create_entity{name = 'rocket-silo', position = {2000.5, 1992.5}, force = f}
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+c.get_main_inventory().insert{name = 'space-platform-starter-pack', count = 1}
+c.get_main_inventory().insert{name = 'solar-panel', count = 10}
+rcon.print('ok')" >/dev/null
+sa_silo() {
+    raw_lua "local st = {} for k, v in pairs(defines.rocket_silo_status) do st[v] = k end
+local silo = game.surfaces.nauvis.find_entities_filtered{name = 'rocket-silo', position = {2000.5, 1992.5}, radius = 1}[1]
+rcon.print(helpers.table_to_json({status = st[silo.rocket_silo_status]}))"
+}
+sa_ready() {
+    raw_lua "local silo = game.surfaces.nauvis.find_entities_filtered{name = 'rocket-silo', position = {2000.5, 1992.5}, radius = 1}[1]
+silo.rocket_parts = silo.prototype.rocket_parts_required; rcon.print('ok')" >/dev/null
+    for _ in $(seq 1 90); do
+        [[ "$(sa_silo | jq -r '.status')" == "rocket_ready" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+sa_ready || fail "the Nauvis silo readies its first rocket"
+SA_CREATE="$(tool_payload "$(mcp_tool space_platform '{"action":"create"}')")"
+assert_json "space_platform create waits for the starter pack" "$SA_CREATE" \
+    '.success == true and .state == "waiting_for_starter_pack"'
+SA_PLATFORM="$(jq -r '.name' <<<"$SA_CREATE")"
+SA_SPEC="{\"platform\":\"$SA_PLATFORM\""
+assert_json "space_platform ships the starter pack" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"ship\",\"items\":[{\"name\":\"space-platform-starter-pack\",\"count\":1}]}")")" \
+    '.success == true'
+# Coprocess descriptors do not reach pipeline subshells: read the tool
+# result into a variable before piping it.
+sa_platform() {
+    local status
+    status="$(tool_payload "$(mcp_tool space_platform '{"action":"status"}')")"
+    jq -c --arg p "$SA_PLATFORM" '.platforms[] | select(.name == $p)' <<<"$status"
+}
+for _ in $(seq 1 45); do
+    [[ "$(jq -r '.surface != null' <<<"$(sa_platform)")" == "true" ]] && break
+    sleep 2
+done
+assert_json "the starter pack builds the platform hub" "$(sa_platform)" '.surface != null'
+SA_SURFACE="$(jq -r '.surface' <<<"$(sa_platform)")"
+# A shipment made while the silo is still building its rocket waits in the
+# silo and leaves by itself once the rocket is ready.
+assert_json "space_platform queues cargo while the rocket is not ready" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"ship\",\"items\":[{\"name\":\"solar-panel\",\"count\":10}]}")")" \
+    '.success == true and .rockets_launched_now == 0 and .rockets_still_needed == 1'
+assert_json "queued cargo is shown on the platform and left the inventory" \
+    "$(jq -c '{queued: .queued_cargo}' <<<"$(sa_platform)")" \
+    'any(.queued[]; .name == "solar-panel" and .count == 10)'
+assert_json "space_platform unship takes queued cargo back" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"unship\",\"items\":[{\"name\":\"solar-panel\",\"count\":2}]}")")" \
+    '.success == true and .returned == [{"name":"solar-panel","count":2}] and any(.queued_cargo[]; .name == "solar-panel" and .count == 8)'
+assert_json "unshipped cargo can be shipped again" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"ship\",\"items\":[{\"name\":\"solar-panel\",\"count\":2}]}")")" \
+    '.success == true'
+raw_lua "local silo = game.surfaces.nauvis.find_entities_filtered{name = 'rocket-silo', position = {2000.5, 1992.5}, radius = 1}[1]
+silo.rocket_parts = silo.prototype.rocket_parts_required; rcon.print('ok')" >/dev/null
+for _ in $(seq 1 45); do
+    [[ "$(jq -r '(([.hub_items[]? | select(.name == "solar-panel") | .count] | add) // 0) >= 10' <<<"$(sa_platform)")" == "true" ]] && break
+    sleep 2
+done
+assert_json "the shipped solar panels arrive in the hub" "$(sa_platform)" \
+    '(([.hub_items[]? | select(.name == "solar-panel") | .count] | add) // 0) >= 10'
+# A full hub destroys delivered cargo, so shipping into it is refused.
+raw_lua "local p = game.forces.player.platforms[1]
+for _, platform in pairs(game.forces.player.platforms) do if platform.name == '$SA_PLATFORM' then p = platform end end
+local inv = p.hub.get_inventory(defines.inventory.hub_main)
+inv.insert{name = 'metallic-asteroid-chunk', count = inv.count_empty_stacks()}
+remote.call('claude_interface', 'get_character', '$AGENT_ID').insert{name = 'iron-chest', count = 5}
+rcon.print('ok')" >/dev/null
+assert_json "space_platform refuses cargo for a full hub" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"ship\",\"items\":[{\"name\":\"iron-chest\",\"count\":5}]}")")" \
+    '.success == false and .error_kind == "hub_full"'
+assert_json "jettisoning chunks frees the full hub" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"jettison\",\"items\":[{\"name\":\"metallic-asteroid-chunk\",\"count\":1000}]}")")" \
+    '.success == true and .jettisoned[0].count > 0 and .hub_free_slots > 0'
+sa_ready || fail "the Nauvis silo readies a rocket to board"
+assert_json "space_platform boards the character onto a ready rocket" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"board\"}")")" \
+    '.success == true'
+sa_character() {
+    raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+rcon.print(helpers.table_to_json({surface = c and c.valid and c.surface.name or '', in_pod = c and c.valid and c.cargo_pod ~= nil, x = c and c.valid and c.position.x or 0, y = c and c.valid and c.position.y or 0}))"
+}
+for _ in $(seq 1 45); do
+    [[ "$(sa_character | jq -r --arg s "$SA_SURFACE" '.surface == $s and .in_pod == false')" == "true" ]] && break
+    sleep 2
+done
+assert_json "the character arrives on the platform" "$(sa_character)" --arg s "$SA_SURFACE" \
+    '.surface == $s and .in_pod == false'
+assert_json "walk_to refuses to walk on a space platform" \
+    "$(jq -Rs '{text: .}' <<<"$(tool_payload "$(mcp_tool walk_to '{"x":3,"y":3}')")")" \
+    '.text | test("cannot walk on a space platform")'
+assert_json "research status counts home labs while on the platform" \
+    "$(tool_payload "$(mcp_tool get_research_status '{}')")" \
+    '.labs.count >= 1 and .labs.powered >= 1'
+# start_research puts an already-queued technology first, so it is not stuck
+# behind a technology whose packs are never made.
+SA_QUEUE="$(raw_lua "
+local f = game.forces.player
+local ready = {}
+for _, name in ipairs({'automation', 'logistics', 'fast-inserter', 'logistic-science-pack', 'turrets', 'stone-wall', 'military', 'optics'}) do
+    local tech = f.technologies[name]
+    if #ready < 2 and tech and tech.enabled and not tech.researched and not tech.prototype.research_trigger then
+        for _, prereq in pairs(tech.prerequisites) do prereq.researched = true end
+        ready[#ready + 1] = name
+    end
+end
+f.research_queue = ready
+local q = {} for _, t in pairs(f.research_queue) do q[#q + 1] = t.name end
+rcon.print(helpers.table_to_json({queue = q}))
+")"
+require_json "a two-technology research queue fixture exists" "$SA_QUEUE" '(.queue | length) == 2'
+SA_SECOND="$(jq -r '.queue[1]' <<<"$SA_QUEUE")"
+assert_json "start_research moves a queued technology to the front" \
+    "$(tool_payload "$(mcp_tool start_research "{\"technology\":\"$SA_SECOND\"}")")" \
+    --arg t "$SA_SECOND" '.success == true and .moved_to_front == true and .queue[0] == $t and (.queue | length) == 2'
+SA_TILES="$(jq -nc '[range(5; 8) as $x | range(-2; 1) as $y | {name: "space-platform-foundation", dx: $x, dy: $y}]')"
+assert_json "place_ghosts queues foundation and a solar panel on the platform" \
+    "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"tiles\":$SA_TILES,\"entities\":[{\"name\":\"solar-panel\",\"dx\":6.5,\"dy\":-0.5}]}")")" \
+    '.success == true and .placed == 1 and .placed_tiles == 9'
+sa_panels() {
+    raw_lua "rcon.print(helpers.table_to_json({panels = game.surfaces['$SA_SURFACE'].count_entities_filtered{name = 'solar-panel'}}))"
+}
+for _ in $(seq 1 30); do
+    [[ "$(sa_panels | jq -r '.panels')" -ge 1 ]] && break
+    sleep 2
+done
+assert_json "the hub builds the solar panel from its stock" "$(sa_panels)" '.panels >= 1'
+assert_json "place_ghosts refuses a platform ghost over empty space" \
+    "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"dry_run\":true,\"entities\":[{\"name\":\"solar-panel\",\"dx\":30.5,\"dy\":30.5}]}")")" \
+    '.success == false and .error_kind == "placement_blocked" and (.blockers | length) == 0'
+assert_json "a blocked platform ghost names its blocker and a free spot" \
+    "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"dry_run\":true,\"entities\":[{\"name\":\"small-electric-pole\",\"dx\":6.5,\"dy\":-0.5}]}")")" \
+    '.success == false and any(.blockers[]; . == "solar-panel") and .nearest_free != null'
+assert_json "place_ghosts refuses foundation that does not join the platform" \
+    "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"dry_run\":true,\"tiles\":[{\"name\":\"space-platform-foundation\",\"dx\":30,\"dy\":30}]}")")" \
+    '.success == false and .error_kind == "disconnected_foundation" and .tiles[0].x == 30'
+# A ghost left over empty space is never built; placing over it with
+# foundation replaces it instead of reporting it as already built.
+raw_lua "game.surfaces['$SA_SURFACE'].create_entity{name = 'entity-ghost', inner_name = 'small-electric-pole', position = {8.5, -0.5}, force = 'player'}
+rcon.print('ok')" >/dev/null
+assert_json "place_ghosts replaces a stranded platform ghost" \
+    "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"tiles\":[{\"name\":\"space-platform-foundation\",\"dx\":8,\"dy\":-1}],\"entities\":[{\"name\":\"small-electric-pole\",\"dx\":8.5,\"dy\":-0.5}]}")")" \
+    '.success == true and .placed == 1 and .placed_tiles == 1 and (.removed_stranded_ghosts | length) == 1'
+assert_json "space_platform schedules a stop" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"schedule\",\"stops\":[\"nauvis\"]}")")" \
+    '.success == true and .stops == ["nauvis"]'
+assert_json "space_platform lands the character" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"land\",\"x\":2000,\"y\":2000}")")" \
+    '.success == true and .landing_on == "nauvis"'
+for _ in $(seq 1 45); do
+    [[ "$(sa_character | jq -r '.surface == "nauvis" and .in_pod == false')" == "true" ]] && break
+    sleep 2
+done
+assert_json "the character lands near the requested spot" "$(sa_character)" \
+    '.surface == "nauvis" and ((.x - 2000) | fabs) < 40 and ((.y - 2000) | fabs) < 40'
 
 stop_mcp
 

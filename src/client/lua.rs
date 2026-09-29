@@ -1199,6 +1199,69 @@ impl LuaCommand {
         )
     }
 
+    /// Robot, roboport and ghost state of a surface (default: the character's).
+    pub fn robot_logistics(agent_id: &AgentId, surface_name: Option<&str>) -> String {
+        Self::claude_interface_json_call(
+            "robot_logistics",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                surface_name.map_or_else(|| "nil".to_string(), Self::lua_string_arg),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before reading robot logistics.",
+        )
+    }
+
+    /// Place entity and tile ghosts for robots or a platform hub to build.
+    /// `entities` and `tiles` are JSON arrays of `{name, dx, dy, ...}`.
+    pub fn place_ghosts(
+        agent_id: &AgentId,
+        surface_name: Option<&str>,
+        origin: Position,
+        entities: &Value,
+        tiles: &Value,
+        dry_run: bool,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "place_ghosts",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                surface_name.map_or_else(|| "nil".to_string(), Self::lua_string_arg),
+                origin.x.to_string(),
+                origin.y.to_string(),
+                entities.to_string(),
+                tiles.to_string(),
+                dry_run.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before placing ghosts.",
+        )
+    }
+
+    /// Space platform action (status, create, ship, request, schedule, board, land).
+    /// `items` and `stops` are JSON arrays.
+    pub fn space_platform(
+        agent_id: &AgentId,
+        action: &str,
+        platform: Option<&str>,
+        items: &Value,
+        stops: &Value,
+        x: Option<f64>,
+        y: Option<f64>,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "space_platform",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                Self::lua_string_arg(action),
+                platform.map_or_else(|| "nil".to_string(), Self::lua_string_arg),
+                items.to_string(),
+                stops.to_string(),
+                x.map_or_else(|| "nil".to_string(), |x| x.to_string()),
+                y.map_or_else(|| "nil".to_string(), |y| y.to_string()),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before space platform actions.",
+        )
+    }
+
     // --- Power Network Commands ---
 
     /// Get power status at a location (enhanced version with generator/consumer details)

@@ -331,12 +331,25 @@ function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, cou
     return result
 end
 
+-- Research is force-wide: count labs on every planet surface, so status
+-- stays right while the character is on a platform or another planet.
+local function force_labs(force)
+    local labs = {}
+    for _, surface in pairs(game.surfaces) do
+        if surface.platform == nil then
+            for _, lab in pairs(surface.find_entities_filtered{type = "lab", force = force}) do
+                labs[#labs + 1] = lab
+            end
+        end
+    end
+    return labs
+end
+
 function M.get_research_status(character)
     if not (character and character.valid) then
         return {success = false, error = "no character; spawn first"}
     end
     local force = character.force
-    local surface = character.surface
     local result = {
         researched_count = 0,
         total_count = 0,
@@ -379,7 +392,7 @@ function M.get_research_status(character)
         end
     end
 
-    local labs = surface.find_entities_filtered{type = "lab", force = force}
+    local labs = force_labs(force)
     result.labs.count = #labs
 
     local science_totals = science_totals_from_labs(labs)
@@ -411,7 +424,6 @@ function M.get_available_research(character)
         return {success = false, error = "no character; spawn first", technologies = {}}
     end
     local force = character.force
-    local surface = character.surface
     local result = {
         technologies = {},
         lab_status = {
@@ -421,7 +433,7 @@ function M.get_available_research(character)
         science_available = {},
     }
 
-    local labs = surface.find_entities_filtered{type = "lab", force = force}
+    local labs = force_labs(force)
     result.lab_status.count = #labs
 
     local science_totals = science_totals_from_labs(labs)
@@ -568,8 +580,7 @@ function M.start_research(character, tech_name)
         }
     end
 
-    local surface = character.surface
-    local labs = surface.find_entities_filtered{type = "lab", force = force}
+    local labs = force_labs(force)
     local powered_labs = 0
     for _, lab in pairs(labs) do
         if lab_has_power(lab) then
@@ -585,7 +596,38 @@ function M.start_research(character, tech_name)
         end
     end
 
-    local added = force.add_research(tech)
+    -- "Start" means next: put the technology at the front of the queue,
+    -- behind only its own queued prerequisites. Appending would leave it
+    -- behind a technology whose packs are not made, which never finishes.
+    local was_queued = queued[tech.name] == true
+    local needed = {}
+    local function mark(t)
+        for _, prereq in pairs(t.prerequisites) do
+            if not prereq.researched and not needed[prereq.name] then
+                needed[prereq.name] = true
+                mark(prereq)
+            end
+        end
+    end
+    mark(tech)
+    local order, rest = {}, {}
+    for _, entry in pairs(queue_ok and queue or {}) do
+        if needed[entry.name] then order[#order + 1] = entry.name
+        elseif entry.name ~= tech.name then rest[#rest + 1] = entry.name end
+    end
+    order[#order + 1] = tech.name
+    for _, name in ipairs(rest) do order[#order + 1] = name end
+    local set_ok = pcall(function() force.research_queue = order end)
+    local queue_now = {}
+    local added = false
+    local read_ok, current_queue = pcall(function() return force.research_queue end)
+    for _, entry in pairs(read_ok and current_queue or {}) do
+        queue_now[#queue_now + 1] = entry.name
+        if entry.name == tech.name then added = true end
+    end
+    if not added and not set_ok then
+        added = force.add_research(tech)
+    end
     if added then
         return {
             success = true,
@@ -597,15 +639,27 @@ function M.start_research(character, tech_name)
                 powered = powered_labs,
                 missing_packs = missing_packs,
             },
-            queue_length = (function()
-                local ok, q = pcall(function() return force.research_queue end)
-                return ok and q and #q or nil
+            moved_to_front = was_queued or nil,
+            dropped_from_queue = (function()
+                local kept, dropped = {}, {}
+                for _, name in ipairs(queue_now) do kept[name] = true end
+                for _, name in ipairs(order) do
+                    if not kept[name] then dropped[#dropped + 1] = name end
+                end
+                return dropped[1] and dropped or nil
             end)(),
-            message = "Research queued. Keep at least 3 technologies queued so labs never idle, and automate any missing lab power or science delivery.",
+            queue = queue_now,
+            queue_length = #queue_now,
+            message = "Research queued first. Keep at least 3 technologies queued so labs never idle, and automate any missing lab power or science delivery.",
         }
     end
 
-    return {success = false, error = "Failed to queue research - check if another research is in progress"}
+    return {
+        success = false,
+        error_kind = "research_queue_refused",
+        error = "Factorio refused to queue it; the queue may be full",
+        queue = queue_now,
+    }
 end
 
 function M.is_tech_researched(character, tech_name)

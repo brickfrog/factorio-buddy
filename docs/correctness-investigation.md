@@ -597,6 +597,159 @@ A read-only review of the new code found real defects, all fixed:
 
 Gates after these fixes: fmt, clippy and 436 cargo tests pass; `luac` is clean; `live_regressions.sh` has 474 passed and 0 failed; `buddy_runtime.sh` 21/21. The long runs above predate the two-phase steam build and the widened water box.
 
+## Space Age for one character: robots, a platform, Vulcanus
+
+After the first rocket, Buddy continues into Space Age with one character. Nauvis is run by construction robots while the character is away. Enemies stay off (peaceful map; Vulcanus inherits it).
+
+### Changes
+
+- **Three model tools** (Lua in `mod/claude-interface/space.lua`):
+  - `robot_logistics`: roboports, robots, ghosts, ghosts outside construction range and the items ghosts still lack, on any surface. On a platform it adds the hub stock and build queue.
+  - `place_ghosts`: entity and tile ghosts on any surface, all-or-nothing, in `build_layout`'s format. On a planet every position must be in construction range (`no_construction_coverage` otherwise); trees and rocks are marked for removal; recipes are set on the ghosts. On a platform the hub builds from its own stock, including foundation tiles.
+  - `space_platform`: `status`, `create`, `ship` (items from the inventory in a ready rocket; the starter pack for a new platform), `request` (landing-pad requests), `schedule`, `board` and `land`. A silo out of reach is approached once and the call retried.
+- **One character across surfaces:**
+  - Walking on a platform is refused (`on_space_platform`).
+  - Research status counts labs on every planet surface, not only the character's.
+  - The snapshot and `evaluation_sample` describe Nauvis while the character is on a platform or another planet. Test surfaces without a planet keep their old behaviour.
+- **Progression:** the old "a rocket has been launched" rung is gone. After the first rocket the ladder goes: construction robotics, a home roboport network with 10 robots, a platform, space science on it, a landing pad with a request, the research path to `planet-discovery-vulcanus` (`progression.space_path`), thrusters, turrets, boarding, course, landing. Recipe text in rungs is read from the prototypes. New warnings cover ghosts outside roboport range, items the home robots lack, and damaged platform tiles.
+- The trial `summary.json` records `.space` from the final sample.
+- The model tool schema cap rose from 60 KiB to 72 KiB. With the three tools it is 64 824 bytes.
+
+**Found while testing:** a character that arrives on a platform by rocket sits inside the hub (`driving` true, `teleport` refused). A cargo pod then silently ignores it as a passenger and flies empty. `land` now forces it out of the hub first (`set_driving(false, true)`) and refuses when the pod does not hold the character.
+
+Gates: fmt, clippy, 438 cargo tests, `luac`, `live_regressions.sh` 503 passed and 0 failed (`fb-evidence/git-gud/live21`, with 19 new Space Age checks), and `buddy_runtime.sh` passed. On long19's final save, `next_goal` is "Research construction-robotics: …", with 0 roboports and no platforms.
+
+### `long20-cont19-opus-open-2590060469-60m`
+
+long20 continues from long19's save: 60 minutes, 98 turns, none provider-limited, 247 tool calls with 17 errors, 0 invariant failures. `plate_automation` and `powered_production` were achieved.
+- Buddy created platform `buddy-1` and shipped its starter pack; the hub was built and `space-platform` completed. All 8 `space_platform` calls succeeded.
+- It never got construction robots. `start_research construction-robotics` failed three times with "Failed to queue research". On the final save the technology was already second in the queue, behind `mining-productivity-3`, whose packs were not made. Factorio refuses to queue a technology twice, and the old message blamed "another research in progress".
+- `diagnose_steam_power` twice returned 75–80 KB, which Claude refused to read (119 entities, 47 KB in `entities`).
+- 52 `collect_from_chest` calls: most of the hour went to hand logistics for crafting.
+
+**Fixes after long20:**
+- `start_research` puts the technology first in the queue, behind only its own queued prerequisites; an already-queued technology is moved to the front (`moved_to_front`). The result lists the queue. On long20's save, `construction-robotics` moved from second to first. A live check covers the move.
+- `diagnose_steam_power` keeps its first 40 entities and reports `entities_omitted`.
+
+Gates: 438 cargo tests, clippy, `luac`, `live_regressions.sh` 505 passed and 0 failed (`fb-evidence/git-gud/live22`).
+
+### `long21-cont20-opus-open-2590060469-60m`
+
+long21 continues from long20 with the queue fix: 60 minutes, 25 turns (several near the 300 s cut), none provider-limited, 30 tool errors, 0 invariant failures. `plate_automation` and `powered_production` held.
+- `start_research construction-robotics` succeeded first time and the technology finished. A roboport with 10 construction robots now runs at home.
+- Buddy crafted an asteroid collector, shipped it with `space_platform ship`, and placed it and 6 foundation tiles with `place_ghosts surface=platform-1`; the hub built them. Building the collector completed `space-science-pack`. It scheduled the platform at Nauvis.
+- Most errors were hand logistics, not the new tools: 11 `wait_for_crafting` timeouts behind long crafts (low-density structure, roboport), 5 "stuck" walks inside the dense base, and 5 `route_belt` dry runs refused at occupied endpoints. None of the 44 `space_platform`/`place_ghosts`/`robot_logistics` calls failed.
+- End state: next rung "Make space science on buddy-1" (crushers, furnace, assembler, inserters, power on the platform); no landing pad yet.
+
+### `long22-cont21-opus-open-2590060469-60m`
+
+60 minutes, 27 turns, none provider-limited, 38 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- On `buddy-1` Buddy built an asteroid collector, 2 crushers on carbonic and oxide crushing, 9 inserters, poles and solar panels with `place_ghosts`, all built by the hub. The hub holds 317 carbon, 85 ice and 36 iron plate. The assembler and electric furnace for space science were shipped but not yet placed: one `place_ghosts` call was refused (`placement_blocked`, nothing placed) and the retry at another spot was cut by the turn limit.
+- **Rockets are the bottleneck.** 12 of the 38 errors were `space_platform ship` refused with `rocket_not_ready`, mostly repeated within a turn while the silo refilled (28/50 parts at the end). One was `rocket_cargo_full` for 74 foundation (a rocket lifts 50).
+- `analyze_item_flow` returned 81 KB, which Claude refused to read.
+
+**Fixes after long22:**
+- `rocket_not_ready` now reports `parts_required` and says to fill each rocket and do other work instead of retrying. `rocket_cargo_full` reports `max_per_rocket` from the item weight (1 t per rocket: 50 foundation, 10 crushers, 100 magazines).
+- `analyze_item_flow` keeps the first 40 `reachable_belts` and `items_on_path`, with `_omitted` counts.
+
+### `long23-cont22-opus-open-2590060469-60m`
+
+60 minutes, 39 turns, none provider-limited, 57 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- `buddy-1` now has an assembler set to `space-science-pack` and crushers on metallic and oxide crushing; the hub holds 420 carbon, 135 ice and 150 iron ore. The electric furnace for iron plate was never placed, so no space science was made.
+- **The furnace placement failed five times** (dry runs refused with `placement_blocked`). On the final save the refusals were correct: each spot overlapped a crusher, solar panels or the collector, and the model could not see which. Checking this also showed a real defect: a platform ghost over empty space passed the check (a 3x3 furnace at 12.5,0.5 with no foundation), and the hub would never have built it.
+- Rockets again: 13 `ship`/`board` refusals with `rocket_not_ready` and 7 `launch_rocket` refusals, despite the new "do not retry" guidance.
+- 60 `walk_to` calls and 7 "stuck" failures inside the dense base.
+
+**Fixes after long23:**
+- On a platform, `place_ghosts` refuses an entity whose footprint is empty space not covered by a planned foundation tile.
+- `placement_blocked` names the blockers in the error text and returns `nearest_free`, the closest spot within 12 tiles where the entity fits. When a platform has none, it says to add foundation tiles in the same call. On long23's save, the furnace at 6.5,0.5 is "blocked by crusher; nearest free spot … at 8.5,-1.5" before the foundation rule and has no free spot after it (the platform is full), so the message asks for foundation.
+- Two live checks cover both. Gates: 438 cargo tests, clippy, `luac`, `live_regressions.sh` 507 passed and 0 failed (`fb-evidence/git-gud/live23`).
+
+### `long24-cont23-opus-open-2590060469-60m`
+
+Stopped after 40 minutes by `max_autonomous_turns`: 120 turns, of which **108 made no tool call**. None provider-limited, 14 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- In its working turns Buddy traced why the silo was stuck at 14/50 rocket parts: the low-density-structure assembler got no copper because iron filled the copper lane. It built a dedicated copper feed and reworked side-fed underground belts. The silo reached 35/50.
+- It then followed the new `rocket_not_ready` guidance literally: "holding the inserter and pole next to the silo, will ship as soon as the rocket is ready. No other changes this turn." Buddy starts an autonomy turn about 10 s after the last one ends, so the waiting turns spent the 120-turn budget in minutes. Nothing was shipped; the platform is unchanged.
+
+**Fix after long24:** an autonomy turn with no tool call delays the next one by 6, then 12, at most 18 heartbeats (capped at 180 s; with the trial's 5 s heartbeat: 30, 60, 90 s). Any turn that calls a tool resets it; player messages are unaffected. A unit test pins the steps and caps.
+
+### `long25-cont24-opus-open-2590060469-60m` (provider-limited, invalid as a trial)
+
+The five-hour subscription limit was hit 10 minutes in: 10 of 17 turns were provider-limited, so this does not count. Nauvis held `plate_automation` and `powered_production` through the hour without the model.
+- In the valid 10 minutes Buddy shipped 3 inserters and 3 poles (the silo had filled), then asked to ship 6 inserters and 150 iron plate **18 times within one turn** while the next rocket built. The zero-call backoff from long24 does not catch this: each turn did make calls.
+
+**Fix after long25: shipments queue at the silo.** `space_platform ship` no longer needs a ready rocket. Beside any silo, it takes the items from the inventory into a shipment the mod holds, and a once-a-second handler loads each ready rocket with as much as it lifts (1 t) and launches it until the shipment is empty. The result reports `rockets_launched_now` and `rockets_still_needed`; `status` shows waiting cargo as `queued_cargo` per platform. Cargo for a platform that no longer exists goes back to the character. This also removes `rocket_cargo_full`: large shipments split across rockets. `board` still needs a ready rocket with empty cargo.
+- Sandbox on long25's save, silo at 37/50: 120 foundation and 5 solar panels queued (3 rockets needed); after three refills the hub received them in 50/50/rest batches and `queued_cargo` emptied.
+- A live check ships while the rocket is not ready, sees the cargo queued and out of the inventory, then fills the silo and sees it arrive. Gates: 439 cargo tests, clippy, `luac`, `live_regressions.sh` 508 passed and 0 failed (`fb-evidence/git-gud/live24`), `buddy_runtime.sh` passed (after the long24 fix).
+
+### `long26-cont25-opus-open-2590060469-60m`
+
+60 minutes, 51 turns (10 without a tool call, now backed off), none provider-limited, 47 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- Buddy used the queued `ship` as intended: 6 and 5 inserters, then 800 iron plate (16 rockets). It no longer retried `ship`; it called `launch_rocket` 27 times instead (22 refused while the silo refilled).
+- **All of that cargo was lost.** Loading the final save: the hub's 59 slots had been full since long23 (38 metallic asteroid chunks at one per slot, 420 carbon, ice, iron ore). A rocket delivering to a full hub parks its pod and the cargo disappears. Reproduced on the save: 20 iron plate shipped, the pod parked, the hub count stayed 0. The full hub is also why the platform had not changed since long23: collectors and crushers stop when the hub cannot take their output.
+- `walk_to` once failed with "Packet too large: 17613457 bytes" (target 33,386 across the base). Not fixed yet.
+
+**Fixes after long26:**
+- Queued shipments load each rocket only with what the hub can take now: room in partly filled stacks plus free slots shared across the rocket. The rest keeps waiting (`cargo_blocked: hub_full` in status). On long26's save, 100 iron plate and 40 carbon queued; only 30 carbon (the free space in a carbon stack) left, the rest waited.
+- `ship` refuses with `hub_full` when the hub has no room for any of the items, with the hub contents and how to free slots.
+- Platform status reports `hub_slots` and `hub_free_slots`; the snapshot warns when a hub is full.
+- A live check fills a hub and sees `ship` refused. Gates: `luac`, 55 golden tests, `live_regressions.sh` 509 passed and 0 failed (`fb-evidence/git-gud/live25`).
+
+### `long27-cont26-opus-open-2590060469-60m`
+
+60 minutes, 43 turns, none provider-limited, 42 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held. The character stayed on Nauvis.
+- **Space science reached the labs:** `space-platform-thruster` was researched by the end. `planet-discovery-vulcanus` was queued twice (and `planet-discovery-fulgora` once) but was not finished. Buddy also requested iron ore and carbonic asteroid chunks on the landing pad.
+- **The hub-full fix worked:** Buddy freed 16 of the 59 hub slots, and cargo now arrives: the hub held 336 iron plate at the end, where long26's 800 had vanished. One `ship` was refused with `hub_full` before slots were freed; the retry was accepted. 600 iron plate and a few smaller items were still queued at the silo at the end.
+- The platform was still missing its electric furnace, which sat in the hub. 11 `place_ghosts` dry runs were blocked by the crushers, the collector and the solar panels. Buddy then added foundation tiles east of the hub, and 4 ghosts were waiting at the end.
+- The other errors were Nauvis base work: `verify_production` ×7, `launch_rocket` ×6 while the silo refilled, `build_layout` ×4 (blocked tiles, or out of reach). There was also one `start_research calcite-processing`, which is a trigger tech.
+
+The chain stopped here as agreed: two runs after long25. To reach Vulcanus, Buddy still has to:
+1. finish the planet-discovery-vulcanus research;
+2. build thrusters with their fuel and oxidizer chain, and turrets;
+3. schedule the platform for Vulcanus, board it, fly there and land.
+
+**Fixes after long27** (the user extended the chain until the quota runs out):
+- Loading long27's save showed why the furnace never got placed. The electric-furnace ghost at 3.5,-6.5, and two pole ghosts, sat over empty space with no foundation under them; they were placed before the long23 foundation check. The hub never builds such a ghost, yet `place_ghosts` counted it as `already_built` and other ghosts collided with it ("blocked by ghost of electric-furnace").
+- Four foundation tile ghosts at x=8–9 did not touch the platform, so the hub never laid them either.
+- `place_ghosts` on a platform now treats a ghost standing over empty space with no tile ghost under it as stranded: it is neither `already_built` nor a blocker. A call that places over it removes it when it executes (`removed_stranded_ghosts`; a dry run reports `would_remove_stranded_ghosts`) and puts it back on rollback. Dry runs and refused calls change nothing.
+- New foundation tiles must join the platform, directly or through other tiles in the same call or existing tile ghosts; otherwise the call fails with `disconnected_foundation` and lists the tiles.
+- Checked on long27's save: two loose tiles were refused. The furnace was placed over its stranded ghost with 9 foundation tiles: the dry run removed nothing, the execute replaced the ghost, and the hub built the tiles and the furnace. Two live checks added. Gates: `luac`, 55 golden tests, `live_regressions.sh` 511 passed and 0 failed (`fb-evidence/git-gud/live26`).
+
+### `long28-cont27-opus-open-2590060469-60m`
+
+60 minutes, 25 turns, none provider-limited, 47 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held. The character stayed on Nauvis; `planet-discovery-vulcanus` was still not researched.
+- Most of the run went into chemical science on Nauvis. The snapshot's goal had been "Get chemical-science-pack made: … the missing link is pipe, needed by engine-unit". Errors: `route_belt` ×14, `verify_production` ×9, `wait_for_crafting` ×5.
+- The hub filled again (0 of 59 slots free) and Buddy never tried `place_ghosts`. The hub held 832 iron ore and 32 carbonic chunks: the platform crushes metallic and oxide chunks, but nothing crushes carbonic chunks, and they take one slot each. Buddy tried to ship a third crusher, which was refused with `hub_full`: a deadlock, since the part that would free the hub could not be delivered. It also set landing-pad requests for iron ore and chunks repeatedly, to drain the hub.
+
+**Fixes after long28:**
+- `space_platform action=jettison` throws asteroid chunks out of the hub, as an inserter over the platform edge would. Other items are refused with `not_jettisonable` and pointed to landing-pad requests.
+- The snapshot warns about each chunk type in the hub that no crusher on the platform processes. The hub-full warning and the `hub_full` guidance now name `jettison`.
+- On long28's save, the warning named `carbonic-asteroid-chunk x31`; jettisoning them freed 32 slots, and iron ore was refused. Two live checks added. Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 513 passed and 0 failed (`fb-evidence/git-gud/live27`).
+
+### `long29-cont28-opus-open-2590060469-60m`
+
+60 minutes, 61 turns, none provider-limited, 39 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held. Still on Nauvis, `planet-discovery-vulcanus` not researched.
+- Buddy used `jettison` at once (31 carbonic chunks), shipped a third crusher, and placed it with `place_ghosts` on carbonic crushing, together with a foundation tile.
+- It then jettisoned 1–5 carbonic chunks at a time in more than 25 calls, because the collector kept bringing more while the new crusher was not built. The hub had no foundation for the crusher's tile, and the `ship` of foundation could not get through a hub that was full again. This time the hub held 1932 iron ore and 648 ice: metallic crushing makes ore, and the electric furnace was still a stranded ghost.
+- Loading the save: the **home landing pad was full** (80 of 80 slots: 2422 iron ore, 350 ice, chunks). Buddy's requests for iron ore (min 5000) had drained the hub into it, so the 200 space science requested could never land.
+
+**Fixes after long29:**
+- `jettison` takes any hub item, as an inserter over the platform edge would (all items can be thrown overboard in the game).
+- Platform status adds `stranded_ghosts` and `ghosts_missing_items`, and the snapshot warns on both. On the save it named the furnace and the two poles, and "lacks space-platform-foundation x8".
+- Space status adds `landing_pad_free_slots`, and the snapshot warns when the pad is full and says to drop bulk requests.
+- On long29's save, jettisoning 1500 iron ore freed 30 slots. The `not_jettisonable` live check was deleted. Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 512 passed and 0 failed (`fb-evidence/git-gud/live28`).
+
+### `long30-cont29-opus-open-2590060469-60m`
+
+60 minutes, 71 turns, none provider-limited, 51 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held. Still on Nauvis.
+- The hub stayed usable (32 free slots at the end), the landing pad had room again (19 free) and requested only space science. There were 35 `jettison` calls, the carbonic chunks again.
+- The platform was still stuck on foundation: its ghosts lacked 8 `space-platform-foundation`. 9 foundation had been queued at the silo since long27, but behind 43 carbonic chunks from the same `ship` call, at 100 kg each (10 per rocket). The silo built about 1 rocket in 30 minutes, so the foundation would have waited hours. The other errors: `verify_production` ×18 and `launch_rocket` ×15 while the silo refilled.
+
+**Fixes after long30:**
+- A rocket loads the items the platform's ghosts lack first. On long30's save, the next rocket carried the 9 foundation and only 8 chunks.
+- `space_platform action=unship` takes queued cargo back into the character's inventory, standing by the silo; with no items it takes everything back. It fails with `inventory_full` when nothing fits, and `nothing_queued` when there is no queue. A live check unships 2 of 10 queued panels and ships them again.
+- Cargo shipped to a platform joins the cargo already waiting for it, rather than forming a second queue that needs its own rocket. The first live run with unship caught this: the 2 panels shipped again left in their own rocket. Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 514 passed and 0 failed (`fb-evidence/git-gud/live29`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

@@ -2150,6 +2150,73 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
+    /// Robots, roboports and ghosts of a surface (default: the character's).
+    pub async fn robot_logistics(
+        &mut self,
+        surface_name: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .call_remote(
+                "robot_logistics",
+                &[json!(self.agent_id.as_str()), json!(surface_name)],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Place entity and tile ghosts for robots or a platform hub to build.
+    pub async fn place_ghosts(
+        &mut self,
+        surface_name: Option<&str>,
+        origin: Position,
+        entities: &Value,
+        tiles: &Value,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .call_remote(
+                "place_ghosts",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(surface_name),
+                    json!(origin.x),
+                    json!(origin.y),
+                    entities.clone(),
+                    tiles.clone(),
+                    json!(dry_run),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// One space platform action; `items` and `stops` are JSON arrays.
+    pub async fn space_platform(
+        &mut self,
+        action: &str,
+        platform: Option<&str>,
+        items: &Value,
+        stops: &Value,
+        x: Option<f64>,
+        y: Option<f64>,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .call_remote(
+                "space_platform",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(action),
+                    json!(platform),
+                    items.clone(),
+                    stops.clone(),
+                    json!(x),
+                    json!(y),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     /// Collect bounded construction or recovery stock from an existing chest.
     pub async fn collect_from_chest(
         &mut self,

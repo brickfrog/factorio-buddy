@@ -2829,6 +2829,7 @@ write_summary() {
         --arg fixture_case "$FIXTURE_CASE" \
         --arg layout "$LAYOUT" \
         --argjson fixture_validation_ok "$(jq '.ok // false' "$TRIAL/fixture-validation.json" 2>/dev/null || echo null)" \
+        --argjson space "$(jq -c '.space // null' "$SAMPLES/after.json" 2>/dev/null || echo null)" \
         '{
             arm: $arm,
             scenario: $scenario,
@@ -2851,6 +2852,7 @@ write_summary() {
             tool_errors: $evidence.tool_errors,
             repeated_failures: $evidence.repeated_failures,
             milestones: $milestones,
+            space: $space,
             holdout: $holdout,
             usage: {
                 claude: $usage_claude.claude,

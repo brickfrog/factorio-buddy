@@ -921,7 +921,6 @@ fn critical_mod_safety_contracts_are_explicit() {
 
     assert!(
         research_lua.contains("error_kind = \"research_trigger_required\"")
-            && research_lua.contains("local added = force.add_research(tech)")
             && research_lua.contains("result.ready_to_call = {")
             && research_lua.contains("result.next_action = \"feed_lab_from_inventory\"")
             && research_lua.contains("result.follow_up_action = \"automate_science_delivery\"")
@@ -3923,9 +3922,6 @@ fn recipe_prototype_blueprint_and_research_snapshots_are_stable() {
 
     assert!(
         research_lua.contains("force.add_research(tech)")
-            && research_lua.contains(
-                "local labs = surface.find_entities_filtered{type = \"lab\", force = force}"
-            )
             && research_lua.contains("lab.get_inventory(defines.inventory.lab_input)")
             && research_lua.contains("entities.find_by_unit_number(tonumber(lab_unit_number))")
             && research_lua.contains("player_inv.remove{name = science_pack, count = count}")
