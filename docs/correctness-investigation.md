@@ -750,6 +750,32 @@ The chain stopped here as agreed: two runs after long25. To reach Vulcanus, Budd
 - `space_platform action=unship` takes queued cargo back into the character's inventory, standing by the silo; with no items it takes everything back. It fails with `inventory_full` when nothing fits, and `nothing_queued` when there is no queue. A live check unships 2 of 10 queued panels and ships them again.
 - Cargo shipped to a platform joins the cargo already waiting for it, rather than forming a second queue that needs its own rocket. The first live run with unship caught this: the 2 panels shipped again left in their own rocket. Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 514 passed and 0 failed (`fb-evidence/git-gud/live29`).
 
+### `long31-cont30-opus-open-2590060469-60m`
+
+A first attempt hit the usage cap after 6 provider-limited turns. It is kept as `long31-…-60m-capped` and does not count. The rerun from long30's save: 60 minutes, 41 turns, none provider-limited, 58 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- **`planet-discovery-vulcanus` is researched.** Space science landed through the pad again (49 slots free at the end).
+- The platform now crushes carbonic chunks too (3 crushers), and the hub stayed below full (21 slots free) with 3 `jettison` calls. Buddy used `unship` three times to reorder the silo queue.
+- Buddy started on thrusters. It placed foundation and a thruster ghost at the back (1, 16.5), and queued 2 thrusters, 3 chemical plants, pipes and pipe-to-ground at the silo. The platform's ghosts still lacked the thruster at the end.
+- Errors: `wait_for_crafting` ×11, `place_ghosts` ×9 (blocked footprints and 2 refused loose foundation tiles), `launch_rocket` ×8 while the silo refilled. No tool defect was found, so long32 continues from this save unchanged.
+
+### `long32-cont31-opus-open-2590060469-60m`
+
+60 minutes, 37 turns, none provider-limited, 64 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- **Buddy boarded the platform** (`character_surface = platform-1`) and scheduled it for Vulcanus.
+- The platform had 1 thruster, 3 chemical plants (ice melting, thruster fuel, thruster oxidizer), 25 pipes and 1 gun turret. It sat in `waiting_for_departure` because the thruster had no fluid: the fuel and oxidizer pipes stopped one tile short of the thruster inputs, over empty space, and the oxidizer line had a one-tile gap. Errors: `place_ghosts` ×17 (blocked footprints, pipes over empty space), `route_belt` ×16, `space_platform board` refused ×5 while the silo refilled.
+
+Sandbox runs on long32's save:
+- Filling in the 4 missing pipes (and foundation) fed the thruster, and the platform left. With its single turret and 10 magazines, **the platform was destroyed on the way, and the character with it**.
+- Four turrets clustered at one corner, mostly unfed, were also destroyed.
+- Six gun turrets across the front, preloaded with 620 magazines between them, arrived at Vulcanus with every turret destroyed and the hub at 657/1000. `space_platform land` then put the character on Vulcanus, and the snapshot said "You are on Vulcanus." So the full path works once the platform is fed and armed.
+- **The hub never lays a foundation tile that would close off empty space.** Tile ghosts at a fjord's mouth (2,11), (1,10), (1,11), and in front at (−1..1, −9..−8), stayed ghosts with foundation in the hub. Script `set_tiles` placed them, and filling the enclosed cells let the hub finish the rest. The hub does lay tiles that touch the platform only diagonally.
+
+**Fixes after long32:**
+- The snapshot warns on each thruster input with no fluid. It names the fluid and the tiles to pipe to (from `fluidbox.get_pipe_connections`), or says the touching pipe carries none of it.
+- When the platform is scheduled for Vulcanus, the rung moves on from "Set course" to "Get <platform> moving", or to arming it first.
+- Departures are held until the platform is armed. A platform about to leave orbit has its schedule kept aside (status still shows `stops`, plus `departure_held: "unarmed"`) until it has 6 gun turrets fed by inserters, 4 of them in front of the hub, and 1000 magazines in turrets and hub. These minimums are a judgement from the runs above. A paused platform does not build its ghosts, so the hold is not a pause. `armament` in platform status gives the counts and a `needs` line, and `schedule` explains the hold.
+- `place_ghosts` refuses foundation that closes off empty space (`encloses_space`, listing the holes). Platform status reports `foundation_holes` left by existing tile ghosts, and the snapshot warns about them. Foundation connectivity counts diagonal neighbours.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

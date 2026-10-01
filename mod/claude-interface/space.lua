@@ -225,7 +225,98 @@ local function safe_value(read)
     return nil
 end
 
-local stranded_ghosts -- defined with the place_ghosts helpers below
+-- Defined with the place_ghosts helpers below.
+local stranded_ghosts, tile_ghost_keys, enclosed_space
+
+-- A platform leaving orbit meets asteroids, mostly from the front (negative
+-- y, the direction of travel). Measured from Nauvis to Vulcanus: one fed
+-- turret with 10 magazines, and four turrets clustered at one side, were
+-- destroyed on the way; six gun turrets across the front holding 620
+-- magazines between them, unfed, arrived with every turret destroyed and
+-- the hub damaged. These minimums are a judgement from those runs.
+local MIN_FED_TURRETS = 6
+local MIN_FRONT_TURRETS = 4
+local MIN_AMMO = 1000
+
+local function armament(platform)
+    local surface = platform.surface
+    local result = {
+        turrets = 0, turrets_fed = 0, front_turrets_fed = 0, turret_ammo = 0, hub_ammo = 0,
+        min_fed_turrets = MIN_FED_TURRETS, min_front_turrets = MIN_FRONT_TURRETS, min_ammo = MIN_AMMO,
+    }
+    if not surface then return result end
+    local fed = {}
+    for _, inserter in pairs(surface.find_entities_filtered{type = "inserter", force = platform.force}) do
+        local target = inserter.drop_target
+        if target and target.valid and target.type == "ammo-turret" and inserter.pickup_target then
+            fed[target.unit_number] = true
+        end
+    end
+    local hub_top = platform.hub and platform.hub.valid and platform.hub.bounding_box.left_top.y or 0
+    for _, turret in pairs(surface.find_entities_filtered{type = "ammo-turret", force = platform.force}) do
+        result.turrets = result.turrets + 1
+        if fed[turret.unit_number] then
+            result.turrets_fed = result.turrets_fed + 1
+            if turret.position.y < hub_top then result.front_turrets_fed = result.front_turrets_fed + 1 end
+        end
+        local ammo = turret.get_inventory(defines.inventory.turret_ammo)
+        if ammo then result.turret_ammo = result.turret_ammo + ammo.get_item_count() end
+    end
+    if platform.hub and platform.hub.valid then
+        for _, entry in pairs(platform.hub.get_inventory(defines.inventory.hub_main).get_contents()) do
+            local proto = prototypes.item[entry.name]
+            if proto and proto.type == "ammo" then result.hub_ammo = result.hub_ammo + entry.count end
+        end
+    end
+    result.armed = result.turrets_fed >= MIN_FED_TURRETS and result.front_turrets_fed >= MIN_FRONT_TURRETS
+        and result.hub_ammo + result.turret_ammo >= MIN_AMMO
+    result.needs = result.turrets_fed .. "/" .. MIN_FED_TURRETS .. " gun turrets fed by inserters, "
+        .. result.front_turrets_fed .. "/" .. MIN_FRONT_TURRETS .. " of them in front of the hub (smaller y, the direction of travel), "
+        .. (result.hub_ammo + result.turret_ammo) .. "/" .. MIN_AMMO .. " magazines in turrets and hub"
+    return result
+end
+
+-- The station the platform's schedule sends it to next, when that is not
+-- where it is parked; nil when it is staying.
+local function leaving_for(platform)
+    local schedule = platform.schedule
+    local location = platform.space_location
+    if not (schedule and schedule.records and location) then return nil end
+    local record = schedule.records[schedule.current or 1]
+    if record and record.station and record.station ~= location.name then return record.station end
+    return nil
+end
+
+-- Called every second: a platform about to leave orbit unarmed has its
+-- schedule parked in storage (pausing it would also stop its hub building
+-- the turrets it needs); once armed the schedule is put back and it leaves.
+function M.guard_departures()
+    storage.departure_held = storage.departure_held or {}
+    local held = storage.departure_held
+    for _, force in pairs(game.forces) do
+        for _, platform in pairs(force.platforms) do
+            if platform.valid and platform.hub and platform.hub.valid and platform.space_location then
+                local armed = armament(platform).armed
+                if held[platform.index] then
+                    if armed then
+                        platform.schedule = {current = 1, records = held[platform.index]}
+                        platform.paused = false
+                        held[platform.index] = nil
+                    end
+                elseif leaving_for(platform) and not armed then
+                    held[platform.index] = platform.schedule.records
+                    platform.schedule = nil
+                    platform.paused = false
+                end
+            end
+        end
+    end
+end
+
+-- Drop a held departure, e.g. when the schedule is set again.
+local function release_hold(platform)
+    if storage.departure_held then storage.departure_held[platform.index] = nil end
+end
 
 local function platform_summary(platform)
     local location = platform.space_location
@@ -239,7 +330,8 @@ local function platform_summary(platform)
         stops = {},
     }
     local schedule = platform.schedule
-    for _, record in pairs(schedule and schedule.records or {}) do
+    local held = storage.departure_held and storage.departure_held[platform.index]
+    for _, record in pairs(held or (schedule and schedule.records) or {}) do
         summary.stops[#summary.stops + 1] = record.station
     end
     local hub = platform.hub
@@ -249,6 +341,8 @@ local function platform_summary(platform)
         summary.hub_slots = inventory and #inventory or nil
         summary.hub_free_slots = inventory and inventory.count_empty_stacks() or nil
     end
+    summary.armament = armament(platform)
+    summary.departure_held = storage.departure_held and storage.departure_held[platform.index] and "unarmed" or nil
     local queued = {}
     for _, shipment in ipairs(storage.space_shipments or {}) do
         if shipment.platform_name == platform.name and shipment.inventory and shipment.inventory.valid then
@@ -264,13 +358,34 @@ local function platform_summary(platform)
     if surface then
         local force = platform.force
         local counts, recipes = {}, {}
-        local thrusters, turrets, collectors = 0, 0, 0
+        local thrusters, turrets, collectors, thruster_inputs = 0, 0, 0, {}
         for _, entity in pairs(surface.find_entities_filtered{force = force}) do
             local kind = entity.type
             if kind ~= "entity-ghost" and kind ~= "tile-ghost" and entity.name ~= "space-platform-hub" then
                 counts[entity.name] = (counts[entity.name] or 0) + 1
             end
-            if kind == "thruster" then thrusters = thrusters + 1 end
+            if kind == "thruster" then
+                thrusters = thrusters + 1
+                if #thruster_inputs < 5 then
+                    for index = 1, #entity.fluidbox do
+                        local filter = safe_value(function() return entity.fluidbox.get_filter(index) end)
+                        local fluid = entity.fluidbox[index]
+                        if not (fluid and fluid.amount > 0) then
+                            local connect_at, connected = {}, false
+                            for _, connection in pairs(entity.fluidbox.get_pipe_connections(index)) do
+                                connect_at[#connect_at + 1] = connection.target_position
+                                if connection.target then connected = true end
+                            end
+                            thruster_inputs[#thruster_inputs + 1] = {
+                                thruster = entity.position,
+                                fluid = filter and filter.name or nil,
+                                pipe_to = connect_at,
+                                pipe_connected = connected,
+                            }
+                        end
+                    end
+                end
+            end
             if kind == "ammo-turret" then turrets = turrets + 1 end
             if entity.name == "asteroid-collector" then collectors = collectors + 1 end
             if kind == "assembling-machine" or kind == "furnace" then
@@ -290,7 +405,14 @@ local function platform_summary(platform)
             stranded[#stranded + 1] = ghost.ghost_name .. "@" .. ghost.position.x .. "," .. ghost.position.y
         end
         summary.stranded_ghosts = stranded
+        local holes = {}
+        for _, cell in ipairs(enclosed_space(surface, tile_ghost_keys(surface))) do
+            if #holes >= 10 then break end
+            holes[#holes + 1] = cell
+        end
+        summary.foundation_holes = holes
         summary.thrusters = thrusters
+        summary.thrusters_unfed = thruster_inputs
         summary.turrets = turrets
         summary.collectors = collectors
     end
@@ -431,12 +553,61 @@ local function missing_foundation(surface, area, planned_tiles)
     return false
 end
 
-local function tile_ghost_keys(surface)
+function tile_ghost_keys(surface)
     local keys = {}
     for _, ghost in pairs(surface.find_entities_filtered{type = "tile-ghost"}) do
         keys[math.floor(ghost.position.x) .. "," .. math.floor(ghost.position.y)] = true
     end
     return keys
+end
+
+-- Empty-space cells enclosed by foundation once the tiles in `extra` (a set
+-- of "x,y" keys) are laid too. The hub never lays a foundation tile that
+-- would close off such a hole, so ghosts that do stay unbuilt.
+function enclosed_space(surface, extra)
+    local solid = {}
+    local x1, y1, x2, y2 = math.huge, math.huge, -math.huge, -math.huge
+    local function add(x, y)
+        solid[x .. "," .. y] = true
+        if x < x1 then x1 = x end
+        if y < y1 then y1 = y end
+        if x > x2 then x2 = x end
+        if y > y2 then y2 = y end
+    end
+    for _, tile in pairs(surface.find_tiles_filtered{name = "space-platform-foundation"}) do
+        add(tile.position.x, tile.position.y)
+    end
+    for key in pairs(extra) do
+        local x, y = key:match("^(-?%d+),(-?%d+)$")
+        if x then add(tonumber(x), tonumber(y)) end
+    end
+    if x1 == math.huge then return {} end
+    x1, y1, x2, y2 = x1 - 1, y1 - 1, x2 + 1, y2 + 1
+    -- Flood the open space from the bounding box edge; what it misses is enclosed.
+    local outside, queue = {}, {}
+    local function visit(x, y)
+        local key = x .. "," .. y
+        if x < x1 or x > x2 or y < y1 or y > y2 or solid[key] or outside[key] then return end
+        outside[key] = true
+        queue[#queue + 1] = {x, y}
+    end
+    for x = x1, x2 do visit(x, y1) visit(x, y2) end
+    for y = y1, y2 do visit(x1, y) visit(x2, y) end
+    local head = 1
+    while queue[head] do
+        local cell = queue[head]
+        head = head + 1
+        visit(cell[1] + 1, cell[2]) visit(cell[1] - 1, cell[2])
+        visit(cell[1], cell[2] + 1) visit(cell[1], cell[2] - 1)
+    end
+    local holes = {}
+    for x = x1, x2 do
+        for y = y1, y2 do
+            local key = x .. "," .. y
+            if not solid[key] and not outside[key] then holes[#holes + 1] = {x = x, y = y} end
+        end
+    end
+    return holes
 end
 
 -- Entity ghosts on a platform standing partly over empty space with no tile
@@ -455,7 +626,9 @@ function stranded_ghosts(surface)
 end
 
 -- Planned platform foundation tiles that do not join the platform: the hub
--- only lays foundation next to existing foundation (or connected tile ghosts).
+-- only lays foundation touching existing foundation, diagonals included (or
+-- connected tile ghosts).
+local NEIGHBOURS = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}}
 local function disconnected_tiles(surface, new_tiles)
     local pending, joined, queue = {}, {}, {}
     for _, plan in ipairs(new_tiles) do pending[plan.x .. "," .. plan.y] = plan end
@@ -465,16 +638,19 @@ local function disconnected_tiles(surface, new_tiles)
         return joined[key] or ghosts[key] or surface.get_tile(x, y).name ~= "empty-space"
     end
     for _, plan in ipairs(new_tiles) do
-        if solid(plan.x + 1, plan.y) or solid(plan.x - 1, plan.y) or solid(plan.x, plan.y + 1) or solid(plan.x, plan.y - 1) then
-            local key = plan.x .. "," .. plan.y
-            if not joined[key] then joined[key] = true queue[#queue + 1] = plan end
+        for _, d in ipairs(NEIGHBOURS) do
+            if solid(plan.x + d[1], plan.y + d[2]) then
+                local key = plan.x .. "," .. plan.y
+                if not joined[key] then joined[key] = true queue[#queue + 1] = plan end
+                break
+            end
         end
     end
     local head = 1
     while queue[head] do
         local plan = queue[head]
         head = head + 1
-        for _, d in ipairs({{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) do
+        for _, d in ipairs(NEIGHBOURS) do
             local key = (plan.x + d[1]) .. "," .. (plan.y + d[2])
             if pending[key] and not joined[key] then
                 joined[key] = true
@@ -644,7 +820,23 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         if #loose > 0 then
             return fail("disconnected_foundation", #loose .. " foundation tile(s) do not join the platform; nothing was placed", {
                 tiles = loose,
-                guidance = "The hub only lays space-platform-foundation next to existing foundation: add the tiles that connect these to the platform edge in the same call.",
+                guidance = "The hub only lays space-platform-foundation touching existing foundation (diagonals count): add the tiles that connect these to the platform edge in the same call.",
+            })
+        end
+        local ghost_keys = tile_ghost_keys(surface)
+        local before = {}
+        for _, cell in ipairs(enclosed_space(surface, ghost_keys)) do before[cell.x .. "," .. cell.y] = true end
+        local planned = {}
+        for key in pairs(ghost_keys) do planned[key] = true end
+        for _, plan in ipairs(new_tiles) do planned[plan.x .. "," .. plan.y] = true end
+        local holes = {}
+        for _, cell in ipairs(enclosed_space(surface, planned)) do
+            if not before[cell.x .. "," .. cell.y] and #holes < 20 then holes[#holes + 1] = cell end
+        end
+        if #holes > 0 then
+            return fail("encloses_space", "these foundation tiles would close off " .. #holes .. " empty-space cell(s); nothing was placed", {
+                holes = holes,
+                guidance = "The hub never lays a tile that closes off empty space inside the platform, so such tiles stay ghosts forever. Add foundation tiles on the listed holes too (dx = x - origin_x, dy = y - origin_y), or leave a gap to open space.",
             })
         end
     end
@@ -1351,6 +1543,7 @@ local function action_schedule(character, platform, stops)
             return fail("locked_destination", stop .. " is not discovered yet", {name = stop})
         end
     end
+    release_hold(platform)
     if #stops == 0 then
         platform.schedule = nil
         platform.paused = true
@@ -1360,8 +1553,14 @@ local function action_schedule(character, platform, stops)
         platform.schedule = {current = 1, records = records}
         platform.paused = false
     end
+    M.guard_departures()
     local result = platform_summary(platform)
     result.success = true
+    if result.departure_held then
+        local a = result.armament
+        result.guidance = "Course set, but " .. platform.name .. " stays parked until it is armed: asteroids destroy it on the way. It has "
+            .. a.needs .. ". It leaves by itself once armed."
+    end
     return result
 end
 

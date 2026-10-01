@@ -7872,6 +7872,16 @@ rcon.print('ok')" >/dev/null
 assert_json "place_ghosts replaces a stranded platform ghost" \
     "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"tiles\":[{\"name\":\"space-platform-foundation\",\"dx\":8,\"dy\":-1}],\"entities\":[{\"name\":\"small-electric-pole\",\"dx\":8.5,\"dy\":-0.5}]}")")" \
     '.success == true and .placed == 1 and .placed_tiles == 1 and (.removed_stranded_ghosts | length) == 1'
+SA_RING="$(jq -nc '[[9,-2],[10,-2],[11,-2],[9,-1],[11,-1],[9,0],[10,0],[11,0]] | map({name: "space-platform-foundation", dx: .[0], dy: .[1]})')"
+assert_json "place_ghosts refuses foundation that closes off empty space" \
+    "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"dry_run\":true,\"tiles\":$SA_RING}")")" \
+    '.success == false and .error_kind == "encloses_space" and .holes == [{"x":10,"y":-1}]'
+raw_lua "game.forces.player.unlock_space_location('vulcanus'); rcon.print('ok')" >/dev/null
+assert_json "an unarmed platform is held in orbit when scheduled away" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"schedule\",\"stops\":[\"vulcanus\"]}")")" \
+    '.success == true and .departure_held == "unarmed" and .stops == ["vulcanus"] and .space_location == "nauvis" and .armament.armed == false'
+sleep 3
+assert_json "the held platform stays at Nauvis" "$(sa_platform)" '.space_location == "nauvis" and .departure_held == "unarmed"'
 assert_json "space_platform schedules a stop" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"schedule\",\"stops\":[\"nauvis\"]}")")" \
     '.success == true and .stops == ["nauvis"]'

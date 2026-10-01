@@ -3064,6 +3064,7 @@ script.on_init(init_storage)
 -- Queued space shipments ride each ready rocket.
 script.on_nth_tick(60, function()
     space.process_shipments()
+    space.guard_departures()
 end)
 
 -- Process RCON queue and walk states every tick
