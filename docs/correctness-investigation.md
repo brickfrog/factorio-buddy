@@ -776,6 +776,21 @@ Sandbox runs on long32's save:
 - Departures are held until the platform is armed. A platform about to leave orbit has its schedule kept aside (status still shows `stops`, plus `departure_held: "unarmed"`) until it has 6 gun turrets fed by inserters, 4 of them in front of the hub, and 1000 magazines in turrets and hub. These minimums are a judgement from the runs above. A paused platform does not build its ghosts, so the hold is not a pause. `armament` in platform status gives the counts and a `needs` line, and `schedule` explains the hold.
 - `place_ghosts` refuses foundation that closes off empty space (`encloses_space`, listing the holes). Platform status reports `foundation_holes` left by existing tile ghosts, and the snapshot warns about them. Foundation connectivity counts diagonal neighbours.
 
+### `long33-cont32-opus-open-2590060469-60m`
+
+60 minutes, 28 turns, none provider-limited, 44 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- The hold worked as intended. The platform stayed at Nauvis (`departure_held: "unarmed"`, stops `["vulcanus"]`). Buddy followed the rung: it landed on Nauvis and queued 522 magazines, 15 foundation and 4 inserters for the platform (11 `ship` calls, 1 `unship`).
+- Its foundation plan now leaves no holes (`foundation_holes` empty). One `place_ghosts` was refused with `encloses_space` and corrected.
+- At the end the platform still had 1 fed turret, both thruster inputs unfed, and ghosts lacking 33 foundation. Rocket throughput was the limit.
+- The other errors were Nauvis work: `route_belt` ×14, `wait_for_crafting` ×6, `collect_from_chest` ×6. No tool defect was found.
+
+### `long34-cont33-opus-open-2590060469-60m` (provider-limited, invalid as a trial)
+
+31 turns, 4 of them provider-limited (the usage cap), 28 tool errors.
+- The platform was still held (`unarmed`): 3/6 fed turrets, 1/4 in front, 340/1000 magazines on board, and 763 more magazines plus 4 inserters queued at the silo. Both thruster inputs were still unfed.
+- `powered_production` was false in the holdout, although 26 machines were working (125 products). 65 machines sat at `full_output` and 53 at `no_ingredients`. This was not investigated, because the trial is invalid anyway.
+- Rocket throughput is the slow part: 5, 3 and 2 rockets in long31, long32 and long33.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
