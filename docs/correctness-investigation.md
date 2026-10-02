@@ -882,6 +882,20 @@ Sandbox runs on long32's save:
   - Flown with long40's real loadout: 7 turrets became 5, the hub fell to 531 HP, and the ore ran out at 0.88; the platform coasted in at speed 0.17 and arrived. `land` → "You are on Vulcanus."
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 519 passed and 0 failed (`fb-evidence/git-gud/live35`; the board check now books before the rocket is ready and expects the automatic launch).
 
+### `long41-cont40-opus-open-2590060469-60m`: Buddy on Vulcanus
+
+60 minutes, 41 turns, none provider-limited, 12 tool errors, 0 invariant failures. `plate_automation` and `powered_production` held. **`space.character_surface == "vulcanus"`**: the plan's acceptance condition is met.
+- Sequence (minutes from the first `space_platform` call):
+  - 0: `schedule` for Vulcanus (held);
+  - 8: `ship` (one refused out of reach, then accepted);
+  - 13: `board`;
+  - 44: `load_turrets` and `clear_ghosts` on the platform;
+  - 54: `land`.
+  
+  Rockets: 3 (50 → 53).
+- At the end the platform waits at Vulcanus with 5 turrets (3 in front) and 153 piercing left. Losses on the way match the sandbox flights.
+- 12 errors, none in the space path except the one out-of-reach `ship`.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
