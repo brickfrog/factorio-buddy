@@ -784,12 +784,27 @@ Sandbox runs on long32's save:
 - At the end the platform still had 1 fed turret, both thruster inputs unfed, and ghosts lacking 33 foundation. Rocket throughput was the limit.
 - The other errors were Nauvis work: `route_belt` ×14, `wait_for_crafting` ×6, `collect_from_chest` ×6. No tool defect was found.
 
-### `long34-cont33-opus-open-2590060469-60m` (provider-limited, invalid as a trial)
+### `long34-cont33-opus-open-2590060469-60m-capped` (provider-limited, invalid as a trial)
 
 31 turns, 4 of them provider-limited (the usage cap), 28 tool errors.
 - The platform was still held (`unarmed`): 3/6 fed turrets, 1/4 in front, 340/1000 magazines on board, and 763 more magazines plus 4 inserters queued at the silo. Both thruster inputs were still unfed.
 - `powered_production` was false in the holdout, although 26 machines were working (125 products). 65 machines sat at `full_output` and 53 at `no_ingredients`. This was not investigated, because the trial is invalid anyway.
 - Rocket throughput is the slow part: 5, 3 and 2 rockets in long31, long32 and long33.
+
+### `long34-cont33-opus-open-2590060469-60m` (rerun from long33)
+
+60 minutes, 56 turns, none provider-limited, 33 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- Both thruster inputs are now fed (`thrusters_unfed` empty), and there are no foundation holes. The platform is still held as `unarmed`: 3/6 fed turrets, 1/4 in front, 336/1000 magazines on board.
+- 780 magazines and 4 inserters still wait at the silo. Only 2 rockets went up in the hour (31 → 33). At the end the silo had 8/50 parts. In the last 10 minutes it had 11 processing units, 5 low-density structures and 10 rocket fuel to build them from.
+- 15 `place_ghosts` errors, mostly dry runs of thruster pipes over empty space. The refusal pointed at the "nearest free spot", which is the wrong fix when a pipe must reach an exact input tile.
+
+### Fixes after long34
+
+- After the first launch, nothing told Buddy why cargo was not leaving. The snapshot now warns whenever a platform has queued cargo but no rocket is ready. It gives the silo's part count and how many of each rocket-part ingredient were made in the last 10 minutes, so the bottleneck is named. Before the first launch, the "Fill the rocket silo" rung gives the same ingredient list.
+- `place_ghosts` refusing an entity over empty space on a platform now says first to add `space-platform-foundation` tiles under it in the same call. The nearest free spot follows as an alternative.
+- `walk_to` across a grown base failed with `Packet too large` (long10, long19, long26, long33). One collision map covered the whole walk plus padding, and the RCON reply exceeded 16 MiB. Pathfinding now goes in legs of at most 96 tiles, each with its own map. An intermediate leg passes if it gains at least half a leg; the final leg keeps the exact arrival check.
+- Sandbox on long34's save: the walk from (51,156) to (386,-109) arrived (502 tiles walked, 75 s), and so did the walk back. The new silo warning reads "the silo has 8/50 rocket parts … low-density-structure (5 made in 10 min)".
+- Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 517 passed and 0 failed (`fb-evidence/git-gud/live31`), `buddy_runtime.sh` passed.
 
 ## Comparison with other harnesses
 

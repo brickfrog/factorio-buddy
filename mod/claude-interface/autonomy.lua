@@ -177,6 +177,16 @@ local function made_with_platforms(force, surface, facts, item)
     return count
 end
 
+-- Rocket-part ingredients with how many of each were made in the last ten minutes.
+local function rocket_part_inputs(force, surface)
+    local recipe = prototypes.recipe["rocket-part"]
+    local inputs = {}
+    for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
+        inputs[#inputs + 1] = ingredient.name .. " (" .. made_last_ten_minutes(force, surface, ingredient.name) .. " made in 10 min)"
+    end
+    return table.concat(inputs, ", ")
+end
+
 -- Unresearched technologies on the way to `target_name`, prerequisites
 -- first, and the ones whose prerequisites are all researched.
 local function tech_path(force, surface, facts, target_name)
@@ -476,13 +486,8 @@ local function progression(surface, force, facts, character)
         goal = "Launch the rocket: the silo's rocket is ready."
         how = "Call launch_rocket. Space Age silos never launch on their own."
     elseif force.rockets_launched == 0 and tech_done(force, "rocket-silo") then
-        local recipe = prototypes.recipe["rocket-part"]
-        local inputs = {}
-        for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
-            inputs[#inputs + 1] = ingredient.name .. " (" .. made_last_ten_minutes(force, surface, ingredient.name) .. " made in 10 min)"
-        end
         goal = "Fill the rocket silo: " .. (facts.rocket_parts or 0) .. "/" .. parts_required .. " rocket parts."
-        how = "Each rocket part needs " .. table.concat(inputs, ", ")
+        how = "Each rocket part needs " .. rocket_part_inputs(force, surface)
             .. ". Automate the scarcest with build_layout (assemblers, chemical plants, their inputs and power) and feed all three into the silo with inserters; the silo builds the parts itself. Then launch_rocket."
     elseif space_goal then
         goal, how = space_goal, space_how
@@ -651,6 +656,12 @@ local function progression(surface, force, facts, character)
             end
             warnings[#warnings + 1] = platform.name .. "'s hub lacks " .. table.concat(lacking, ", ")
                 .. " for its ghosts: ship them (space_platform action=ship)."
+        end
+        if platform.queued_cargo and platform.queued_cargo[1] and (facts.rocket_silos or 0) > 0 and not facts.rocket_ready then
+            warnings[#warnings + 1] = "Cargo for " .. platform.name .. " waits for rockets, and the silo has "
+                .. (facts.rocket_parts or 0) .. "/" .. parts_required .. " rocket parts. Each part needs "
+                .. rocket_part_inputs(force, surface)
+                .. ": the scarcest input sets how fast cargo leaves, so add assemblers (and their inputs) for it and feed the silo with inserters."
         end
     end
     if S.landing_pad_free_slots == 0 then

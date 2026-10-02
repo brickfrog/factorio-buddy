@@ -27,6 +27,10 @@ pub const DEFAULT_CRAFTING_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_CRAFTING_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Collision-map padding for the second, wider A* attempt.
 const WIDE_PATHFIND_PADDING: f64 = 48.0;
+/// Longest straight-line distance pathfound with one collision map.
+const MAX_PATHFIND_LEG: f64 = 96.0;
+/// Intermediate legs end on any walkable tile this close to their waypoint.
+const LEG_ARRIVAL_RADIUS: f64 = 8.0;
 
 type CraftingQueueFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CraftingQueueSnapshot>> + Send + 'a>>;
@@ -2668,7 +2672,60 @@ impl FactorioClient {
             .await
     }
 
+    /// Long walks go in legs of at most `MAX_PATHFIND_LEG` tiles, each with its
+    /// own collision map: one map spanning a 400-tile walk across a grown base
+    /// exceeds the RCON packet limit.
     async fn walk_to_pathfind_with_tolerance(
+        &mut self,
+        target: Position,
+        search_radius: u32,
+        final_tolerance: f64,
+        physical_arrival_distance: f64,
+    ) -> Result<WalkResult> {
+        let mut walked = 0.0;
+        loop {
+            let here = self.get_character_position().await?;
+            let remaining = here.distance(&target);
+            if remaining <= MAX_PATHFIND_LEG {
+                let last = self
+                    .pathfind_leg(
+                        target,
+                        search_radius,
+                        final_tolerance,
+                        physical_arrival_distance,
+                    )
+                    .await?;
+                return Ok(WalkResult {
+                    distance_walked: walked + last.distance_walked,
+                    ..last
+                });
+            }
+            let step = MAX_PATHFIND_LEG / remaining;
+            let via = Position::new(
+                here.x + (target.x - here.x) * step,
+                here.y + (target.y - here.y) * step,
+            );
+            let leg = self
+                .pathfind_leg(via, search_radius, LEG_ARRIVAL_RADIUS, 0.0)
+                .await?;
+            walked += leg.distance_walked;
+            // An intermediate leg only has to gain ground: stopping a hair
+            // outside its arrival radius is still progress. Requiring half a
+            // leg per round also bounds the loop.
+            if leg.final_position.distance(&target) > remaining - MAX_PATHFIND_LEG / 2.0 {
+                return Ok(WalkResult {
+                    arrived: false,
+                    distance_walked: walked,
+                    reason: leg
+                        .reason
+                        .or_else(|| Some("Walk stopped short of the next waypoint".to_string())),
+                    ..leg
+                });
+            }
+        }
+    }
+
+    async fn pathfind_leg(
         &mut self,
         target: Position,
         search_radius: u32,

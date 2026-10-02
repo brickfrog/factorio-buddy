@@ -889,10 +889,13 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
                         local message = "entity " .. plan.index .. " (" .. plan.name .. ") cannot be placed there ("
                             .. (#blockers > 0 and ("blocked by " .. table.concat(blockers, ", ")) or "no foundation or wrong ground")
                             .. "); nothing was placed"
+                        if surface.platform and #blockers == 0 then
+                            message = message .. "; to keep this position, add space-platform-foundation tiles under it in the same call (tiles)"
+                        end
                         if free then
                             message = message .. "; nearest free spot is " .. free.dx .. "," .. free.dy .. " tiles away at "
                                 .. free.position.x .. "," .. free.position.y
-                        elseif surface.platform then
+                        elseif surface.platform and #blockers > 0 then
                             message = message .. "; no free foundation fits it within 12 tiles: add space-platform-foundation tiles for it in the same call"
                         end
                         return fail("placement_blocked", message, {
