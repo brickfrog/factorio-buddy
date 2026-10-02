@@ -7862,6 +7862,15 @@ assert_json "place_ghosts refuses a platform ghost over empty space" \
 assert_json "a blocked platform ghost names its blocker and a free spot" \
     "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"dry_run\":true,\"entities\":[{\"name\":\"small-electric-pole\",\"dx\":6.5,\"dy\":-0.5}]}")")" \
     '.success == false and any(.blockers[]; . == "solar-panel") and .nearest_free != null'
+# A ghost on a built entity is never built either: status lists it and
+# clear_ghosts removes it.
+raw_lua "game.surfaces['$SA_SURFACE'].create_entity{name = 'entity-ghost', inner_name = 'small-electric-pole', position = {6.5, -0.5}, force = 'player'}
+rcon.print('ok')" >/dev/null
+assert_json "a ghost on a built entity is listed as never built" "$(sa_platform)" \
+    'any(.stranded_ghosts[]; startswith("small-electric-pole@6.5,-0.5"))'
+assert_json "clear_ghosts removes the never-built ghost" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"clear_ghosts\"}")")" \
+    '.success == true and (.removed | length) == 1 and .removed[0].name == "small-electric-pole"'
 assert_json "place_ghosts refuses foundation that does not join the platform" \
     "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"dry_run\":true,\"tiles\":[{\"name\":\"space-platform-foundation\",\"dx\":30,\"dy\":30}]}")")" \
     '.success == false and .error_kind == "disconnected_foundation" and .tiles[0].x == 30'

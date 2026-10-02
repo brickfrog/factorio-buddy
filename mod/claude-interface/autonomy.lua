@@ -308,6 +308,33 @@ local function recipe_text(name)
     return name .. ": " .. list(recipe.ingredients) .. " -> " .. list(recipe.products)
 end
 
+-- How to add the turrets a platform still needs: the free front-half slots
+-- the platform status found (hub-fed pairs first, then turrets the hub
+-- loads with magazines), else how to make room.
+local function turret_plan(arms, surface)
+    local slots = arms.turret_slots or {}
+    local load = ((arms.missing_research or {})[1]
+            and ("Research " .. table.concat(arms.missing_research, ", ") .. " (red and green science, start_research): flown tests lost six turrets with yellow magazines and no upgrades, while piercing rounds with these upgrades arrived intact. Make piercing-rounds-magazine and ship them. ") or "")
+        .. ((arms.turrets or 0) > (arms.turrets_ready or 0)
+            and "Turrets that are neither fed nor loaded: space_platform action=load_turrets has the hub fill them with magazines and keep them topped up. " or "")
+    if slots[1] then
+        local entities = {}
+        for _, slot in ipairs(slots) do
+            entities[#entities + 1] = string.format('{name:"gun-turret",dx:%s,dy:%s}', slot.turret.x, slot.turret.y)
+            if slot.inserter then
+                entities[#entities + 1] = string.format('{name:"inserter",dx:%s,dy:%s,direction:"%s"}',
+                    slot.inserter.x, slot.inserter.y, slot.inserter_direction)
+            end
+        end
+        local wanted = math.max((arms.min_ready_turrets or 0) - (arms.turrets_ready or 0), (arms.min_front_turrets or 0) - (arms.front_turrets_ready or 0))
+        return load .. "Free turret slots, front first (an inserter beside the hub feeds a turret; turrets without one are loaded by the hub with magazines when built): place_ghosts surface="
+            .. tostring(surface) .. " origin_x=0 origin_y=0 entities=[" .. table.concat(entities, ",") .. "]."
+            .. (#slots < wanted and " That is not enough: extend space-platform-foundation forward (smaller y) for more turrets." or "")
+    end
+    return load .. "No free spot in the front half: extend space-platform-foundation forward (smaller y) with place_ghosts surface="
+        .. tostring(surface) .. " and put gun turrets on it; the hub loads them with magazines."
+end
+
 -- Rungs for a character away from home: on a platform or on Vulcanus.
 local function travel_rung(S, character)
     local char_surface = character.surface.name
@@ -332,8 +359,8 @@ local function travel_rung(S, character)
         local arms = here.armament or {}
         if not arms.armed then
             return "Arm " .. here.name .. " before it leaves (" .. tostring(arms.needs) .. ").",
-                "It stays parked until armed, because asteroids destroy it and you on the way. Put gun turrets along the front edge (smaller y), each with an inserter feeding firearm-magazine from the hub or from a belt out of the hub (place_ghosts surface="
-                .. tostring(here.surface) .. "). You are aboard and cannot ship: land on Nauvis (space_platform action=land) to craft and ship the turrets, inserters, belts and magazines, then board again."
+                "It stays parked until armed, because asteroids destroy it and you on the way. " .. turret_plan(arms, here.surface)
+                .. " You are aboard and cannot ship: land on Nauvis (space_platform action=land) to craft and ship the turrets, inserters, belts and magazines, then board again."
         end
         return "Get " .. here.name .. " moving to Vulcanus (" .. tostring(here.state) .. ").",
             "It leaves once its thrusters get both thruster-fuel and thruster-oxidizer: follow the thruster warnings, building pipe and foundation with place_ghosts on " .. tostring(here.surface) .. ", and ship what its ghosts lack."
@@ -404,11 +431,26 @@ local function space_rung(facts)
     local arms = P.armament or {}
     if not arms.armed then
         return "Arm " .. P.name .. " before leaving (" .. tostring(arms.needs) .. ").",
-            "Asteroids destroy an unarmed platform on the way, and you with it; it will not leave orbit until armed. Put gun turrets along the front edge (smaller y), each with an inserter feeding firearm-magazine from the hub or from a belt out of the hub, using place_ghosts surface="
-            .. tostring(P.surface) .. ". Ship the turrets, inserters, belts and magazines. Keep spare space-platform-foundation and parts in the hub: it rebuilds what asteroids break."
+            "Asteroids destroy an unarmed platform on the way, and you with it; it will not leave orbit until armed. " .. turret_plan(arms, P.surface)
+            .. " Ship the turrets, inserters and magazines. Keep spare space-platform-foundation and parts in the hub: it rebuilds what asteroids break."
+    end
+    if P.thrust_short and P.thrust_short[1] then
+        local parts, items = {}, {}
+        for _, producer in ipairs(P.thrust_short) do
+            for _, item in ipairs(producer.short) do
+                parts[#parts + 1] = "the " .. producer.recipe .. " plant at " .. producer.position.x .. "," .. producer.position.y
+                    .. " is low on " .. item.name .. " (hub has " .. item.hub .. ", keep 500+ for the trip"
+                    .. (item.made_by[1] and ("; made by " .. table.concat(item.made_by, ", ")) or "") .. ")"
+                items[#items + 1] = item.name
+            end
+        end
+        return "Stock " .. P.name .. "'s thruster fuel before boarding: " .. table.concat(parts, "; ") .. ".",
+            "Without it the thrusters burn out within seconds and the platform stalls. Ship 500+ " .. table.concat(items, ", ")
+            .. " now (space_platform action=ship), and make it on the platform: asteroid-collectors at the foundation edge and a crusher on that recipe, with inserters to and from the hub (place_ghosts surface="
+            .. tostring(P.surface) .. ")."
     end
     return "Board " .. P.name .. " for Vulcanus.",
-        "Carry what you need to start there (roboport, robots, steam/solar power, drills, furnaces, belts, inserters, poles). Stand by a silo with a ready rocket and empty cargo, then space_platform action=board."
+        "It waits in orbit until you are aboard, then leaves on its schedule (set it with action=schedule stops=[\"vulcanus\"] if it has none). Carry what you need to start there (roboport, robots, steam/solar power, drills, furnaces, belts, inserters, poles). Stand by a silo with a ready rocket and empty cargo, then space_platform action=board."
 end
 
 -- Code-computed tech-progression ladder for the early game. Each rung names
@@ -624,10 +666,26 @@ local function progression(surface, force, facts, character)
         for _, input in ipairs(platform.thrusters_unfed or {}) do
             local spots = {}
             for _, at in ipairs(input.pipe_to or {}) do spots[#spots + 1] = at.x .. "," .. at.y end
+            local starved = {}
+            for _, producer in ipairs(input.producers or {}) do
+                for _, item in ipairs(producer.short or {}) do
+                    starved[#starved + 1] = item.name .. " (hub has " .. item.hub .. (item.made_by[1] and ("; made by " .. table.concat(item.made_by, ", ")) or "") .. ")"
+                end
+            end
+            local reason
+            if not input.pipe_connected then
+                reason = ": nothing is connected; extend that fluid's pipe to one of " .. table.concat(spots, " or ")
+                    .. " with place_ghosts (surface coordinates; add space-platform-foundation tiles in the same call wherever the pipe crosses empty space)."
+            elseif starved[1] then
+                reason = ": its " .. tostring(input.fluid) .. " plant lacks " .. table.concat(starved, ", ")
+                    .. ". Ship it (space_platform action=ship) and keep it coming: more asteroid-collectors at the foundation edge and a crusher on that recipe, fed from the hub."
+            elseif input.producers and not input.producers[1] then
+                reason = ": a pipe touches this input but no chemical plant on the platform makes " .. tostring(input.fluid) .. "; add one with place_ghosts and pipe it here."
+            else
+                reason = ": a pipe touches this input but carries none of it; check that the pipe line from the " .. tostring(input.fluid) .. " chemical plant has no gaps and does not mix fluids."
+            end
             warnings[#warnings + 1] = platform.name .. "'s thruster at " .. input.thruster.x .. "," .. input.thruster.y
-                .. " gets no " .. tostring(input.fluid or "fluid") .. ", so the platform cannot leave"
-                .. (input.pipe_connected and ": a pipe touches this input but carries none of it; check that the pipe line from the " .. tostring(input.fluid) .. " chemical plant has no gaps and does not mix fluids."
-                    or (": nothing is connected; extend that fluid's pipe to one of " .. table.concat(spots, " or ") .. " with place_ghosts (surface coordinates; add space-platform-foundation tiles in the same call wherever the pipe crosses empty space)."))
+                .. " gets no " .. tostring(input.fluid or "fluid") .. ", so the platform cannot leave" .. reason
         end
         if platform.hub_free_slots == 0 then
             warnings[#warnings + 1] = platform.name .. "'s hub is full (" .. tostring(platform.hub_slots)
@@ -645,9 +703,9 @@ local function progression(surface, force, facts, character)
                 .. table.concat(uncrushed, ", ") .. ". Add those crushers with place_ghosts or jettison the chunks."
         end
         if platform.stranded_ghosts and platform.stranded_ghosts[1] then
-            warnings[#warnings + 1] = platform.name .. " has ghosts over empty space that the hub will never build: "
+            warnings[#warnings + 1] = platform.name .. " has ghosts the hub will never build: "
                 .. table.concat(platform.stranded_ghosts, ", ")
-                .. ". Place them again with place_ghosts including space-platform-foundation tiles under them (that replaces the old ghost)."
+                .. ". Remove them with space_platform action=clear_ghosts, then place what you need where it fits (place_ghosts; over empty space, include space-platform-foundation tiles under it)."
         end
         if platform.ghosts_missing_items and platform.ghosts_missing_items[1] then
             local lacking = {}

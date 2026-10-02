@@ -8105,7 +8105,7 @@ pub struct GhostTile {
 /// Space platform action.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SpacePlatformParams {
-    /// status, create, ship, unship, request, jettison, schedule, board or land.
+    /// status, create, ship, unship, request, jettison, clear_ghosts, load_turrets, schedule, board or land.
     pub action: String,
     /// Platform name (create: optional new name).
     pub platform: Option<String>,
@@ -17667,7 +17667,7 @@ impl FactorioMcp {
 
     /// Create, supply, fly, board and land space platforms.
     #[tool(
-        description = "Space platforms. status; create (needs rocket-silo); ship items from your inventory beside a silo: they leave by themselves with each ready rocket, 1 t per rocket, items the platform's ghosts lack first (a new platform needs its starter pack first); unship takes queued cargo back; request items on the landing pads here; jettison hub items overboard (lost); schedule planet stops; board (ride a ready rocket up, empty cargo); land (drop from the hub to the planet below)."
+        description = "Space platforms. status; create (needs rocket-silo); ship items from your inventory beside a silo: they leave by themselves with each ready rocket, 1 t per rocket, items the platform's ghosts lack first (a new platform needs its starter pack first); unship takes queued cargo back; request items on the landing pads here; jettison hub items overboard (lost); clear_ghosts removes ghosts the hub can never build (over empty space, or on a built entity); load_turrets has the hub fill the platform's turrets with ammo; schedule planet stops; board (ride a ready rocket up, empty cargo); land (drop from the hub to the planet below)."
     )]
     async fn space_platform(&self, Parameters(params): Parameters<SpacePlatformParams>) -> String {
         let mut client = match self.connect().await {

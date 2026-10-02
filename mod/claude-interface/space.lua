@@ -205,6 +205,13 @@ local function surface_logistics(surface, force, detail)
     return result
 end
 
+local STATUS_NAMES = {}
+for name, value in pairs(defines.entity_status) do STATUS_NAMES[value] = name end
+
+local function status_name(entity)
+    return entity.status and STATUS_NAMES[entity.status] or nil
+end
+
 local function entity_recipe_name(entity)
     local ok, recipe = pcall(entity.get_recipe)
     if ok and recipe then return recipe.name end
@@ -229,21 +236,38 @@ end
 local stranded_ghosts, tile_ghost_keys, enclosed_space
 
 -- A platform leaving orbit meets asteroids, mostly from the front (negative
--- y, the direction of travel). Measured from Nauvis to Vulcanus: one fed
--- turret with 10 magazines, and four turrets clustered at one side, were
--- destroyed on the way; six gun turrets across the front holding 620
--- magazines between them, unfed, arrived with every turret destroyed and
--- the hub damaged. These minimums are a judgement from those runs.
-local MIN_FED_TURRETS = 6
+-- y, the direction of travel). Flown from Nauvis to Vulcanus (one thruster,
+-- speed 1.1-1.5): one fed turret with 10 magazines, and four turrets
+-- clustered at one side, were destroyed on the way; six turrets (four in
+-- the front half) with yellow magazines and no military research were
+-- destroyed at 0.8 of the way, even with the hub topping them up; the same
+-- six with piercing rounds, military-2, physical-projectile-damage-2 and
+-- weapon-shooting-speed-2 arrived intact, using about 410 magazines. "Front"
+-- is the front half (turret centre ahead of the hub centre): with an
+-- 18-tile range, turrets beside the hub's front half cover the front edge.
+local MIN_READY_TURRETS = 6
 local MIN_FRONT_TURRETS = 4
-local MIN_AMMO = 1000
+local MIN_AMMO = 600
+local REQUIRED_RESEARCH = {"military-2", "physical-projectile-damage-2", "weapon-shooting-speed-2"}
+-- Ammo too weak to count toward MIN_AMMO.
+local WEAK_AMMO = {["firearm-magazine"] = true}
+-- Strongest first; the hub loads turrets with the first it holds.
+local AMMO_PREFERENCE = {"uranium-rounds-magazine", "piercing-rounds-magazine", "firearm-magazine"}
+-- A turret counts as ready when an inserter feeds it or it holds this many
+-- magazines (a gun turret holds one stack, 100).
+local MIN_LOADED_AMMO = 50
 
 local function armament(platform)
     local surface = platform.surface
     local result = {
-        turrets = 0, turrets_fed = 0, front_turrets_fed = 0, turret_ammo = 0, hub_ammo = 0,
-        min_fed_turrets = MIN_FED_TURRETS, min_front_turrets = MIN_FRONT_TURRETS, min_ammo = MIN_AMMO,
+        turrets = 0, turrets_ready = 0, front_turrets_ready = 0, turret_ammo = 0, hub_ammo = 0, weak_ammo = 0,
+        min_ready_turrets = MIN_READY_TURRETS, min_front_turrets = MIN_FRONT_TURRETS, min_ammo = MIN_AMMO,
+        missing_research = {},
     }
+    for _, name in ipairs(REQUIRED_RESEARCH) do
+        local technology = platform.force.technologies[name]
+        if technology and not technology.researched then result.missing_research[#result.missing_research + 1] = name end
+    end
     if not surface then return result end
     local fed = {}
     for _, inserter in pairs(surface.find_entities_filtered{type = "inserter", force = platform.force}) do
@@ -252,28 +276,182 @@ local function armament(platform)
             fed[target.unit_number] = true
         end
     end
-    local hub_top = platform.hub and platform.hub.valid and platform.hub.bounding_box.left_top.y or 0
+    local function count_ammo(contents, field)
+        for _, entry in pairs(contents) do
+            local proto = prototypes.item[entry.name]
+            if proto and proto.type == "ammo" then
+                if WEAK_AMMO[entry.name] then
+                    result.weak_ammo = result.weak_ammo + entry.count
+                else
+                    result[field] = result[field] + entry.count
+                end
+            end
+        end
+    end
+    local hub_y = platform.hub and platform.hub.valid and platform.hub.position.y or 0
     for _, turret in pairs(surface.find_entities_filtered{type = "ammo-turret", force = platform.force}) do
         result.turrets = result.turrets + 1
-        if fed[turret.unit_number] then
-            result.turrets_fed = result.turrets_fed + 1
-            if turret.position.y < hub_top then result.front_turrets_fed = result.front_turrets_fed + 1 end
+        local inventory = turret.get_inventory(defines.inventory.turret_ammo)
+        if inventory then count_ammo(inventory.get_contents(), "turret_ammo") end
+        if fed[turret.unit_number] or (inventory and inventory.get_item_count() or 0) >= MIN_LOADED_AMMO then
+            result.turrets_ready = result.turrets_ready + 1
+            if turret.position.y < hub_y then result.front_turrets_ready = result.front_turrets_ready + 1 end
         end
-        local ammo = turret.get_inventory(defines.inventory.turret_ammo)
-        if ammo then result.turret_ammo = result.turret_ammo + ammo.get_item_count() end
     end
     if platform.hub and platform.hub.valid then
-        for _, entry in pairs(platform.hub.get_inventory(defines.inventory.hub_main).get_contents()) do
-            local proto = prototypes.item[entry.name]
-            if proto and proto.type == "ammo" then result.hub_ammo = result.hub_ammo + entry.count end
+        count_ammo(platform.hub.get_inventory(defines.inventory.hub_main).get_contents(), "hub_ammo")
+    end
+    result.armed = result.turrets_ready >= MIN_READY_TURRETS and result.front_turrets_ready >= MIN_FRONT_TURRETS
+        and result.hub_ammo + result.turret_ammo >= MIN_AMMO and not result.missing_research[1]
+    result.needs = result.turrets_ready .. "/" .. MIN_READY_TURRETS .. " gun turrets ready (fed by an inserter or holding "
+        .. MIN_LOADED_AMMO .. "+ magazines), " .. result.front_turrets_ready .. "/" .. MIN_FRONT_TURRETS
+        .. " of them in the front half (ahead of the hub centre; smaller y is the direction of travel), "
+        .. (result.hub_ammo + result.turret_ammo) .. "/" .. MIN_AMMO .. " piercing-rounds-magazine (or better) in turrets and hub"
+        .. (result.weak_ammo > 0 and (" (" .. result.weak_ammo .. " firearm-magazine do not count: too weak)") or "")
+        .. (result.missing_research[1] and (", research " .. table.concat(result.missing_research, ", ")) or "")
+    return result
+end
+
+-- Where more turrets fit now (foundation under them, nothing built or
+-- planned in the way), front first; only ahead of the hub centre while
+-- `front_only`. First turret + inserter pairs fed straight from the hub
+-- (`inserter_direction` faces the hub, as place_ghosts takes it), then free
+-- spots for turrets the hub loads with magazines (place_ghosts requests
+-- them; action=load_turrets for turrets already built).
+local function turret_slots(platform, wanted, front_only)
+    local slots = {}
+    local hub = platform.hub
+    if wanted <= 0 or not (hub and hub.valid) then return slots end
+    local surface, force = platform.surface, platform.force
+    local box = hub.bounding_box
+    local l, r = math.floor(box.left_top.x), math.ceil(box.right_bottom.x)
+    local t, b = math.floor(box.left_top.y), math.ceil(box.right_bottom.y)
+    local hub_y = hub.position.y
+    local taken = {}
+    -- Ghosts the hub never builds do not count: place_ghosts replaces them.
+    local dead = {}
+    for _, ghost in ipairs(stranded_ghosts(surface)) do dead[ghost.unit_number] = true end
+    local function cells_of(name, position)
+        local c = prototypes.entity[name].collision_box
+        local cells = {}
+        for x = math.floor(position.x + c.left_top.x), math.ceil(position.x + c.right_bottom.x) - 1 do
+            for y = math.floor(position.y + c.left_top.y), math.ceil(position.y + c.right_bottom.y) - 1 do
+                cells[#cells + 1] = x .. "," .. y
+            end
+        end
+        return cells
+    end
+    local function free(name, position)
+        local cells = cells_of(name, position)
+        for _, cell in ipairs(cells) do
+            if taken[cell] then return nil end
+        end
+        if not surface.can_place_entity{name = name, position = position, force = force} then return nil end
+        local c = prototypes.entity[name].collision_box
+        for _, ghost in pairs(surface.find_entities_filtered{
+            area = {{position.x + c.left_top.x, position.y + c.left_top.y}, {position.x + c.right_bottom.x, position.y + c.right_bottom.y}},
+            type = "entity-ghost",
+        }) do
+            if not dead[ghost.unit_number] then return nil end
+        end
+        return cells
+    end
+    local function take(cells)
+        for _, cell in ipairs(cells) do taken[cell] = true end
+    end
+    local fed = {}
+    for x = l, r - 1 do
+        fed[#fed + 1] = {inserter = {x = x + 0.5, y = t - 0.5}, pickup = "south", turrets = {{x = x, y = t - 2}, {x = x + 1, y = t - 2}}}
+    end
+    for y = t, b - 1 do
+        fed[#fed + 1] = {inserter = {x = l - 0.5, y = y + 0.5}, pickup = "east", turrets = {{x = l - 2, y = y}, {x = l - 2, y = y + 1}}}
+        fed[#fed + 1] = {inserter = {x = r + 0.5, y = y + 0.5}, pickup = "west", turrets = {{x = r + 2, y = y}, {x = r + 2, y = y + 1}}}
+    end
+    for _, candidate in ipairs(fed) do
+        if #slots >= wanted then return slots end
+        local inserter_cells = free("inserter", candidate.inserter)
+        if inserter_cells then
+            for _, turret in ipairs(candidate.turrets) do
+                local cells = (turret.y < hub_y or not front_only) and free("gun-turret", turret)
+                if cells then
+                    take(cells)
+                    take(inserter_cells)
+                    slots[#slots + 1] = {turret = turret, inserter = candidate.inserter, inserter_direction = candidate.pickup}
+                    break
+                end
+            end
         end
     end
-    result.armed = result.turrets_fed >= MIN_FED_TURRETS and result.front_turrets_fed >= MIN_FRONT_TURRETS
-        and result.hub_ammo + result.turret_ammo >= MIN_AMMO
-    result.needs = result.turrets_fed .. "/" .. MIN_FED_TURRETS .. " gun turrets fed by inserters, "
-        .. result.front_turrets_fed .. "/" .. MIN_FRONT_TURRETS .. " of them in front of the hub (smaller y, the direction of travel), "
-        .. (result.hub_ammo + result.turret_ammo) .. "/" .. MIN_AMMO .. " magazines in turrets and hub"
-    return result
+    -- Loaded turrets: any free spot (ahead of the hub centre while
+    -- front_only), front rows first.
+    local spots = {}
+    for y = t - 24, front_only and math.ceil(hub_y) - 1 or b + 24 do
+        for x = l - 24, r + 24 do spots[#spots + 1] = {x = x, y = y} end
+    end
+    table.sort(spots, function(a, c)
+        if a.y ~= c.y then return a.y < c.y end
+        return math.abs(a.x - hub.position.x) < math.abs(c.x - hub.position.x)
+    end)
+    for _, spot in ipairs(spots) do
+        if #slots >= wanted then break end
+        local cells = free("gun-turret", spot)
+        if cells then
+            take(cells)
+            slots[#slots + 1] = {turret = spot, loaded = true}
+        end
+    end
+    return slots
+end
+
+-- The ammo in the hub that `turret_name` can fire: the first of
+-- AMMO_PREFERENCE it holds, else the one it holds most of; nil when none.
+local function hub_ammo_for(platform, turret_name)
+    local hub = platform.hub
+    if not (hub and hub.valid) then return nil end
+    local categories = {}
+    for _, category in pairs(prototypes.entity[turret_name].attack_parameters.ammo_categories or {}) do categories[category] = true end
+    local inventory = hub.get_inventory(defines.inventory.hub_main)
+    local function fits(name)
+        local proto = prototypes.item[name]
+        local category = proto and proto.type == "ammo" and proto.ammo_category
+        return category and categories[category.name]
+    end
+    for _, name in ipairs(AMMO_PREFERENCE) do
+        if prototypes.item[name] and fits(name) and inventory.get_item_count(name) > 0 then return name end
+    end
+    local best, most = nil, 0
+    for _, entry in pairs(inventory.get_contents()) do
+        if fits(entry.name) and entry.count > most then best, most = entry.name, entry.count end
+    end
+    return best
+end
+
+-- Ask the hub to fill a turret (or turret ghost) to one stack of ammo; the
+-- hub delivers item requests on its platform. A turret already holding
+-- MIN_LOADED_AMMO, or with a request pending, is left alone. Returns the
+-- count requested.
+local function request_turret_ammo(platform, entity)
+    local is_ghost = entity.type == "entity-ghost"
+    local function plan(ammo, count)
+        return {{id = {name = ammo}, items = {in_inventory = {{inventory = defines.inventory.turret_ammo, stack = 0, count = count}}}}}
+    end
+    if is_ghost then
+        local ammo = hub_ammo_for(platform, entity.ghost_name)
+        if not ammo or next(entity.insert_plan) then return 0 end
+        local count = prototypes.item[ammo].stack_size
+        entity.insert_plan = plan(ammo, count)
+        return count
+    end
+    local inventory = entity.get_inventory(defines.inventory.turret_ammo)
+    if not inventory or entity.item_request_proxy then return 0 end
+    local have = inventory.get_item_count()
+    if have >= MIN_LOADED_AMMO then return 0 end
+    local loaded = not inventory.is_empty() and inventory[1].valid_for_read and inventory[1].name
+    local ammo = loaded or hub_ammo_for(platform, entity.name)
+    if not ammo then return 0 end
+    local count = prototypes.item[ammo].stack_size - have
+    entity.surface.create_entity{name = "item-request-proxy", position = entity.position, force = entity.force, target = entity, modules = plan(ammo, count)}
+    return count
 end
 
 -- The station the platform's schedule sends it to next, when that is not
@@ -287,23 +465,52 @@ local function leaving_for(platform)
     return nil
 end
 
--- Called every second: a platform about to leave orbit unarmed has its
--- schedule parked in storage (pausing it would also stop its hub building
--- the turrets it needs); once armed the schedule is put back and it leaves.
-function M.guard_departures()
+-- True when an agent character is on the platform: a platform sent to
+-- another planet without its crew strands the agent at home.
+local function crewed(platform)
+    for _, character in pairs(storage.characters or {}) do
+        if character.valid and character.surface == platform.surface then return true end
+    end
+    return false
+end
+
+-- Why a departure is held: "unarmed", "no_crew", or nil when it may leave.
+local function hold_reason(platform)
+    if not armament(platform).armed then return "unarmed" end
+    if not crewed(platform) then return "no_crew" end
+    return nil
+end
+
+-- Called every second, for each platform:
+-- * A platform about to leave orbit unarmed or without an agent aboard has
+--   its schedule parked in storage (pausing it would also stop its hub
+--   building the turrets it needs); once both hold, the schedule is put back
+--   and it leaves.
+-- * With a standing ammo order (load_turrets, or turrets placed with
+--   place_ghosts), turrets below MIN_LOADED_AMMO get a request the hub fills,
+--   in flight too: loaded turrets otherwise run dry within two minutes, and
+--   rebuilt ones start empty.
+function M.tend_platforms()
     storage.departure_held = storage.departure_held or {}
+    storage.turret_ammo_orders = storage.turret_ammo_orders or {}
     local held = storage.departure_held
     for _, force in pairs(game.forces) do
         for _, platform in pairs(force.platforms) do
-            if platform.valid and platform.hub and platform.hub.valid and platform.space_location then
-                local armed = armament(platform).armed
+            if platform.valid and platform.hub and platform.hub.valid then
+                if storage.turret_ammo_orders[platform.index] then
+                    for _, turret in pairs(platform.surface.find_entities_filtered{type = "ammo-turret", force = force}) do
+                        request_turret_ammo(platform, turret)
+                    end
+                end
+                -- leaving_for is nil in transit, and a held platform has no
+                -- schedule, so it never moves while held.
                 if held[platform.index] then
-                    if armed then
+                    if not hold_reason(platform) then
                         platform.schedule = {current = 1, records = held[platform.index]}
                         platform.paused = false
                         held[platform.index] = nil
                     end
-                elseif leaving_for(platform) and not armed then
+                elseif leaving_for(platform) and hold_reason(platform) then
                     held[platform.index] = platform.schedule.records
                     platform.schedule = nil
                     platform.paused = false
@@ -316,6 +523,46 @@ end
 -- Drop a held departure, e.g. when the schedule is set again.
 local function release_hold(platform)
     if storage.departure_held then storage.departure_held[platform.index] = nil end
+end
+
+-- Item stock the hub should hold for each thruster-fluid ingredient before
+-- departure: one thruster from Nauvis to Vulcanus burned about 400 iron-ore
+-- for oxidizer.
+local THRUST_RESERVE = 500
+
+-- Assembling machines (chemical plants) on `surface` whose recipe makes
+-- `fluid`, with their status and the item ingredients the hub holds less of
+-- than `reserve` (default: one craft) (`made_by`: asteroid-crushing recipes
+-- for it).
+local function fluid_producers(surface, force, fluid, hub_inventory, reserve)
+    local producers = {}
+    if not fluid then return producers end
+    for _, plant in pairs(surface.find_entities_filtered{type = "assembling-machine", force = force}) do
+        local recipe = plant.get_recipe()
+        local makes = false
+        for _, product in pairs(recipe and recipe.products or {}) do
+            if product.name == fluid then makes = true end
+        end
+        if makes then
+            local short = {}
+            for _, ingredient in pairs(recipe.ingredients) do
+                local have = ingredient.type == "item" and hub_inventory and hub_inventory.get_item_count(ingredient.name) or nil
+                if have and have < (reserve or ingredient.amount) then
+                    local sources = {}
+                    for name, candidate in pairs(prototypes.recipe) do
+                        if name:find("asteroid%-crushing$") and not name:find("^advanced") then
+                            for _, product in pairs(candidate.products) do
+                                if product.name == ingredient.name then sources[#sources + 1] = name end
+                            end
+                        end
+                    end
+                    short[#short + 1] = {name = ingredient.name, hub = have, made_by = sources}
+                end
+            end
+            producers[#producers + 1] = {position = plant.position, recipe = recipe.name, status = status_name(plant), short = short}
+        end
+    end
+    return producers
 end
 
 local function platform_summary(platform)
@@ -342,7 +589,12 @@ local function platform_summary(platform)
         summary.hub_free_slots = inventory and inventory.count_empty_stacks() or nil
     end
     summary.armament = armament(platform)
-    summary.departure_held = storage.departure_held and storage.departure_held[platform.index] and "unarmed" or nil
+    if not summary.armament.armed then
+        local a = summary.armament
+        summary.armament.turret_slots = turret_slots(platform, math.max(a.min_ready_turrets - a.turrets_ready, a.min_front_turrets - a.front_turrets_ready),
+            a.front_turrets_ready < a.min_front_turrets)
+    end
+    summary.departure_held = storage.departure_held and storage.departure_held[platform.index] and (hold_reason(platform) or "releasing") or nil
     local queued = {}
     for _, shipment in ipairs(storage.space_shipments or {}) do
         if shipment.platform_name == platform.name and shipment.inventory and shipment.inventory.valid then
@@ -400,9 +652,11 @@ local function platform_summary(platform)
         summary.foundation_tiles = surface.count_tiles_filtered{name = "space-platform-foundation"}
         summary.ghosts_missing_items = surface_logistics(surface, force, false).missing_items
         local stranded = {}
-        for _, ghost in ipairs(stranded_ghosts(surface)) do
+        local ghosts, why = stranded_ghosts(surface)
+        for _, ghost in ipairs(ghosts) do
             if #stranded >= 10 then break end
             stranded[#stranded + 1] = ghost.ghost_name .. "@" .. ghost.position.x .. "," .. ghost.position.y
+                .. " (" .. why[ghost.unit_number] .. ")"
         end
         summary.stranded_ghosts = stranded
         local holes = {}
@@ -412,6 +666,28 @@ local function platform_summary(platform)
         end
         summary.foundation_holes = holes
         summary.thrusters = thrusters
+        -- The plants making each thruster fluid, and the item ingredients the
+        -- hub cannot supply them: a full thruster buffer lasts seconds.
+        local hub_inventory = platform.hub and platform.hub.valid and platform.hub.get_inventory(defines.inventory.hub_main)
+        for _, input in ipairs(thruster_inputs) do
+            input.producers = fluid_producers(surface, force, input.fluid, hub_inventory)
+        end
+        local thrust_fluids, thrust_short = {}, {}
+        for _, thruster in pairs(surface.find_entities_filtered{type = "thruster", force = force}) do
+            for index = 1, #thruster.fluidbox do
+                local filter = safe_value(function() return thruster.fluidbox.get_filter(index) end)
+                if filter and not thrust_fluids[filter.name] then
+                    thrust_fluids[filter.name] = true
+                    for _, producer in ipairs(fluid_producers(surface, force, filter.name, hub_inventory, THRUST_RESERVE)) do
+                        if producer.short[1] then
+                            producer.fluid = filter.name
+                            thrust_short[#thrust_short + 1] = producer
+                        end
+                    end
+                end
+            end
+        end
+        summary.thrust_short = thrust_short
         summary.thrusters_unfed = thruster_inputs
         summary.turrets = turrets
         summary.collectors = collectors
@@ -610,19 +886,35 @@ function enclosed_space(surface, extra)
     return holes
 end
 
--- Entity ghosts on a platform standing partly over empty space with no tile
--- ghost under them: the hub never builds them, yet they block placement.
+-- Entity ghosts on a platform the hub never builds, yet which block
+-- placement: partly over empty space with no tile ghost under them, or
+-- overlapping a built entity that is neither marked for deconstruction nor
+-- fast-replaceable by the ghost. Returns the ghosts and, by unit number, why.
 function stranded_ghosts(surface)
-    local stranded = {}
-    if not surface.platform then return stranded end
+    local stranded, why = {}, {}
+    if not surface.platform then return stranded, why end
     local keys = tile_ghost_keys(surface)
     for _, ghost in pairs(surface.find_entities_filtered{type = "entity-ghost"}) do
         local box = ghost.bounding_box
         if missing_foundation(surface, {{box.left_top.x, box.left_top.y}, {box.right_bottom.x, box.right_bottom.y}}, keys) then
             stranded[#stranded + 1] = ghost
+            why[ghost.unit_number] = "over empty space"
+        else
+            local group = ghost.ghost_prototype.fast_replaceable_group
+            local inner = {{box.left_top.x + 0.05, box.left_top.y + 0.05}, {box.right_bottom.x - 0.05, box.right_bottom.y - 0.05}}
+            for _, found in pairs(surface.find_entities_filtered{area = inner}) do
+                if found.type ~= "entity-ghost" and found.prototype.has_flag("player-creation")
+                    and not found.to_be_deconstructed()
+                    and not (group and found.prototype.fast_replaceable_group == group)
+                then
+                    stranded[#stranded + 1] = ghost
+                    why[ghost.unit_number] = "on a built " .. found.name
+                    break
+                end
+            end
         end
     end
-    return stranded
+    return stranded, why
 end
 
 -- Planned platform foundation tiles that do not join the platform: the hub
@@ -967,7 +1259,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         end
         created[#created + 1] = ghost
     end
-    local recipes, placed, recipe_failed = {}, 0, false
+    local recipes, placed, recipe_failed, ammo_requested = {}, 0, false, 0
     for _, plan in ipairs(new_entities) do
         local ghost = surface.create_entity{
             name = "entity-ghost",
@@ -987,10 +1279,16 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             if not ok then recipe_failed = true end
             recipes[#recipes + 1] = {index = plan.index, recipe = plan.recipe, recipe_set = ok}
         end
+        if surface.platform and ghost.ghost_type == "ammo-turret" then
+            ammo_requested = ammo_requested + request_turret_ammo(surface.platform, ghost)
+            storage.turret_ammo_orders = storage.turret_ammo_orders or {}
+            storage.turret_ammo_orders[surface.platform.index] = true
+        end
     end
 
     local guidance = surface.platform
-        and "The hub builds these from its inventory; bring missing_items with space_platform action=ship."
+        and ("The hub builds these from its inventory; bring missing_items with space_platform action=ship."
+            .. (ammo_requested > 0 and " It also loads the new turrets with " .. ammo_requested .. " magazines from the hub." or ""))
         or "Robots build these from items in the network; put missing_items into a storage or passive-provider chest in range. Check progress with robot_logistics."
     if recipe_failed then
         guidance = guidance .. " Recipes with recipe_set=false were not applied: set them with set_recipe once the machine is built and you are there."
@@ -1005,6 +1303,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         recipes = recipes,
         missing_items = missing_items,
         removed_stranded_ghosts = removed_stranded,
+        ammo_requested = ammo_requested,
         guidance = guidance,
     }
 end
@@ -1013,7 +1312,7 @@ end
 -- space_platform
 -- ============================================================
 
-local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, jettison = true, schedule = true, board = true, land = true}
+local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, jettison = true, clear_ghosts = true, load_turrets = true, schedule = true, board = true, land = true}
 
 local function resolve_platform(character, platform_name)
     local force = character.force
@@ -1535,6 +1834,50 @@ local function action_jettison(platform, items)
     }
 end
 
+-- Remove the ghosts the hub can never build (stranded_ghosts); every other
+-- ghost stays.
+local function action_clear_ghosts(platform)
+    local removed = {}
+    local ghosts, why = stranded_ghosts(platform.surface)
+    for _, ghost in ipairs(ghosts) do
+        removed[#removed + 1] = {name = ghost.ghost_name, position = ghost.position, reason = why[ghost.unit_number]}
+        ghost.destroy()
+    end
+    return {success = true, removed = removed}
+end
+
+-- Have the hub fill every empty turret and turret ghost on the platform with
+-- one stack of the ammo it holds most of, and keep them topped up from now
+-- on (see tend_platforms).
+local function action_load_turrets(platform)
+    if not (platform.hub and platform.hub.valid) then
+        return fail("platform_not_ready", platform.name .. " has no hub yet (" .. state_name(platform.state) .. ")")
+    end
+    storage.turret_ammo_orders = storage.turret_ammo_orders or {}
+    storage.turret_ammo_orders[platform.index] = true
+    local loading = {}
+    local surface = platform.surface
+    for _, entity in pairs(surface.find_entities_filtered{type = "ammo-turret", force = platform.force}) do
+        local count = request_turret_ammo(platform, entity)
+        if count > 0 then loading[#loading + 1] = {name = entity.name, position = entity.position, count = count} end
+    end
+    local dead = {}
+    for _, ghost in ipairs(stranded_ghosts(surface)) do dead[ghost.unit_number] = true end
+    for _, ghost in pairs(surface.find_entities_filtered{type = "entity-ghost", ghost_type = "ammo-turret", force = platform.force}) do
+        local count = not dead[ghost.unit_number] and request_turret_ammo(platform, ghost) or 0
+        if count > 0 then loading[#loading + 1] = {name = ghost.ghost_name, position = ghost.position, count = count, ghost = true} end
+    end
+    local result = {success = true, loading = loading, armament = armament(platform)}
+    if not loading[1] then
+        result.guidance = hub_ammo_for(platform, "gun-turret") and "Every turret already holds ammo or has a request. The hub keeps them topped up from now on."
+            or "The hub has no ammo for its turrets: ship firearm-magazine (space_platform action=ship)."
+    else
+        result.guidance = "The hub delivers these within seconds and keeps every turret topped up from now on, in flight too; a turret holding "
+            .. MIN_LOADED_AMMO .. "+ magazines counts as ready. Keep magazines and a few spare gun-turrets in the hub: it rebuilds destroyed turrets."
+    end
+    return result
+end
+
 local function action_schedule(character, platform, stops)
     local force = character.force
     stops = type(stops) == "table" and stops or {}
@@ -1556,13 +1899,15 @@ local function action_schedule(character, platform, stops)
         platform.schedule = {current = 1, records = records}
         platform.paused = false
     end
-    M.guard_departures()
+    M.tend_platforms()
     local result = platform_summary(platform)
     result.success = true
-    if result.departure_held then
+    if result.departure_held == "unarmed" then
         local a = result.armament
         result.guidance = "Course set, but " .. platform.name .. " stays parked until it is armed: asteroids destroy it on the way. It has "
-            .. a.needs .. ". It leaves by itself once armed."
+            .. a.needs .. ". It leaves by itself once armed and you are aboard."
+    elseif result.departure_held == "no_crew" then
+        result.guidance = "Course set; " .. platform.name .. " waits in orbit until you are aboard (space_platform action=board beside a silo), then leaves by itself."
     end
     return result
 end
@@ -1602,7 +1947,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     local character = characters.find(agent_id)
     if not character then return no_character(agent_id) end
     if not ACTIONS[action] then
-        return fail("invalid_action", "action must be status, create, ship, unship, request, jettison, schedule, board or land", {action = action})
+        return fail("invalid_action", "action must be status, create, ship, unship, request, jettison, clear_ghosts, load_turrets, schedule, board or land", {action = action})
     end
     if action == "status" then return action_status(character) end
     if action == "create" then return action_create(character, platform_name) end
@@ -1612,6 +1957,8 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     if action == "ship" then return action_ship(agent_id, character, platform, items) end
     if action == "board" then return action_board(agent_id, character, platform) end
     if action == "jettison" then return action_jettison(platform, items) end
+    if action == "clear_ghosts" then return action_clear_ghosts(platform) end
+    if action == "load_turrets" then return action_load_turrets(platform) end
     if action == "unship" then return action_unship(character, platform, items) end
     if action == "schedule" then return action_schedule(character, platform, stops) end
     return action_land(character, platform, x, y)
