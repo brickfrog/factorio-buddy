@@ -373,7 +373,7 @@ end
 
 -- Space Age rungs after the first rocket, up to boarding for Vulcanus. Nil
 -- when the generic research rungs (on space_path) are the right next step.
-local function space_rung(facts)
+local function space_rung(facts, force, surface)
     local S = facts.space
     local P = S.platforms[1]
     local vulcanus_found = S.techs.planet_discovery_vulcanus
@@ -429,6 +429,19 @@ local function space_rung(facts)
             .. ". Build thrusters at the back edge, fed by pipes from chemical plants on the platform; place with place_ghosts surface=" .. tostring(P.surface) .. "."
     end
     local arms = P.armament or {}
+    -- Cargo the platform still waits for, when it outweighs what the silo
+    -- launches soon: a bigger rocket-part line is then the next step.
+    if (P.queued_rockets or 0) >= 2 and not (arms.missing_research or {})[1]
+        and (not arms.armed or (P.thrust_short and P.thrust_short[1]))
+    then
+        local parts_required = prototypes.entity["rocket-silo"] and prototypes.entity["rocket-silo"].rocket_parts_required or 50
+        local per_hour = made_last_ten_minutes(force, surface, "rocket-part") * 6 / parts_required
+        local hours = per_hour > 0 and string.format("about %.1f h at %.1f rockets/h", P.queued_rockets / per_hour, per_hour) or "no rocket parts made in the last 10 min"
+        return "Launch rockets faster: " .. P.queued_rockets .. " rockets of cargo wait for " .. P.name .. " (" .. hours .. ").",
+            "Each rocket part needs " .. rocket_part_inputs(force, surface)
+            .. ". Add assemblers for the scarcest of these and for its own inputs (build_layout, route_belt), and feed all three into the silo with inserters. One rocket lifts 1 t: 50 piercing-rounds-magazine or 500 iron-ore. Still needed on "
+            .. P.name .. ": " .. tostring(arms.needs) .. "."
+    end
     if not arms.armed then
         return "Arm " .. P.name .. " before leaving (" .. tostring(arms.needs) .. ").",
             "Asteroids destroy an unarmed platform on the way, and you with it; it will not leave orbit until armed. " .. turret_plan(arms, P.surface)
@@ -496,7 +509,7 @@ local function progression(surface, force, facts, character)
     end
     local goal, how = travel_rung(facts.space, character)
     local space_goal, space_how = nil, nil
-    if not goal and force.rockets_launched > 0 then space_goal, space_how = space_rung(facts) end
+    if not goal and force.rockets_launched > 0 then space_goal, space_how = space_rung(facts, force, surface) end
     local silo_prototype = prototypes.entity["rocket-silo"]
     local parts_required = silo_prototype and silo_prototype.rocket_parts_required or 50
     if goal then

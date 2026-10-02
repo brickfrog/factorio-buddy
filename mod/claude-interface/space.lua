@@ -565,6 +565,16 @@ local function fluid_producers(surface, force, fluid, hub_inventory, reserve)
     return producers
 end
 
+local function rockets_for(counts)
+    local lift = safe_value(function() return prototypes.utility_constants.rocket_lift_weight end)
+    if not lift then return 1 end
+    local weight = 0
+    for name, count in pairs(counts) do
+        weight = weight + (safe_value(function() return prototypes.item[name].weight end) or 0) * count
+    end
+    return math.max(1, math.ceil(weight / lift))
+end
+
 local function platform_summary(platform)
     local location = platform.space_location
     local surface = platform.surface
@@ -603,7 +613,10 @@ local function platform_summary(platform)
             end
         end
     end
-    if next(queued) then summary.queued_cargo = top_counts(queued, 15) end
+    if next(queued) then
+        summary.queued_cargo = top_counts(queued, 15)
+        summary.queued_rockets = rockets_for(queued)
+    end
     for _, shipment in ipairs(storage.space_shipments or {}) do
         if shipment.platform_name == platform.name and shipment.blocked then summary.cargo_blocked = shipment.blocked end
     end
@@ -1469,16 +1482,6 @@ local function inventory_counts(inventory)
         end
     end
     return counts
-end
-
-local function rockets_for(counts)
-    local lift = safe_value(function() return prototypes.utility_constants.rocket_lift_weight end)
-    if not lift then return 1 end
-    local weight = 0
-    for name, count in pairs(counts) do
-        weight = weight + (safe_value(function() return prototypes.item[name].weight end) or 0) * count
-    end
-    return math.max(1, math.ceil(weight / lift))
 end
 
 -- Hand undeliverable cargo back to its owner, or drop it by the silo.

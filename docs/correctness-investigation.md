@@ -837,6 +837,19 @@ Sandbox runs on long32's save:
 - At the end: 5/6 ready turrets, 4/4 in front, 92/600 piercing on board; `thrust_short` iron-ore 0; no never-built ghosts left. Rockets: 2 (35 → 37).
 - Errors were long hand-crafts outlasting `wait_for_crafting` timeouts (17) and `launch_rocket` before a rocket was ready (2). No tool defect.
 
+### `long37-cont36-opus-open-2590060469-60m`
+
+60 minutes, 23 turns, none provider-limited, 33 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- All three researches done. The platform had 5/6 ready turrets, 4/4 in front, 192/600 piercing aboard and 408 queued, with `thrust_short` iron-ore 0. Rockets: 2 (37 → 39).
+- Errors were again hand-craft waits (20) and early `launch_rocket` (4).
+
+### Sandbox on long37's save, and the fix
+
+- Flight with what was aboard (6 turrets holding 516 yellow, 192 piercing in the hub, upgrades researched; only 500 iron ore added): the turrets fired yellow first and drew piercing top-ups from 0.6 of the way. Two turrets were lost and the platform was destroyed at about 0.85. So mixed ammo is not enough, and the 600-piercing rule stands.
+- A piercing magazine weighs 20 kg: one rocket lifts 50 (500 iron ore, 50 gun turrets). The 408 queued rounds need 9 rockets, about 3.3 h at the measured 2.8 rockets/h. Low-density structure is the scarcest rocket-part input (18 per 10 min).
+- Platform status now reports `queued_rockets` (`rockets_for`, moved above `platform_summary`). While the research is done, at least 2 rockets of cargo wait, and the platform is unarmed or short of thrust stock, the space rung becomes "Launch rockets faster". It gives the rockets waiting, hours at the current rate (from rocket-part production in the last 10 min), the rocket-part inputs with their rates, the per-rocket lift, and what the platform still needs.
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 519 passed and 0 failed (`fb-evidence/git-gud/live33`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
