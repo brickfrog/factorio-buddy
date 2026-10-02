@@ -362,6 +362,14 @@ local function travel_rung(S, character)
                 "It stays parked until armed, because asteroids destroy it and you on the way. " .. turret_plan(arms, here.surface)
                 .. " You are aboard and cannot ship: land on Nauvis (space_platform action=land) to craft and ship the turrets, inserters, belts and magazines, then board again."
         end
+        if here.departure_held == "thrust_stock" then
+            local items = {}
+            for _, producer in ipairs(here.thrust_short or {}) do
+                for _, item in ipairs(producer.short) do items[#items + 1] = item.name .. " (hub has " .. item.hub .. ")" end
+            end
+            return "Stock " .. here.name .. "'s thruster fuel: it stays parked until the hub holds " .. tostring(here.thrust_reserve) .. "+ of " .. table.concat(items, ", ") .. ".",
+                "Queued shipments keep going up without you. If none is queued, you are aboard and cannot ship: land on Nauvis (space_platform action=land), ship them, then board again (board books the next ready rocket for you)."
+        end
         return "Get " .. here.name .. " moving to Vulcanus (" .. tostring(here.state) .. ").",
             "It leaves once its thrusters get both thruster-fuel and thruster-oxidizer: follow the thruster warnings, building pipe and foundation with place_ghosts on " .. tostring(here.surface) .. ", and ship what its ghosts lack."
     end
@@ -447,23 +455,34 @@ local function space_rung(facts, force, surface)
             "Asteroids destroy an unarmed platform on the way, and you with it; it will not leave orbit until armed. " .. turret_plan(arms, P.surface)
             .. " Ship the turrets, inserters and magazines. Keep spare space-platform-foundation and parts in the hub: it rebuilds what asteroids break."
     end
-    if P.thrust_short and P.thrust_short[1] then
-        local parts, items = {}, {}
-        for _, producer in ipairs(P.thrust_short) do
-            for _, item in ipairs(producer.short) do
+    -- Ingredients already queued for the platform count: once they cover the
+    -- reserve, boarding is next (the hold keeps the platform parked until
+    -- they land).
+    local queued = {}
+    for _, entry in ipairs(P.queued_cargo or {}) do queued[entry.name] = (queued[entry.name] or 0) + entry.count end
+    local parts, items = {}, {}
+    for _, producer in ipairs(P.thrust_short or {}) do
+        for _, item in ipairs(producer.short) do
+            if item.hub + (queued[item.name] or 0) < (P.thrust_reserve or 0) then
                 parts[#parts + 1] = "the " .. producer.recipe .. " plant at " .. producer.position.x .. "," .. producer.position.y
-                    .. " is low on " .. item.name .. " (hub has " .. item.hub .. ", keep 500+ for the trip"
+                    .. " is low on " .. item.name .. " (hub has " .. item.hub .. ", " .. (queued[item.name] or 0) .. " queued; keep " .. tostring(P.thrust_reserve) .. "+ for the trip"
                     .. (item.made_by[1] and ("; made by " .. table.concat(item.made_by, ", ")) or "") .. ")"
                 items[#items + 1] = item.name
             end
         end
+    end
+    if parts[1] then
         return "Stock " .. P.name .. "'s thruster fuel before boarding: " .. table.concat(parts, "; ") .. ".",
-            "Without it the thrusters burn out within seconds and the platform stalls. Ship 500+ " .. table.concat(items, ", ")
+            "Without it the thrusters burn out within seconds and the platform stalls. Ship " .. tostring(P.thrust_reserve) .. "+ " .. table.concat(items, ", ")
             .. " now (space_platform action=ship), and make it on the platform: asteroid-collectors at the foundation edge and a crusher on that recipe, with inserters to and from the hub (place_ghosts surface="
             .. tostring(P.surface) .. ")."
     end
+    if (P.stops or {})[1] ~= "vulcanus" then
+        return "Set " .. P.name .. "'s course for Vulcanus.",
+            "space_platform action=schedule stops=[\"vulcanus\"]. It stays in orbit until you are aboard (and armed and stocked), then leaves by itself."
+    end
     return "Board " .. P.name .. " for Vulcanus.",
-        "It waits in orbit until you are aboard, then leaves on its schedule (set it with action=schedule stops=[\"vulcanus\"] if it has none). Carry what you need to start there (roboport, robots, steam/solar power, drills, furnaces, belts, inserters, poles). Stand by a silo with a ready rocket and empty cargo, then space_platform action=board."
+        "It waits in orbit until you are aboard, then leaves. Carry what you need to start there (roboport, robots, steam/solar power, drills, furnaces, belts, inserters, poles). Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
 end
 
 -- Code-computed tech-progression ladder for the early game. Each rung names

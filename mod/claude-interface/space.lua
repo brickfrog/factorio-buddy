@@ -233,7 +233,7 @@ local function safe_value(read)
 end
 
 -- Defined with the place_ghosts helpers below.
-local stranded_ghosts, tile_ghost_keys, enclosed_space
+local stranded_ghosts, tile_ghost_keys, enclosed_space, thrust_shortages
 
 -- A platform leaving orbit meets asteroids, mostly from the front (negative
 -- y, the direction of travel). Flown from Nauvis to Vulcanus (one thruster,
@@ -474,18 +474,21 @@ local function crewed(platform)
     return false
 end
 
--- Why a departure is held: "unarmed", "no_crew", or nil when it may leave.
+-- Why a departure is held: "unarmed", "thrust_stock" (thruster-fluid
+-- ingredients under THRUST_RESERVE: the thrusters burn out within seconds
+-- and the platform stalls), "no_crew", or nil when it may leave.
 local function hold_reason(platform)
     if not armament(platform).armed then return "unarmed" end
+    if thrust_shortages(platform)[1] then return "thrust_stock" end
     if not crewed(platform) then return "no_crew" end
     return nil
 end
 
 -- Called every second, for each platform:
--- * A platform about to leave orbit unarmed or without an agent aboard has
---   its schedule parked in storage (pausing it would also stop its hub
---   building the turrets it needs); once both hold, the schedule is put back
---   and it leaves.
+-- * A platform about to leave orbit unarmed, short of thrust stock, or
+--   without an agent aboard has its schedule parked in storage (pausing it
+--   would also stop its hub building the turrets it needs); once all hold,
+--   the schedule is put back and it leaves.
 -- * With a standing ammo order (load_turrets, or turrets placed with
 --   place_ghosts), turrets below MIN_LOADED_AMMO get a request the hub fills,
 --   in flight too: loaded turrets otherwise run dry within two minutes, and
@@ -528,7 +531,24 @@ end
 -- Item stock the hub should hold for each thruster-fluid ingredient before
 -- departure: one thruster from Nauvis to Vulcanus burned about 400 iron-ore
 -- for oxidizer.
-local THRUST_RESERVE = 500
+local THRUST_RESERVE = 450
+
+-- Asteroid-crushing recipes (basic ones) that make `item`; prototypes do
+-- not change at runtime, so the answer is cached.
+local crushing_cache = {}
+local function crushing_sources(item)
+    if crushing_cache[item] then return crushing_cache[item] end
+    local sources = {}
+    for name, candidate in pairs(prototypes.recipe) do
+        if name:find("asteroid%-crushing$") and not name:find("^advanced") then
+            for _, product in pairs(candidate.products) do
+                if product.name == item then sources[#sources + 1] = name end
+            end
+        end
+    end
+    crushing_cache[item] = sources
+    return sources
+end
 
 -- Assembling machines (chemical plants) on `surface` whose recipe makes
 -- `fluid`, with their status and the item ingredients the hub holds less of
@@ -548,21 +568,37 @@ local function fluid_producers(surface, force, fluid, hub_inventory, reserve)
             for _, ingredient in pairs(recipe.ingredients) do
                 local have = ingredient.type == "item" and hub_inventory and hub_inventory.get_item_count(ingredient.name) or nil
                 if have and have < (reserve or ingredient.amount) then
-                    local sources = {}
-                    for name, candidate in pairs(prototypes.recipe) do
-                        if name:find("asteroid%-crushing$") and not name:find("^advanced") then
-                            for _, product in pairs(candidate.products) do
-                                if product.name == ingredient.name then sources[#sources + 1] = name end
-                            end
-                        end
-                    end
-                    short[#short + 1] = {name = ingredient.name, hub = have, made_by = sources}
+                    short[#short + 1] = {name = ingredient.name, hub = have, made_by = crushing_sources(ingredient.name)}
                 end
             end
             producers[#producers + 1] = {position = plant.position, recipe = recipe.name, status = status_name(plant), short = short}
         end
     end
     return producers
+end
+
+-- Thruster-fluid plants on the platform whose item ingredients the hub
+-- holds under THRUST_RESERVE of.
+function thrust_shortages(platform)
+    local surface, force = platform.surface, platform.force
+    local hub_inventory = platform.hub and platform.hub.valid and platform.hub.get_inventory(defines.inventory.hub_main)
+    local seen, short = {}, {}
+    if not surface then return short end
+    for _, thruster in pairs(surface.find_entities_filtered{type = "thruster", force = force}) do
+        for index = 1, #thruster.fluidbox do
+            local filter = safe_value(function() return thruster.fluidbox.get_filter(index) end)
+            if filter and not seen[filter.name] then
+                seen[filter.name] = true
+                for _, producer in ipairs(fluid_producers(surface, force, filter.name, hub_inventory, THRUST_RESERVE)) do
+                    if producer.short[1] then
+                        producer.fluid = filter.name
+                        short[#short + 1] = producer
+                    end
+                end
+            end
+        end
+    end
+    return short
 end
 
 local function rockets_for(counts)
@@ -685,22 +721,8 @@ local function platform_summary(platform)
         for _, input in ipairs(thruster_inputs) do
             input.producers = fluid_producers(surface, force, input.fluid, hub_inventory)
         end
-        local thrust_fluids, thrust_short = {}, {}
-        for _, thruster in pairs(surface.find_entities_filtered{type = "thruster", force = force}) do
-            for index = 1, #thruster.fluidbox do
-                local filter = safe_value(function() return thruster.fluidbox.get_filter(index) end)
-                if filter and not thrust_fluids[filter.name] then
-                    thrust_fluids[filter.name] = true
-                    for _, producer in ipairs(fluid_producers(surface, force, filter.name, hub_inventory, THRUST_RESERVE)) do
-                        if producer.short[1] then
-                            producer.fluid = filter.name
-                            thrust_short[#thrust_short + 1] = producer
-                        end
-                    end
-                end
-            end
-        end
-        summary.thrust_short = thrust_short
+        summary.thrust_short = thrust_shortages(platform)
+        summary.thrust_reserve = THRUST_RESERVE
         summary.thrusters_unfed = thruster_inputs
         summary.turrets = turrets
         summary.collectors = collectors
@@ -1559,8 +1581,59 @@ local function launch_shipment(shipment, silo)
     return true
 end
 
--- Called every second: send pending cargo with each ready rocket.
+-- A booking keeps the next ready rocket on its surface empty for the agent
+-- this long, so queued cargo cannot take every rocket from under it.
+local BOOKING_TICKS = 10 * 60 * 60
+
+local function launch_character(agent_id, character, platform, silo)
+    if storage.walk_targets and storage.walk_targets[agent_id] then
+        characters.finish_walk(agent_id, character, "boarded")
+    end
+    local ok, launched = pcall(silo.launch_rocket, {type = defines.cargo_destination.station, station = platform.hub}, character)
+    if not (ok and launched) then return false, ok and "the silo refused to launch" or tostring(launched) end
+    return true
+end
+
+-- Launch booked agents from the first ready, empty rocket in their reach.
+-- Returns the surfaces where a booking still waits for a rocket.
+local function serve_bookings()
+    local waiting = {}
+    storage.board_bookings = storage.board_bookings or {}
+    for agent_id, booking in pairs(storage.board_bookings) do
+        local character = characters.find(agent_id)
+        local platform = booking.platform
+        if not (character and character.valid and platform.valid and platform.hub and platform.hub.valid)
+            or game.tick - booking.tick > BOOKING_TICKS or character.surface.index ~= booking.surface_index
+        then
+            storage.board_bookings[agent_id] = nil
+        else
+            local launched = false
+            local location = platform.space_location
+            if location and character.surface.planet and location.name == character.surface.planet.name then
+                for _, silo in pairs(character.surface.find_entities_filtered{type = "rocket-silo", force = character.force}) do
+                    local cargo = silo.get_inventory(defines.inventory.rocket_silo_rocket)
+                    if silo.rocket_silo_status == defines.rocket_silo_status.rocket_ready and (not cargo or cargo.is_empty())
+                        and not characters.require_entity_reach(character, silo)
+                    then
+                        launched = launch_character(agent_id, character, platform, silo)
+                        break
+                    end
+                end
+            end
+            if launched then
+                storage.board_bookings[agent_id] = nil
+            else
+                waiting[booking.surface_index] = true
+            end
+        end
+    end
+    return waiting
+end
+
+-- Called every second: launch booked agents, then send pending cargo with
+-- each ready rocket on surfaces where no booking waits.
 function M.process_shipments()
+    local booked = serve_bookings()
     local list = storage.space_shipments
     if not list or #list == 0 then return end
     for index = #list, 1, -1 do
@@ -1574,7 +1647,7 @@ function M.process_shipments()
         elseif not (shipment.platform and shipment.platform.valid and surface) then
             return_shipment(shipment, surface, shipment.position)
             table.remove(list, index)
-        else
+        elseif not booked[shipment.surface_index] then
             local location = shipment.platform.space_location
             if location and surface.planet and location.name == surface.planet.name then
                 for _, silo in pairs(surface.find_entities_filtered{type = "rocket-silo", force = shipment.force}) do
@@ -1766,7 +1839,19 @@ local function action_board(agent_id, character, platform)
         return fail("platform_not_ready", platform.name .. " has no hub yet (" .. state_name(platform.state) .. ")")
     end
     local silo, silo_err = pick_silo(character, platform)
-    if not silo then return silo_err end
+    if not silo then
+        if silo_err.error_kind ~= "rocket_not_ready" then return silo_err end
+        storage.board_bookings = storage.board_bookings or {}
+        storage.board_bookings[agent_id] = {platform = platform, surface_index = character.surface.index, tick = game.tick}
+        return {
+            success = true,
+            booked = platform.name,
+            silos = silo_err.silos,
+            parts_required = silo_err.parts_required,
+            guidance = "No rocket is ready yet, so the next ready rocket is booked for you (queued cargo waits for the one after). Stay within reach of the silo: you are launched to "
+                .. platform.name .. " the moment it is ready, without calling board again. The booking lapses after 10 minutes.",
+        }
+    end
     local rocket_inventory = silo.get_inventory(defines.inventory.rocket_silo_rocket)
     if rocket_inventory and not rocket_inventory.is_empty() then
         return fail("rocket_has_cargo", "the rocket already holds cargo", {
@@ -1774,13 +1859,9 @@ local function action_board(agent_id, character, platform)
             guidance = "cargo riding with you is lost; ship it first",
         })
     end
-    if storage.walk_targets and storage.walk_targets[agent_id] then
-        characters.finish_walk(agent_id, character, "boarded")
-    end
-    local ok, launched = pcall(silo.launch_rocket, {type = defines.cargo_destination.station, station = platform.hub}, character)
-    if not (ok and launched) then
-        return fail("launch_refused", ok and "the silo refused to launch" or tostring(launched))
-    end
+    local launched, err = launch_character(agent_id, character, platform, silo)
+    if not launched then return fail("launch_refused", err) end
+    if storage.board_bookings then storage.board_bookings[agent_id] = nil end
     return {
         success = true,
         boarding = platform.name,
@@ -1909,6 +1990,8 @@ local function action_schedule(character, platform, stops)
         local a = result.armament
         result.guidance = "Course set, but " .. platform.name .. " stays parked until it is armed: asteroids destroy it on the way. It has "
             .. a.needs .. ". It leaves by itself once armed and you are aboard."
+    elseif result.departure_held == "thrust_stock" then
+        result.guidance = "Course set, but " .. platform.name .. " stays parked until its hub holds the thruster-fuel ingredients for the trip (thrust_short): ship them, then it leaves once you are aboard."
     elseif result.departure_held == "no_crew" then
         result.guidance = "Course set; " .. platform.name .. " waits in orbit until you are aboard (space_platform action=board beside a silo), then leaves by itself."
     end

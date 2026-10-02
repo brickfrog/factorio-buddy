@@ -7803,10 +7803,13 @@ assert_json "space_platform refuses cargo for a full hub" \
 assert_json "jettisoning chunks frees the full hub" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"jettison\",\"items\":[{\"name\":\"metallic-asteroid-chunk\",\"count\":1000}]}")")" \
     '.success == true and .jettisoned[0].count > 0 and .hub_free_slots > 0'
-sa_ready || fail "the Nauvis silo readies a rocket to board"
-assert_json "space_platform boards the character onto a ready rocket" \
+# Boarding with no rocket ready books the next one; it launches the character
+# by itself, ahead of queued cargo.
+assert_json "space_platform board books the next rocket when none is ready" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"board\"}")")" \
-    '.success == true'
+    --arg p "$SA_PLATFORM" '.success == true and .booked == $p'
+raw_lua "local silo = game.surfaces.nauvis.find_entities_filtered{name = 'rocket-silo', position = {2000.5, 1992.5}, radius = 1}[1]
+silo.rocket_parts = silo.prototype.rocket_parts_required; rcon.print('ok')" >/dev/null
 sa_character() {
     raw_lua "local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 rcon.print(helpers.table_to_json({surface = c and c.valid and c.surface.name or '', in_pod = c and c.valid and c.cargo_pod ~= nil, x = c and c.valid and c.position.x or 0, y = c and c.valid and c.position.y or 0}))"

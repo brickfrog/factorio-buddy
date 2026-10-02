@@ -865,6 +865,23 @@ Sandbox runs on long32's save:
 - At the end: 6/6 ready turrets, 4/4 in front, 592/600 piercing aboard, the last 8 queued. Still to come are the 500 iron ore for oxidizer (`thrust_short`, the rung after arming) and boarding.
 - Errors were Nauvis building (`route_belt` ×7, `remove_entity` ×6) and two turret dry runs blocked by long-handed inserters.
 
+### `long40-cont39-opus-open-2590060469-60m`
+
+60 minutes, 61 turns, none provider-limited, 23 tool errors, 0 invariant failures. `plate_automation` held; `powered_production` was false (see below).
+- **The platform was armed** (7/6 ready, 4/4 front, 600/600 piercing). 3 rockets (47 → 50).
+- Buddy queued 498 iron ore for oxidizer. `board` then failed 6 times with `rocket_not_ready`, because every ready rocket took queued cargo, so Buddy unshipped the ore and boarded. Aboard, armed and crewed, the platform left at once without oxidizer stock. Buddy rescheduled it to Nauvis mid-flight ("between planets" ×3 on `land`), landed, and queued the ore again. It ended at Nauvis scheduled for Nauvis.
+- `powered_production` false: the holdout samples a radius around the character, who ended by the silo among starved rocket-part machines (70 machines sampled, against 242 in long34). The base had not stopped. The evaluator was left unchanged mid-series.
+
+### Fixes after long40
+
+- **Boarding is booked.** `board` with no ready rocket now succeeds with `booked`: the next ready, empty rocket on that surface is kept for the agent (queued cargo waits for the one after), and the mod launches the character as soon as it is ready, if still in reach of the silo. Bookings lapse after 10 minutes. `launch_character` is shared by `board` and the booking.
+- **The hold also waits for thrust stock** (`departure_held: "thrust_stock"`): an armed, crewed platform stays parked while its thruster-fluid ingredients are under the reserve (`thrust_shortages`, shared with status). The reserve is now 450, reported as `thrust_reserve`. Crushing sources are cached.
+- **Rungs.** On Nauvis, queued ingredients count toward the reserve, so with the ore queued the next rung is boarding. A platform not scheduled for Vulcanus first gets "Set course". Aboard with a `thrust_stock` hold, the rung says queued shipments still go up without you. The Board rung says to call `board` once and not to unship.
+- **Sandbox on long40's save:**
+  - "Set course" → schedule (held `thrust_stock`) → "Board" → `board` (booked) → with the silo filled by script, the booked rocket launched the character while the ore stayed queued → the next rocket brought the ore (hub 482) → the hold released and the platform left with the character.
+  - Flown with long40's real loadout: 7 turrets became 5, the hub fell to 531 HP, and the ore ran out at 0.88; the platform coasted in at speed 0.17 and arrived. `land` → "You are on Vulcanus."
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 519 passed and 0 failed (`fb-evidence/git-gud/live35`; the board check now books before the rocket is ready and expects the automatic launch).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
