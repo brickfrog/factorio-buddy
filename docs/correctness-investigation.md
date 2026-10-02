@@ -826,6 +826,17 @@ Sandbox runs on long32's save:
 - Smaller fixes: `hub_ammo_for` read the ammo category from the wrong field (`get_ammo_type().category`; the 2.0 field is `ammo_category`), so no ghost got an ammo request until fixed. `turret_slots` ignores never-built ghosts, because `place_ghosts` replaces them.
 - Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 519 passed and 0 failed (`fb-evidence/git-gud/live32`; new checks: a ghost on a built entity is listed, and `clear_ghosts` removes it), `buddy_runtime.sh` passed.
 
+### `long36-cont35-opus-open-2590060469-60m`
+
+60 minutes, 27 turns, none provider-limited, 32 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- Buddy followed the new arm rung end to end:
+  - researched military, military-2, physical-projectile-damage-1 and weapon-shooting-speed-1, and queued both level-2 upgrades;
+  - hand-crafted piercing rounds and shipped them (508 queued, 92 aboard);
+  - unshipped yellow magazines;
+  - ran `clear_ghosts` and `load_turrets`, then placed a slot turret.
+- At the end: 5/6 ready turrets, 4/4 in front, 92/600 piercing on board; `thrust_short` iron-ore 0; no never-built ghosts left. Rockets: 2 (35 → 37).
+- Errors were long hand-crafts outlasting `wait_for_crafting` timeouts (17) and `launch_rocket` before a rocket was ready (2). No tool defect.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
