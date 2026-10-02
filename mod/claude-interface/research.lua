@@ -703,6 +703,16 @@ function M.launch_rocket(character, unit_number)
     end
     local launched_before = character.force.rockets_launched
     if not chosen then
+        -- Platform cargo queued on this surface rides each ready rocket by
+        -- itself (space.process_shipments); polling here only spends turns.
+        local queued = false
+        for _, shipment in ipairs(storage.space_shipments or {}) do
+            if shipment.surface_index == character.surface.index and shipment.inventory and shipment.inventory.valid
+                and not shipment.inventory.is_empty()
+            then
+                queued = true
+            end
+        end
         return {
             success = false,
             error_kind = #silos == 0 and "no_rocket_silo" or "rocket_not_ready",
@@ -710,6 +720,7 @@ function M.launch_rocket(character, unit_number)
                 or "no matching silo has a ready rocket; a rocket needs the silo's full rocket_parts and power, then about 20 s to rise",
             silos = summaries,
             rockets_launched = launched_before,
+            guidance = queued and "Queued space_platform cargo launches by itself as soon as a rocket is ready: do not wait or call launch_rocket for it. Spend the time on the rocket-part inputs (silos shows rocket_parts)." or nil,
         }
     end
     local ok, launched = pcall(function() return chosen.launch_rocket() end)

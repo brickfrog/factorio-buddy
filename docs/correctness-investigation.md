@@ -850,6 +850,14 @@ Sandbox runs on long32's save:
 - Platform status now reports `queued_rockets` (`rockets_for`, moved above `platform_summary`). While the research is done, at least 2 rockets of cargo wait, and the platform is unarmed or short of thrust stock, the space rung becomes "Launch rockets faster". It gives the rockets waiting, hours at the current rate (from rocket-part production in the last 10 min), the rocket-part inputs with their rates, the per-rocket lift, and what the platform still needs.
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 519 passed and 0 failed (`fb-evidence/git-gud/live33`).
 
+### `long38-cont37-opus-open-2590060469-60m`
+
+60 minutes, 34 turns, none provider-limited, 41 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- Buddy took the "Launch rockets faster" rung and worked on the rocket-part lines (12 `build_layout`, 18 `verify_production`). Rockets doubled: 4 this hour (39 → 43); measured afterwards at 4.4 per hour.
+- Aboard: 392/600 piercing. 208 still queued (5 rockets with the iron ore). `thrust_short` iron-ore 0.
+- 24 `launch_rocket` calls all failed with `rocket_not_ready`: Buddy polled the silo although queued cargo launches by itself. When cargo is queued on that surface, the refusal now adds guidance to that effect, pointing at the rocket-part inputs (`silos` already gives `rocket_parts`).
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 519 passed and 0 failed (`fb-evidence/git-gud/live34`); sandbox on long38's save shows the guidance and "5 rockets of cargo … about 1.1 h at 4.4 rockets/h".
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
