@@ -858,6 +858,13 @@ Sandbox runs on long32's save:
 - 24 `launch_rocket` calls all failed with `rocket_not_ready`: Buddy polled the silo although queued cargo launches by itself. When cargo is queued on that surface, the refusal now adds guidance to that effect, pointing at the rocket-part inputs (`silos` already gives `rocket_parts`).
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 519 passed and 0 failed (`fb-evidence/git-gud/live34`); sandbox on long38's save shows the guidance and "5 rockets of cargo … about 1.1 h at 4.4 rockets/h".
 
+### `long39-cont38-opus-open-2590060469-60m`
+
+60 minutes, 39 turns, none provider-limited, 31 tool errors, 0 invariant failures; `plate_automation` and `powered_production` held.
+- 4 rockets again (43 → 47). `launch_rocket` was called once (24 times in long38).
+- At the end: 6/6 ready turrets, 4/4 in front, 592/600 piercing aboard, the last 8 queued. Still to come are the 500 iron ore for oxidizer (`thrust_short`, the rung after arming) and boarding.
+- Errors were Nauvis building (`route_belt` ×7, `remove_entity` ×6) and two turret dry runs blocked by long-handed inserters.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
