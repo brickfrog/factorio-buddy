@@ -330,16 +330,29 @@ local function water_tile_names()
     return names
 end
 
--- Water is a tile, not a resource entity. Search expanding squares around the
--- origin so the nearest shoreline wins without scanning the whole surface.
-local function find_nearest_water(surface, from_x, from_y, explore_radius)
+-- Tile names whose tiles an offshore pump draws `fluid` from (e.g. lava on
+-- Vulcanus), read from the tile prototypes.
+local function fluid_tile_names(fluid)
+    local names = {}
+    for name, tile in pairs(prototypes.tile) do
+        if tile.fluid and tile.fluid.name == fluid then names[#names + 1] = name end
+    end
+    table.sort(names)
+    return names
+end
+
+-- Water (or another pumpable fluid's tiles) is a tile, not a resource
+-- entity. Search expanding squares around the origin so the nearest
+-- shoreline wins without scanning the whole surface.
+local function find_nearest_water(surface, from_x, from_y, explore_radius, fluid)
+    fluid = fluid or "water"
     local max_radius = explore_radius or 256
     local chunks_before = generated_chunk_count(surface)
     if explore_radius then
         surface.request_to_generate_chunks({from_x, from_y}, math.ceil(explore_radius / 32))
         surface.force_generate_chunk_requests()
     end
-    local names = water_tile_names()
+    local names = fluid == "water" and water_tile_names() or fluid_tile_names(fluid)
     local nearest, nearest_dist = nil, math.huge
     local radius = math.min(32, max_radius)
     while true do
@@ -373,9 +386,9 @@ local function find_nearest_water(surface, from_x, from_y, explore_radius)
         return {
             success = true,
             found = false,
-            resource_name = "water",
+            resource_name = fluid,
             search = search,
-            guidance = "No water tiles within the searched square. Set explore_radius (up to "
+            guidance = "No " .. fluid .. " tiles within the searched square. Set explore_radius (up to "
                 .. MAX_RESOURCE_EXPLORE_RADIUS .. ") or search from another origin.",
         }
     end
@@ -384,6 +397,19 @@ local function find_nearest_water(surface, from_x, from_y, explore_radius)
         area = area_table(x - 8, y - 8, x + 8, y + 8),
         name = names,
     }
+    if fluid ~= "water" then
+        return {
+            success = true,
+            found = true,
+            resource_name = fluid,
+            fluid_tile = {x = x, y = y},
+            fluid_tiles_within_8 = nearby,
+            distance = math.sqrt(nearest_dist),
+            search = search,
+            guidance = "fluid_tile is the nearest " .. fluid .. " tile. An offshore-pump placed on its shore, facing it, pumps " .. fluid
+                .. ": place one there with build_layout (try each direction; Factorio refuses spots that are not on the shore) and pipe it to the machine.",
+        }
+    end
     return {
         success = true,
         found = true,
@@ -417,6 +443,10 @@ function M.find_nearest_resource(surface, resource_name, from_x, from_y, explore
     end
     if resource_name == "water" then
         return find_nearest_water(surface, from_x, from_y, explore_radius)
+    end
+    -- Other pumpable fluids that lie as tiles (lava).
+    if prototypes.fluid[resource_name] and not prototypes.entity[resource_name] and fluid_tile_names(resource_name)[1] then
+        return find_nearest_water(surface, from_x, from_y, explore_radius, resource_name)
     end
 
     local chunks_before = generated_chunk_count(surface)

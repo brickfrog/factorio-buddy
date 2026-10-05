@@ -944,6 +944,27 @@ Sandbox runs on long32's save:
   - On Nauvis (1 roboport, 111/297 machines covered): a roboport and pole ghost placed with `place_ghosts surface=nauvis` from Vulcanus reported the shortfall in the away wording. Once a provider chest held the items, robots built it; coverage rose to 137/297, and the warning named the next spot.
 - Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 522 passed and 0 failed (`fb-evidence/git-gud/live36`; new live checks: whole-craft machine feed leaves the remainder with the character, and `collect_from_chest` takes machine output).
 
+### `long43-cont42-opus-open-2590060469-60m`: foundry and big-mining-drill researched
+
+60 minutes, 39 turns, none provider-limited, 88 tool errors, 0 invariant failures. `plate_automation` and `powered_production` held. Vulcanus now has 284 force entities (`away_planet_entities`).
+- **Trigger chain:**
+  - `feed_machine_from_inventory` (17 calls) loaded the first tungsten carbide → **foundry researched**.
+  - Buddy then gathered the foundry's inputs:
+    - 51 tungsten carbide (ore from huge volcanic rocks);
+    - steel from an automated coal-fed furnace chain it built;
+    - 30 circuits;
+    - refined concrete from water made by acid neutralisation → steam condensation;
+    - lubricant from an oil refinery on simple coal liquefaction.
+  - It crafted the foundry in an assembler → **big-mining-drill researched**.
+- **Blocker at the end: lava.** Buddy hunted lava for molten iron with `plan_steam_power` pump-spot scans (about 2 million positions). The post-long42 water check rightly rejects lava pumps there, and no tool located lava tiles. It idled the last turns.
+- Errors: `mine_at` 105 calls, many stuck walking among cliffs toward rocks; full inventory cut mining short. The cliff-box fix also changes the walking collision map, but this run used it and still got stuck at cliff pockets [INFERENCE: pathing across terraces remains hard].
+
+### Fixes after long43
+
+- `find_nearest_resource resource_type=lava` (any fluid whose tiles an offshore pump draws from, read from the tile prototypes) returns the nearest tile and shore guidance; water keeps its own result and steam box. On long43's save it found lava 104 tiles from Buddy (82 lava tiles within 8).
+- The tungsten-plate rung says it needs two foundries (one makes molten iron, piped into the tungsten-plate one). It offers `molten-iron` from iron ore when that recipe is enabled (it is after foundry research), and lava via `find_nearest_resource`.
+- Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 522 passed and 0 failed (`fb-evidence/git-gud/live37`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

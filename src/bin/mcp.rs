@@ -9609,7 +9609,7 @@ impl FactorioMcp {
 
     /// Find the nearest resource patch of a specific type.
     #[tool(
-        description = "Find a resource across all generated chunks. Set explore_radius to generate and search nearby terrain. resource_type \"water\" finds the nearest offshore-pump water tile and returns steam_power_water_box."
+        description = "Find a resource across all generated chunks. Set explore_radius to generate and search nearby terrain. resource_type \"water\" finds the nearest offshore-pump water tile and returns steam_power_water_box; \"lava\" (or another tile fluid) returns the nearest such tile for an offshore pump."
     )]
     async fn find_nearest_resource(
         &self,

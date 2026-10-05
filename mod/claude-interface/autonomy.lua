@@ -440,9 +440,12 @@ local function vulcanus_rung(here, force, character)
             .. " (oil refinery); water from " .. recipe_text("steam-condensation") .. " fed by " .. recipe_text("acid-neutralisation") .. "." .. REMOTE_HOME
     end
     if not tech_done(force, "metallurgic-science-pack") then
+        local ore_route = force.recipes["molten-iron"] and force.recipes["molten-iron"].enabled
         return "Make tungsten-plate in a foundry: it unlocks metallurgic-science-pack research.",
-            recipe_text("tungsten-plate") .. "; molten iron from " .. recipe_text("molten-iron-from-lava")
-            .. " (place the foundry by lava and pump lava with an offshore-pump). Foundries placed: " .. (here.counts["foundry"] or 0) .. "." .. REMOTE_HOME
+            recipe_text("tungsten-plate") .. " (foundry recipe; set it with set_recipe). It needs two foundries: one makes molten iron, piped into one set to tungsten-plate. Molten iron from "
+            .. (ore_route and (recipe_text("molten-iron") .. " (no lava; load the ore with feed_machine_from_inventory), or from ") or "")
+            .. recipe_text("molten-iron-from-lava") .. " (find_nearest_resource resource_type=lava; an offshore-pump on its shore pumps lava). Foundries placed: "
+            .. (here.counts["foundry"] or 0) .. " (craft more from " .. recipe_text("foundry") .. "); " .. (here.made["tungsten-plate"] or 0) .. " tungsten-plate made." .. REMOTE_HOME
     end
     return "Automate metallurgic science on Vulcanus.",
         recipe_text("metallurgic-science-pack") .. " in a foundry; tungsten ore from big mining drills (" .. recipe_text("big-mining-drill") .. ")." .. REMOTE_HOME
