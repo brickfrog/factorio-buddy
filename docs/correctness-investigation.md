@@ -984,6 +984,25 @@ Sandbox runs on long32's save:
   - Sandbox on long44's save: 17 walks, including long43's stuck `mine_at` spots and long44's failed `walk_to` targets. 14 arrived, e.g. 252 tiles to the coal patch across the cliff terraces, and 331 tiles to the west lava shore. The 3 misses stopped 0.3–1.8 tiles from targets in occupied tiles.
 - Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 522 passed and 0 failed (`fb-evidence/git-gud/live38`).
 
+### `long45-cont44-opus-open-2590060469-60m`: metallurgic science made by machines
+
+60 minutes, 28 turns, none provider-limited, 48 tool errors, 0 invariant failures. `plate_automation` and `powered_production` held. Vulcanus: 664 force entities.
+- **Walking:** no `Could not move within … reach` failures (long43: about 15, from `mine_at` and `collect_from_chest` approaches). Only 1 `walk_to` call.
+- **Second foundry:** Buddy built it, its refined concrete fed by its own foundry's molten iron and the water chain, then swapped the foundries to reach lava past a cliff. It got metallurgic science running in a foundry with molten copper from lava: **72 packs made**, and a big mining drill on tungsten ore.
+- **Hand-fed:** inputs (carbide, tungsten plate, calcite, coal) are still loaded by hand: 61 `feed_machine_from_inventory` and 55 `collect_from_chest` calls. Buddy said so every turn and started a carbide belt.
+- **Nauvis:** Buddy checked whether it could fix Nauvis remotely and found the home network holds no items. All 18 home labs have lacked logistic-science-pack since about long42, so research (fluid-wagon) has stalled.
+- **What the packs unlock:** every technology researchable with metallurgic packs (coal-liquefaction, asteroid-reprocessing, low-density-structure-productivity, …) also needs red, green and blue packs, plus space or production packs. The packs count only once they share a lab with Nauvis science, which needs interplanetary logistics:
+  - a silo on Vulcanus, whose rocket parts must be made there from shipped processing units, low-density structures and rocket fuel;
+  - a platform shuttle;
+  - landing pads with requests.
+  
+  The harness supports none of that without the agent at the Nauvis silo.
+
+### Fixes after long45
+
+- The idle-lab warning names the current research and the packs the labs lack, with a remote fix while away (research what Nauvis still makes, or rebuild the pack's supply with `place_ghosts surface=nauvis`). On long45's save: "Research (fluid-wagon) is queued but no lab at home is working: they lack logistic-science-pack (18 labs)…".
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 522 passed and 0 failed (`fb-evidence/git-gud/live39`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

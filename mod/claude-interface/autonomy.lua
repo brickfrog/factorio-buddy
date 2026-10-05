@@ -798,7 +798,10 @@ local function progression(surface, force, facts, character)
             .. "Carry items from the full machines to the starved assemblers with output inserters and belts (route_belt, build_layout) instead of moving them by hand."
     end
     if facts.labs_powered > 0 and facts.labs_working == 0 and state.current_research ~= nil then
-        warnings[#warnings + 1] = "Research is queued but no lab is working: check lab science packs and power."
+        warnings[#warnings + 1] = "Research (" .. state.current_research .. ") is queued but no lab at home is working"
+            .. (lacked[1] and (": they lack " .. table.concat(lacked, ", ") .. ". ") or ": check lab science packs and power. ")
+            .. (away and "From here, start_research a technology whose packs Nauvis still makes, or rebuild the missing pack's supply with place_ghosts surface=nauvis."
+                or "Queue technologies whose packs are made, or restore the missing pack's supply.")
     end
     local S = facts.space
     if S.home_logistics.uncovered_ghosts > 0 then
