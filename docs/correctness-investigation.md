@@ -965,6 +965,25 @@ Sandbox runs on long32's save:
 - The tungsten-plate rung says it needs two foundries (one makes molten iron, piped into the tungsten-plate one). It offers `molten-iron` from iron ore when that recipe is enabled (it is after foundry research), and lava via `find_nearest_resource`.
 - Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 522 passed and 0 failed (`fb-evidence/git-gud/live37`).
 
+### `long44-cont43-opus-open-2590060469-60m`: metallurgic science researched
+
+60 minutes, 37 turns, none provider-limited, 56 tool errors, 0 invariant failures. `plate_automation` and `powered_production` held. Vulcanus: 434 force entities.
+- Buddy found lava on the east shore, piped it into a foundry (molten iron, then molten copper from lava), cast iron plates, and powered the site with steam engines on acid neutralisation.
+- It crafted a big mining drill → tungsten-steel researched → a tungsten plate → **metallurgic-science-pack researched**. It hand-made the first metallurgic science pack and started automating carbide (output inserter and chest).
+- The rung was wrong at one step: it said a tungsten plate unlocks next, but the tungsten-plate recipe is locked behind tungsten-steel, which crafting a big mining drill unlocks. Buddy read the tech tree and worked it out itself.
+- One foundry did both jobs: Buddy made molten iron first, held it in pipes, then switched the recipe.
+- Walking: 41 of 81 `walk_to` calls arrived. The platform buddy-1 was destroyed in Vulcanus orbit (no ammo, no supply).
+
+### Fixes after long44
+
+- **Rungs:** after big-mining-drill: craft a big mining drill (unlocks tungsten-steel) → make a tungsten plate (unlocks metallurgic science) → automate metallurgic science. These read from the real trigger tree, checked on long44's save: `tungsten-steel` is triggered by crafting `big-mining-drill`; `metallurgic-science-pack` by crafting `tungsten-plate`. The molten-iron text offers ore or lava, and one foundry held in pipes or two foundries. Metallurgic packs made on the planet are tracked.
+- **Walking through cliff mazes:** when the windowed A* finds no route, a waypoint walk sticks, or a long-walk leg stops gaining ground, the walker now asks Factorio's own pathfinder:
+  - new remotes `request_walk_path`/`get_walk_path`, with the result from `on_script_path_request_finished`;
+  - it walks the engine's turning points, then falls back to the straight walk as before.
+  - A character wedged between corner cliffs (`can_stand` false) starts the engine path from the nearest clear spot; the engine finds no path from a start touching a cliff. Long44's wedge at (27.4,48.5) sat between four 45° cliff boxes.
+  - Sandbox on long44's save: 17 walks, including long43's stuck `mine_at` spots and long44's failed `walk_to` targets. 14 arrived, e.g. 252 tiles to the coal patch across the cliff terraces, and 331 tiles to the west lava shore. The 3 misses stopped 0.3–1.8 tiles from targets in occupied tiles.
+- Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 522 passed and 0 failed (`fb-evidence/git-gud/live38`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

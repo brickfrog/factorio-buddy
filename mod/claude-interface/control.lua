@@ -2554,6 +2554,16 @@ local api = {
         return json_remote_call("get_walk_status", characters.get_walk_status, agent_id, walk_id)
     end,
 
+    -- Factorio's pathfinder: request a character path, then poll for its
+    -- turning-point waypoints.
+    request_walk_path = function(agent_id, x, y, radius)
+        return json_remote_call("request_walk_path", characters.request_walk_path, agent_id, x, y, radius)
+    end,
+
+    get_walk_path = function(agent_id, path_id)
+        return json_remote_call("get_walk_path", characters.get_walk_path, agent_id, path_id)
+    end,
+
     -- Report whether an agent has an active deterministic walk target
     has_walk_target = function(agent_id)
         return storage.walk_targets ~= nil and storage.walk_targets[agent_id] ~= nil
@@ -3071,6 +3081,9 @@ script.on_nth_tick(60, function()
     space.process_shipments()
     space.tend_platforms()
 end)
+
+-- Character paths requested from Factorio's pathfinder.
+script.on_event(defines.events.on_script_path_request_finished, characters.on_path_finished)
 
 -- Process RCON queue and walk states every tick
 script.on_event(defines.events.on_tick, function(event)

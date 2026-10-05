@@ -709,6 +709,91 @@ function M.clear_walk_target(agent_id, walk_id)
     return M.get_walk_status(agent_id, walk_id)
 end
 
+-- Factorio's own pathfinder, for routes the windowed A* in Rust cannot see
+-- (cliff mazes whose detour leaves its collision window). The result
+-- arrives in on_script_path_request_finished (M.on_path_finished).
+local PATH_RESULT_TICKS = 60 * 60
+
+function M.request_walk_path(agent_id, x, y, radius)
+    local character = M.find(agent_id)
+    if not (character and character.valid) then
+        return {success = false, error = "no character for agent " .. tostring(agent_id) .. "; spawn first"}
+    end
+    if not (inventory.finite_number(x) and inventory.finite_number(y)) then
+        return {success = false, error_kind = "invalid_walk_target", error = "path goal x and y must be finite numbers"}
+    end
+    local prototype = character.prototype
+    -- Factorio finds no path from a start that touches a cliff (a character
+    -- wedged between corner cliffs); start from the nearest clear spot then.
+    -- The waypoints begin with the start, so the walk goes there first.
+    local start = pos_table(character.position)
+    if not can_stand_result(character, start.x, start.y).can_stand then
+        local clear = nearby_stand_candidates(character, start, 3, 1)[1]
+        if clear then start = clear.position end
+    end
+    local id = character.surface.request_path{
+        bounding_box = prototype.collision_box,
+        collision_mask = prototype.collision_mask,
+        start = start,
+        goal = {x = x, y = y},
+        force = character.force,
+        radius = math.max(tonumber(radius) or 1, 1),
+        entity_to_ignore = character,
+        can_open_gates = true,
+        pathfind_flags = {cache = false, prefer_straight_paths = true, no_break = true},
+    }
+    storage.walk_paths = storage.walk_paths or {}
+    storage.walk_paths[id] = {agent_id = agent_id, pending = true, tick = game.tick}
+    return {success = true, path_id = id}
+end
+
+-- Keep only the waypoints where the path turns, so each straight walk
+-- between them follows the engine's collision-free segments.
+local function turning_points(path)
+    local points = {}
+    for index, waypoint in ipairs(path) do
+        local p = waypoint.position
+        local keep = index == 1 or index == #path
+        if not keep then
+            local a, b = path[index - 1].position, path[index + 1].position
+            local cross = (p.x - a.x) * (b.y - p.y) - (p.y - a.y) * (b.x - p.x)
+            keep = math.abs(cross) > 1e-3
+        end
+        if keep then points[#points + 1] = {x = p.x, y = p.y} end
+    end
+    return points
+end
+
+function M.on_path_finished(event)
+    local entry = storage.walk_paths and storage.walk_paths[event.id]
+    if not entry then return end
+    entry.pending = false
+    entry.try_again_later = event.try_again_later
+    entry.waypoints = event.path and turning_points(event.path) or nil
+end
+
+function M.get_walk_path(agent_id, path_id)
+    path_id = tonumber(path_id)
+    local paths = storage.walk_paths or {}
+    local entry = path_id and paths[path_id]
+    if not entry or entry.agent_id ~= agent_id then
+        return {success = false, error_kind = "unknown_path", error = "no path request " .. tostring(path_id) .. " for this agent"}
+    end
+    -- Drop stale requests from callers that never came back.
+    for id, other in pairs(paths) do
+        if game.tick - other.tick > PATH_RESULT_TICKS then paths[id] = nil end
+    end
+    if entry.pending then return {success = true, pending = true} end
+    paths[path_id] = nil
+    return {
+        success = true,
+        pending = false,
+        found = entry.waypoints ~= nil,
+        try_again_later = entry.try_again_later == true,
+        waypoints = entry.waypoints or {},
+    }
+end
+
 function M.init(agent_id, x, y)
     local character = M.find(agent_id)
     if not (character and character.valid) then

@@ -304,6 +304,30 @@ impl LuaCommand {
         )
     }
 
+    pub fn request_walk_path(agent_id: &AgentId, position: Position, radius: f64) -> String {
+        Self::claude_interface_json_call(
+            "request_walk_path",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                position.x.to_string(),
+                position.y.to_string(),
+                radius.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before pathfinding.",
+        )
+    }
+
+    pub fn get_walk_path(agent_id: &AgentId, path_id: u64) -> String {
+        Self::claude_interface_json_call(
+            "get_walk_path",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                path_id.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before reading paths.",
+        )
+    }
+
     pub fn get_entity_reach(agent_id: &AgentId, unit_number: u32) -> String {
         Self::claude_interface_json_call(
             "get_entity_reach",

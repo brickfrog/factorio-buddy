@@ -2726,6 +2726,17 @@ impl FactorioClient {
             // outside its arrival radius is still progress. Requiring half a
             // leg per round also bounds the loop.
             if leg.final_position.distance(&target) > remaining - MAX_PATHFIND_LEG / 2.0 {
+                // The windowed search found no way forward (cliff mazes):
+                // ask Factorio's pathfinder for the whole route.
+                if let Some(engine) = self
+                    .walk_engine_path(target, final_tolerance, physical_arrival_distance)
+                    .await?
+                {
+                    return Ok(WalkResult {
+                        distance_walked: walked + engine.distance_walked,
+                        ..engine
+                    });
+                }
                 return Ok(WalkResult {
                     arrived: false,
                     distance_walked: walked,
@@ -2805,9 +2816,15 @@ impl FactorioClient {
         };
 
         if !path_result.success {
-            // Preserve the ordinary walking fallback when the collision map
-            // cannot find any route. The terminal receipt still reports a
-            // truthful `stuck` result rather than fabricating arrival.
+            // Factorio's own pathfinder sees past the collision window; the
+            // straight walk stays the last resort, and its terminal receipt
+            // still reports a truthful `stuck` rather than fabricating arrival.
+            if let Some(engine) = self
+                .walk_engine_path(target, final_tolerance, physical_arrival_distance)
+                .await?
+            {
+                return Ok(engine);
+            }
             return self.walk_to_with_tolerance(target, final_tolerance).await;
         }
 
@@ -2849,6 +2866,15 @@ impl FactorioClient {
             total_distance += result.distance_walked;
 
             if !result.arrived {
+                if let Some(engine) = self
+                    .walk_engine_path(target, final_tolerance, physical_arrival_distance)
+                    .await?
+                {
+                    return Ok(WalkResult {
+                        distance_walked: total_distance + engine.distance_walked,
+                        ..engine
+                    });
+                }
                 return Ok(WalkResult {
                     arrived: false,
                     final_position: result.final_position,
@@ -2885,6 +2911,90 @@ impl FactorioClient {
             distance_walked: total_distance,
             reason: None,
         })
+    }
+
+    /// Walk the route Factorio's pathfinder finds to `target` (its turning
+    /// points, then a short final hop). `None` when it finds no route, so the
+    /// caller keeps its own fallback.
+    async fn walk_engine_path(
+        &mut self,
+        target: Position,
+        final_tolerance: f64,
+        physical_arrival_distance: f64,
+    ) -> Result<Option<WalkResult>> {
+        let radius = (final_tolerance - physical_arrival_distance).max(1.0);
+        let mut waypoints: Option<Vec<Position>> = None;
+        // The engine may ask to retry when its pathfinder is busy.
+        for _ in 0..2 {
+            let request: Value = serde_json::from_str(
+                &self
+                    .call_remote(
+                        "request_walk_path",
+                        &[
+                            json!(self.agent_id.as_str()),
+                            json!(target.x),
+                            json!(target.y),
+                            json!(radius),
+                        ],
+                    )
+                    .await?,
+            )?;
+            let Some(path_id) = request.get("path_id").and_then(Value::as_u64) else {
+                return Ok(None);
+            };
+            let mut finished = None;
+            for _ in 0..100 {
+                let status: Value = serde_json::from_str(
+                    &self
+                        .call_remote(
+                            "get_walk_path",
+                            &[json!(self.agent_id.as_str()), json!(path_id)],
+                        )
+                        .await?,
+                )?;
+                if status.get("success").and_then(Value::as_bool) != Some(true) {
+                    return Ok(None);
+                }
+                if status.get("pending").and_then(Value::as_bool) != Some(true) {
+                    finished = Some(status);
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            }
+            let Some(status) = finished else {
+                return Ok(None);
+            };
+            if status.get("found").and_then(Value::as_bool) == Some(true) {
+                waypoints = Some(serde_json::from_value(
+                    status.get("waypoints").cloned().unwrap_or(Value::Null),
+                )?);
+                break;
+            }
+            if status.get("try_again_later").and_then(Value::as_bool) != Some(true) {
+                return Ok(None);
+            }
+        }
+        let Some(waypoints) = waypoints else {
+            return Ok(None);
+        };
+        let mut walked = 0.0;
+        // The first waypoint is the path's start: the character's spot, or the
+        // nearest clear one when it stands wedged against a cliff.
+        for waypoint in &waypoints {
+            let result = self.walk_to_with_tolerance(*waypoint, 0.0).await?;
+            walked += result.distance_walked;
+            if !result.arrived {
+                return Ok(Some(WalkResult {
+                    distance_walked: walked,
+                    ..result
+                }));
+            }
+        }
+        let last = self.walk_to_with_tolerance(target, final_tolerance).await?;
+        Ok(Some(WalkResult {
+            distance_walked: walked + last.distance_walked,
+            ..last
+        }))
     }
 
     /// Smooth walk to a target position (direct, no pathfinding)
