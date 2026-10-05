@@ -5,7 +5,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Area, Direction, Position};
+use super::{collision_box_tiles, Area, Direction, Position};
 
 /// Underground belt configuration
 #[derive(Debug, Clone)]
@@ -184,6 +184,14 @@ impl CollisionMap {
             for y in area.left_top.y.floor() as i32..area.right_bottom.y.ceil() as i32 {
                 self.block(GridPos::new(x, y));
             }
+        }
+    }
+
+    /// Block every tile a Factorio collision box overlaps, including the
+    /// off-corner reach of rotated (cliff) boxes; see `collision_box_tiles`.
+    pub fn block_collision_box(&mut self, bounds: &Area, orientation: Option<f64>) {
+        for tile in collision_box_tiles(bounds, orientation) {
+            self.block(GridPos::new(tile.x, tile.y));
         }
     }
 
@@ -1545,6 +1553,56 @@ mod tests {
         assert_eq!(result.belts.first().unwrap().kind, BeltKind::Surface);
         assert_eq!(result.belts.last().unwrap().kind, BeltKind::Surface);
         assert!(result.topology.unwrap().connected);
+    }
+
+    #[test]
+    fn rotated_cliff_box_keeps_underground_exit_off_its_off_corner_tiles() {
+        // Vulcanus trial: an east_to_north cliff-vulcanus at (-30, 30.5) reads
+        // back as these unrotated corners plus orientation 0.125. The rotated
+        // box reaches row y=30, where Factorio rejected a planned underground
+        // exit at (-28.5, 30.5) that axis-aligned rasterisation left open.
+        let mut collision_map = CollisionMap::new(Area::new(-40.0, 20.0, -20.0, 40.0));
+        collision_map
+            .block_collision_box(&Area::new(-31.018, 28.543, -27.482, 29.957), Some(0.125));
+        let options = RoutingOptions {
+            allow_underground: true,
+            underground_config: UndergroundConfig::from_belt_type("transport-belt"),
+            ..RoutingOptions::default()
+        };
+
+        let result = find_belt_route_with_options(
+            GridPos::new(-33, 30),
+            GridPos::new(-27, 30),
+            &collision_map,
+            &options,
+        );
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.connected));
+        let cliff_tiles = [
+            GridPos::new(-30, 30),
+            GridPos::new(-29, 30),
+            GridPos::new(-28, 30),
+        ];
+        for belt in &result.belts {
+            let tile = GridPos::from_position(&belt.position);
+            assert!(
+                !cliff_tiles.contains(&tile),
+                "{belt:?} placed on a cliff tile"
+            );
+        }
+        let exit = result
+            .belts
+            .iter()
+            .find(|belt| belt.kind == BeltKind::UndergroundExit)
+            .expect("route should tunnel under the cliff");
+        assert_eq!(
+            GridPos::from_position(&exit.position),
+            GridPos::new(-27, 30)
+        );
     }
 
     #[test]

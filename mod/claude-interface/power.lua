@@ -1745,13 +1745,27 @@ function M.plan_steam_power(character, water_x1, water_y1, water_x2, water_y2, t
     local search_pad = 4
     local pump_candidates = {}
     local checked = 0
+    -- Offshore pumps pump whatever fluid their tile holds: lava on Vulcanus
+    -- would feed boilers nothing, so only spots by water (and no other
+    -- fluid tile) count.
+    local function pumps_water(pump_pos)
+        local water = false
+        for _, tile in pairs(surface.find_tiles_filtered{position = pump_pos, radius = 1.5}) do
+            local fluid = tile.prototype.fluid
+            if fluid then
+                if fluid.name ~= "water" then return false end
+                water = true
+            end
+        end
+        return water
+    end
 
     for x = math.floor(water_area.left_top.x) - search_pad, math.ceil(water_area.right_bottom.x) + search_pad do
         for y = math.floor(water_area.left_top.y) - search_pad, math.ceil(water_area.right_bottom.y) + search_pad do
             for _, dir in ipairs(DIRECTIONS) do
                 checked = checked + 1
                 local pump_pos = pos(x, y)
-                local allowed = can_place(surface, force, "offshore-pump", pump_pos, dir.value)
+                local allowed = can_place(surface, force, "offshore-pump", pump_pos, dir.value) and pumps_water(pump_pos)
                 if allowed then
                     table.insert(pump_candidates, {
                         position = pump_pos,

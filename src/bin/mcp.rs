@@ -3079,6 +3079,7 @@ mod tests {
             health: Some(160.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -3150,6 +3151,7 @@ mod tests {
             health: Some(160.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -3184,6 +3186,7 @@ mod tests {
             health: Some(300.0),
             force: Some("player".to_string()),
             bounding_box: Some(Area::new(10.0, 10.0, 13.0, 13.0)),
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -3529,6 +3532,7 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -3588,6 +3592,7 @@ mod tests {
             "collect_from_chest",
             "configure_inserter",
             "feed_lab_from_inventory",
+            "feed_machine_from_inventory",
             "file_issue",
             "get_entity_inventory",
             "wait_for_crafting",
@@ -3810,6 +3815,7 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: Some(Area::new(9.0, 19.0, 12.0, 22.0)),
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -3856,6 +3862,7 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -3880,6 +3887,7 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -4025,6 +4033,7 @@ mod tests {
             health: Some(150.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -4069,6 +4078,7 @@ mod tests {
             health: Some(150.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: Some(mode.to_string()),
@@ -4374,6 +4384,7 @@ mod tests {
             health: Some(150.0),
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -4584,6 +4595,7 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -4601,6 +4613,7 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -4618,6 +4631,7 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -5065,6 +5079,7 @@ mod tests {
             health: None,
             force: Some("player".to_string()),
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -5618,7 +5633,7 @@ pub struct BootstrapBurnerOnceParams {
 /// Chest collection request.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CollectFromChestParams {
-    /// Exact chest or furnace unit number.
+    /// Exact chest, furnace or machine unit number.
     pub unit_number: u32,
     /// Exact item name.
     pub item: String,
@@ -7949,6 +7964,18 @@ pub struct FeedLabFromInventoryParams {
     pub dry_run: bool,
 }
 
+/// Parameters for feed_machine_from_inventory tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct FeedMachineFromInventoryParams {
+    /// Unit number of an assembler, chemical plant, or foundry with a recipe set
+    pub unit_number: u32,
+    /// Whole crafts to load, from 1 through 20.
+    pub crafts: u32,
+    /// If true, only validate and return an execution step. Defaults to true.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -8631,6 +8658,7 @@ const MODEL_VISIBLE_TOOLS: &[&str] = &[
     "execute_entity_placement_near",
     "extend_power_to",
     "feed_lab_from_inventory",
+    "feed_machine_from_inventory",
     "file_issue",
     "find_nearest_resource",
     "get_available_research",
@@ -11379,7 +11407,7 @@ impl FactorioMcp {
 
     /// Collect a bounded item count from an existing chest.
     #[tool(
-        description = "Collect 1-1000 of a known item from a chest or from a furnace's output slot, without mining. Call get_entity_inventory first; item_not_found means that item is absent. Reports conservation, not automation."
+        description = "Collect 1-1000 of a known item from a chest or from a furnace's or machine's output slot, without mining. Call get_entity_inventory first; item_not_found means that item is absent. Reports conservation, not automation."
     )]
     async fn collect_from_chest(
         &self,
@@ -17393,6 +17421,30 @@ impl FactorioMcp {
             Err(e) => format!("Error: {}", e),
         };
         result
+    }
+
+    /// Load a machine's recipe ingredients from the agent inventory.
+    #[tool(
+        description = "Dry-run or load 1-20 crafts of a machine's current recipe (item ingredients only) from your inventory into an exact assembler/chemical plant/foundry for bootstrap. Fluids must be piped. Then feed it with inserters."
+    )]
+    async fn feed_machine_from_inventory(
+        &self,
+        Parameters(params): Parameters<FeedMachineFromInventoryParams>,
+    ) -> String {
+        let mut client = match self.connect().await {
+            Ok(c) => c,
+            Err(e) => return format!("Error: {}", e),
+        };
+
+        match client
+            .feed_machine_from_inventory(params.unit_number, params.crafts, params.dry_run)
+            .await
+        {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            Err(e) => format!("Error: {}", e),
+        }
     }
 
     /// Start researching a technology.

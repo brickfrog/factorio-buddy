@@ -325,6 +325,7 @@ const MANUAL_TRANSFER_TOOLS: &[&str] = &[
     "collect_from_chest",
     "refuel_burners",
     "feed_lab_from_inventory",
+    "feed_machine_from_inventory",
 ];
 /// Window of recent calls over which the manual-transfer share is measured.
 const MANUAL_TRANSFER_WINDOW: usize = 60;

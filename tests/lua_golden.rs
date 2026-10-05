@@ -559,6 +559,10 @@ fn all_lua_cases() -> Vec<LuaCase> {
                 true,
             ),
         ),
+        LuaCase::new(
+            "feed_machine_from_inventory",
+            LuaCommand::feed_machine_from_inventory(&legacy_agent(), 42, 3, true),
+        ),
         LuaCase::new("start_research", LuaCommand::start_research("automation")),
         LuaCase::new(
             "is_tech_researched",
@@ -3983,6 +3987,7 @@ fn lua_plans_only_recommend_model_visible_tools() {
         "execute_edge_miner",
         "execute_entity_placement_near",
         "feed_lab_from_inventory",
+        "feed_machine_from_inventory",
         "get_belt_lane_contents",
         "get_power_status",
         "get_research_status",

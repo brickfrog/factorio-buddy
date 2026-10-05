@@ -21,6 +21,7 @@ local COLLECTABLE_INVENTORIES = {
     ["container"] = defines.inventory.chest,
     ["logistic-container"] = defines.inventory.chest,
     ["furnace"] = defines.inventory.furnace_result,
+    ["assembling-machine"] = defines.inventory.assembling_machine_output,
 }
 
 local function fail(error_kind, message, action_needed, extra)
@@ -574,9 +575,9 @@ function M.collect_from_chest(agent_id, unit_number, item, count)
     if inventory_id == nil then
         return fail(
             "wrong_entity_type",
-            "collect_from_chest accepts only chests and furnace output",
+            "collect_from_chest accepts only chests and furnace or machine output",
             "choose_existing_chest",
-            {target = target_summary(entity), allowed_types = {"container", "logistic-container", "furnace"}}
+            {target = target_summary(entity), allowed_types = {"container", "logistic-container", "furnace", "assembling-machine"}}
         )
     end
 

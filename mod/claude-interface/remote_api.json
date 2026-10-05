@@ -35,6 +35,7 @@
     "extend_power_to": {"args": ["agent_id", "x", "y", "radius", "target_x", "target_y"], "returns": "json"},
     "extract_items": {"args": ["agent_id", "unit_number", "item", "count", "inventory_type"], "returns": "json"},
     "feed_lab_from_inventory": {"args": ["agent_id", "lab_unit_number", "science_pack", "count", "dry_run"], "returns": "json"},
+    "feed_machine_from_inventory": {"args": ["agent_id", "unit_number", "crafts", "dry_run"], "returns": "json"},
     "find_entities": {"args": ["x1", "y1", "x2", "y2", "entity_type", "name", "agent_id"], "returns": "json"},
     "find_entity_placements": {"args": ["agent_id", "entity_name", "center_x", "center_y", "radius", "limit"], "returns": "json"},
     "find_nearest_minable": {"args": ["agent_id", "entity_name", "radius"], "returns": "json"},

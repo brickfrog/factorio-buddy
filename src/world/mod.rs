@@ -275,36 +275,101 @@ pub fn entity_size(name: &str) -> (u32, u32) {
 
 /// Return every map tile occupied by an entity.
 ///
-/// Live entity summaries include the authoritative, already-rotated collision
-/// box. The prototype-size fallback exists for synthetic/offline inputs and
-/// rotates non-square footprints for east/west-facing entities.
+/// Live entity summaries include the authoritative collision box (with its
+/// orientation when Factorio reports one). The prototype-size fallback exists
+/// for synthetic/offline inputs and rotates non-square footprints for
+/// east/west-facing entities.
 pub fn entity_occupied_tiles(entity: &Entity) -> Vec<TilePos> {
-    let (left, top, right, bottom) = match entity.bounding_box {
-        Some(bounds) => (
+    if let Some(bounds) = &entity.bounding_box {
+        return collision_box_tiles(bounds, entity.bounding_box_orientation).collect();
+    }
+    let (mut width, mut height) = entity_size(&entity.name);
+    if matches!(entity.direction_enum(), Direction::East | Direction::West) {
+        std::mem::swap(&mut width, &mut height);
+    }
+    let half_width = width as f64 / 2.0;
+    let half_height = height as f64 / 2.0;
+    let left = (entity.position.x - half_width).floor() as i32;
+    let top = (entity.position.y - half_height).floor() as i32;
+    let right = (entity.position.x + half_width).ceil() as i32;
+    let bottom = (entity.position.y + half_height).ceil() as i32;
+
+    (left..right)
+        .flat_map(|x| (top..bottom).map(move |y| TilePos::new(x, y)))
+        .collect()
+}
+
+/// Tiles whose interior overlaps a collision box read from Factorio.
+///
+/// Factorio reports some boxes (cliffs) with a non-zero `orientation` (in
+/// turns, clockwise): `bounds` then holds the unrotated corners and the real
+/// box is that rectangle rotated about its centre, so it reaches tiles outside
+/// `bounds` and misses some inside it. Touching a tile edge does not occupy
+/// the tile, matching the axis-aligned floor/ceil coverage.
+pub fn collision_box_tiles(
+    bounds: &Area,
+    orientation: Option<f64>,
+) -> impl Iterator<Item = TilePos> {
+    // A half-turn maps a rectangle onto itself about its centre.
+    let rotation = orientation
+        .filter(|turns| turns.rem_euclid(0.5) != 0.0)
+        .map(|turns| (turns * std::f64::consts::TAU).sin_cos());
+    let center = bounds.center();
+    let half = (bounds.width() / 2.0, bounds.height() / 2.0);
+    let (left, top, right, bottom) = match rotation {
+        None => (
             bounds.left_top.x.floor() as i32,
             bounds.left_top.y.floor() as i32,
             bounds.right_bottom.x.ceil() as i32,
             bounds.right_bottom.y.ceil() as i32,
         ),
-        None => {
-            let (mut width, mut height) = entity_size(&entity.name);
-            if matches!(entity.direction_enum(), Direction::East | Direction::West) {
-                std::mem::swap(&mut width, &mut height);
-            }
-            let half_width = width as f64 / 2.0;
-            let half_height = height as f64 / 2.0;
+        Some((sin, cos)) => {
+            let reach_x = half.0 * cos.abs() + half.1 * sin.abs();
+            let reach_y = half.0 * sin.abs() + half.1 * cos.abs();
             (
-                (entity.position.x - half_width).floor() as i32,
-                (entity.position.y - half_height).floor() as i32,
-                (entity.position.x + half_width).ceil() as i32,
-                (entity.position.y + half_height).ceil() as i32,
+                (center.x - reach_x).floor() as i32,
+                (center.y - reach_y).floor() as i32,
+                (center.x + reach_x).ceil() as i32,
+                (center.y + reach_y).ceil() as i32,
             )
         }
     };
 
     (left..right)
-        .flat_map(|x| (top..bottom).map(move |y| TilePos::new(x, y)))
-        .collect()
+        .flat_map(move |x| (top..bottom).map(move |y| TilePos::new(x, y)))
+        .filter(move |tile| {
+            rotation
+                .is_none_or(|(sin, cos)| rotated_box_overlaps_tile(center, half, sin, cos, *tile))
+        })
+}
+
+/// Separating-axis test between a unit tile and a rectangle with half extents
+/// `half`, rotated clockwise (y points down) by the angle with `sin`/`cos`
+/// about `center`. Overlaps shallower than Factorio's 1/256-tile position
+/// resolution count as touching: belt, underground and character boxes stop
+/// well short of their tile edges, and exact corner contacts must not block.
+fn rotated_box_overlaps_tile(
+    center: Position,
+    half: (f64, f64),
+    sin: f64,
+    cos: f64,
+    tile: TilePos,
+) -> bool {
+    const TOUCH_EPSILON: f64 = 1.0 / 256.0;
+    let dx = tile.x as f64 + 0.5 - center.x;
+    let dy = tile.y as f64 + 0.5 - center.y;
+    let (sin_abs, cos_abs) = (sin.abs(), cos.abs());
+    // Reach of the rotated box along world axes, plus the tile's half-width.
+    let reach_x = half.0 * cos_abs + half.1 * sin_abs + 0.5;
+    let reach_y = half.0 * sin_abs + half.1 * cos_abs + 0.5;
+    // Tile half-width projected onto either rotated box axis.
+    let tile_reach = 0.5 * (sin_abs + cos_abs);
+    let along = (dx * cos + dy * sin).abs();
+    let across = (dy * cos - dx * sin).abs();
+    dx.abs() < reach_x - TOUCH_EPSILON
+        && dy.abs() < reach_y - TOUCH_EPSILON
+        && along < half.0 + tile_reach - TOUCH_EPSILON
+        && across < half.1 + tile_reach - TOUCH_EPSILON
 }
 
 /// Direction enum matching Factorio 2.0's defines.direction
@@ -442,6 +507,7 @@ mod tests {
             health: None,
             force: None,
             bounding_box: Some(Area::new(2.1, -0.9, 4.9, 1.9)),
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,
@@ -468,6 +534,7 @@ mod tests {
             health: None,
             force: None,
             bounding_box: None,
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,

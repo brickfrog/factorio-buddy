@@ -779,7 +779,8 @@ impl FactorioClient {
     ) -> Result<(CollisionMap, Vec<Entity>)> {
         let mut collision_map = CollisionMap::new(area);
 
-        // Query tiles for terrain obstacles (water, cliffs)
+        // Query tiles for terrain obstacles (water). Cliffs are entities and
+        // are blocked below from their rotated collision boxes.
         let tiles = self.get_tiles(area).await?;
         for tile in tiles {
             if tile.collides_with_player {
@@ -797,16 +798,7 @@ impl FactorioClient {
 
             // Use actual bounding box if available, otherwise fall back to padding
             if let Some(bb) = &entity.bounding_box {
-                // Block all tiles covered by the bounding box
-                let min_x = bb.left_top.x.floor() as i32;
-                let max_x = bb.right_bottom.x.ceil() as i32;
-                let min_y = bb.left_top.y.floor() as i32;
-                let max_y = bb.right_bottom.y.ceil() as i32;
-                for x in min_x..max_x {
-                    for y in min_y..max_y {
-                        collision_map.block(GridPos::new(x, y));
-                    }
-                }
+                collision_map.block_collision_box(bb, entity.bounding_box_orientation);
             } else {
                 // Fallback: use hardcoded padding
                 let padding = entity_collision_padding(&entity.name);
@@ -2361,6 +2353,27 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
+    pub async fn feed_machine_from_inventory(
+        &mut self,
+        unit_number: u32,
+        crafts: u32,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        self.approach_entity(unit_number).await?;
+        let response = self
+            .call_remote(
+                "feed_machine_from_inventory",
+                &[
+                    json!(self.agent_id.as_str()),
+                    json!(unit_number),
+                    json!(crafts),
+                    json!(dry_run),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
     /// Check if a technology has been researched
     pub async fn is_tech_researched(&mut self, tech_name: &str) -> Result<bool> {
         let response = self
@@ -3368,6 +3381,7 @@ mod tests {
             health: Some(100.0),
             force: Some("player".to_string()),
             bounding_box: Some(Area::new(0.1, 0.1, 0.9, 0.9)),
+            bounding_box_orientation: None,
             pickup_position: None,
             drop_position: None,
             belt_to_ground_type: None,

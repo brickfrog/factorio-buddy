@@ -13,6 +13,7 @@ fn entity(name: &str, x: f64, y: f64) -> Entity {
         health: None,
         force: None,
         bounding_box: None,
+        bounding_box_orientation: None,
         pickup_position: None,
         drop_position: None,
         belt_to_ground_type: None,

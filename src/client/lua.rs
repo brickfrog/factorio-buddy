@@ -1169,6 +1169,25 @@ impl LuaCommand {
         )
     }
 
+    /// Load whole crafts of a machine's recipe from the agent inventory, dry-run by default.
+    pub fn feed_machine_from_inventory(
+        agent_id: &AgentId,
+        unit_number: u32,
+        crafts: u32,
+        dry_run: bool,
+    ) -> String {
+        Self::claude_interface_json_call(
+            "feed_machine_from_inventory",
+            &[
+                Self::lua_string_arg(agent_id.as_str()),
+                unit_number.to_string(),
+                crafts.to_string(),
+                dry_run.to_string(),
+            ],
+            "Run just sync/resume so the updated claude-interface mod is loaded before feeding machines.",
+        )
+    }
+
     /// Start researching a technology (queues it properly)
     pub fn start_research(tech_name: &str) -> String {
         Self::claude_interface_json_call(

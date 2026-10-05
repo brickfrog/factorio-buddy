@@ -3507,7 +3507,7 @@ EXPECTED_TOOLS="$(printf '%s\n' \
     build_assembler_feed build_assembler_output build_automation_science \
     build_lab_feed build_layout build_recipe_assembler_cell build_steam_power collect_from_chest configure_inserter craft diagnose_factory_blockers \
     diagnose_steam_power execute_direct_smelter execute_edge_miner \
-    execute_entity_placement_near extend_power_to feed_lab_from_inventory file_issue \
+    execute_entity_placement_near extend_power_to feed_lab_from_inventory feed_machine_from_inventory file_issue \
     find_nearest_resource \
     get_available_research get_belt_lane_contents get_entities get_entity_inventory \
     get_machine_belt_positions get_power_status get_recipe get_recipes_for_item \
@@ -7168,6 +7168,51 @@ game.tick_paused = false
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 c.force = game.forces.player
 c.teleport({28.5, 10.5}, game.surfaces['buddy-live-regression'])
+" >/dev/null
+
+# feed_machine_from_inventory loads whole crafts of the machine's recipe only
+# and leaves the remainder with the character; collect_from_chest takes a
+# machine's output. The machine is inactive so it never crafts.
+MACHINE_FEED_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local spot = s.find_non_colliding_position('assembling-machine-1', {c.position.x + 4, c.position.y}, 6, 1)
+local machine = s.create_entity{name = 'assembling-machine-1', position = spot, force = c.force}
+machine.set_recipe('iron-gear-wheel')
+machine.active = false
+storage.live_machine_feed_spot = machine.position
+local inv = c.get_main_inventory()
+storage.live_machine_feed_plates = inv.get_item_count('iron-plate')
+if storage.live_machine_feed_plates > 0 then inv.remove{name = 'iron-plate', count = storage.live_machine_feed_plates} end
+inv.insert{name = 'iron-plate', count = 7}
+rcon.print(helpers.table_to_json({unit = machine.unit_number}))
+")"
+MACHINE_FEED_UNIT="$(jq -r '.unit' <<<"$MACHINE_FEED_FIXTURE")"
+assert_json "feed_machine_from_inventory loads only whole crafts of the recipe" \
+    "$(tool_payload "$(mcp_tool feed_machine_from_inventory "$(jq -cn --argjson unit "$MACHINE_FEED_UNIT" '{unit_number:$unit, crafts:5, dry_run:false}')")")" \
+    '.success == true and .recipe == "iron-gear-wheel" and .crafts_loaded == 3 and .inserted == [{"name":"iron-plate","count":6}]'
+MACHINE_FEED_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local machine = c.surface.find_entities_filtered{name = 'assembling-machine-1', position = storage.live_machine_feed_spot, radius = 0.5}[1]
+machine.get_inventory(defines.inventory.assembling_machine_output).insert{name = 'iron-gear-wheel', count = 3}
+rcon.print(helpers.table_to_json({
+    character_plates = c.get_main_inventory().get_item_count('iron-plate'),
+    machine_plates = machine.get_inventory(defines.inventory.assembling_machine_input).get_item_count('iron-plate'),
+}))
+")"
+assert_json "the leftover plate stays with the character" "$MACHINE_FEED_WORLD" \
+    '.character_plates == 1 and .machine_plates == 6'
+assert_json "collect_from_chest takes a machine's output" \
+    "$(tool_payload "$(mcp_tool collect_from_chest "$(jq -cn --argjson unit "$MACHINE_FEED_UNIT" '{unit_number:$unit, item:"iron-gear-wheel", count:2}')")")" \
+    '.success == true and .transferred == 2'
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local inv = c.get_main_inventory()
+if inv.get_item_count('iron-plate') > 0 then inv.remove{name = 'iron-plate', count = inv.get_item_count('iron-plate')} end
+inv.remove{name = 'iron-gear-wheel', count = 2}
+if storage.live_machine_feed_plates > 0 then inv.insert{name = 'iron-plate', count = storage.live_machine_feed_plates} end
+local machine = c.surface.find_entities_filtered{name = 'assembling-machine-1', position = storage.live_machine_feed_spot, radius = 0.5}[1]
+if machine then machine.destroy() end
 " >/dev/null
 
 # Invalid model-authored issue fields must fail validation before `bd create`.

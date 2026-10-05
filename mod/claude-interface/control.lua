@@ -2932,6 +2932,11 @@ local api = {
         return json_remote_call("feed_lab_from_inventory", research.feed_lab_from_inventory, character, lab_unit_number, science_pack, count, dry_run)
     end,
 
+    feed_machine_from_inventory = function(agent_id, unit_number, crafts, dry_run)
+        local character = find_factorioctl_character(agent_id)
+        return json_remote_call("feed_machine_from_inventory", research.feed_machine_from_inventory, character, unit_number, crafts, dry_run)
+    end,
+
     start_research = function(tech_name, agent_id)
         return json_remote_call("start_research", research.start_research, scoped_character(agent_id), tech_name)
     end,

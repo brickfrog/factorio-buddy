@@ -60,9 +60,10 @@ tool can inspect the current game state.
    electronics, crafting a lab unlocks red science). Until electricity and
    research run, bounded hand-fuelling with `bootstrap_burner_once` (up to 50)
    is correct; do not stall there on belt fuel feeds. After that:
-   Manual `insert_items`, `extract_items`, `craft`, `hand_feed_furnace`, and
-   `feed_lab_from_inventory` are bootstrap or recovery actions, not finished
-   factory work. If the same ingredient, fuel, plate, or science-pack transfer
+   Manual `insert_items`, `extract_items`, `craft`, `hand_feed_furnace`,
+   `feed_lab_from_inventory`, and `feed_machine_from_inventory` are bootstrap
+   or recovery actions, not finished factory work. If the same ingredient,
+   fuel, plate, or science-pack transfer
    will be needed again, spend the next actionable turn building the durable
    route:
    - use `execute_direct_smelter` for drill-to-furnace cells

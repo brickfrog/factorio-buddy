@@ -3,6 +3,8 @@ local characters = require("characters")
 
 local M = {}
 local MAX_LAB_FEED_COUNT = 200
+local MAX_MACHINE_FEED_CRAFTS = 20
+local MACHINE_FEED_GUIDANCE = "One-time bootstrap (e.g. a first craft that triggers research on a new planet); feed it durably with inserters and belts afterwards."
 
 local function pos_table(pos)
     if not pos then return nil end
@@ -328,6 +330,238 @@ function M.feed_lab_from_inventory(character, lab_unit_number, science_pack, cou
     result.next_action = "get_research_status"
     result.follow_up_actions = {"build_automation_science", "build_lab_feed"}
     result.guidance = "Science packs transferred once. Use build_automation_science and build_lab_feed before treating research logistics as complete."
+    return result
+end
+
+local function machine_summary(machine)
+    return {
+        unit_number = machine.unit_number,
+        name = machine.name,
+        type = machine.type,
+        position = pos_table(machine.position),
+    }
+end
+
+-- Load whole crafts of a crafting machine's current recipe (item ingredients
+-- only, all together) from the character inventory. Fluids must be piped.
+function M.feed_machine_from_inventory(character, unit_number, crafts, dry_run)
+    local parsed_crafts = tonumber(crafts)
+    local do_dry_run = dry_run ~= false
+    local result = {
+        success = false,
+        dry_run = do_dry_run,
+        unit_number = tonumber(unit_number),
+        requested_crafts = parsed_crafts or crafts,
+        maximum_crafts = MAX_MACHINE_FEED_CRAFTS,
+        crafts_loaded = 0,
+        inserted = {},
+        missing_items = {},
+        fluid_ingredients = {},
+        blockers = {},
+        classification = "bootstrap_machine_transfer",
+        bootstrap = true,
+        automation_complete = false,
+        guidance = MACHINE_FEED_GUIDANCE,
+    }
+
+    if not parsed_crafts
+        or parsed_crafts ~= parsed_crafts
+        or parsed_crafts == math.huge
+        or parsed_crafts == -math.huge
+        or parsed_crafts <= 0
+        or parsed_crafts ~= math.floor(parsed_crafts)
+        or parsed_crafts > MAX_MACHINE_FEED_CRAFTS
+    then
+        result.error_kind = parsed_crafts and parsed_crafts > MAX_MACHINE_FEED_CRAFTS
+            and "crafts_exceed_limit" or "invalid_crafts"
+        result.error = "crafts must be a positive integer no greater than " .. tostring(MAX_MACHINE_FEED_CRAFTS)
+        result.action_needed = "choose_bounded_craft_count"
+        add_blocker(result, result.error_kind, result.error)
+        return result
+    end
+
+    if not (character and character.valid) then
+        add_blocker(result, "no_character", "No character for agent; spawn first.")
+        return expected_miss(result, "spawn_character")
+    end
+
+    local machine = entities.find_by_unit_number(result.unit_number)
+    if not (machine and machine.valid) then
+        add_blocker(result, "machine_not_found", "No valid entity with unit_number " .. tostring(unit_number) .. ".")
+        return expected_miss(result, "get_entities")
+    end
+    result.machine = machine_summary(machine)
+
+    if machine.type ~= "assembling-machine" then
+        add_blocker(result, "not_a_crafting_machine", "Entity " .. tostring(unit_number) .. " is " .. tostring(machine.name)
+            .. " (" .. tostring(machine.type) .. "), not an assembler, chemical plant, or foundry.")
+        return expected_miss(result, "choose_crafting_machine")
+    end
+
+    local recipe, quality = machine.get_recipe()
+    if not recipe then
+        add_blocker(result, "no_recipe", tostring(machine.name) .. " " .. tostring(unit_number) .. " has no recipe; set one first.")
+        return expected_miss(result, "set_recipe")
+    end
+    local quality_name = quality and quality.name or "normal"
+    result.recipe = recipe.name
+    result.recipe_quality = quality_name
+
+    local item_ingredients = {}
+    for _, ingredient in ipairs(recipe.ingredients) do
+        if ingredient.type == "fluid" then
+            table.insert(result.fluid_ingredients, {name = ingredient.name, amount = ingredient.amount})
+        else
+            table.insert(item_ingredients, {name = ingredient.name, amount = ingredient.amount})
+        end
+    end
+    if #result.fluid_ingredients > 0 then
+        result.fluid_guidance = "Fluid ingredients cannot be loaded from inventory; pipe them into the machine."
+    end
+    if #item_ingredients == 0 then
+        add_blocker(result, "no_item_ingredients", "Recipe " .. recipe.name .. " has no item ingredients; pipe its fluids in instead.")
+        return expected_miss(result, "pipe_fluid_ingredients")
+    end
+
+    local reach_error = characters.require_entity_reach(character, machine)
+    if reach_error then
+        result.error = reach_error.error
+        result.error_kind = reach_error.error_kind
+        result.action_needed = reach_error.action_needed
+        result.character_position = reach_error.character_position
+        result.target_position = reach_error.target_position
+        result.distance = reach_error.distance
+        result.max_distance = reach_error.max_distance
+        add_blocker(result, "out_of_reach", "Walk to the machine before loading ingredients.")
+        return result
+    end
+
+    local machine_inv = machine.get_inventory(defines.inventory.assembling_machine_input)
+    if not machine_inv then
+        add_blocker(result, "no_machine_input_inventory", "Machine has no assembling_machine_input inventory.")
+        return expected_miss(result, "choose_crafting_machine")
+    end
+
+    local player_inv = character.get_main_inventory()
+    if not player_inv then
+        add_blocker(result, "no_character_inventory", "Character has no main inventory.")
+        return expected_miss(result, "spawn_character")
+    end
+
+    local loadable = parsed_crafts
+    for _, ingredient in ipairs(item_ingredients) do
+        local accepts_ok, accepts = pcall(function()
+            return machine_inv.can_insert{name = ingredient.name, quality = quality_name, count = ingredient.amount}
+        end)
+        if not accepts_ok or accepts ~= true then
+            add_blocker(result, "machine_rejects_item", "Machine input does not accept more " .. ingredient.name .. ".")
+            return expected_miss(result, "wait_for_machine_to_consume_input")
+        end
+        local id = {name = ingredient.name, quality = quality_name}
+        ingredient.available = player_inv.get_item_count(id)
+        ingredient.machine_before = machine_inv.get_item_count(id)
+        loadable = math.min(loadable, math.floor(ingredient.available / ingredient.amount))
+        if ingredient.available < ingredient.amount * parsed_crafts then
+            result.missing_items[ingredient.name] = {
+                available = ingredient.available,
+                required_per_craft = ingredient.amount,
+                required = ingredient.amount * parsed_crafts,
+            }
+        end
+    end
+    if loadable <= 0 then
+        add_blocker(result, "missing_ingredients", "Character inventory lacks one whole craft of " .. recipe.name .. "; see missing_items.")
+        return expected_miss(result, "craft_or_collect")
+    end
+    result.crafts_to_load = loadable
+    result.planned_items = {}
+    for _, ingredient in ipairs(item_ingredients) do
+        table.insert(result.planned_items, {name = ingredient.name, count = ingredient.amount * loadable})
+    end
+
+    if do_dry_run then
+        result.ready_to_call = {
+            tool = "feed_machine_from_inventory",
+            args = {
+                unit_number = result.unit_number,
+                crafts = loadable,
+                dry_run = false,
+            },
+        }
+        result.steps = {{
+            tool = result.ready_to_call.tool,
+            args = result.ready_to_call.args,
+            description = "Execute the validated one-time ingredient load into this exact machine.",
+        }}
+        result.success = true
+        result.ready = true
+        result.manual_bootstrap_available = true
+        result.next_action = "feed_machine_from_inventory"
+        return result
+    end
+
+    local crafts_loaded = loadable
+    local balanced = true
+    result.conservation = {}
+    for _, ingredient in ipairs(item_ingredients) do
+        local id = {name = ingredient.name, quality = quality_name}
+        local wanted = ingredient.amount * loadable
+        local removed = player_inv.remove{name = ingredient.name, quality = quality_name, count = wanted}
+        local inserted = 0
+        if removed > 0 then
+            inserted = machine_inv.insert{name = ingredient.name, quality = quality_name, count = removed}
+        end
+        local returned = 0
+        if inserted < removed then
+            returned = player_inv.insert{name = ingredient.name, quality = quality_name, count = removed - inserted}
+        end
+        local record = {
+            name = ingredient.name,
+            wanted = wanted,
+            removed = removed,
+            inserted = inserted,
+            returned = returned,
+            balanced = removed == inserted + returned,
+            machine_increase = machine_inv.get_item_count(id) - ingredient.machine_before,
+            character_decrease = ingredient.available - player_inv.get_item_count(id),
+        }
+        record.measured_balanced = record.machine_increase == inserted and record.character_decrease == inserted
+        balanced = balanced and record.balanced and record.measured_balanced
+        table.insert(result.conservation, record)
+        if inserted > 0 then
+            table.insert(result.inserted, {name = ingredient.name, count = inserted})
+        end
+        crafts_loaded = math.min(crafts_loaded, math.floor(inserted / ingredient.amount))
+    end
+    result.crafts_loaded = crafts_loaded
+    result.machine_identity_preserved = machine.valid and machine.unit_number == result.unit_number
+
+    if not balanced then
+        result.error_kind = "item_conservation_failure"
+        result.error = "ingredient transfer did not conserve the measured machine and character inventories"
+        result.action_needed = "stop_and_inspect_inventories"
+        add_blocker(result, result.error_kind, result.error)
+        return result
+    end
+    if not result.machine_identity_preserved then
+        result.error_kind = "entity_identity_changed"
+        result.error = "machine identity changed during ingredient transfer"
+        result.action_needed = "stop_and_inspect_machine"
+        add_blocker(result, result.error_kind, result.error)
+        return result
+    end
+    if crafts_loaded == 0 then
+        add_blocker(result, "machine_input_full", "Machine input accepted no whole craft; leftovers returned to your inventory.")
+        return expected_miss(result, "wait_for_machine_to_consume_input")
+    end
+    if crafts_loaded < loadable then
+        add_blocker(result, "partial_load", "Machine input accepted " .. tostring(crafts_loaded) .. " of " .. tostring(loadable)
+            .. " crafts; leftovers returned to your inventory.")
+    end
+
+    result.success = true
+    result.next_action = "build_assembler_feed"
+    result.follow_up_actions = {"build_assembler_feed", "verify_production"}
     return result
 end
 

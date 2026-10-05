@@ -896,6 +896,54 @@ Sandbox runs on long32's save:
 - At the end the platform waits at Vulcanus with 5 turrets (3 in front) and 153 piercing left. Losses on the way match the sandbox flights.
 - 12 errors, none in the space path except the one out-of-reach `ship`.
 
+## Working on Vulcanus and from Vulcanus
+
+### `long42-cont41-opus-open-2590060469-60m`: the first hour on Vulcanus
+
+60 minutes, 38 turns, none provider-limited, 37 tool errors, 0 invariant failures. `plate_automation` and `powered_production` held; Buddy stayed on Vulcanus.
+- **Rung:** a fixed string ("Build power and a roboport from what you carried"). The snapshot described only Nauvis.
+- **What Buddy did:** worked out the trigger chain itself (tungsten-carbide unlocks foundry research). It smelted steel, hand-crafted 2 solar panels and a chemical plant (carbon), and spent about 40 minutes routing one coal belt from the coal patch to the plant through the cliff terraces. Carbon flowed late in the hour.
+- **Blockers:**
+  - *No way to load a machine by hand.* With 80 tungsten ore and carbon in hand, the tungsten-carbide assembler could not be loaded, because `insert_items` is deliberately hidden from the model. Buddy filed evaltrial-51h and idled for many turns.
+  - *`route_belt` through cliffs:* 50 calls, most failing preflight with underground ends on cliff tiles. Buddy filed an issue.
+  - *It arrived without a kit:* no roboport, robots or chemical plant; the Board rung's carry list was generic and named steam power.
+  - *The platform stayed in Vulcanus orbit* with no crew and no supply: ammo ran out, asteroids wore it down, and thruster ingredients reached 0. Nothing from Vulcanus can reach it until a silo stands there.
+
+### Fixes after long42
+
+- **`feed_machine_from_inventory` (new bootstrap tool, model-visible):**
+  - loads whole crafts (1–20) of an assembler, chemical plant or foundry's current recipe from the character's inventory: item ingredients only, the same count of crafts for all of them;
+  - reports fluid ingredients it cannot load;
+  - checks reach, dry-runs by default and reports conservation;
+  - counts as a manual transfer, like the lab feed.
+  - `collect_from_chest` also takes an assembling machine's output, so a first carbon can go from the plant into the assembler by hand.
+- **Cliffs in `route_belt`:** Factorio reports corner cliffs' collision boxes with an `orientation` (rotated 45°), and the mod dropped it. The planner therefore blocked the wrong tiles: it allowed underground ends on cliff tiles, and blocked some free tiles next to cliffs.
+  - `entities.lua`/`placement.lua` now emit `bounding_box_orientation`.
+  - `src/world/mod.rs` `collision_box_tiles` rasterises rotated boxes with a separating-axis test, used by the collision map and `entity_occupied_tiles`.
+  - Unit regression: `rotated_cliff_box_keeps_underground_exit_off_its_off_corner_tiles`.
+- **Vulcanus facts and ladder:**
+  - The snapshot now has `here`: entities, statuses, recipes per machine, acid pumpjacks and items made on the planet the character stands on, when that is not home.
+  - `vulcanus_rung` goes: mine a big volcanic rock → mine calcite → solar power (the planet's 400 % solar; no water for steam) → pumpjack on a sulfuric-acid geyser → one tungsten-carbide (carbon plant + assembler, loaded by hand) → a foundry (recipe chain read from prototypes) → tungsten plate → metallurgic science.
+  - Each Vulcanus rung ends by pointing Buddy at Nauvis through robots.
+  - The Board rung now lists a Vulcanus kit.
+- **Steam planner:** offshore-pump spots must border water and no other fluid tile; lava pumps are rejected.
+- **Robots:**
+  - Ghost shortfalls are per network: each covered ghost counts against the network that builds it.
+  - `home_logistics.construction_robots_available` is reported, with a warning when every robot is busy and ghosts wait.
+  - A coverage fact counts home machines in construction range, with a warning below half coverage that names the uncovered machine nearest the network and how to extend it remotely (a roboport ghost inside the range).
+  - Away from home, the missing-items warnings and the `place_ghosts` guidance tell Buddy to have Nauvis make the items (assembler into a passive-provider chest), not to stock a chest by hand. Hand-refuel warnings for home are dropped while away.
+- **Summary:** `away_planet_entities` and the Vulcanus trigger techs (`calcite_processing`, `tungsten_carbide`, `foundry`, `big_mining_drill`, `metallurgic_science_pack`) under `.space.techs`.
+- **Sandbox on long41's save:**
+  - `route_belt` from (-53,-48) to (-28.5,79.5), Buddy's failing route, now preflights clean and placed all 71 pieces in one call (`connected: true`).
+  - The rung read "Make one tungsten-carbide" with the live machine states.
+  - With a script-placed chemical plant and assembler (power and acid also by script):
+    - `feed_machine_from_inventory` loaded 10 coal;
+    - `collect_from_chest` took 2 carbon from the plant;
+    - feeding carbon and tungsten ore to the assembler crafted tungsten carbide, and `foundry` was researched;
+    - the rung moved on to "Craft a foundry".
+  - On Nauvis (1 roboport, 111/297 machines covered): a roboport and pole ghost placed with `place_ghosts surface=nauvis` from Vulcanus reported the shortfall in the away wording. Once a provider chest held the items, robots built it; coverage rose to 137/297, and the warning named the next spot.
+- Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 522 passed and 0 failed (`fb-evidence/git-gud/live36`; new live checks: whole-craft machine feed leaves the remainder with the character, and `collect_from_chest` takes machine output).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

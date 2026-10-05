@@ -103,7 +103,14 @@ function M.summary(entity, include_bounding_box)
     }
 
     if include_bounding_box then
-        result.bounding_box = bounding_box_table(entity.bounding_box)
+        local box = entity.bounding_box
+        result.bounding_box = bounding_box_table(box)
+        -- Factorio reads some boxes (cliffs) with a non-zero orientation: the
+        -- corners above are then unrotated and the real collision box is that
+        -- rectangle rotated clockwise about its centre, reaching past them.
+        if box and box.orientation and box.orientation ~= 0 then
+            result.bounding_box_orientation = box.orientation
+        end
     end
 
     if entity.type == "inserter" then

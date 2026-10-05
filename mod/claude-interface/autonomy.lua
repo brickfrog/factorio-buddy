@@ -101,6 +101,12 @@ end
 -- Below this many fuel items a burner drill/furnace is reported as running dry.
 local LOW_BURNER_FUEL = 5
 
+-- Machines counted for home roboport coverage.
+local COVERAGE_TYPES = {
+    ["assembling-machine"] = true, ["furnace"] = true, ["mining-drill"] = true,
+    ["lab"] = true, ["rocket-silo"] = true,
+}
+
 local function tech_done(force, name)
     local tech = force.technologies[name]
     return tech ~= nil and tech.researched
@@ -335,12 +341,118 @@ local function turret_plan(arms, surface)
         .. tostring(surface) .. " and put gun turrets on it; the hub loads them with magazines."
 end
 
+-- Items whose all-time production on the away planet the rungs read.
+local PLANET_MADE = {"carbon", "tungsten-carbide", "tungsten-plate", "foundry", "steel-plate"}
+
+-- What stands on the planet the character is on, when that is not home and
+-- not a platform (nil otherwise): entity counts, statuses, recipes by
+-- machine, pumpjacks on sulfuric-acid geysers, and items made there.
+local function planet_facts(character, force)
+    local surface = character.surface
+    if surface.platform or surface == space.home_surface(character) then return nil end
+    local here = {
+        surface = surface.name, counts = {}, statuses = {}, recipes = {},
+        acid_pumpjacks = 0, acid_pumpjacks_working = 0, made = {}, ghosts = 0,
+    }
+    for _, entity in pairs(surface.find_entities_filtered{force = force}) do
+        if entity.type == "entity-ghost" or entity.type == "tile-ghost" then
+            here.ghosts = here.ghosts + 1
+        elseif is_factory_entity(entity) then
+            here.counts[entity.name] = (here.counts[entity.name] or 0) + 1
+            local status = entity_status(entity)
+            if status then here.statuses[status] = (here.statuses[status] or 0) + 1 end
+            if entity.type == "assembling-machine" then
+                local ok, recipe = pcall(function() return entity.get_recipe() end)
+                if ok and recipe then
+                    local entry = here.recipes[recipe.name] or {machines = 0, working = 0, statuses = {}}
+                    entry.machines = entry.machines + 1
+                    if status == "working" then entry.working = entry.working + 1 end
+                    if status then entry.statuses[status] = (entry.statuses[status] or 0) + 1 end
+                    here.recipes[recipe.name] = entry
+                end
+            elseif entity.type == "mining-drill" then
+                local ok, target = pcall(function() return entity.mining_target end)
+                if ok and target and target.valid and target.name == "sulfuric-acid-geyser" then
+                    here.acid_pumpjacks = here.acid_pumpjacks + 1
+                    if status == "working" then here.acid_pumpjacks_working = here.acid_pumpjacks_working + 1 end
+                end
+            end
+        end
+    end
+    for _, item in ipairs(PLANET_MADE) do here.made[item] = produced_count(force, surface, item) end
+    local ok, solar = pcall(function() return surface.planet.prototype.surface_properties["solar-power"] end)
+    here.solar_power_percent = ok and solar or nil
+    return here
+end
+
+-- "machines (statuses)" for one recipe on the away planet, or "none".
+local function recipe_state(here, recipe)
+    local entry = here.recipes[recipe]
+    if not entry then return "none placed" end
+    local parts = {}
+    for status, count in pairs(entry.statuses) do parts[#parts + 1] = count .. " " .. status end
+    table.sort(parts)
+    return entry.machines .. " placed (" .. table.concat(parts, ", ") .. ")"
+end
+
+local REMOTE_HOME = " Nauvis runs without you: check it with robot_logistics surface=nauvis and build there with place_ghosts surface=nauvis."
+
+-- The Vulcanus ladder, read from what stands there and the trigger
+-- technologies: rocks and calcite, solar power, acid, one tungsten carbide
+-- (unlocks foundry), a foundry (unlocks big-mining-drill), tungsten plate
+-- (unlocks metallurgic science).
+local function vulcanus_rung(here, force, character)
+    local inventory = character.get_main_inventory()
+    local function have(item) return inventory and inventory.get_item_count(item) or 0 end
+    if not tech_done(force, "tungsten-carbide") then
+        return "Mine a big volcanic rock: it unlocks tungsten-carbide research.",
+            "find_nearest_minable big-volcanic-rock, walk_to it, mine_at it. Rocks drop tungsten-ore (no drill you have can mine tungsten ore patches), calcite, coal and iron and copper ore." .. REMOTE_HOME
+    end
+    if not tech_done(force, "calcite-processing") then
+        return "Mine calcite: it unlocks calcite-processing research.",
+            "find_nearest_resource calcite, walk_to it, mine_at it." .. REMOTE_HOME
+    end
+    local generators = (here.counts["solar-panel"] or 0) + (here.counts["steam-engine"] or 0) + (here.counts["steam-turbine"] or 0)
+    if generators == 0 then
+        return "Power Vulcanus with solar panels.",
+            "There is no water here for steam; solar panels give " .. tostring(here.solar_power_percent or "?") .. "% power on Vulcanus. "
+            .. recipe_text("solar-panel") .. " (you have " .. have("solar-panel") .. "). Place them with build_layout beside the machines and connect with poles; accumulators carry the night." .. REMOTE_HOME
+    end
+    if here.acid_pumpjacks == 0 then
+        return "Pump sulfuric acid: put a pumpjack on a sulfuric-acid-geyser.",
+            "find_nearest_resource sulfuric-acid-geyser; place a pumpjack (you have " .. have("pumpjack") .. "; " .. recipe_text("pumpjack")
+            .. ") on it with build_layout, power it, and pipe the acid toward where the chemical plant and assembler will stand." .. REMOTE_HOME
+    end
+    if not tech_done(force, "foundry") then
+        local carbon = here.made["carbon"] or 0
+        return "Make one tungsten-carbide: crafting it unlocks foundry research.",
+            "Acid: " .. here.acid_pumpjacks_working .. "/" .. here.acid_pumpjacks .. " geyser pumpjacks working. "
+            .. "1) A chemical-plant set to carbon (" .. recipe_text("carbon") .. "): " .. recipe_state(here, "carbon") .. ", " .. carbon .. " carbon made here. "
+            .. "2) An assembling-machine-2 set to tungsten-carbide (" .. recipe_text("tungsten-carbide") .. "): " .. recipe_state(here, "tungsten-carbide") .. ". "
+            .. "Pipe acid into both. One craft needs no belts: load the solids with feed_machine_from_inventory (coal into the carbon plant; carbon and tungsten-ore into the assembler), take carbon out with collect_from_chest. "
+            .. "You carry " .. have("coal") .. " coal, " .. have("carbon") .. " carbon, " .. have("tungsten-ore") .. " tungsten-ore (more from big volcanic rocks)." .. REMOTE_HOME
+    end
+    if not tech_done(force, "big-mining-drill") then
+        return "Craft a foundry on Vulcanus: crafting it unlocks big-mining-drill research.",
+            recipe_text("foundry") .. " in an assembling-machine-2 on Vulcanus (it needs Vulcanus pressure and piped lubricant). Inputs: "
+            .. recipe_text("tungsten-carbide") .. " (" .. (here.made["tungsten-carbide"] or 0) .. " made here); "
+            .. recipe_text("refined-concrete") .. "; " .. recipe_text("lubricant") .. "; heavy oil from " .. recipe_text("simple-coal-liquefaction")
+            .. " (oil refinery); water from " .. recipe_text("steam-condensation") .. " fed by " .. recipe_text("acid-neutralisation") .. "." .. REMOTE_HOME
+    end
+    if not tech_done(force, "metallurgic-science-pack") then
+        return "Make tungsten-plate in a foundry: it unlocks metallurgic-science-pack research.",
+            recipe_text("tungsten-plate") .. "; molten iron from " .. recipe_text("molten-iron-from-lava")
+            .. " (place the foundry by lava and pump lava with an offshore-pump). Foundries placed: " .. (here.counts["foundry"] or 0) .. "." .. REMOTE_HOME
+    end
+    return "Automate metallurgic science on Vulcanus.",
+        recipe_text("metallurgic-science-pack") .. " in a foundry; tungsten ore from big mining drills (" .. recipe_text("big-mining-drill") .. ")." .. REMOTE_HOME
+end
+
 -- Rungs for a character away from home: on a platform or on Vulcanus.
-local function travel_rung(S, character)
-    local char_surface = character.surface.name
-    if char_surface == "vulcanus" then
-        return "You are on Vulcanus.",
-            "Build power and a roboport from what you carried (build_layout). Nauvis runs without you: check it with robot_logistics surface=nauvis, fix it with place_ghosts surface=nauvis."
+local function travel_rung(S, character, here, force)
+    if here then
+        if here.surface == "vulcanus" then return vulcanus_rung(here, force, character) end
+        return "You are on " .. here.surface .. ".", "Build power and a roboport from what you carried." .. REMOTE_HOME
     end
     if not S.character_on_platform then return nil end
     local here = nil
@@ -482,7 +594,7 @@ local function space_rung(facts, force, surface)
             "space_platform action=schedule stops=[\"vulcanus\"]. It stays in orbit until you are aboard (and armed and stocked), then leaves by itself."
     end
     return "Board " .. P.name .. " for Vulcanus.",
-        "It waits in orbit until you are aboard, then leaves. Carry what you need to start there (roboport, robots, steam/solar power, drills, furnaces, belts, inserters, poles). Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
+        "It waits in orbit until you are aboard, then leaves. Carry what you need to start there: Vulcanus has no water, so solar panels (4x power there) and accumulators, not steam; a roboport, construction robots and a storage chest so place_ghosts works there; chemical plants and assembling-machine-2s (carbon, tungsten carbide), a pumpjack (sulfuric acid geysers), pipes, drills, steel furnaces, belts, inserters, poles. Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
 end
 
 -- Code-computed tech-progression ladder for the early game. Each rung names
@@ -526,7 +638,7 @@ local function progression(surface, force, facts, character)
         if pack.assemblers == 0 then unautomated = unautomated or pack
         elseif pack.made_last_10_min == 0 then stalled = stalled or pack end
     end
-    local goal, how = travel_rung(facts.space, character)
+    local goal, how = travel_rung(facts.space, character, facts.here, force)
     local space_goal, space_how = nil, nil
     if not goal and force.rockets_launched > 0 then space_goal, space_how = space_rung(facts, force, surface) end
     local silo_prototype = prototypes.entity["rocket-silo"]
@@ -614,10 +726,12 @@ local function progression(surface, force, facts, character)
             .. ". Add assemblers for it and its intermediates, the plate and power supply they need, with build_layout, and deliver it to every lab; replace hand-fed fuel with belts or electric machines."
     end
     local warnings = {}
-    if facts.boilers > 0 and (facts.boiler_fuel_min or 0) < 10 then
+    -- Away from home, hand refuelling at home is out of reach.
+    local away = facts.space.character_surface ~= surface.name
+    if not away and facts.boilers > 0 and (facts.boiler_fuel_min or 0) < 10 then
         warnings[#warnings + 1] = "A boiler has under 10 fuel: top it up with refuel_burners, then belt coal to it with an inserter so power never stops."
     end
-    if facts.low_fuel_count > 0 then
+    if not away and facts.low_fuel_count > 0 then
         local units = {}
         for _, unit in ipairs(facts.low_fuel_units) do
             units[#units + 1] = unit.name .. " " .. tostring(unit.unit_number) .. " (" .. unit.fuel .. ")"
@@ -683,7 +797,21 @@ local function progression(surface, force, facts, character)
             lacking[#lacking + 1] = item.name .. " x" .. (item.needed - item.available)
         end
         warnings[#warnings + 1] = "Robots at home lack " .. table.concat(lacking, ", ")
-            .. " for placed ghosts: stock them in a storage chest in the network."
+            .. (away and " for placed ghosts, in the network covering them: from here, have Nauvis make them (place_ghosts surface=nauvis an assembler on the item, fed by inserters, with an inserter into a passive-provider-chest in that network)."
+                or " for placed ghosts, in the network covering them: stock them in a storage chest in that network.")
+    end
+    local buildable = (S.home_logistics.entity_ghosts or 0) + (S.home_logistics.tile_ghosts or 0) - S.home_logistics.uncovered_ghosts
+    if buildable > 0 and S.home_logistics.construction_robots > 0 and S.home_logistics.construction_robots_available == 0 then
+        warnings[#warnings + 1] = "All " .. S.home_logistics.construction_robots .. " construction robots at home are busy with "
+            .. buildable .. " ghosts: add robots (place_entity at home, or a construction-robot assembler with an inserter into a passive-provider-chest in the network)."
+    end
+    local coverage = facts.robot_coverage
+    if coverage and S.home_logistics.roboports > 0 and coverage.covered * 2 < coverage.machines then
+        local toward = coverage.uncovered_example
+        warnings[#warnings + 1] = "Only " .. coverage.covered .. "/" .. coverage.machines
+            .. " home machines are in roboport construction range, so robots and place_ghosts reach little of Nauvis. Extend it"
+            .. (toward and (" toward " .. math.floor(toward.x) .. "," .. math.floor(toward.y)) or "")
+            .. ": place_ghosts surface=nauvis a roboport (with poles to power it) inside the current range near its edge; robots build it from network stock (stock roboports there), and each roboport adds a 110x110 build area."
     end
     for _, platform in ipairs(S.platforms) do
         if (platform.damaged_tiles or 0) > 0 then
@@ -778,6 +906,7 @@ function M.snapshot(character)
     local mining_drills = {}
     local mining_targets = {}
     local power_networks_by_id = {}
+    local machine_positions = {}
     local entity_count = 0
     local facts = {
         steam_engines = 0, steam_engines_working = 0,
@@ -824,6 +953,7 @@ function M.snapshot(character)
                 facts.starved_assemblers = facts.starved_assemblers + 1
             end
             if status then statuses[status] = (statuses[status] or 0) + 1 end
+            if COVERAGE_TYPES[entity.type] then machine_positions[#machine_positions + 1] = entity.position end
 
             local x, y = entity.position.x, entity.position.y
             min_x = min_x and math.min(min_x, x) or x
@@ -921,6 +1051,30 @@ function M.snapshot(character)
         right_bottom = {x = max_x, y = max_y},
     }
 
+    -- Home machines inside roboport construction range: robots (and so
+    -- place_ghosts) reach only those, which matters most while away.
+    local cells = {}
+    for _, network in pairs(force.logistic_networks[surface.name] or {}) do
+        for _, cell in pairs(network.cells) do cells[#cells + 1] = cell end
+    end
+    local covered_machines, uncovered_example, best = 0, nil, nil
+    for _, position in ipairs(machine_positions) do
+        local hit, nearest = false, nil
+        for _, cell in ipairs(cells) do
+            if cell.valid then
+                if cell.is_in_construction_range(position) then hit = true break end
+                local owner = cell.owner.position
+                local d = (owner.x - position.x) ^ 2 + (owner.y - position.y) ^ 2
+                if not nearest or d < nearest then nearest = d end
+            end
+        end
+        if hit then covered_machines = covered_machines + 1
+        elseif nearest and (not best or nearest < best) then
+            best, uncovered_example = nearest, position_table(position)
+        end
+    end
+    facts.robot_coverage = {machines = #machine_positions, covered = covered_machines, uncovered_example = uncovered_example}
+
     table.sort(mining_drills, function(a, b)
         if a.name ~= b.name then return a.name < b.name end
         if a.position.x ~= b.position.x then return a.position.x < b.position.x end
@@ -955,10 +1109,23 @@ function M.snapshot(character)
     )
 
     facts.space = space.summary(force, character)
+    facts.here = planet_facts(character, force)
+    local here = facts.here and {
+        surface = facts.here.surface,
+        entities_by_name = sorted_counts(facts.here.counts),
+        statuses = sorted_counts(facts.here.statuses),
+        recipes = facts.here.recipes,
+        acid_pumpjacks = facts.here.acid_pumpjacks,
+        acid_pumpjacks_working = facts.here.acid_pumpjacks_working,
+        ghosts = facts.here.ghosts,
+        made = facts.here.made,
+    } or nil
     return {
         tick = game.tick,
         surface = surface.name,
         character_surface = character.surface.name,
+        -- The planet the character stands on when that is not home.
+        here = here,
         space = facts.space,
         character = character_snapshot(character),
         research = research.get_research_status(character),

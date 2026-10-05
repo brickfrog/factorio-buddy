@@ -107,11 +107,16 @@ local function construction_cells(surface, force)
     return cells
 end
 
-local function covered(cells, position)
+-- The logistic network whose construction range covers `position`, or nil.
+local function covering_network(cells, position)
     for _, cell in ipairs(cells) do
-        if cell.valid and cell.is_in_construction_range(position) then return true end
+        if cell.valid and cell.is_in_construction_range(position) then return cell.logistic_network end
     end
-    return false
+    return nil
+end
+
+local function covered(cells, position)
+    return covering_network(cells, position) ~= nil
 end
 
 local function first_item(items)
@@ -156,11 +161,39 @@ local function shortfalls(needed, surface, force)
     return list
 end
 
+-- Ghost-item shortfalls on a planet, each covered ghost counted against the
+-- network that builds it (stock in another network does not help it); same
+-- shape as shortfalls().
+local function network_shortfalls(needed_by_network)
+    local short = {}
+    for _, entry in pairs(needed_by_network) do
+        for name, count in pairs(entry.needed) do
+            local available = entry.network.valid and entry.network.get_item_count(name) or 0
+            local item = short[name] or {name = name, needed = 0, available = 0}
+            item.needed = item.needed + count
+            item.available = item.available + math.min(count, available)
+            short[name] = item
+        end
+    end
+    local list = {}
+    for _, item in pairs(short) do
+        if item.needed > item.available then list[#list + 1] = item end
+    end
+    table.sort(list, function(a, b)
+        local sa, sb = a.needed - a.available, b.needed - b.available
+        if sa ~= sb then return sa > sb end
+        return a.name < b.name
+    end)
+    while #list > 10 do list[#list] = nil end
+    return list
+end
+
 local function surface_logistics(surface, force, detail)
     local result = {
         networks = {},
         roboports = 0,
         construction_robots = 0,
+        construction_robots_available = 0,
         logistic_robots = 0,
     }
     for _, network in pairs(force.logistic_networks[surface.name] or {}) do
@@ -175,6 +208,7 @@ local function surface_logistics(surface, force, detail)
         result.networks[#result.networks + 1] = entry
         result.roboports = result.roboports + entry.roboports
         result.construction_robots = result.construction_robots + entry.construction_robots
+        result.construction_robots_available = result.construction_robots_available + entry.construction_robots_available
         result.logistic_robots = result.logistic_robots + entry.logistic_robots
     end
     result.entity_ghosts = surface.count_entities_filtered{force = force, type = "entity-ghost"}
@@ -188,18 +222,28 @@ local function surface_logistics(surface, force, detail)
         type = {"entity-ghost", "tile-ghost"},
         limit = GHOST_SCAN_LIMIT,
     }
-    local needed, uncovered, sample = {}, 0, {}
+    local needed, by_network, uncovered, sample = {}, {}, 0, {}
     for _, ghost in ipairs(ghosts) do
-        local is_covered = on_platform or covered(cells, ghost.position)
+        local network = (not on_platform) and covering_network(cells, ghost.position) or nil
+        local is_covered = on_platform or network ~= nil
         if not is_covered then uncovered = uncovered + 1 end
         local item = ghost_item(ghost)
-        if item then needed[item.name] = (needed[item.name] or 0) + item.count end
+        if item and on_platform then
+            needed[item.name] = (needed[item.name] or 0) + item.count
+        elseif item and network then
+            local entry = by_network[network.network_id]
+            if not entry then
+                entry = {network = network, needed = {}}
+                by_network[network.network_id] = entry
+            end
+            entry.needed[item.name] = (entry.needed[item.name] or 0) + item.count
+        end
         if detail and #sample < 10 then
             sample[#sample + 1] = {name = ghost.ghost_name, position = pos_table(ghost.position), covered = is_covered}
         end
     end
     result.uncovered_ghosts = uncovered
-    result.missing_items = shortfalls(needed, surface, force)
+    result.missing_items = on_platform and shortfalls(needed, surface, force) or network_shortfalls(by_network)
     result.ghosts_truncated = result.entity_ghosts + result.tile_ghosts > GHOST_SCAN_LIMIT
     if detail then result.ghost_sample = sample end
     return result
@@ -781,9 +825,13 @@ function M.summary(force, character)
         local inventory = pad.get_inventory(defines.inventory.cargo_landing_pad_main)
         if inventory then pad_free_slots = (pad_free_slots or 0) + inventory.count_empty_stacks() end
     end
+    local away_planet = (character.surface ~= home and not here) and character.surface or nil
     return {
         character_surface = character.surface.name,
         character_on_platform = here and here.name or nil,
+        -- Force entities on the planet the character stands on, when that is
+        -- not home: how much it has built there.
+        away_planet_entities = away_planet and away_planet.count_entities_filtered{force = force} or nil,
         platforms = platforms,
         home_logistics = surface_logistics(home, force, false),
         landing_pads = #pads,
@@ -796,6 +844,11 @@ function M.summary(force, character)
             space_science_pack = tech_done(force, "space-science-pack"),
             space_platform_thruster = tech_done(force, "space-platform-thruster"),
             planet_discovery_vulcanus = tech_done(force, "planet-discovery-vulcanus"),
+            calcite_processing = tech_done(force, "calcite-processing"),
+            tungsten_carbide = tech_done(force, "tungsten-carbide"),
+            foundry = tech_done(force, "foundry"),
+            big_mining_drill = tech_done(force, "big-mining-drill"),
+            metallurgic_science_pack = tech_done(force, "metallurgic-science-pack"),
         },
     }
 end
@@ -1324,7 +1377,9 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
     local guidance = surface.platform
         and ("The hub builds these from its inventory; bring missing_items with space_platform action=ship."
             .. (ammo_requested > 0 and " It also loads the new turrets with " .. ammo_requested .. " magazines from the hub." or ""))
-        or "Robots build these from items in the network; put missing_items into a storage or passive-provider chest in range. Check progress with robot_logistics."
+        or (surface ~= character.surface
+            and "Robots build these from items in the network; you are on another surface, so if missing_items is not empty, have this planet make them: place_ghosts an assembler on each item (fed by inserters) with an inserter into a passive-provider-chest in range. Check progress with robot_logistics."
+            or "Robots build these from items in the network; put missing_items into a storage or passive-provider chest in range. Check progress with robot_logistics.")
     if recipe_failed then
         guidance = guidance .. " Recipes with recipe_set=false were not applied: set them with set_recipe once the machine is built and you are there."
     end

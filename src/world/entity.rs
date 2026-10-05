@@ -37,6 +37,13 @@ pub struct Entity {
     #[serde(default)]
     pub bounding_box: Option<Area>,
 
+    /// Factorio `RealOrientation` of `bounding_box`, present only when
+    /// non-zero (cliffs). `bounding_box` then holds the unrotated corners and
+    /// the real collision box is rotated clockwise about its centre, so it
+    /// covers tiles outside those corners. Use `collision_box_tiles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounding_box_orientation: Option<f64>,
+
     /// Authoritative pickup point exposed by Factorio for inserters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pickup_position: Option<Position>,

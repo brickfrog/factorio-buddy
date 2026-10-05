@@ -94,6 +94,7 @@ pub const FACTORIO_MCP_TOOLS: &[FactorioToolMetadata] = &[
     tool("get_research_status", false, true, false),
     tool("get_available_research", false, true, false),
     tool("feed_lab_from_inventory", true, false, false),
+    tool("feed_machine_from_inventory", true, false, false),
     tool("start_research", true, false, false),
     tool("get_power_status", false, true, false),
     tool("get_power_networks", false, true, false),

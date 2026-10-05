@@ -17,6 +17,14 @@ local function bounding_box_table(entity)
     }
 end
 
+-- Non-nil only for rotated boxes (cliffs); see entities.summary.
+local function bounding_box_orientation(entity)
+    if not (entity and entity.valid and entity.bounding_box) then return nil end
+    local orientation = entity.bounding_box.orientation
+    if orientation and orientation ~= 0 then return orientation end
+    return nil
+end
+
 local function entity_summary(entity)
     if not (entity and entity.valid) then return nil end
     return {
@@ -28,6 +36,7 @@ local function entity_summary(entity)
         direction = entity.direction,
         force = entity.force and entity.force.name or nil,
         bounding_box = bounding_box_table(entity),
+        bounding_box_orientation = bounding_box_orientation(entity),
     }
 end
 
