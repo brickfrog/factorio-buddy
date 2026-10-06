@@ -1383,15 +1383,24 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             })
         end
     end
+    -- Pasting a machine with a recipe over the same built machine sets its
+    -- recipe, as a blueprint paste does.
+    local retarget = {}
     for _, plan in ipairs(planned_entities) do
-        local built = false
+        local built = nil
         for _, found in pairs(surface.find_entities_filtered{position = plan.position, radius = 1, force = force}) do
             local same = found.name == plan.name or (found.type == "entity-ghost" and found.ghost_name == plan.name)
             local dx, dy = found.position.x - plan.position.x, found.position.y - plan.position.y
-            if same and dx * dx + dy * dy <= 0.51 * 0.51 and not stranded[found.unit_number] then built = true break end
+            if same and dx * dx + dy * dy <= 0.51 * 0.51 and not stranded[found.unit_number] then built = found break end
         end
         if built then
             already_built[#already_built + 1] = {kind = "entity", index = plan.index}
+            if plan.recipe and built.type == "assembling-machine" then
+                local current = built.get_recipe()
+                if not current or current.name ~= plan.recipe then
+                    retarget[#retarget + 1] = {entity = built, recipe = plan.recipe, index = plan.index}
+                end
+            end
         else
             for _, found in pairs(surface.find_entities_filtered{area = plan.area, type = "entity-ghost"}) do
                 if stranded[found.unit_number] and not clear_keys[found.unit_number] then
@@ -1472,6 +1481,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             obstacles = #obstacles,
             missing_items = missing_items,
             would_remove_stranded_ghosts = #clear,
+            would_set_recipes = #retarget,
         }
     end
 
@@ -1534,6 +1544,21 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             ammo_requested = ammo_requested + request_turret_ammo(surface.platform, ghost)
             storage.turret_ammo_orders = storage.turret_ammo_orders or {}
             storage.turret_ammo_orders[surface.platform.index] = true
+        end
+    end
+
+    -- Ingredients a recipe change pulls out go to the hub, or onto the ground.
+    for _, change in ipairs(retarget) do
+        local entity = change.entity
+        local ok, returned = pcall(entity.set_recipe, change.recipe)
+        recipes[#recipes + 1] = {index = change.index, recipe = change.recipe, recipe_set = ok, existing = true}
+        if not ok then recipe_failed = true end
+        for _, item in pairs(ok and returned or {}) do
+            local left = item.count
+            if surface.platform and surface.platform.hub and surface.platform.hub.valid then
+                left = left - surface.platform.hub.insert(item)
+            end
+            if left > 0 then surface.spill_item_stack{position = entity.position, stack = {name = item.name, count = left, quality = item.quality}} end
         end
     end
 
@@ -2187,29 +2212,41 @@ local function action_board(agent_id, character, platform)
     }
 end
 
-local function action_request(character, items)
+-- Landing-pad requests on the planet you stand on, or on stops[1] (pads are
+-- configured remotely, as from the map).
+local function action_request(character, items, stops)
     local list, err = normalize_items(items)
     if not list then return err end
-    if not character.surface.planet then
-        return fail("no_landing_pad", "landing pad requests are set from a planet surface")
+    local surface = character.surface
+    if type(stops) == "table" and stops[1] then
+        surface = game.planets[stops[1]] and game.get_surface(stops[1])
+        if not surface then return fail("invalid_planet", "stops[1] names a planet you have reached", {name = stops[1]}) end
     end
-    local pads = character.surface.find_entities_filtered{name = "cargo-landing-pad", force = character.force}
+    if not surface.planet then
+        return fail("no_landing_pad", "landing pad requests are set on a planet: stand on one or name it in stops")
+    end
+    local pads = surface.find_entities_filtered{name = "cargo-landing-pad", force = character.force}
     if #pads == 0 then
-        return fail("no_landing_pad", "build a cargo-landing-pad on " .. character.surface.name .. " first")
+        return fail("no_landing_pad", "build a cargo-landing-pad on " .. surface.name .. " first")
     end
+    -- Logistic groups are shared by name across the force, so each planet's
+    -- pads get their own; the old shared "buddy" group is dropped from them.
+    local group = "buddy-" .. surface.name
     for _, pad in pairs(pads) do
         local sections = pad.get_logistic_sections()
         local section = nil
-        for _, candidate in pairs(sections.sections) do
-            if candidate.group == "buddy" then section = candidate break end
+        for index = sections.sections_count, 1, -1 do
+            local candidate = sections.get_section(index)
+            if candidate.group == group then section = candidate
+            elseif candidate.group == "buddy" then sections.remove_section(index) end
         end
-        section = section or sections.add_section("buddy")
+        section = section or sections.add_section(group)
         for slot = section.filters_count, 1, -1 do section.clear_slot(slot) end
         for slot, item in ipairs(list) do
             section.set_slot(slot, {value = {type = "item", name = item.name, quality = "normal"}, min = item.count})
         end
     end
-    return {success = true, pads = #pads, requests = list}
+    return {success = true, surface = surface.name, pads = #pads, requests = list}
 end
 
 -- Throw items out of the hub, as an inserter over the platform edge would;
@@ -2445,7 +2482,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     end
     if action == "status" then return action_status(character) end
     if action == "create" then return action_create(character, platform_name) end
-    if action == "request" then return action_request(character, items) end
+    if action == "request" then return action_request(character, items, stops) end
     local platform, err = resolve_platform(character, platform_name)
     if not platform then return err end
     if action == "ship" then return action_ship(agent_id, character, platform, items) end

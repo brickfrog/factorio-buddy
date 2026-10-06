@@ -518,6 +518,27 @@ local function travel_rung(S, character, here, force)
     return nil
 end
 
+-- Space science made on the platform and landed at home: the next missing
+-- step, or nil when it is running.
+local function space_science_rung(P, S)
+    if ((P.recipes or {})["space-science-pack"] or 0) == 0 then
+        return "Make space science on " .. P.name .. ".",
+            recipe_text("space-science-pack") .. ", made only at zero gravity. On the platform: asteroid collectors at the foundation edge, crushers ("
+            .. recipe_text("metallic-asteroid-crushing") .. "; " .. recipe_text("carbonic-asteroid-crushing") .. "; " .. recipe_text("oxide-asteroid-crushing")
+            .. "), an electric furnace for iron plate, an assembler on space-science-pack, inserters from and into the hub, solar panels. Ship the parts (action=ship), then lay them out with place_ghosts surface="
+            .. tostring(P.surface) .. " (add space-platform-foundation tiles to grow it). An assembler already there without a recipe takes one from place_ghosts with its name, position and recipe."
+    end
+    if S.landing_pads == 0 then
+        return "Build a cargo landing pad at home near the labs.",
+            "build_layout; then space_platform action=request items=[{name:\"space-science-pack\",count:100}]."
+    end
+    for _, name in ipairs(S.landing_pad_requests) do
+        if name == "space-science-pack" then return nil end
+    end
+    return "Request space science on the landing pad.",
+        "space_platform action=request items=[{name:\"space-science-pack\",count:100}]. Platforms in orbit drop requested items on their own."
+end
+
 -- Space Age rungs after the first rocket, up to boarding for Vulcanus. Nil
 -- when the generic research rungs (on space_path) are the right next step.
 local function space_rung(facts, force, surface)
@@ -548,26 +569,9 @@ local function space_rung(facts, force, surface)
         return "The starter pack is on its way to " .. P.name .. " (about 30 s).",
             "Meanwhile craft platform parts: asteroid collectors, crushers, solar panels, an electric furnace, an assembler, inserters, belts."
     end
-    if not vulcanus_found and ((P.recipes or {})["space-science-pack"] or 0) == 0 then
-        return "Make space science on " .. P.name .. ".",
-            recipe_text("space-science-pack") .. ", made only at zero gravity. On the platform: asteroid collectors at the foundation edge, crushers ("
-            .. recipe_text("metallic-asteroid-crushing") .. "; " .. recipe_text("carbonic-asteroid-crushing") .. "; " .. recipe_text("oxide-asteroid-crushing")
-            .. "), an electric furnace for iron plate, an assembler on space-science-pack, inserters from and into the hub, solar panels. Ship the parts (action=ship), then lay them out with place_ghosts surface="
-            .. tostring(P.surface) .. " (add space-platform-foundation tiles to grow it)."
-    end
-    if not vulcanus_found and S.landing_pads == 0 then
-        return "Build a cargo landing pad at home near the labs.",
-            "build_layout; then space_platform action=request items=[{name:\"space-science-pack\",count:100}]."
-    end
     if not vulcanus_found then
-        local requested = false
-        for _, name in ipairs(S.landing_pad_requests) do
-            if name == "space-science-pack" then requested = true end
-        end
-        if not requested then
-            return "Request space science on the landing pad.",
-                "space_platform action=request items=[{name:\"space-science-pack\",count:100}]. Platforms in orbit drop requested items on their own."
-        end
+        local goal, how = space_science_rung(P, S)
+        if goal then return goal, how end
         return nil
     end
     if (P.thrusters or 0) == 0 then
@@ -631,6 +635,17 @@ local function space_rung(facts, force, surface)
     end
     if (H.storage_chests or 0) == 0 then
         return "Add a storage-chest to the home network.", "build_layout a storage-chest inside the roboport network: robots put what they carry back there."
+    end
+    -- Requester chests come with logistic-system, which needs space science.
+    if not tech_done(force, "logistic-system") then
+        local goal, how = space_science_rung(P, S)
+        if goal then return goal, how end
+        local tech = force.technologies["logistic-system"]
+        local packs = {}
+        for _, ingredient in pairs(tech and tech.research_unit_ingredients or {}) do packs[#packs + 1] = ingredient.name end
+        return "Research logistic-system: the silo's supply chest is a requester chest.",
+            "start_research logistic-system (" .. tostring(tech and tech.research_unit_count) .. " units of " .. table.concat(packs, ", ")
+            .. "). Space science lands on the pad from " .. P.name .. "'s assembler; keep its crushers and the labs fed."
     end
     if (H.silos_with_supply_chest or 0) == 0 then
         return "Give the silo a supply chest.",

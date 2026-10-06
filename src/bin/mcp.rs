@@ -8139,7 +8139,7 @@ pub struct SpacePlatformParams {
     /// ship: items from your inventory; unship: queued items to take back (empty = all); request: landing-pad requests (count = minimum); supply: hub import requests (count = minimum, 0 drops); jettison: hub items to throw away.
     #[serde(default)]
     pub items: Vec<ItemCount>,
-    /// schedule: planet names in order (two or more = shuttle); empty = stay. supply: the planet the items come from (default home).
+    /// schedule: planet names in order (two or more = shuttle); empty = stay. supply: the planet the items come from (default home). request: the planet whose landing pads to set (default yours).
     #[serde(default)]
     pub stops: Vec<String>,
     /// land: spot to land near.
@@ -17719,7 +17719,7 @@ impl FactorioMcp {
 
     /// Create, supply, fly, board and land space platforms.
     #[tool(
-        description = "Space platforms. status; create (needs rocket-silo); ship items from your inventory beside a silo: they leave by themselves with each ready rocket, 1 t per rocket, items the platform's ghosts lack first (a new platform needs its starter pack first); unship takes queued cargo back; request items on the landing pads here; supply sets standing hub requests from a planet, filled by rockets whose silo has a supply chest (requester chest + inserter into the silo) while the platform orbits it, also when you are away; jettison hub items overboard (lost); clear_ghosts removes ghosts the hub can never build (over empty space, or on a built entity); load_turrets has the hub fill the platform's turrets with ammo; schedule planet stops (two or more shuttle: wait for supply where it imports, for the landing pads elsewhere); board (ride a ready rocket up, empty cargo); land (drop from the hub to the planet below)."
+        description = "Space platforms. status; create (needs rocket-silo); ship items from your inventory beside a silo: they leave by themselves with each ready rocket, 1 t per rocket, items the platform's ghosts lack first (a new platform needs its starter pack first); unship takes queued cargo back; request items on the landing pads here (or on the planet in stops); supply sets standing hub requests from a planet, filled by rockets whose silo has a supply chest (requester chest + inserter into the silo) while the platform orbits it, also when you are away; jettison hub items overboard (lost); clear_ghosts removes ghosts the hub can never build (over empty space, or on a built entity); load_turrets has the hub fill the platform's turrets with ammo; schedule planet stops (two or more shuttle: wait for supply where it imports, for the landing pads elsewhere); board (ride a ready rocket up, empty cargo); land (drop from the hub to the planet below)."
     )]
     async fn space_platform(&self, Parameters(params): Parameters<SpacePlatformParams>) -> String {
         let mut client = match self.connect().await {

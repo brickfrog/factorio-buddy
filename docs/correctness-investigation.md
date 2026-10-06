@@ -1052,6 +1052,25 @@ The supply line therefore has to be set up before departure. A new chain branche
   - The new rungs advance one by one as each piece is placed, ending at "Set buddy-1's course for Vulcanus". Supply waits while Buddy's own iron-ore shipment is queued.
 - Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live40`; new checks: `supply` sets a hub import request and reports what is missing, and a count of 0 drops it).
 
+### `s41-cont40-opus-open-2590060469-60m`: the backbone, first hour
+
+60 minutes, 30 turns, none provider-limited, 54 tool errors, 0 invariant failures. `plate_automation` and `powered_production` held.
+- Buddy built the home backbone in rung order:
+  - a second roboport at (72,111) covering the silo's logistic range (crafted after fixing a plastic plant whose output belt was full);
+  - a battery line (water, sulfuric acid, batteries) for 20 logistic robots;
+  - 2 storage chests;
+  - topped up buddy-1's thruster ore to 559;
+  - 28 `place_ghosts` calls on Nauvis.
+- **Blocked at the supply chest:** requester chests come with `logistic-system`, which needs 500 units of red, green, blue and space science. No space science was made: buddy-1's assembler had no recipe, and the space-science rung was gated off once Vulcanus was discovered. Buddy also found no tool that sets a recipe on an existing platform machine.
+- Late in the hour Buddy turned to Nauvis science (a copper jam in the green-science inserter feed); only 1 of 18 labs was working.
+
+### Fixes after s41
+
+- Before the supply chest: space science on the platform (shared `space_science_rung`), the pad and its request, then "Research logistic-system" with its pack list.
+- **Recipe paste:** `place_ghosts` with a recipe over the same built assembling machine sets that recipe, as a blueprint paste does. Ingredients the change pulls out go to the hub (or the ground); `would_set_recipes` shows it on a dry run. On s41's save, buddy-1's idle assembler-2 at (-8.5,3.5) took `space-science-pack`, and the rung moved to "Research logistic-system".
+- **Landing pads per planet:** `request` takes `stops[1]` to set another planet's pads (e.g. the Nauvis pad from Vulcanus). Each planet's pads use their own logistic group (`buddy-<planet>`): groups are shared force-wide by name, so the old shared `buddy` group would have copied Vulcanus requests onto Nauvis. The old group is dropped from pads it is set on.
+- Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live41`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
