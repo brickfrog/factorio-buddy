@@ -1003,6 +1003,55 @@ Sandbox runs on long32's save:
 - The idle-lab warning names the current research and the packs the labs lack, with a remote fix while away (research what Nauvis still makes, or rebuild the pack's supply with `place_ghosts surface=nauvis`). On long45's save: "Research (fluid-wagon) is queued but no lab at home is working: they lack logistic-science-pack (18 labs)…".
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 522 passed and 0 failed (`fb-evidence/git-gud/live39`).
 
+## Supply line: prepare before leaving
+
+Long45 showed the limit: metallurgic packs are only useful in a lab beside Nauvis science, and Buddy on Vulcanus could not move anything between planets.
+- The Nauvis robot network held no items, so ghosts placed from Vulcanus could not be built.
+- Leaving Vulcanus needs a silo and 50 rocket parts made there.
+
+The supply line therefore has to be set up before departure. A new chain branches from long40's save (Buddy on Nauvis, armed platform at Nauvis).
+
+### Mechanics, verified in the sandbox
+
+- **Vanilla automatic requests do not engage here.** With `silo.use_transitional_requests` on and a hub request `import_from = "nauvis"`, a covered silo (long40 save) got no `transitional_request_target`, and its rocket inventory refused inserts.
+- **Requester chest + inserter into the silo works with real robots** (manual mode): robots filled the chest from the network and the inserter loaded the ready rocket (24 → 150 gears). Vanilla does not launch a partly filled rocket.
+- **Landing pads pull from platforms in orbit.** On long45's save, a Vulcanus pad requesting 100 processing units and 50 gears took both from a platform orbiting Vulcanus, though the hub itself imported processing units from Nauvis.
+- **Platform schedules take wait conditions:** `all_requests_satisfied`, `time` and `inactivity`, with `compare_type = "or"`.
+
+### What the mod does now
+
+- **`space_platform action=supply`** sets the hub's own vanilla import requests (a logistic section per platform and planet; `stops[1]` picks the planet, default home; 0 drops an item).
+- **`process_supply`** runs every second after `process_shipments`:
+  - It serves each platform orbiting a planet where it has unmet imports. Cargo launched in the last 75 s counts as delivered.
+  - It uses a silo with a **supply chest** (a requester or buffer chest whose inserter drops into the silo). The chest's request is set to the shortfall not yet in the rocket or the chests, written only when it changes.
+  - The rocket launches to the hub once it holds the shortfall, is full, or the network has none left of what it lacks.
+  - The agent's queued shipments and boarding bookings on that surface go first.
+  - Chests no longer needed stop requesting.
+- **Schedules with two or more stops are shuttles:**
+  - where the hub imports from the planet, it waits for `all_requests_satisfied` (or 10 min);
+  - elsewhere, it waits for 30 s of inactivity (or 5 min) while landing pads take what they request.
+  
+  `supply` re-derives these waits.
+- **Departure holds:**
+  - `unarmed` and `thrust_stock` hold only where the platform can be restocked (a silo with a supply chest, or an agent beside or above a silo), so a shuttle that spent its ammo at Vulcanus still flies home.
+  - `no_crew` holds only the first trip to a planet where the force has built nothing.
+  - A parked schedule keeps its current stop.
+- **Status:** `platform.supply` (`from`, `requests`, `missing`, silos with a supply chest); `space.home_supply` (silos in logistic range, silos with a supply chest, logistic robots, storage chests, imports the network holds none of).
+- **Rungs before "Set course":**
+  1. silo inside logistic range;
+  2. 20 logistic robots;
+  3. a storage chest;
+  4. a supply chest at the silo;
+  5. the platform's standing supply (piercing magazines, iron ore, foundation);
+  6. stock the network with what it lacks.
+  
+  The Board kit adds a cargo-landing-pad and logistic robots.
+- **On Vulcanus:** place the carried landing pad, then turn the orbiting platform into a shuttle (`stops=["nauvis","vulcanus"]`) and add what Vulcanus needs to its supply and the pad's requests.
+- **Sandbox on long40's save:**
+  - `supply` of 200 gears through a scripted network (roboport, 20 logistic robots, storage chest, requester chest, inserter): the chest's request went 164 → 134 → … as the rocket filled, the rocket launched at the shortfall, and **202 gears reached the hub**.
+  - The new rungs advance one by one as each piece is placed, ending at "Set buddy-1's course for Vulcanus". Supply waits while Buddy's own iron-ore shipment is queued.
+- Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live40`; new checks: `supply` sets a hub import request and reports what is missing, and a count of 0 drops it).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

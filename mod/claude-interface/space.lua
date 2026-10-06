@@ -498,6 +498,94 @@ local function request_turret_ammo(platform, entity)
     return count
 end
 
+-- ============================================================
+-- Standing supply: a platform's own hub import requests, filled by rockets
+-- whose cargo robots bring to a supply chest beside the silo.
+-- ============================================================
+
+-- The platform's hub requests (vanilla logistic sections) that import from
+-- `planet`: item name -> minimum.
+local function hub_imports(platform, planet)
+    local wanted = {}
+    local hub = platform.hub
+    if not (hub and hub.valid) then return wanted end
+    for _, section in pairs(hub.get_logistic_sections().sections) do
+        if section.active then
+            for slot = 1, section.filters_count do
+                local filter = section.get_slot(slot)
+                local from = filter.import_from
+                local from_name = from and (type(from) == "string" and from or from.name)
+                local name = filter.value and filter.value.name
+                if name and prototypes.item[name] and (filter.min or 0) > 0 and from_name == planet then
+                    wanted[name] = math.max(wanted[name] or 0, filter.min)
+                end
+            end
+        end
+    end
+    return wanted
+end
+
+-- A supply rocket lands within about a minute; until then its cargo counts
+-- as on the way.
+local SUPPLY_FLIGHT_TICKS = 75 * 60
+
+local function in_flight(platform)
+    local items = {}
+    local flights = storage.supply_flights and storage.supply_flights[platform.index]
+    if not flights then return items end
+    for index = #flights, 1, -1 do
+        if game.tick - flights[index].tick > SUPPLY_FLIGHT_TICKS then
+            table.remove(flights, index)
+        else
+            for name, count in pairs(flights[index].items) do items[name] = (items[name] or 0) + count end
+        end
+    end
+    return items
+end
+
+-- What the platform still needs from `planet` (name -> count), or nil.
+local function supply_deficits(platform, planet)
+    local hub = platform.hub
+    if not (hub and hub.valid) then return nil end
+    local deficits, any = {}, false
+    local flying = in_flight(platform)
+    for name, min in pairs(hub_imports(platform, planet)) do
+        local short = min - hub.get_item_count(name) - (flying[name] or 0)
+        if short > 0 then deficits[name], any = short, true end
+    end
+    return any and deficits or nil
+end
+
+-- Requester or buffer chests whose inserter loads `silo`'s rocket.
+local function supply_chests(silo)
+    local chests = {}
+    local box = silo.bounding_box
+    local area = {{box.left_top.x - 2, box.left_top.y - 2}, {box.right_bottom.x + 2, box.right_bottom.y + 2}}
+    for _, inserter in pairs(silo.surface.find_entities_filtered{type = "inserter", force = silo.force, area = area}) do
+        local source = inserter.drop_target == silo and inserter.pickup_target
+        if source and source.valid and source.type == "logistic-container" then
+            local mode = source.prototype.logistic_mode
+            if mode == "requester" or mode == "buffer" then chests[#chests + 1] = source end
+        end
+    end
+    return chests
+end
+
+-- True when silos on `surface` can resupply a platform: one has a supply
+-- chest, or an agent stands there to ship by hand.
+local function resuppliable(surface, force)
+    if not surface then return false end
+    local silos = surface.find_entities_filtered{type = "rocket-silo", force = force}
+    for _, silo in pairs(silos) do
+        if supply_chests(silo)[1] then return true end
+    end
+    if not silos[1] then return false end
+    for _, character in pairs(storage.characters or {}) do
+        if character.valid and character.surface == surface then return true end
+    end
+    return false
+end
+
 -- The station the platform's schedule sends it to next, when that is not
 -- where it is parked; nil when it is staying.
 local function leaving_for(platform)
@@ -518,13 +606,23 @@ local function crewed(platform)
     return false
 end
 
--- Why a departure is held: "unarmed", "thrust_stock" (thruster-fluid
--- ingredients under THRUST_RESERVE: the thrusters burn out within seconds
--- and the platform stalls), "no_crew", or nil when it may leave.
-local function hold_reason(platform)
-    if not armament(platform).armed then return "unarmed" end
-    if thrust_shortages(platform)[1] then return "thrust_stock" end
-    if not crewed(platform) then return "no_crew" end
+-- Why a departure for `destination` is held: "unarmed" or "thrust_stock"
+-- (thruster-fluid ingredients under THRUST_RESERVE: the thrusters burn out
+-- within seconds and the platform stalls) where it can be restocked, so a
+-- shuttle that spent its ammo at a planet without silos still flies home;
+-- "no_crew" for the first trip to a planet, which strands the agent if it
+-- goes alone; or nil when it may leave. Once a planet has been reached,
+-- platforms shuttle there without crew.
+local function hold_reason(platform, destination)
+    local here = platform.space_location and game.get_surface(platform.space_location.name)
+    -- Crew aboard can land and ship, where the planet below has a silo.
+    local restockable = resuppliable(here, platform.force)
+        or (here ~= nil and crewed(platform) and here.find_entities_filtered{type = "rocket-silo", force = platform.force, limit = 1}[1] ~= nil)
+    if restockable and not armament(platform).armed then return "unarmed" end
+    if restockable and thrust_shortages(platform)[1] then return "thrust_stock" end
+    local target = destination and game.get_surface(destination)
+    local visited = target ~= nil and target.count_entities_filtered{force = platform.force, limit = 1} > 0
+    if not crewed(platform) and not visited then return "no_crew" end
     return nil
 end
 
@@ -552,15 +650,23 @@ function M.tend_platforms()
                 -- leaving_for is nil in transit, and a held platform has no
                 -- schedule, so it never moves while held.
                 if held[platform.index] then
-                    if not hold_reason(platform) then
-                        platform.schedule = {current = 1, records = held[platform.index]}
+                    -- Saves before shuttles stored the bare record list.
+                    local entry = held[platform.index]
+                    local records = entry.records or entry
+                    local current = entry.current or 1
+                    local record = records[current]
+                    if not hold_reason(platform, record and record.station) then
+                        platform.schedule = {current = current, records = records}
                         platform.paused = false
                         held[platform.index] = nil
                     end
-                elseif leaving_for(platform) and hold_reason(platform) then
-                    held[platform.index] = platform.schedule.records
-                    platform.schedule = nil
-                    platform.paused = false
+                else
+                    local destination = leaving_for(platform)
+                    if destination and hold_reason(platform, destination) then
+                        held[platform.index] = {records = platform.schedule.records, current = platform.schedule.current or 1}
+                        platform.schedule = nil
+                        platform.paused = false
+                    end
                 end
             end
         end
@@ -668,7 +774,8 @@ local function platform_summary(platform)
     }
     local schedule = platform.schedule
     local held = storage.departure_held and storage.departure_held[platform.index]
-    for _, record in pairs(held or (schedule and schedule.records) or {}) do
+    local held_records = held and (held.records or held)
+    for _, record in pairs(held_records or (schedule and schedule.records) or {}) do
         summary.stops[#summary.stops + 1] = record.station
     end
     local hub = platform.hub
@@ -684,7 +791,27 @@ local function platform_summary(platform)
         summary.armament.turret_slots = turret_slots(platform, math.max(a.min_ready_turrets - a.turrets_ready, a.min_front_turrets - a.front_turrets_ready),
             a.front_turrets_ready < a.min_front_turrets)
     end
-    summary.departure_held = storage.departure_held and storage.departure_held[platform.index] and (hold_reason(platform) or "releasing") or nil
+    if held then
+        local record = held_records[held.current or 1]
+        summary.departure_held = hold_reason(platform, record and record.station) or "releasing"
+    end
+    -- Standing supply from the planet it orbits: the hub's import requests
+    -- and what is still missing (cargo already flying counts as delivered).
+    if location and hub and hub.valid then
+        local imports = hub_imports(platform, location.name)
+        if next(imports) then
+            summary.supply = {from = location.name, requests = top_counts(imports, 15), missing = supply_deficits(platform, location.name)}
+            if summary.supply.missing then summary.supply.missing = top_counts(summary.supply.missing, 15) end
+            local silos, fed = 0, 0
+            local here = game.get_surface(location.name)
+            for _, silo in pairs(here and here.find_entities_filtered{type = "rocket-silo", force = platform.force} or {}) do
+                silos = silos + 1
+                if supply_chests(silo)[1] then fed = fed + 1 end
+            end
+            summary.supply.silos = silos
+            summary.supply.silos_with_supply_chest = fed
+        end
+    end
     local queued = {}
     for _, shipment in ipairs(storage.space_shipments or {}) do
         if shipment.platform_name == platform.name and shipment.inventory and shipment.inventory.valid then
@@ -811,6 +938,41 @@ function M.home_surface(character)
     return surface
 end
 
+-- The home side of standing supply: silos inside a logistic network's
+-- logistic range, silos with a supply chest, logistic robots, storage
+-- chests, and hub imports from home the network holds none of.
+local function home_supply(home, force)
+    local result = {silos = 0, silos_in_logistic_range = 0, silos_with_supply_chest = 0, logistic_robots = 0, storage_chests = 0, network_lacks = {}}
+    local networks = force.logistic_networks[home.name] or {}
+    for _, network in pairs(networks) do
+        result.logistic_robots = result.logistic_robots + network.all_logistic_robots
+        result.storage_chests = result.storage_chests + #network.storages
+    end
+    for _, silo in pairs(home.find_entities_filtered{type = "rocket-silo", force = force}) do
+        result.silos = result.silos + 1
+        for _, network in pairs(networks) do
+            local covered_here = false
+            for _, cell in pairs(network.cells) do
+                if cell.valid and cell.is_in_logistic_range(silo.position) then covered_here = true break end
+            end
+            if covered_here then result.silos_in_logistic_range = result.silos_in_logistic_range + 1 break end
+        end
+        if supply_chests(silo)[1] then result.silos_with_supply_chest = result.silos_with_supply_chest + 1 end
+    end
+    local imports = {}
+    for _, platform in ipairs(valid_platforms(force)) do
+        for name, count in pairs(hub_imports(platform, home.name)) do imports[name] = math.max(imports[name] or 0, count) end
+    end
+    result.imports = next(imports) and top_counts(imports, 15) or nil
+    for name in pairs(imports) do
+        local stock = 0
+        for _, network in pairs(networks) do stock = stock + network.get_item_count(name) end
+        if stock == 0 then result.network_lacks[#result.network_lacks + 1] = name end
+    end
+    table.sort(result.network_lacks)
+    return result
+end
+
 function M.summary(force, character)
     local home = M.home_surface(character)
     local platforms = {}
@@ -834,6 +996,7 @@ function M.summary(force, character)
         away_planet_entities = away_planet and away_planet.count_entities_filtered{force = force} or nil,
         platforms = platforms,
         home_logistics = surface_logistics(home, force, false),
+        home_supply = home_supply(home, force),
         landing_pads = #pads,
         landing_pad_requests = requests,
         landing_pad_free_slots = pad_free_slots,
@@ -1402,7 +1565,7 @@ end
 -- space_platform
 -- ============================================================
 
-local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, jettison = true, clear_ghosts = true, load_turrets = true, schedule = true, board = true, land = true}
+local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, supply = true, jettison = true, clear_ghosts = true, load_turrets = true, schedule = true, board = true, land = true}
 
 local function resolve_platform(character, platform_name)
     local force = character.force
@@ -1717,6 +1880,104 @@ function M.process_shipments()
     end
 end
 
+-- Point a supply chest's request section at `wanted` (name -> count); only
+-- written when it changes, so robots are not re-dispatched every second.
+local function set_chest_requests(chest, wanted)
+    storage.supply_chest_requests = storage.supply_chest_requests or {}
+    local names = {}
+    for name, count in pairs(wanted) do
+        if count > 0 then names[#names + 1] = name end
+    end
+    table.sort(names)
+    local parts = {}
+    for _, name in ipairs(names) do parts[#parts + 1] = name .. "=" .. wanted[name] end
+    local signature = table.concat(parts, ",")
+    local previous = storage.supply_chest_requests[chest.unit_number]
+    if (previous and previous.signature or "") == signature then return end
+    storage.supply_chest_requests[chest.unit_number] = signature ~= "" and {entity = chest, signature = signature} or nil
+    local sections = chest.get_logistic_sections()
+    local section = sections.get_section(1) or sections.add_section()
+    for slot = section.filters_count, 1, -1 do section.clear_slot(slot) end
+    for slot, name in ipairs(names) do
+        section.set_slot(slot, {value = {type = "item", name = name, quality = "normal"}, min = wanted[name]})
+    end
+end
+
+-- Fill one platform's shortfall through `silo`: its first supply chest asks
+-- robots for what the rocket and the chests do not hold yet, the inserter
+-- loads the rocket, and the rocket goes up once it holds the shortfall (or
+-- is full, or the network has none left of what it lacks).
+local function supply_silo(platform, silo, chests, deficits)
+    local rocket = silo.get_inventory(defines.inventory.rocket_silo_rocket)
+    if not rocket then return end
+    local network = chests[1].logistic_network
+    local wanted = {}
+    for name, short in pairs(deficits) do
+        local queued = 0
+        for _, chest in ipairs(chests) do queued = queued + chest.get_item_count(name) end
+        local more = short - rocket.get_item_count(name) - queued
+        wanted[name] = chests[1].get_item_count(name) + math.max(0, more)
+    end
+    set_chest_requests(chests[1], wanted)
+    for index = 2, #chests do set_chest_requests(chests[index], {}) end
+
+    if silo.rocket_silo_status ~= defines.rocket_silo_status.rocket_ready or rocket.is_empty() then return end
+    local hub_inventory = platform.hub.get_inventory(defines.inventory.hub_main)
+    if hub_inventory and hub_inventory.count_empty_stacks() == 0 then return end
+    for name, short in pairs(deficits) do
+        if rocket.get_item_count(name) < short and rocket.can_insert{name = name, count = 1} then
+            local left = network and network.get_item_count(name) or 0
+            for _, chest in ipairs(chests) do left = left + chest.get_item_count(name) end
+            if left > 0 then return end
+        end
+    end
+    local items = {}
+    for _, entry in pairs(rocket.get_contents()) do items[entry.name] = (items[entry.name] or 0) + entry.count end
+    local ok, launched = pcall(silo.launch_rocket, {type = defines.cargo_destination.station, station = platform.hub})
+    if ok and launched then
+        storage.supply_flights = storage.supply_flights or {}
+        storage.supply_flights[platform.index] = storage.supply_flights[platform.index] or {}
+        table.insert(storage.supply_flights[platform.index], {tick = game.tick, items = items})
+    end
+end
+
+-- Called every second after process_shipments: platforms in orbit with hub
+-- import requests from that planet are served by silos that have a supply
+-- chest. The agent's own shipments and boarding bookings go first, so their
+-- surfaces are skipped; idle supply chests stop requesting.
+function M.process_supply()
+    local busy = {}
+    for _, shipment in ipairs(storage.space_shipments or {}) do busy[shipment.surface_index] = true end
+    for _, booking in pairs(storage.board_bookings or {}) do busy[booking.surface_index] = true end
+    local active = {}
+    for _, force in pairs(game.forces) do
+        local claimed = {}
+        for _, platform in pairs(force.platforms) do
+            local location = platform.valid and platform.hub and platform.hub.valid and platform.space_location
+            local surface = location and game.get_surface(location.name)
+            local deficits = surface and not busy[surface.index] and supply_deficits(platform, location.name)
+            if deficits then
+                for _, silo in pairs(surface.find_entities_filtered{type = "rocket-silo", force = force}) do
+                    if not claimed[silo.unit_number] then
+                        local chests = supply_chests(silo)
+                        if chests[1] then
+                            claimed[silo.unit_number] = true
+                            for _, chest in ipairs(chests) do active[chest.unit_number] = true end
+                            supply_silo(platform, silo, chests, deficits)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    for unit_number, entry in pairs(storage.supply_chest_requests or {}) do
+        if not active[unit_number] then
+            if entry.entity and entry.entity.valid then set_chest_requests(entry.entity, {}) else storage.supply_chest_requests[unit_number] = nil end
+        end
+    end
+end
+
 local function action_ship(agent_id, character, platform, items)
     local list, err = normalize_items(items)
     if not list then return err end
@@ -2017,6 +2278,100 @@ local function action_load_turrets(platform)
     return result
 end
 
+-- Schedule records for `stations`. With two or more stops the platform
+-- shuttles: where its hub imports from the planet it waits until those
+-- requests are filled (10 minutes at most, so an empty network cannot
+-- strand it); elsewhere it waits for 30 seconds without cargo moving, so
+-- landing pads there can take what they request.
+local function shuttle_records(platform, stations)
+    local records = {}
+    for _, station in ipairs(stations) do
+        local record = {station = station}
+        if #stations > 1 then
+            if next(hub_imports(platform, station)) then
+                record.wait_conditions = {
+                    {type = "all_requests_satisfied"},
+                    {type = "time", ticks = 10 * 60 * 60, compare_type = "or"},
+                }
+            else
+                record.wait_conditions = {
+                    {type = "inactivity", ticks = 30 * 60},
+                    {type = "time", ticks = 5 * 60 * 60, compare_type = "or"},
+                }
+            end
+        end
+        records[#records + 1] = record
+    end
+    return records
+end
+
+-- Standing supply: set the hub's import requests from `planet` (default:
+-- home). Silos there with a supply chest fill them by rocket whenever the
+-- platform orbits that planet. A count of 0 drops an item.
+local function action_supply(character, platform, items, stops)
+    local planet = type(stops) == "table" and stops[1] or M.home_surface(character).name
+    if type(planet) ~= "string" or not game.planets[planet] then
+        return fail("invalid_planet", "stops[1] names the planet the items come from", {name = planet})
+    end
+    if not (platform.hub and platform.hub.valid) then
+        return fail("platform_not_ready", platform.name .. " has no hub yet (" .. state_name(platform.state) .. ")")
+    end
+    if type(items) ~= "table" or #items == 0 then
+        return fail("invalid_items", "items must list at least one {name, count}")
+    end
+    local requests = {}
+    for index, item in ipairs(items) do
+        local name = type(item) == "table" and item.name or nil
+        local count = type(item) == "table" and item.count or nil
+        if type(name) ~= "string" or not prototypes.item[name] then
+            return fail("invalid_items", "item " .. index .. " is not a known item", {index = index, name = name})
+        end
+        if type(count) ~= "number" or count < 0 or count % 1 ~= 0 then
+            return fail("invalid_items", "item " .. index .. " needs a whole count (0 drops it)", {index = index})
+        end
+        requests[name] = count
+    end
+    local group = "buddy-supply-" .. platform.index .. "-" .. planet
+    local sections = platform.hub.get_logistic_sections()
+    local section = nil
+    for _, candidate in pairs(sections.sections) do
+        if candidate.group == group then section = candidate break end
+    end
+    section = section or sections.add_section(group)
+    for slot = 1, section.filters_count do
+        local filter = section.get_slot(slot)
+        local name = filter.value and filter.value.name
+        if name and requests[name] == nil then requests[name] = filter.min or 0 end
+    end
+    for slot = section.filters_count, 1, -1 do section.clear_slot(slot) end
+    local names = {}
+    for name, count in pairs(requests) do
+        if count > 0 then names[#names + 1] = name end
+    end
+    table.sort(names)
+    for slot, name in ipairs(names) do
+        section.set_slot(slot, {value = {type = "item", name = name, quality = "normal"}, min = requests[name], import_from = planet})
+    end
+    -- A shuttle's waits follow its imports.
+    local schedule = platform.schedule
+    if schedule and schedule.records and #schedule.records > 1 then
+        local stations = {}
+        for _, record in ipairs(schedule.records) do stations[#stations + 1] = record.station end
+        platform.schedule = {current = schedule.current or 1, records = shuttle_records(platform, stations)}
+    end
+    local result = platform_summary(platform)
+    result.success = true
+    local surface = game.get_surface(planet)
+    local fed = 0
+    for _, silo in pairs(surface and surface.find_entities_filtered{type = "rocket-silo", force = platform.force} or {}) do
+        if supply_chests(silo)[1] then fed = fed + 1 end
+    end
+    result.guidance = fed > 0
+        and ("Whenever " .. platform.name .. " orbits " .. planet .. ", robots bring these to the silo's supply chest and rockets carry them up. Stock them in " .. planet .. "'s logistic network (provider or storage chests).")
+        or ("Requests set, but no silo on " .. planet .. " has a supply chest: place a requester-chest beside a silo with an inserter into the silo (inside the roboport network); the mod sets its requests and launches the rockets.")
+    return result
+end
+
 local function action_schedule(character, platform, stops)
     local force = character.force
     stops = type(stops) == "table" and stops or {}
@@ -2033,9 +2388,7 @@ local function action_schedule(character, platform, stops)
         platform.schedule = nil
         platform.paused = true
     else
-        local records = {}
-        for _, stop in ipairs(stops) do records[#records + 1] = {station = stop} end
-        platform.schedule = {current = 1, records = records}
+        platform.schedule = {current = 1, records = shuttle_records(platform, stops)}
         platform.paused = false
     end
     M.tend_platforms()
@@ -2088,7 +2441,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     local character = characters.find(agent_id)
     if not character then return no_character(agent_id) end
     if not ACTIONS[action] then
-        return fail("invalid_action", "action must be status, create, ship, unship, request, jettison, clear_ghosts, load_turrets, schedule, board or land", {action = action})
+        return fail("invalid_action", "action must be status, create, ship, unship, request, supply, jettison, clear_ghosts, load_turrets, schedule, board or land", {action = action})
     end
     if action == "status" then return action_status(character) end
     if action == "create" then return action_create(character, platform_name) end
@@ -2102,6 +2455,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     if action == "load_turrets" then return action_load_turrets(platform) end
     if action == "unship" then return action_unship(character, platform, items) end
     if action == "schedule" then return action_schedule(character, platform, stops) end
+    if action == "supply" then return action_supply(character, platform, items, stops) end
     return action_land(character, platform, x, y)
 end
 

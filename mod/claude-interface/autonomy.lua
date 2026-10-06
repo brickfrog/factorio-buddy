@@ -401,7 +401,7 @@ local REMOTE_HOME = " Nauvis runs without you: check it with robot_logistics sur
 -- technologies: rocks and calcite, solar power, acid, one tungsten carbide
 -- (unlocks foundry), a foundry (unlocks big-mining-drill), tungsten plate
 -- (unlocks metallurgic science).
-local function vulcanus_rung(here, force, character)
+local function vulcanus_rung(here, force, character, S)
     local inventory = character.get_main_inventory()
     local function have(item) return inventory and inventory.get_item_count(item) or 0 end
     if not tech_done(force, "tungsten-carbide") then
@@ -417,6 +417,19 @@ local function vulcanus_rung(here, force, character)
         return "Power Vulcanus with solar panels.",
             "There is no water here for steam; solar panels give " .. tostring(here.solar_power_percent or "?") .. "% power on Vulcanus. "
             .. recipe_text("solar-panel") .. " (you have " .. have("solar-panel") .. "). Place them with build_layout beside the machines and connect with poles; accumulators carry the night." .. REMOTE_HOME
+    end
+    -- The supply line: a landing pad here takes what the shuttle brings.
+    if (here.counts["cargo-landing-pad"] or 0) == 0 and have("cargo-landing-pad") > 0 then
+        return "Place your cargo-landing-pad on Vulcanus.",
+            "build_layout it inside the power network. Platforms orbiting Vulcanus drop what it requests (space_platform action=request items=[...])." .. REMOTE_HOME
+    end
+    for _, platform in ipairs(S.platforms or {}) do
+        local stops = platform.stops or {}
+        if platform.space_location == "vulcanus" and #stops < 2 and (here.counts["cargo-landing-pad"] or 0) > 0 then
+            return "Turn " .. platform.name .. " into a shuttle between Nauvis and Vulcanus.",
+                "space_platform action=schedule platform=" .. platform.name .. " stops=[\"nauvis\",\"vulcanus\"]: at Nauvis it waits until its supply requests are filled (rockets bring them while you are here), at Vulcanus until the landing pad has taken what it requests. "
+                .. "Then add what Vulcanus needs to its supply (space_platform action=supply items=[...]) and to the pad's requests here (action=request). Orbiting Vulcanus with no supply, it is worn down by asteroids." .. REMOTE_HOME
+        end
     end
     if here.acid_pumpjacks == 0 then
         return "Pump sulfuric acid: put a pumpjack on a sulfuric-acid-geyser.",
@@ -465,7 +478,7 @@ end
 -- Rungs for a character away from home: on a platform or on Vulcanus.
 local function travel_rung(S, character, here, force)
     if here then
-        if here.surface == "vulcanus" then return vulcanus_rung(here, force, character) end
+        if here.surface == "vulcanus" then return vulcanus_rung(here, force, character, S) end
         return "You are on " .. here.surface .. ".", "Build power and a roboport from what you carried." .. REMOTE_HOME
     end
     if not S.character_on_platform then return nil end
@@ -603,12 +616,42 @@ local function space_rung(facts, force, surface)
             .. " now (space_platform action=ship), and make it on the platform: asteroid-collectors at the foundation edge and a crusher on that recipe, with inserters to and from the hub (place_ghosts surface="
             .. tostring(P.surface) .. ")."
     end
+    -- The supply line keeps running after you leave: robots load a silo
+    -- with what the platform's hub requests from Nauvis, so it can shuttle
+    -- to Vulcanus and back without you.
+    local H = S.home_supply or {}
+    if (H.silos_in_logistic_range or 0) == 0 then
+        return "Bring the rocket silo into the roboport network's logistic range.",
+            "Logistic robots serve only a roboport's logistic area (" .. recipe_text("roboport")
+            .. "; its logistic area is much smaller than its build area): place a powered roboport beside the silo (build_layout, or place_ghosts surface=nauvis inside current coverage)."
+    end
+    if (H.logistic_robots or 0) < 20 then
+        return "Give the home network at least 20 logistic robots (" .. (H.logistic_robots or 0) .. " now).",
+            recipe_text("logistic-robot") .. ". Craft them and place them beside a roboport with place_entity."
+    end
+    if (H.storage_chests or 0) == 0 then
+        return "Add a storage-chest to the home network.", "build_layout a storage-chest inside the roboport network: robots put what they carry back there."
+    end
+    if (H.silos_with_supply_chest or 0) == 0 then
+        return "Give the silo a supply chest.",
+            "Place a requester-chest beside the rocket silo with an inserter from the chest into the silo (build_layout, inside logistic range). The mod sets the chest's requests to what platforms' supply orders still miss; robots fill it, the inserter loads the rocket and the rocket goes up."
+    end
+    local supplied = {}
+    for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
+    if not (supplied["piercing-rounds-magazine"] and supplied["iron-ore"]) then
+        return "Set " .. P.name .. "'s standing supply from Nauvis.",
+            "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 400, iron-ore 1000, space-platform-foundation 20]: whenever it orbits Nauvis, rockets keep its ammo, thruster ore and spare foundation topped up, also while you are away. Add what Vulcanus will need later the same way."
+    end
+    if H.network_lacks and H.network_lacks[1] then
+        return "Stock the home network with " .. table.concat(H.network_lacks, ", ") .. " for " .. P.name .. "'s supply.",
+            "Robots load only what the network holds: from each line making these, add an inserter into a passive-provider-chest inside the roboport network (build_layout), or put a stock of them into a storage chest."
+    end
     if (P.stops or {})[1] ~= "vulcanus" then
         return "Set " .. P.name .. "'s course for Vulcanus.",
             "space_platform action=schedule stops=[\"vulcanus\"]. It stays in orbit until you are aboard (and armed and stocked), then leaves by itself."
     end
     return "Board " .. P.name .. " for Vulcanus.",
-        "It waits in orbit until you are aboard, then leaves. Carry what you need to start there: Vulcanus has no water, so solar panels (4x power there) and accumulators, not steam; a roboport, construction robots and a storage chest so place_ghosts works there; chemical plants and assembling-machine-2s (carbon, tungsten carbide), a pumpjack (sulfuric acid geysers), pipes, drills, steel furnaces, belts, inserters, poles. Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
+        "It waits in orbit until you are aboard, then leaves. Carry what you need to start there: a cargo-landing-pad (the shuttle drops what you request there); Vulcanus has no water, so solar panels (4x power there) and accumulators, not steam; roboports, construction and logistic robots and a storage chest so place_ghosts works there; chemical plants and assembling-machine-2s (carbon, tungsten carbide), a pumpjack (sulfuric acid geysers), pipes, drills, steel furnaces, belts, inserters, poles. Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
 end
 
 -- Code-computed tech-progression ladder for the early game. Each rung names

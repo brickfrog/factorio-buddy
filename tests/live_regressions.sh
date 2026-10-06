@@ -7942,6 +7942,13 @@ assert_json "the held platform stays at Nauvis" "$(sa_platform)" '.space_locatio
 assert_json "space_platform schedules a stop" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"schedule\",\"stops\":[\"nauvis\"]}")")" \
     '.success == true and .stops == ["nauvis"]'
+assert_json "space_platform supply sets a hub import request and reports what is missing" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"supply\",\"items\":[{\"name\":\"iron-gear-wheel\",\"count\":30}]}")")" \
+    '.success == true and .supply.from == "nauvis" and any(.supply.requests[]; .name == "iron-gear-wheel" and .count == 30)
+     and any(.supply.missing[]; .name == "iron-gear-wheel" and .count == 30) and .supply.silos_with_supply_chest == 0'
+assert_json "a supply count of 0 drops the request" \
+    "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"supply\",\"items\":[{\"name\":\"iron-gear-wheel\",\"count\":0}]}")")" \
+    '.success == true and ([.supply.requests[]? | select(.name == "iron-gear-wheel")] | length) == 0'
 assert_json "space_platform lands the character" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"land\",\"x\":2000,\"y\":2000}")")" \
     '.success == true and .landing_on == "nauvis"'
