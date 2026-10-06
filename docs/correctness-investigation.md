@@ -1071,6 +1071,27 @@ The supply line therefore has to be set up before departure. A new chain branche
 - **Landing pads per planet:** `request` takes `stops[1]` to set another planet's pads (e.g. the Nauvis pad from Vulcanus). Each planet's pads use their own logistic group (`buddy-<planet>`): groups are shared force-wide by name, so the old shared `buddy` group would have copied Vulcanus requests onto Nauvis. The old group is dropped from pads it is set on.
 - Gates: `luac`, clippy, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live41`).
 
+### `s42-cont41-opus-open-2590060469-60m-premature`: left before the supply line (invalid)
+
+60 minutes, 47 turns, none provider-limited, 39 tool errors. `plate_automation` and `powered_production` held.
+- Buddy pasted `space-science-pack` onto buddy-1's assembler, started `logistic-system` (28 %) and repaired green and chemical science.
+- Believing the platform's ice supply could only be fixed aboard ("Can't modify platform entities from the ground"), it boarded. Aboard at Nauvis, the travel rung said "Set course for Vulcanus", so it scheduled Vulcanus and the platform left with no supply chest. It landed on Vulcanus and built a carbide line again.
+- **Two defects:**
+  - The aboard rungs ignored the supply line.
+  - **Holds never caught a fuelled platform:** assigning a schedule (or vanilla advancing it when wait conditions are met) starts the trip in the same tick (`space_location` nil, `on_the_path`). So the once-a-second check that keys on "leaving from where it is parked" only held platforms that could not move anyway. Long40's thrust hold worked because that platform had no oxidizer stock.
+- The trial does not count toward the chain; s42 is rerun from s41.
+
+### Fixes after s42
+
+- **Holds act before departure:**
+  - `schedule` checks the hold against the first station that differs from where the platform is, and parks the records instead of assigning them.
+  - `tend_platforms` checks platforms waiting at a station against their next station (`next_station`) and parks them before the wait conditions can release them.
+  - `supply` rebuilds a held shuttle's waits too.
+- **New hold `no_supply_line`:** the first trip to a planet waits until the planet it leaves has a silo with a supply chest and the hub imports from it.
+- **Aboard at home:** with the supply line not ready, the rung is "Land on Nauvis: the supply line is not ready". The space-science rung says all of it works from the ground.
+- Sandbox on s41's save: `schedule stops=["vulcanus"]` from the ground returned `departure_held: no_supply_line` with the platform still at Nauvis (`no_schedule`). Aboard, it stayed held and the rung said to land.
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live42`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

@@ -494,6 +494,17 @@ local function travel_rung(S, character, here, force)
         return "Flying to " .. tostring((here.stops or {})[1] or "the next stop") .. ".",
             "Watch space_platform action=status (ammo, fuel, damaged_tiles); keep Nauvis running with robot_logistics / place_ghosts surface=nauvis."
     end
+    -- Aboard at home before the supply line exists: leaving would strand
+    -- you, and the platform can be changed from the ground.
+    local H = S.home_supply or {}
+    local supply_ready = (H.silos_with_supply_chest or 0) > 0 and here.supply ~= nil
+    if here.space_location == "nauvis" and (here.departure_held == "no_supply_line"
+        or ((here.stops or {})[1] ~= "vulcanus" and not supply_ready))
+    then
+        return "Land on Nauvis: the supply line is not ready, so " .. here.name .. " must not leave yet.",
+            "space_platform action=land, then follow progression (a silo supply chest and the platform's standing supply come first). You can change the platform from the ground: place_ghosts surface="
+            .. tostring(here.surface) .. " (a machine with a recipe pastes it onto the built one) and ship what it needs."
+    end
     if S.vulcanus_unlocked and (here.stops or {})[1] == "vulcanus" then
         local arms = here.armament or {}
         if not arms.armed then
@@ -526,7 +537,7 @@ local function space_science_rung(P, S)
             recipe_text("space-science-pack") .. ", made only at zero gravity. On the platform: asteroid collectors at the foundation edge, crushers ("
             .. recipe_text("metallic-asteroid-crushing") .. "; " .. recipe_text("carbonic-asteroid-crushing") .. "; " .. recipe_text("oxide-asteroid-crushing")
             .. "), an electric furnace for iron plate, an assembler on space-science-pack, inserters from and into the hub, solar panels. Ship the parts (action=ship), then lay them out with place_ghosts surface="
-            .. tostring(P.surface) .. " (add space-platform-foundation tiles to grow it). An assembler already there without a recipe takes one from place_ghosts with its name, position and recipe."
+            .. tostring(P.surface) .. " (add space-platform-foundation tiles to grow it); all of this works from the ground, without boarding. An assembler already there without a recipe takes one from place_ghosts with its name, position and recipe."
     end
     if S.landing_pads == 0 then
         return "Build a cargo landing pad at home near the labs.",

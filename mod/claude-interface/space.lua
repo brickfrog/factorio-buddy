@@ -586,14 +586,18 @@ local function resuppliable(surface, force)
     return false
 end
 
--- The station the platform's schedule sends it to next, when that is not
--- where it is parked; nil when it is staying.
-local function leaving_for(platform)
-    local schedule = platform.schedule
+-- The station a schedule (`records`, from `current` on) sends the platform
+-- to when it next leaves its orbit; nil in transit or when every stop is
+-- where it is. Assigning a schedule, or vanilla advancing it once the wait
+-- conditions are met, starts the trip in the same tick, so holds must act
+-- on this before then.
+local function next_station(platform, records, current)
     local location = platform.space_location
-    if not (schedule and schedule.records and location) then return nil end
-    local record = schedule.records[schedule.current or 1]
-    if record and record.station and record.station ~= location.name then return record.station end
+    if not (location and records and #records > 0) then return nil end
+    for step = 0, #records - 1 do
+        local record = records[((current or 1) - 1 + step) % #records + 1]
+        if record and record.station and record.station ~= location.name then return record.station end
+    end
     return nil
 end
 
@@ -606,13 +610,17 @@ local function crewed(platform)
     return false
 end
 
--- Why a departure for `destination` is held: "unarmed" or "thrust_stock"
--- (thruster-fluid ingredients under THRUST_RESERVE: the thrusters burn out
--- within seconds and the platform stalls) where it can be restocked, so a
--- shuttle that spent its ammo at a planet without silos still flies home;
--- "no_crew" for the first trip to a planet, which strands the agent if it
--- goes alone; or nil when it may leave. Once a planet has been reached,
--- platforms shuttle there without crew.
+-- Why a departure for `destination` is held:
+-- * "unarmed" or "thrust_stock" (thruster-fluid ingredients under
+--   THRUST_RESERVE: the thrusters burn out within seconds and the platform
+--   stalls) where it can be restocked, so a shuttle that spent its ammo at a
+--   planet without silos still flies home;
+-- * "no_supply_line" on the first trip to a planet until the planet it
+--   leaves can resupply it unattended (a silo with a supply chest, and the
+--   hub importing from there): otherwise whoever goes is stranded;
+-- * "no_crew" on the first trip, which strands the agent if it goes alone;
+-- * nil when it may leave. Once a planet has been reached, platforms
+--   shuttle there without crew.
 local function hold_reason(platform, destination)
     local here = platform.space_location and game.get_surface(platform.space_location.name)
     -- Crew aboard can land and ship, where the planet below has a silo.
@@ -622,6 +630,13 @@ local function hold_reason(platform, destination)
     if restockable and thrust_shortages(platform)[1] then return "thrust_stock" end
     local target = destination and game.get_surface(destination)
     local visited = target ~= nil and target.count_entities_filtered{force = platform.force, limit = 1} > 0
+    if not visited and here then
+        local supply_chest = false
+        for _, silo in pairs(here.find_entities_filtered{type = "rocket-silo", force = platform.force}) do
+            if supply_chests(silo)[1] then supply_chest = true break end
+        end
+        if not (supply_chest and next(hub_imports(platform, here.name))) then return "no_supply_line" end
+    end
     if not crewed(platform) and not visited then return "no_crew" end
     return nil
 end
@@ -647,23 +662,24 @@ function M.tend_platforms()
                         request_turret_ammo(platform, turret)
                     end
                 end
-                -- leaving_for is nil in transit, and a held platform has no
-                -- schedule, so it never moves while held.
+                -- A held platform has no schedule, so it never moves while
+                -- held; one waiting at a station is parked before its wait
+                -- conditions can release it.
                 if held[platform.index] then
                     -- Saves before shuttles stored the bare record list.
                     local entry = held[platform.index]
                     local records = entry.records or entry
                     local current = entry.current or 1
-                    local record = records[current]
-                    if not hold_reason(platform, record and record.station) then
+                    if not hold_reason(platform, next_station(platform, records, current)) then
                         platform.schedule = {current = current, records = records}
                         platform.paused = false
                         held[platform.index] = nil
                     end
                 else
-                    local destination = leaving_for(platform)
+                    local schedule = platform.schedule
+                    local destination = schedule and next_station(platform, schedule.records, schedule.current)
                     if destination and hold_reason(platform, destination) then
-                        held[platform.index] = {records = platform.schedule.records, current = platform.schedule.current or 1}
+                        held[platform.index] = {records = schedule.records, current = schedule.current or 1}
                         platform.schedule = nil
                         platform.paused = false
                     end
@@ -792,8 +808,7 @@ local function platform_summary(platform)
             a.front_turrets_ready < a.min_front_turrets)
     end
     if held then
-        local record = held_records[held.current or 1]
-        summary.departure_held = hold_reason(platform, record and record.station) or "releasing"
+        summary.departure_held = hold_reason(platform, next_station(platform, held_records, held.current)) or "releasing"
     end
     -- Standing supply from the planet it orbits: the hub's import requests
     -- and what is still missing (cargo already flying counts as delivered).
@@ -2389,12 +2404,14 @@ local function action_supply(character, platform, items, stops)
     for slot, name in ipairs(names) do
         section.set_slot(slot, {value = {type = "item", name = name, quality = "normal"}, min = requests[name], import_from = planet})
     end
-    -- A shuttle's waits follow its imports.
-    local schedule = platform.schedule
+    -- A shuttle's waits follow its imports, held or not.
+    local held = storage.departure_held and storage.departure_held[platform.index]
+    local schedule = held and {records = held.records or held, current = held.current} or platform.schedule
     if schedule and schedule.records and #schedule.records > 1 then
         local stations = {}
         for _, record in ipairs(schedule.records) do stations[#stations + 1] = record.station end
-        platform.schedule = {current = schedule.current or 1, records = shuttle_records(platform, stations)}
+        local rebuilt = {current = schedule.current or 1, records = shuttle_records(platform, stations)}
+        if held then storage.departure_held[platform.index] = rebuilt else platform.schedule = rebuilt end
     end
     local result = platform_summary(platform)
     result.success = true
@@ -2425,7 +2442,16 @@ local function action_schedule(character, platform, stops)
         platform.schedule = nil
         platform.paused = true
     else
-        platform.schedule = {current = 1, records = shuttle_records(platform, stops)}
+        -- Held before the schedule is assigned: assigning it starts the trip.
+        local records = shuttle_records(platform, stops)
+        local destination = next_station(platform, records, 1)
+        if destination and hold_reason(platform, destination) then
+            storage.departure_held = storage.departure_held or {}
+            storage.departure_held[platform.index] = {records = records, current = 1}
+            platform.schedule = nil
+        else
+            platform.schedule = {current = 1, records = records}
+        end
         platform.paused = false
     end
     M.tend_platforms()
@@ -2437,6 +2463,8 @@ local function action_schedule(character, platform, stops)
             .. a.needs .. ". It leaves by itself once armed and you are aboard."
     elseif result.departure_held == "thrust_stock" then
         result.guidance = "Course set, but " .. platform.name .. " stays parked until its hub holds the thruster-fuel ingredients for the trip (thrust_short): ship them, then it leaves once you are aboard."
+    elseif result.departure_held == "no_supply_line" then
+        result.guidance = "Course set, but " .. platform.name .. " stays parked: nothing could restock it or you after it leaves. Before the first trip, give a silo here a supply chest and the platform standing supply (space_platform action=supply); see progression for the next step."
     elseif result.departure_held == "no_crew" then
         result.guidance = "Course set; " .. platform.name .. " waits in orbit until you are aboard (space_platform action=board beside a silo), then leaves by itself."
     end
