@@ -903,6 +903,15 @@ local function progression(surface, force, facts, character)
         if (platform.damaged_tiles or 0) > 0 then
             warnings[#warnings + 1] = platform.name .. " has " .. platform.damaged_tiles .. " damaged tiles: add turrets and repair packs."
         end
+        if (platform.machines_unpowered or 0) > 0 then
+            local spare = 0
+            for _, item in ipairs(platform.hub_items or {}) do
+                if item.name == "solar-panel" then spare = item.count end
+            end
+            warnings[#warnings + 1] = platform.name .. " has " .. platform.machines_unpowered .. " machines short of power on "
+                .. (platform.solar_panels or 0) .. " solar panels: place more solar panels (and poles) on it with place_ghosts surface="
+                .. tostring(platform.surface) .. (spare > 0 and (" (its hub holds " .. spare .. ")") or ", shipping them first") .. ", from the ground."
+        end
         if platform.foundation_holes and platform.foundation_holes[1] then
             local cells = {}
             for _, cell in ipairs(platform.foundation_holes) do cells[#cells + 1] = cell.x .. "," .. cell.y end

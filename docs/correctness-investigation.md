@@ -1092,6 +1092,19 @@ The supply line therefore has to be set up before departure. A new chain branche
 - Sandbox on s41's save: `schedule stops=["vulcanus"]` from the ground returned `departure_held: no_supply_line` with the platform still at Nauvis (`no_schedule`). Aboard, it stayed held and the rung said to land.
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live42`).
 
+### `s42-cont41-opus-open-2590060469-60m` (rerun): staying home, science gaps
+
+60 minutes, 41 turns, none provider-limited, 51 tool errors, 0 invariant failures. `plate_automation` and `powered_production` held. buddy-1 stayed at Nauvis.
+- `logistic-system` stalled at 24.7 %:
+  - the labs had no space science: buddy-1's assembler made none (Buddy found it short of power on 4–5 solar panels while its hub held 8 more);
+  - nothing on Nauvis makes chemical science: the long chain never automated blue science.
+- Buddy hand-fed green science, rebuilt copper feeds for two green lines, topped up buddy-1's carbon (thruster fuel) by shipping carbonic chunks, and started a circuit cell toward chemical science.
+
+### Fixes after the s42 rerun
+
+- Platform status reports `machines_unpowered` (assemblers and furnaces at low or no power) and `solar_panels`. A warning names the shortfall and the hub's spare panels, to be placed with `place_ghosts` from the ground. On s42's save with the panels removed by script: "buddy-1 has 8 machines short of power on 0 solar panels: place more solar panels (and poles) on it with place_ghosts surface=platform-1 (its hub holds 8), from the ground."
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live43`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

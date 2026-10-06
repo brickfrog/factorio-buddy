@@ -846,6 +846,7 @@ local function platform_summary(platform)
         local force = platform.force
         local counts, recipes = {}, {}
         local thrusters, turrets, collectors, thruster_inputs = 0, 0, 0, {}
+        local unpowered = 0
         for _, entity in pairs(surface.find_entities_filtered{force = force}) do
             local kind = entity.type
             if kind ~= "entity-ghost" and kind ~= "tile-ghost" and entity.name ~= "space-platform-hub" then
@@ -878,10 +879,15 @@ local function platform_summary(platform)
             if kind == "assembling-machine" or kind == "furnace" then
                 local recipe = entity_recipe_name(entity)
                 if recipe then recipes[recipe] = (recipes[recipe] or 0) + 1 end
+                local status = status_name(entity)
+                if status == "low_power" or status == "no_power" then unpowered = unpowered + 1 end
             end
         end
         summary.entities = top_counts(counts, 20)
         summary.recipes = recipes
+        -- Machines short of power, and the solar panels feeding them.
+        summary.machines_unpowered = unpowered
+        summary.solar_panels = counts["solar-panel"] or 0
         summary.entity_ghosts = surface.count_entities_filtered{force = force, type = "entity-ghost"}
         summary.tile_ghosts = surface.count_entities_filtered{force = force, type = "tile-ghost"}
         summary.foundation_tiles = surface.count_tiles_filtered{name = "space-platform-foundation"}
