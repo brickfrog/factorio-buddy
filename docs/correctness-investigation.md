@@ -1193,6 +1193,10 @@ Open defects for the next round:
   - Sandbox on s44's save: following it exactly (character placed on the platform by script, as no rocket was ready) set the furnace back to iron-plate from ore, and the warning cleared.
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live46`).
 
+### `s45-cont44-opus-open-2590060469-60m-capped` (invalid)
+
+The provider limit was reached about 32 minutes in; 6 turns were refused, and the final sample failed with it. The trial was renamed `-capped` and does not count; s45 is rerun from s44's save.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
