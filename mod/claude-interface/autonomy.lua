@@ -1005,7 +1005,7 @@ local function progression(surface, force, facts, character)
             for _, feeder in ipairs(stuck.feeders or {}) do feeders[#feeders + 1] = tostring(feeder.unit_number) end
             warnings[#warnings + 1] = platform.name .. "'s " .. stuck.furnace.name .. " " .. tostring(stuck.furnace.unit_number)
                 .. " at " .. stuck.furnace.position.x .. "," .. stuck.furnace.position.y .. " holds " .. stuck.count .. " " .. stuck.holds
-                .. " taken from the hub: its inserter takes any smeltable item, so it smelts " .. stuck.holds .. " again instead of "
+                .. " from the hub, so it smelts " .. stuck.holds .. " again instead of the hub's "
                 .. stuck.should_take .. ". Board " .. platform.name .. " (space_platform action=board), configure_inserter unit_number="
                 .. table.concat(feeders, "/") .. " allowed_items=[" .. stuck.should_take .. "], then extract_items unit_number="
                 .. tostring(stuck.furnace.unit_number) .. " inventory_type=furnace_source item=" .. stuck.holds .. "."

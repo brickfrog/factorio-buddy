@@ -1191,7 +1191,8 @@ Open defects for the next round:
   - Platform status now reports `resmelting`: a hub-fed furnace whose input is a smelting product while the hub holds that product's raw ore.
   - A warning names the furnace and its feeding inserters, and gives the fix: board, `configure_inserter allowed_items=[iron-ore]`, `extract_items inventory_type=furnace_source`.
   - Sandbox on s44's save: following it exactly (character placed on the platform by script, as no rocket was ready) set the furnace back to iron-plate from ore, and the warning cleared.
-- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live46`).
+  - A hub feeder whose whitelist admits the held item (a deliberate steel furnace on iron plate) is not flagged. Sandbox on s44's save: with the feeder whitelisted to iron-plate, no warning; whitelisted to iron-ore while the furnace still held a plate, the warning stayed.
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live46`; after the whitelist exemption, `live47`).
 
 ### `s45-cont44-opus-open-2590060469-60m-capped` (invalid)
 

@@ -308,6 +308,17 @@ local function resmelted_input(furnace, platform)
             local feeders = {}
             for _, inserter in pairs(furnace.surface.find_entities_filtered{type = "inserter", position = furnace.position, radius = 4}) do
                 if inserter.drop_target == furnace and inserter.pickup_target == hub then
+                    -- A whitelist that admits the held item is a deliberate
+                    -- steel (or similar) furnace, not a stray pickup.
+                    local deliberate = false
+                    if inserter.use_filters and inserter.inserter_filter_mode == "whitelist" then
+                        for slot = 1, inserter.filter_slot_count do
+                            local filter = inserter.get_filter(slot)
+                            local name = filter and (type(filter.name) == "string" and filter.name or (filter.name and filter.name.name))
+                            if name == item.name then deliberate = true end
+                        end
+                    end
+                    if deliberate then return nil end
                     feeders[#feeders + 1] = {unit_number = inserter.unit_number, name = inserter.name, position = inserter.position}
                 end
             end
