@@ -669,6 +669,13 @@ local function space_rung(facts, force, surface)
         -- while labs lack it (idle because the labs are full is fine).
         for _, name in ipairs(packs) do
             if recipe_machines(facts, name) == 0 then
+                for _, machine in ipairs(facts.unset_machines or {}) do
+                    if machine.cleared_recipe == name then
+                        return "Set " .. name .. " back on " .. machine.name .. " " .. tostring(machine.unit_number) .. ".",
+                            "You cleared its recipe " .. machine.cleared_minutes_ago .. " min ago and nothing else makes " .. name
+                            .. " for logistic-system: set_recipe unit_number=" .. tostring(machine.unit_number) .. " recipe=" .. name .. ", then verify_production."
+                    end
+                end
                 return "Automate " .. name .. " for logistic-system: nothing makes it.",
                     recipe_text(name) .. ". Design a compact block with build_layout (assemblers for the pack and its intermediates, inserters, belts from the plate lines, poles) and feed the labs; then verify_production." .. supply_chain_text(force, surface, facts, name)
             end
@@ -891,6 +898,17 @@ local function progression(surface, force, facts, character)
             .. facts.starved_assemblers .. " assemblers lack ingredients: production and consumers are not connected. "
             .. "Carry items from the full machines to the starved assemblers with output inserters and belts (route_belt, build_layout) instead of moving them by hand."
     end
+    if facts.unset_machines and facts.unset_machines[1] then
+        local idle = {}
+        for _, machine in ipairs(facts.unset_machines) do
+            idle[#idle + 1] = machine.name .. " " .. tostring(machine.unit_number) .. " at "
+                .. machine.position.x .. "," .. machine.position.y
+                .. (machine.cleared_recipe and (" (you cleared " .. machine.cleared_recipe .. " " .. machine.cleared_minutes_ago .. " min ago)")
+                    or (" (made " .. machine.products_finished .. " items before)"))
+        end
+        warnings[#warnings + 1] = "Machines that produced before now have no recipe and stand idle: " .. table.concat(idle, "; ")
+            .. ". set_recipe each back to what its inserters and belts feed, or remove it if it is no longer needed."
+    end
     if facts.labs_powered > 0 and facts.labs_working == 0 and state.current_research ~= nil then
         warnings[#warnings + 1] = "Research (" .. state.current_research .. ") is queued but no lab at home is working"
             .. (lacked[1] and (": they lack " .. table.concat(lacked, ", ") .. ". ") or ": check lab science packs and power. ")
@@ -983,7 +1001,7 @@ local function progression(surface, force, facts, character)
                 .. table.concat(uncrushed, ", ") .. ". Add those crushers with place_ghosts or jettison the chunks."
         end
         if platform.stranded_ghosts and platform.stranded_ghosts[1] then
-            warnings[#warnings + 1] = platform.name .. " has ghosts the hub will never build: "
+            warnings[#warnings + 1] = platform.name .. " has ghosts the hub will never build or must not build: "
                 .. table.concat(platform.stranded_ghosts, ", ")
                 .. ". Remove them with space_platform action=clear_ghosts, then place what you need where it fits (place_ghosts; over empty space, include space-platform-foundation tiles under it)."
         end
@@ -1130,6 +1148,21 @@ function M.snapshot(character)
                     facts.recipe_assemblers[recipe.name] = (facts.recipe_assemblers[recipe.name] or 0) + 1
                     if recipe.name == "automation-science-pack" then
                         facts.red_science_assemblers = facts.red_science_assemblers + 1
+                    end
+                elseif recipe_ok and not recipe and entity.products_finished > 0 then
+                    -- Produced before, now without a recipe: usually cleared
+                    -- and forgotten.
+                    facts.unset_machines = facts.unset_machines or {}
+                    if #facts.unset_machines < 5 then
+                        local cleared = (storage.cleared_recipes or {})[entity.unit_number]
+                        table.insert(facts.unset_machines, {
+                            unit_number = entity.unit_number,
+                            name = entity.name,
+                            position = position_table(entity.position),
+                            products_finished = entity.products_finished,
+                            cleared_recipe = cleared and cleared.recipe or nil,
+                            cleared_minutes_ago = cleared and math.floor((game.tick - cleared.tick) / 3600) or nil,
+                        })
                     end
                 end
             elseif entity.type == "rocket-silo" then

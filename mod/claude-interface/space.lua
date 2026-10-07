@@ -1158,10 +1158,64 @@ function enclosed_space(surface, extra)
     return holes
 end
 
--- Entity ghosts on a platform the hub never builds, yet which block
--- placement: partly over empty space with no tile ghost under them, or
--- overlapping a built entity that is neither marked for deconstruction nor
--- fast-replaceable by the ghost. Returns the ghosts and, by unit number, why.
+-- Entities whose tile_buildability_rules need empty space around them (an
+-- asteroid collector's arm reach). A foundation tile there removes the
+-- entity; a tile ghost there stops it (status no_path). Prototype name -> the
+-- rule areas, facing north.
+local keep_clear_rules = nil
+local function keep_clear_prototypes()
+    if keep_clear_rules then return keep_clear_rules end
+    keep_clear_rules = {}
+    for name, prototype in pairs(prototypes.entity) do
+        for _, rule in pairs(prototype.tile_buildability_rules or {}) do
+            local required = rule.required_tiles and rule.required_tiles.layers or {}
+            if required.empty_space and rule.remove_on_collision then
+                keep_clear_rules[name] = keep_clear_rules[name] or {}
+                table.insert(keep_clear_rules[name], rule.area)
+            end
+        end
+    end
+    return keep_clear_rules
+end
+
+-- Rotates a north-facing offset to the entity's direction (16-way, cardinal).
+local function rotate_offset(x, y, direction)
+    if direction == defines.direction.east then return -y, x end
+    if direction == defines.direction.south then return -x, -y end
+    if direction == defines.direction.west then return y, -x end
+    return x, y
+end
+
+-- Tile cells ("x,y") that built entities on the surface need kept empty,
+-- mapped to the entity's "name@x,y".
+function keep_clear_cells(surface)
+    local cells = {}
+    local rules = keep_clear_prototypes()
+    local names = {}
+    for name in pairs(rules) do names[#names + 1] = name end
+    if not names[1] then return cells end
+    for _, entity in pairs(surface.find_entities_filtered{name = names}) do
+        local label = entity.name .. "@" .. entity.position.x .. "," .. entity.position.y
+        for _, area in ipairs(rules[entity.name]) do
+            local ax, ay = rotate_offset(area.left_top.x, area.left_top.y, entity.direction)
+            local bx, by = rotate_offset(area.right_bottom.x, area.right_bottom.y, entity.direction)
+            local x1, x2 = math.min(ax, bx) + entity.position.x, math.max(ax, bx) + entity.position.x
+            local y1, y2 = math.min(ay, by) + entity.position.y, math.max(ay, by) + entity.position.y
+            for x = math.floor(x1), math.ceil(x2) - 1 do
+                for y = math.floor(y1), math.ceil(y2) - 1 do
+                    cells[x .. "," .. y] = label
+                end
+            end
+        end
+    end
+    return cells
+end
+
+-- Ghosts on a platform the hub never builds, or should not: entity ghosts
+-- partly over empty space with no tile ghost under them, or overlapping a
+-- built entity that is neither marked for deconstruction nor
+-- fast-replaceable by the ghost; tile ghosts where a built entity needs empty
+-- space (see keep_clear_cells). Returns the ghosts and, by unit number, why.
 function stranded_ghosts(surface)
     local stranded, why = {}, {}
     if not surface.platform then return stranded, why end
@@ -1184,6 +1238,14 @@ function stranded_ghosts(surface)
                     break
                 end
             end
+        end
+    end
+    local clear_cells = keep_clear_cells(surface)
+    for _, ghost in pairs(surface.find_entities_filtered{type = "tile-ghost"}) do
+        local owner = clear_cells[math.floor(ghost.position.x) .. "," .. math.floor(ghost.position.y)]
+        if owner then
+            stranded[#stranded + 1] = ghost
+            why[ghost.unit_number] = "foundation here would remove " .. owner .. ", which needs empty space"
         end
     end
     return stranded, why
@@ -1378,6 +1440,20 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             new_tiles[#new_tiles + 1] = plan
             add_needed(needed, plan.proto.items_to_place_this)
         end
+    end
+    local clear_cells = keep_clear_cells(surface)
+    local in_reach = {}
+    for _, plan in ipairs(new_tiles) do
+        local owner = clear_cells[plan.x .. "," .. plan.y]
+        if owner and plan.name ~= "empty-space" and #in_reach < 20 then
+            in_reach[#in_reach + 1] = {index = plan.index, x = plan.x, y = plan.y, needed_empty_by = owner}
+        end
+    end
+    if in_reach[1] then
+        return fail("tiles_need_empty_space", #in_reach .. " tile(s) lie where a built entity needs empty space; nothing was placed", {
+            tiles = in_reach,
+            guidance = "An asteroid-collector reaches over the empty space in front of it (4 tiles deep, 3 wide, including the row under its front): foundation there removes it, and a tile ghost there stops it collecting (status no_path). Leave those tiles out; extend the platform elsewhere.",
+        })
     end
     if surface.platform and planned_tiles[1] and planned_tiles[1].name == "space-platform-foundation" then
         local loose = disconnected_tiles(surface, new_tiles)

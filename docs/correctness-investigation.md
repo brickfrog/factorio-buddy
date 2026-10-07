@@ -1145,6 +1145,26 @@ Open defects for the next round:
 - the fuel for copper furnace 7439;
 - why assembler 2641 lost its recipe (not investigated).
 
+### Fixes after the s43 rerun
+
+- **Asteroid collector `no_path`.**
+  - Cause: six foundation tile ghosts sat in front of buddy-1's collector at (0.5,-6.5); they were placed before this chain.
+  - The collector's `tile_buildability_rules` need empty space in front of it: 4 tiles deep and 3 wide, including the row under its front. Foundation there removes the collector (`remove_on_collision`); a tile ghost there stops it (`no_path`).
+  - Sandbox on s43's save: removing the ghosts set its status to working. Setting foundation there by script destroyed the collector.
+  - `keep_clear_cells` reads these rules from the prototypes, for any entity with them.
+  - `stranded_ghosts` now also reports tile ghosts there, so the platform warning names them and `space_platform action=clear_ghosts` removes them.
+  - `place_ghosts` rejects such tiles (`tiles_need_empty_space`).
+- **Recipe cleared and forgotten.**
+  - Cause: chemical-science assembler 2641 lost its recipe in long33, when Buddy cleared it with `set_recipe recipe=""` to divert circuits; no later run set it back until s43. The engine keeps no previous recipe for assemblers (`previous_recipe` errors).
+  - `set_recipe` now remembers what it cleared (`storage.cleared_recipes`).
+  - A warning lists assemblers that produced before and now have no recipe, with the cleared recipe and how long ago, or the product count for older clears. On s42's save: "assembling-machine-2 2641 at 41.5,126.5 (made 835 items before)".
+  - The logistic-system rung says "Set X back on …" when nothing else makes a pack whose recipe was cleared.
+- **Finding machines by recipe.**
+  - In s43, Buddy spent a turn probing assemblers with `feed_machine_from_inventory` dry runs to learn their recipes.
+  - `get_entities` now includes `recipe` for crafting machines (`Entity.recipe`). Smoke: an `entity_type=assembling-machine` query near (41,126) listed copper-cable, advanced-circuit and chemical-science-pack.
+- The thin iron lane and the unfuelled copper furnace are factory state for Buddy to fix; existing tools cover them.
+- Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live45`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

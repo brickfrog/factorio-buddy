@@ -118,6 +118,11 @@ function M.summary(entity, include_bounding_box)
         result.drop_position = pos_table(entity.drop_position)
     end
 
+    if entity.type == "assembling-machine" or entity.type == "furnace" then
+        local ok, recipe = pcall(function() return entity.get_recipe() end)
+        if ok and recipe then result.recipe = recipe.name end
+    end
+
     if entity.type == "transport-belt" or entity.type == "underground-belt" then
         local neighbours = entity.belt_neighbours
         result.belt_neighbours_observed = true

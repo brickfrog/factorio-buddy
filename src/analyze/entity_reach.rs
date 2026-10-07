@@ -86,6 +86,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         }
     }
 

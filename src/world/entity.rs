@@ -80,6 +80,11 @@ pub struct Entity {
     /// did not include Factorio's authoritative belt-neighbour state.
     #[serde(default, skip_serializing_if = "is_false")]
     pub belt_neighbours_observed: bool,
+
+    /// Recipe of a crafting machine (assembler, chemical plant, furnace
+    /// while smelting); absent for other entities and unset machines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {

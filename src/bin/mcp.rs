@@ -3087,6 +3087,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
         let infrastructure = incremental_infrastructure_verification(
             &route,
@@ -3159,6 +3160,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
 
         let report = incremental_infrastructure_verification(
@@ -3194,6 +3196,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         }
     }
 
@@ -3540,6 +3543,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
 
         let failure = rollback_missing_identity_error(&entity);
@@ -3823,6 +3827,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
 
         let north = machine_side_layout(&entity, "north").expect("north side");
@@ -3870,6 +3875,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
         let furnace_north = machine_side_layout(&furnace, "north").expect("furnace north side");
         assert_eq!(furnace_north.inserter_x, 42.5);
@@ -3895,6 +3901,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
         let assembler_south =
             machine_side_layout(&assembler_without_bbox, "south").expect("assembler south side");
@@ -4041,6 +4048,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
         let east_surface = BeltPlacement {
             position: entity.position,
@@ -4086,6 +4094,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: true,
+            recipe: None,
         };
         let entities = vec![
             make_endpoint(1496, -43.5, "input", -39.5),
@@ -4392,6 +4401,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
         let preserved = source_entity_preservation(&before, Some(&before), GridPos::new(-45, 44));
         assert_eq!(preserved["success"], true);
@@ -4603,6 +4613,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
         let furnace = Entity {
             unit_number: Some(2),
@@ -4621,6 +4632,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
         let belt = Entity {
             unit_number: Some(3),
@@ -4639,6 +4651,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
 
         assert!(is_machine_output_source(&assembler));
@@ -5087,6 +5100,7 @@ mod tests {
             belt_input_neighbours: Vec::new(),
             belt_output_neighbours: Vec::new(),
             belt_neighbours_observed: false,
+            recipe: None,
         };
 
         let args = machine_output_build_args(
@@ -9113,7 +9127,7 @@ impl FactorioMcp {
 
     /// Get all entities in an area. Returns entity names, positions, and types.
     #[tool(
-        description = "Find entities near x,y. Prefer prototype name/type filters; narrow radius or limit when results are summarized."
+        description = "Find entities near x,y; crafting machines include their recipe (find the assemblers making an item with entity_type=assembling-machine). Prefer prototype name/type filters; narrow radius or limit when results are summarized."
     )]
     async fn get_entities(&self, Parameters(params): Parameters<GetEntitiesParams>) -> String {
         let mut client = match self.connect().await {
@@ -9151,7 +9165,7 @@ impl FactorioMcp {
                             let height = (bb.right_bottom.y - bb.left_top.y).round() as i32;
                             serde_json::json!({ "width": width, "height": height })
                         });
-                        serde_json::json!({
+                        let mut value = serde_json::json!({
                             "unit_number": e.unit_number,
                             "name": e.name,
                             "type": e.entity_type,
@@ -9159,7 +9173,11 @@ impl FactorioMcp {
                             "y": e.position.y,
                             "direction": e.direction,
                             "size": size,
-                        })
+                        });
+                        if let Some(recipe) = e.recipe {
+                            value["recipe"] = serde_json::json!(recipe);
+                        }
+                        value
                     })
                     .collect();
                 let total = info.len();

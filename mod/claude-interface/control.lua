@@ -2289,8 +2289,14 @@ local function set_recipe_impl(agent_id, unit_number, recipe)
         end
         result.success = true
         result.cleared = true
+        -- Remembered so the snapshot can name what this idle machine made.
+        if previous_name and entity.unit_number then
+            storage.cleared_recipes = storage.cleared_recipes or {}
+            storage.cleared_recipes[entity.unit_number] = {recipe = previous_name, tick = game.tick}
+        end
         return result
     end
+    if storage.cleared_recipes and entity.unit_number then storage.cleared_recipes[entity.unit_number] = nil end
     if not current or current.name ~= requested_recipe then
         result.requested_recipe = requested_recipe
         result.current_recipe = current and current.name or nil
