@@ -183,6 +183,17 @@ local function made_with_platforms(force, surface, facts, item)
     return count
 end
 
+-- " Not made in 10 min: x (for y, N assemblers), ..." for the unmade inputs
+-- behind `item`, or "" when all are made.
+local function supply_chain_text(force, surface, facts, item)
+    local parts = {}
+    for _, link in ipairs(missing_supply_chain(force, surface, facts, item)) do
+        if #parts >= 6 then break end
+        parts[#parts + 1] = link.name .. " (for " .. link.needed_by .. ", " .. link.assemblers .. " assemblers)"
+    end
+    return parts[1] and (" Not made in the last 10 min: " .. table.concat(parts, ", ") .. ".") or ""
+end
+
 -- Rocket-part ingredients with how many of each were made in the last ten minutes.
 local function rocket_part_inputs(force, surface)
     local recipe = prototypes.recipe["rocket-part"]
@@ -654,6 +665,20 @@ local function space_rung(facts, force, surface)
         local tech = force.technologies["logistic-system"]
         local packs = {}
         for _, ingredient in pairs(tech and tech.research_unit_ingredients or {}) do packs[#packs + 1] = ingredient.name end
+        -- A pack nothing makes comes first, then one whose machines stalled
+        -- while labs lack it (idle because the labs are full is fine).
+        for _, name in ipairs(packs) do
+            if recipe_machines(facts, name) == 0 then
+                return "Automate " .. name .. " for logistic-system: nothing makes it.",
+                    recipe_text(name) .. ". Design a compact block with build_layout (assemblers for the pack and its intermediates, inserters, belts from the plate lines, poles) and feed the labs; then verify_production." .. supply_chain_text(force, surface, facts, name)
+            end
+        end
+        for _, name in ipairs(packs) do
+            if made_with_platforms(force, surface, facts, name) == 0 and (facts.lab_missing_packs or {})[name] then
+                return "Get " .. name .. " made again: labs lack it and its machines made none in 10 minutes.",
+                    recipe_text(name) .. ". diagnose_factory_blockers on its assemblers (inputs, power, full output) and fix the feed." .. supply_chain_text(force, surface, facts, name)
+            end
+        end
         return "Research logistic-system: the silo's supply chest is a requester chest.",
             "start_research logistic-system (" .. tostring(tech and tech.research_unit_count) .. " units of " .. table.concat(packs, ", ")
             .. "). Space science lands on the pad from " .. P.name .. "'s assembler; keep its crushers and the labs fed."

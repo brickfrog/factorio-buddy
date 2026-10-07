@@ -1105,6 +1105,19 @@ The supply line therefore has to be set up before departure. A new chain branche
 - Platform status reports `machines_unpowered` (assemblers and furnaces at low or no power) and `solar_panels`. A warning names the shortfall and the hub's spare panels, to be placed with `place_ghosts` from the ground. On s42's save with the panels removed by script: "buddy-1 has 8 machines short of power on 0 solar panels: place more solar panels (and poles) on it with place_ghosts surface=platform-1 (its hub holds 8), from the ground."
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live43`).
 
+### `s43-cont42-opus-open-2590060469-60m-capped` (invalid)
+
+The provider limit was reached about 27 minutes in; the last 7 turns were refused. The trial was renamed `-capped` and does not count; s43 is rerun from s42's save.
+
+### Fixes before the s43 rerun
+
+- Before "Research logistic-system", the rung checks each of its packs:
+  - first, a pack nothing makes ("Automate X for logistic-system: nothing makes it");
+  - then a pack the labs lack whose machines made none in 10 minutes (packs idle only because the labs are full are skipped).
+  
+  Each check lists the unmade inputs behind the pack (`supply_chain_text`). On s42's save (character moved to Nauvis by script): "Get automation-science-pack made again: labs lack it and its machines made none in 10 minutes".
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live44`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
