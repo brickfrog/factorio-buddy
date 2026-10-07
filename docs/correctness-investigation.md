@@ -1118,6 +1118,33 @@ The provider limit was reached about 27 minutes in; the last 7 turns were refuse
   Each check lists the unmade inputs behind the pack (`supply_chain_text`). On s42's save (character moved to Nauvis by script): "Get automation-science-pack made again: labs lack it and its machines made none in 10 minutes".
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live44`).
 
+### `s43-cont42-opus-open-2590060469-60m` (rerun)
+
+41 turns, 33 tool errors, 0 invariant failures, not provider-limited; `plate_automation` and `powered_production` still true.
+
+- **Research:** logistic-system went from 24.7% to 53.1%; 58 rockets launched in total.
+- **Space science:**
+  - Buddy boarded buddy-1, fixed its space-science line, and landed again.
+  - The platform then sent about 10 packs per minute down, but burned its own iron ore to do it (hub 337 → 293).
+  - Its asteroid collector reports `no_path`.
+- **Chemical science on Nauvis:**
+  - Assembler 2641 had no recipe; Buddy set chemical-science-pack again.
+  - It then traced the chain (engines → gears/steel → circuits → iron).
+  - It kept it running with `feed_machine_from_inventory` top-ups (12 calls) and reached about 2 packs per minute.
+  - Root cause it named: the shared iron lane for that block is too thin.
+- **Red science:** the copper feed for the red assemblers by the labs broke; the copper furnace (7439) had ore but no fuel.
+- **Supply backbone:**
+  - `supply` was set on buddy-1 for 6 space-platform-foundation only, before a supply chest existed (`silos_with_supply_chest` 0).
+  - Buddy also shipped plates, ice and ore by hand through the silo, and these waited behind slow rockets (processing units about 1 per minute).
+- **End state:** Buddy on Nauvis; buddy-1 at Nauvis, stops `["nauvis"]`, no hold, 0 unpowered machines.
+
+Open defects for the next round:
+
+- the platform asteroid collector reports `no_path`;
+- the iron supply for the chemical-science block;
+- the fuel for copper furnace 7439;
+- why assembler 2641 lost its recipe (not investigated).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
