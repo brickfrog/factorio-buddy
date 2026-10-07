@@ -1000,6 +1000,16 @@ local function progression(surface, force, facts, character)
             warnings[#warnings + 1] = platform.name .. " collects chunks no crusher uses and they fill its hub: "
                 .. table.concat(uncrushed, ", ") .. ". Add those crushers with place_ghosts or jettison the chunks."
         end
+        for _, stuck in ipairs(platform.resmelting or {}) do
+            local feeders = {}
+            for _, feeder in ipairs(stuck.feeders or {}) do feeders[#feeders + 1] = tostring(feeder.unit_number) end
+            warnings[#warnings + 1] = platform.name .. "'s " .. stuck.furnace.name .. " " .. tostring(stuck.furnace.unit_number)
+                .. " at " .. stuck.furnace.position.x .. "," .. stuck.furnace.position.y .. " holds " .. stuck.count .. " " .. stuck.holds
+                .. " taken from the hub: its inserter takes any smeltable item, so it smelts " .. stuck.holds .. " again instead of "
+                .. stuck.should_take .. ". Board " .. platform.name .. " (space_platform action=board), configure_inserter unit_number="
+                .. table.concat(feeders, "/") .. " allowed_items=[" .. stuck.should_take .. "], then extract_items unit_number="
+                .. tostring(stuck.furnace.unit_number) .. " inventory_type=furnace_source item=" .. stuck.holds .. "."
+        end
         if platform.stranded_ghosts and platform.stranded_ghosts[1] then
             warnings[#warnings + 1] = platform.name .. " has ghosts the hub will never build or must not build: "
                 .. table.concat(platform.stranded_ghosts, ", ")

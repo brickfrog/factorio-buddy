@@ -276,6 +276,54 @@ local function safe_value(read)
     return nil
 end
 
+-- Smelting product -> its ingredient (iron-plate -> iron-ore), built once.
+local smelted_from = nil
+local function smelting_sources()
+    if smelted_from then return smelted_from end
+    smelted_from = {}
+    for _, recipe in pairs(prototypes.get_recipe_filtered{{filter = "category", category = "smelting"}}) do
+        local ingredient = recipe.ingredients[1]
+        for _, product in pairs(recipe.products) do
+            if ingredient and ingredient.type == "item" and product.name ~= ingredient.name then
+                smelted_from[product.name] = smelted_from[product.name] or ingredient.name
+            end
+        end
+    end
+    return smelted_from
+end
+
+-- A platform furnace fed from the hub takes any smeltable item, so plates in
+-- the hub get smelted again (iron plate to steel) and block the ore. Returns
+-- the furnace, the product it holds as input, the hub ore it should take and
+-- the inserters feeding it, or nil.
+local function resmelted_input(furnace, platform)
+    local hub = platform.hub
+    local hub_inventory = hub and hub.valid and hub.get_inventory(defines.inventory.hub_main)
+    local source = furnace.get_inventory(defines.inventory.furnace_source)
+    if not (hub_inventory and source) then return nil end
+    local sources = smelting_sources()
+    for _, item in pairs(source.get_contents()) do
+        local ore = sources[item.name]
+        if ore and sources[ore] == nil and hub_inventory.get_item_count(ore) > 0 then
+            local feeders = {}
+            for _, inserter in pairs(furnace.surface.find_entities_filtered{type = "inserter", position = furnace.position, radius = 4}) do
+                if inserter.drop_target == furnace and inserter.pickup_target == hub then
+                    feeders[#feeders + 1] = {unit_number = inserter.unit_number, name = inserter.name, position = inserter.position}
+                end
+            end
+            if not feeders[1] then return nil end
+            return {
+                furnace = {unit_number = furnace.unit_number, name = furnace.name, position = furnace.position},
+                holds = item.name,
+                count = item.count,
+                should_take = ore,
+                feeders = feeders,
+            }
+        end
+    end
+    return nil
+end
+
 -- Defined with the place_ghosts helpers below.
 local stranded_ghosts, tile_ghost_keys, enclosed_space, thrust_shortages
 
@@ -846,7 +894,7 @@ local function platform_summary(platform)
         local force = platform.force
         local counts, recipes = {}, {}
         local thrusters, turrets, collectors, thruster_inputs = 0, 0, 0, {}
-        local unpowered = 0
+        local unpowered, resmelting = 0, {}
         for _, entity in pairs(surface.find_entities_filtered{force = force}) do
             local kind = entity.type
             if kind ~= "entity-ghost" and kind ~= "tile-ghost" and entity.name ~= "space-platform-hub" then
@@ -882,7 +930,12 @@ local function platform_summary(platform)
                 local status = status_name(entity)
                 if status == "low_power" or status == "no_power" then unpowered = unpowered + 1 end
             end
+            if kind == "furnace" and #resmelting < 5 then
+                local found = resmelted_input(entity, platform)
+                if found then resmelting[#resmelting + 1] = found end
+            end
         end
+        summary.resmelting = resmelting
         summary.entities = top_counts(counts, 20)
         summary.recipes = recipes
         -- Machines short of power, and the solar panels feeding them.
@@ -1188,7 +1241,7 @@ end
 
 -- Tile cells ("x,y") that built entities on the surface need kept empty,
 -- mapped to the entity's "name@x,y".
-function keep_clear_cells(surface)
+local function keep_clear_cells(surface)
     local cells = {}
     local rules = keep_clear_prototypes()
     local names = {}

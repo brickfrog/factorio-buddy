@@ -1165,6 +1165,34 @@ Open defects for the next round:
 - The thin iron lane and the unfuelled copper furnace are factory state for Buddy to fix; existing tools cover them.
 - Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live45`).
 
+### `s44-cont43-opus-open-2590060469-60m`
+
+33 turns, 33 tool errors, 0 invariant failures, not provider-limited; `plate_automation` and `powered_production` still true.
+
+- **Research:** logistic-system went from 53.1% to 81.9%; 62 rockets launched in total.
+- **Iron:**
+  - Buddy found the factory used about 355 iron plates per minute and made 202, with the local patch nearly mined out.
+  - It extended the iron patch at (-271,190) (10 drills working) and built 6 more furnaces; iron ended about +130 per minute.
+- **Chemical science:**
+  - Copper plates had blocked the steel furnaces' dead-end iron belts. Buddy filtered them off with fast inserters into chests.
+  - It unjammed a circuit line; chemical science ended at about 6 packs per minute.
+- **Platform:**
+  - buddy-1's hub filled twice and stopped its collector and crushers. Buddy jettisoned 1,200 iron ore.
+  - Buddy saw that the platform furnace took no ore but could not see why from the ground.
+  - It shipped iron plates instead (600 queued).
+- **Supply backbone:** unchanged; still no supply chest.
+- **End state:** Buddy on Nauvis; buddy-1 at Nauvis, stops `["nauvis"]`; `supply` holds 1 foundation.
+
+### Fixes after s44
+
+- **Platform furnace re-smelting plates.**
+  - Cause: buddy-1's electric furnace is fed from the hub by a long-handed inserter, which takes any smeltable item.
+  - Shipped iron plates went into it as steel-plate input (260 steel in the hub). It ended holding 1 iron plate, waiting for 5, so the 450 iron ore in the hub never reached it and space science stopped.
+  - Platform status now reports `resmelting`: a hub-fed furnace whose input is a smelting product while the hub holds that product's raw ore.
+  - A warning names the furnace and its feeding inserters, and gives the fix: board, `configure_inserter allowed_items=[iron-ore]`, `extract_items inventory_type=furnace_source`.
+  - Sandbox on s44's save: following it exactly (character placed on the platform by script, as no rocket was ready) set the furnace back to iron-plate from ore, and the warning cleared.
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live46`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
