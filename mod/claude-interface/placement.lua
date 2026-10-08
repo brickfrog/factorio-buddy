@@ -2121,10 +2121,16 @@ local function evacuate_disallowed_held_stack(character, entity, allowed_items, 
     if allowed_item_lookup(allowed_items)[held_before.name] then return outcome end
 
     outcome.required = true
-    local inventory = character.get_main_inventory()
+    -- Set remotely on a platform: the held item stays there, in the hub.
+    local inventory, where = character.get_main_inventory(), "Character"
+    if entity.surface ~= character.surface and entity.surface.platform then
+        local hub = entity.surface.platform.hub
+        inventory, where = hub and hub.valid and hub.get_inventory(defines.inventory.hub_main), "Platform hub"
+    end
+    outcome.destination = where
     if not (inventory and inventory.valid) then
         outcome.succeeded = false
-        outcome.error = "Character has no valid main inventory for the disallowed held item"
+        outcome.error = where .. " has no valid inventory for the disallowed held item"
         return outcome
     end
 
@@ -2134,12 +2140,12 @@ local function evacuate_disallowed_held_stack(character, entity, allowed_items, 
     end)
     if not capacity_ok then
         outcome.succeeded = false
-        outcome.error = "Could not inspect character inventory capacity: " .. tostring(insertable)
+        outcome.error = "Could not inspect " .. where .. " inventory capacity: " .. tostring(insertable)
         return outcome
     end
     if insertable < held_before.count then
         outcome.succeeded = false
-        outcome.error = "Character inventory cannot accept the complete disallowed held stack"
+        outcome.error = where .. " inventory cannot accept the complete disallowed held stack"
         outcome.insertable_count = insertable
         return outcome
     end
@@ -2158,7 +2164,7 @@ local function evacuate_disallowed_held_stack(character, entity, allowed_items, 
         )) or 0
         outcome.succeeded = false
         outcome.error = insert_ok
-            and "Character inventory accepted only part of the disallowed held stack"
+            and (where .. " inventory accepted only part of the disallowed held stack")
             or "Could not return the disallowed held stack: " .. tostring(insert_result)
         outcome.inserted_count = inserted
         outcome.inventory_rollback_succeeded = removed == inserted

@@ -451,6 +451,26 @@ pub fn find_belt_route_with_options(
             let path_with_moves =
                 reconstruct_path_with_moves(&came_from, current.state, start_state);
             let belts = path_to_belt_placements_with_moves(&path_with_moves);
+            // Longer loops back onto a used tile cannot be built either.
+            let mut used = HashSet::with_capacity(belts.len());
+            if let Some(reused) = belts
+                .iter()
+                .map(|belt| GridPos::from_position(&belt.position))
+                .find(|tile| !used.insert(*tile))
+            {
+                return RouteResult {
+                    success: false,
+                    belts: vec![],
+                    belt_count: 0,
+                    turn_count: 0,
+                    underground_count: 0,
+                    topology: None,
+                    error: Some(format!(
+                        "Route would place two belts on tile ({}, {}); pick another endpoint or route in legs",
+                        reused.x, reused.y
+                    )),
+                };
+            }
             let turn_count = count_turns(&belts);
             let underground_count = belts
                 .iter()
@@ -478,6 +498,11 @@ pub fn find_belt_route_with_options(
         // Explore surface neighbors
         for (neighbor, move_direction) in current.state.pos.cardinal_neighbors() {
             if current.state.arrived_underground && current.state.arrival != Some(move_direction) {
+                continue;
+            }
+            // Reversing lands on the tile just left: a belt can hold one
+            // direction, so the route would place two belts on one tile.
+            if current.state.arrival == Some(move_direction.opposite()) {
                 continue;
             }
             let neighbor_state = BeltRouteState {
@@ -531,6 +556,9 @@ pub fn find_belt_route_with_options(
                     Direction::South,
                     Direction::West,
                 ] {
+                    if current.state.arrival == Some(direction.opposite()) {
+                        continue;
+                    }
                     // Try underground jumps of length 2 to max_distance
                     for distance in 2..=ug_config.max_distance {
                         let exit_pos = current.state.pos.offset(direction, distance as i32);
@@ -1602,6 +1630,55 @@ mod tests {
         assert_eq!(
             GridPos::from_position(&exit.position),
             GridPos::new(-27, 30)
+        );
+    }
+
+    #[test]
+    fn underground_exit_never_turns_by_reversing_onto_itself() {
+        // s46: an underground exit must leave straight, so the router stepped
+        // one tile on, reversed onto the exit tile and tunnelled sideways from
+        // it, planning two belts on one tile; placement failed halfway.
+        // Here (tiles 0..=5, blocked '#') the only way out of the start is a
+        // tunnel south to (0,2), and the tile after that exit is a dead end:
+        //   S#####
+        //   ######
+        //   ...G..
+        //   .#####
+        //   ######
+        //   ######
+        let mut collision_map = CollisionMap::new(Area::new(0.0, 0.0, 5.0, 5.0));
+        for x in 0..=5 {
+            for y in 0..=5 {
+                let open = (x, y) == (0, 0) || y == 2 || (x, y) == (0, 3);
+                if !open {
+                    collision_map.block(GridPos::new(x, y));
+                }
+            }
+        }
+        let options = RoutingOptions {
+            allow_underground: true,
+            underground_config: UndergroundConfig::from_belt_type("transport-belt"),
+            ..RoutingOptions::default()
+        };
+
+        let result = find_belt_route_with_options(
+            GridPos::new(0, 0),
+            GridPos::new(3, 2),
+            &collision_map,
+            &options,
+        );
+
+        let mut tiles = HashSet::new();
+        for belt in &result.belts {
+            assert!(
+                tiles.insert(GridPos::from_position(&belt.position)),
+                "{belt:?} reuses a tile"
+            );
+        }
+        assert!(
+            !result.success,
+            "no buildable route exists: {:?}",
+            result.belts
         );
     }
 

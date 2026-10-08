@@ -392,8 +392,9 @@ function M.require_entity_reach(character, entity)
     )
 end
 
--- Settings that move no items (inserter filters) can be changed on the
--- force's own space platforms from anywhere, as from remote view.
+-- Settings (inserter filters) can be changed on the force's own space
+-- platforms from anywhere, as from remote view. Callers keep any items they
+-- move on that platform.
 function M.require_settings_reach(character, entity)
     if character and character.valid and entity and entity.valid
         and entity.surface ~= character.surface and entity.surface.platform

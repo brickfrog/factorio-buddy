@@ -1214,12 +1214,43 @@ The provider limit was reached about 32 minutes in; 6 turns were refused, and th
 ### Fixes after s45
 
 - **Platform settings from the ground.** In the game, remote view changes settings on any of the force's entities, platforms included, and marks them for deconstruction; Buddy instead waited 30 minutes for a rocket.
-  - `configure_inserter` now works on the force's own space platforms from any surface (`require_settings_reach`). Filters move no items.
+  - `configure_inserter` now works on the force's own space platforms from any surface (`require_settings_reach`). Items move only as described under held items below.
   - New `space_platform action=deconstruct x y` marks a built platform entity for deconstruction; the hub removes it and its contents go to the hub.
   - Away from the platform, the re-smelting warning now gives this fix: filter the feeder, deconstruct the furnace, and `place_ghosts` it back, with no boarding. Aboard, it still says `extract_items`.
   - Sandbox on s44's save, character on Nauvis: the filter and deconstruct calls succeeded. The furnace went to the hub, `place_ghosts` rebuilt it, it smelted iron ore into plates within 25 s, and the warning cleared.
   - The Rust `configure_inserter` walked to the entity before calling the mod, which failed across surfaces. It now calls the mod first and walks and retries only on `out_of_reach`. MCP smoke: the platform filter was set from Nauvis with no walk; a Nauvis inserter about 110 tiles away was reached by walking, then configured. `space_platform action=deconstruct` at an empty spot returns `entity_not_found`.
+  - Held items: when the new whitelist excludes the item an inserter holds, `configure_inserter` moves it out of the hand. From another surface, it went to the character, carrying platform items to Nauvis. On a platform the character is not on, it now goes to the platform hub (`held_stack_evacuation.destination`). Sandbox on s44's save, same tick: with the feeder holding 1 iron plate, filtered to iron-ore from Nauvis, hub plates went 0 → 1, character plates stayed 0, and the hand was empty.
 - Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live48`).
+
+### `s46-cont45-opus-open-2590060469-60m`
+
+56 turns, 46 tool errors, 0 invariant failures, not provider-limited; `plate_automation` and `powered_production` still true. It ran with commit `4ab84de`, before the held-item fix; Buddy made no `configure_inserter` call on the platform.
+
+- **Research:** logistic-system finished; 100 technologies researched, 68 rockets launched.
+- **Supply backbone, Nauvis side done:**
+  - Buddy placed a requester chest and a fast inserter at the silo, and moved it once into logistic range (`silos_with_supply_chest` 1).
+  - It set buddy-1's `supply`: piercing magazines 400, iron ore (500, then 600 to keep the hub from overfilling) and foundation.
+  - It fed iron ore into the robot network with a new ore line from drill 4334 into a passive-provider chest. The supply imports then flowed.
+- **Departure:**
+  - Buddy scheduled buddy-1 for `["vulcanus"]`; the `no_crew` hold kept it in orbit.
+  - It crafted a burner starter kit (8 burner drills, steel furnaces) and booked a seat with `board`.
+  - The rocket stalled at 43 of 50 parts: processing units are short because copper is short. Buddy hand-fed circuits when the run ended.
+- **Hub space:**
+  - The hub filled several times. Asteroid chunks take a slot each, and shipped plates piled up.
+  - Buddy jettisoned about 2,000 items in total, once 400 iron ore that the thrusters needed (it then said this was a mistake).
+- **Router defect:**
+  - `route_belt` from (-31,99) to (2,105) planned an underground exit at (-16.5,105.5) heading south, a surface belt at (-16.5,106.5) facing north, and an underground entrance back on (-16.5,105.5).
+  - Placement failed at that tile and rolled back. Buddy rebuilt the line in legs by hand.
+
+### Fixes after s46
+
+- **Router reversing onto a used tile.**
+  - The belt search keys its states by tile, arrival direction and whether it arrived underground, so a route could come back onto a tile.
+  - Here the underground exit had to continue straight, so the route stepped one tile on, reversed onto the exit tile (now arriving north, so free to turn) and tunnelled east from it.
+  - Fix: the search no longer reverses (a surface move or tunnel opposite to the arrival direction). A finished route that still uses a tile twice is refused with an error rather than planned.
+  - Regression test `underground_exit_never_turns_by_reversing_onto_itself`: on a 6×6 map whose start can only tunnel south into a dead end, the committed router planned an underground entrance on the exit tile (0.5,2.5). The fixed router finds no route, which is correct.
+  - Live repro on s45's save, with the stub belt 4485 removed as Buddy did: the same `route_belt` call now plans 22 belts on 22 distinct tiles and places them, connected.
+- Gates for the held-item and router fixes: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live50`).
 
 ## Comparison with other harnesses
 
