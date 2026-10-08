@@ -1322,6 +1322,15 @@ The provider refused 3 turns, at 16.5, 21.5 and 26.6 minutes; the rest ran norma
   - Sandbox on s46's save: a jettison of 10,000 iron ore, 10,000 carbon and 5 ice removed 128 ore, 117 carbon and 5 ice, leaving 450, 450 and 522.
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live53`).
 
+### `s49-cont48-opus-open-2590060469-60m-capped` (invalid)
+
+All 12 turns were refused by the provider limit, from the start. The trial was renamed `-capped` and does not count; s49 is rerun from s48's save.
+
+Open risk, found on s48's save while s49 ran, not fixed yet:
+- buddy-1 waits at Vulcanus with 0 piercing magazines in turrets and hub (3 of 6 turrets ready, 8 damaged tiles).
+- The `unarmed` hold applies only where the platform can be restocked, so a schedule home would fly it unarmed; the outbound trip used about 300 magazines.
+- The hub holds 740 iron plates, and `firearm-magazine` and `piercing-rounds-magazine` are unlocked. The return trip needs ammo made at Vulcanus or on the platform before the shuttle runs.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
