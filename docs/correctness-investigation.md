@@ -1299,6 +1299,29 @@ The provider refused 3 turns, at 16.5, 21.5 and 26.6 minutes; the rest ran norma
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live52`).
 - The next trial, `s48-cont46`, branches again from s46's save (platform intact), because s47's save has neither a platform nor a character.
 
+### `s48-cont46-opus-open-2590060469-60m`: Vulcanus reached with the supply line built
+
+77 turns, 31 tool errors, 0 invariant failures, not provider-limited; `plate_automation` and `powered_production` still true. It branched from s46's save and ran with commit `ae0cd03`.
+
+- **Departure:**
+  - Buddy armed buddy-1, booked a seat, and kept renewing the booking while the silo built parts (about 1 per minute; it also fixed a copper feed for the processing units).
+  - It rode the rocket up, and the platform left with no hold.
+- **Flight:** undamaged. The turrets fired piercing rounds (454, then 299 at 95% of the way). Buddy jettisoned uncrushed metallic chunks to keep the hub open.
+- **Mistakes:** twice Buddy jettisoned thruster inputs below the 450 reserve (300 iron ore, then 400 carbon), and the `thrust_stock` hold kept the platform until the crushers made it up.
+- **Vulcanus:**
+  - Buddy built a solar outpost on the calcite field near (-160,80): 7 panels, 3 poles and 3 electric drills.
+  - It hand-crafted a chemical plant and an assembler for tungsten carbide, mined coal, tungsten ore and iron ore, and was working toward the foundry (lubricant and refined concrete pending).
+- **End state:**
+  - Buddy on Vulcanus. buddy-1 waits at Vulcanus with stops `["vulcanus"]`, unarmed: turret and hub ammo are at 0.
+  - 103 technologies researched, 69 rockets launched.
+
+### Fixes after s48
+
+- **Jettison keeps the thrust reserve.**
+  - `space_platform action=jettison` keeps THRUST_RESERVE (450) of each item the platform's thruster-fluid plants consume (here iron ore and carbon), and reports `kept_for_thrust` with guidance. Other items go as asked.
+  - Sandbox on s46's save: a jettison of 10,000 iron ore, 10,000 carbon and 5 ice removed 128 ore, 117 carbon and 5 ice, leaving 450, 450 and 522.
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live53`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

@@ -835,6 +835,34 @@ function thrust_shortages(platform)
     return short
 end
 
+-- Item names the platform's thruster-fluid plants consume (ice, carbon,
+-- iron ore...): the hub keeps THRUST_RESERVE of each.
+local function thrust_inputs(platform)
+    local surface, force = platform.surface, platform.force
+    local names = {}
+    if not surface then return names end
+    local fluids = {}
+    for _, thruster in pairs(surface.find_entities_filtered{type = "thruster", force = force}) do
+        for index = 1, #thruster.fluidbox do
+            local filter = safe_value(function() return thruster.fluidbox.get_filter(index) end)
+            if filter then fluids[filter.name] = true end
+        end
+    end
+    for _, plant in pairs(surface.find_entities_filtered{type = "assembling-machine", force = force}) do
+        local recipe = plant.get_recipe()
+        local makes = false
+        for _, product in pairs(recipe and recipe.products or {}) do
+            if fluids[product.name] then makes = true end
+        end
+        if makes then
+            for _, ingredient in pairs(recipe.ingredients) do
+                if ingredient.type == "item" then names[ingredient.name] = true end
+            end
+        end
+    end
+    return names
+end
+
 local function rockets_for(counts)
     local lift = safe_value(function() return prototypes.utility_constants.rocket_lift_weight end)
     if not lift then return 1 end
@@ -2454,7 +2482,8 @@ local function action_request(character, items, stops)
 end
 
 -- Throw items out of the hub, as an inserter over the platform edge would;
--- they are lost.
+-- they are lost. Thruster-fuel inputs keep THRUST_RESERVE in the hub: below
+-- it the platform cannot leave (thrust_stock hold).
 local function action_jettison(platform, items)
     local list, err = normalize_items(items)
     if not list then return err end
@@ -2462,14 +2491,24 @@ local function action_jettison(platform, items)
         return fail("platform_not_ready", platform.name .. " has no hub yet (" .. state_name(platform.state) .. ")")
     end
     local inventory = platform.hub.get_inventory(defines.inventory.hub_main)
-    local removed = {}
+    local fuel = thrust_inputs(platform)
+    local removed, kept = {}, {}
     for _, item in ipairs(list) do
-        local count = inventory.remove{name = item.name, count = item.count}
-        removed[#removed + 1] = {name = item.name, count = count}
+        local count = item.count
+        if fuel[item.name] then
+            local spare = math.max(0, inventory.get_item_count(item.name) - THRUST_RESERVE)
+            if spare < count then
+                kept[#kept + 1] = {name = item.name, requested = count, kept_in_hub = THRUST_RESERVE}
+                count = spare
+            end
+        end
+        removed[#removed + 1] = {name = item.name, count = count > 0 and inventory.remove{name = item.name, count = count} or 0}
     end
     return {
         success = true,
         jettisoned = removed,
+        kept_for_thrust = kept[1] and kept or nil,
+        guidance = kept[1] and ("Thruster fuel inputs keep " .. THRUST_RESERVE .. " each in the hub, or the platform cannot leave; free slots with uncrushed chunks or surplus plates instead, or add cargo bays.") or nil,
         hub_free_slots = inventory.count_empty_stacks(),
         hub_slots = #inventory,
     }
