@@ -1326,10 +1326,18 @@ The provider refused 3 turns, at 16.5, 21.5 and 26.6 minutes; the rest ran norma
 
 All 12 turns were refused by the provider limit, from the start. The trial was renamed `-capped` and does not count; s49 is rerun from s48's save.
 
-Open risk, found on s48's save while s49 ran, not fixed yet:
+Open risk, found on s48's save while s49 ran:
 - buddy-1 waits at Vulcanus with 0 piercing magazines in turrets and hub (3 of 6 turrets ready, 8 damaged tiles).
-- The `unarmed` hold applies only where the platform can be restocked, so a schedule home would fly it unarmed; the outbound trip used about 300 magazines.
-- The hub holds 740 iron plates, and `firearm-magazine` and `piercing-rounds-magazine` are unlocked. The return trip needs ammo made at Vulcanus or on the platform before the shuttle runs.
+- The `unarmed` hold applied only where the platform could be restocked, so a schedule home would fly it unarmed; the outbound trip used about 300 magazines.
+
+### Fixes after s49 (capped)
+
+- **The `unarmed` hold applies everywhere.** A shuttle that spent its ammo stays parked until piercing rounds (or better) reach it.
+  - Firearm magazines made on the platform are no fix: yellow-fed turrets were destroyed in the recorded trials, s47 included, and platforms cannot make piercing rounds (asteroid crushing gives no copper).
+  - Sandbox on s48's save: `schedule stops=["nauvis"]` returned `departure_held: unarmed`, and the platform stayed at Vulcanus.
+- **Round-trip ammo.** The standing-supply step now suggests 1100 piercing magazines instead of 400: a leg spends 300–400, and the platform leaves only with 600+, so 1100 covers the way back.
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live54`).
+- Still open: re-arming buddy-1 at Vulcanus needs piercing rounds made there (copper and steel from the foundry chain) and lifted by a Vulcanus rocket silo, which Buddy also needs to board.
 
 ## Comparison with other harnesses
 

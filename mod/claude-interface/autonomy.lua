@@ -698,7 +698,7 @@ local function space_rung(facts, force, surface)
     for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
     if not (supplied["piercing-rounds-magazine"] and supplied["iron-ore"]) then
         return "Set " .. P.name .. "'s standing supply from Nauvis.",
-            "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 400, iron-ore 1000, space-platform-foundation 20]: whenever it orbits Nauvis, rockets keep its ammo, thruster ore and spare foundation topped up, also while you are away. Add what Vulcanus will need later the same way."
+            "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]: whenever it orbits Nauvis, rockets keep its ammo, thruster ore and spare foundation topped up, also while you are away. A leg to Vulcanus spends 300-400 magazines and the platform only leaves with 600+ piercing rounds aboard, so 1100 brings it home again. Add what Vulcanus will need later the same way."
     end
     if H.network_lacks and H.network_lacks[1] then
         return "Stock the home network with " .. table.concat(H.network_lacks, ", ") .. " for " .. P.name .. "'s supply.",

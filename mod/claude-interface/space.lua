@@ -679,10 +679,13 @@ local function crewed(platform)
 end
 
 -- Why a departure for `destination` is held:
--- * "unarmed" or "thrust_stock" (thruster-fluid ingredients under
---   THRUST_RESERVE: the thrusters burn out within seconds and the platform
---   stalls) where it can be restocked, so a shuttle that spent its ammo at a
---   planet without silos still flies home;
+-- * "unarmed" anywhere: turrets loaded with piercing-rounds-magazine or
+--   better and MIN_AMMO of it aboard (yellow-fed turrets were destroyed on
+--   the way, s47 included), so a shuttle that spent its ammo stays parked
+--   until piercing rounds reach it;
+-- * "thrust_stock" (thruster-fluid ingredients under THRUST_RESERVE: the
+--   thrusters burn out within seconds and the platform stalls) where it can
+--   be restocked;
 -- * "no_supply_line" on the first trip to a planet until the planet it
 --   leaves can resupply it unattended (a silo with a supply chest, and the
 --   hub importing from there): otherwise whoever goes is stranded;
@@ -694,7 +697,7 @@ local function hold_reason(platform, destination)
     -- Crew aboard can land and ship, where the planet below has a silo.
     local restockable = resuppliable(here, platform.force)
         or (here ~= nil and crewed(platform) and here.find_entities_filtered{type = "rocket-silo", force = platform.force, limit = 1}[1] ~= nil)
-    if restockable and not armament(platform).armed then return "unarmed" end
+    if not armament(platform).armed then return "unarmed" end
     if restockable and thrust_shortages(platform)[1] then return "thrust_stock" end
     local target = destination and game.get_surface(destination)
     local visited = target ~= nil and target.count_entities_filtered{force = platform.force, limit = 1} > 0
