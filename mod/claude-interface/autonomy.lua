@@ -841,6 +841,17 @@ local function progression(surface, force, facts, character)
             .. ". Add assemblers for it and its intermediates, the plate and power supply they need, with build_layout, and deliver it to every lab; replace hand-fed fuel with belts or electric machines."
     end
     local warnings = {}
+    -- A character lost and replaced within the last 30 minutes.
+    for _, respawn in pairs(storage.character_respawns or {}) do
+        if character and respawn.unit_number == character.unit_number and game.tick - respawn.tick < 30 * 3600 then
+            local platform_lost = not game.get_surface(respawn.lost_on)
+            warnings[#warnings + 1] = "Your previous character was lost on " .. tostring(respawn.lost_on)
+                .. (platform_lost and " (that surface no longer exists: its space platform was destroyed)" or "")
+                .. "; you respawned at the Nauvis spawn " .. math.floor((game.tick - respawn.tick) / 3600)
+                .. " min ago with an empty inventory. Everything you carried is gone."
+                .. (platform_lost and " Before flying again, check the replacement platform's defence: turrets loaded with piercing-rounds-magazine (load_turrets), spare turrets and magazines in the hub." or "")
+        end
+    end
     -- Away from home, hand refuelling at home is out of reach.
     local away = facts.space.character_surface ~= surface.name
     if not away and facts.boilers > 0 and (facts.boiler_fuel_min or 0) < 10 then

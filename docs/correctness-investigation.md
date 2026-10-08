@@ -1268,6 +1268,37 @@ The provider refused 3 turns, at 16.5, 21.5 and 26.6 minutes; the rest ran norma
   - Sandbox on s46's save, character booked beside the silo, 50 iron ore in the supply chest, rocket parts completed by script: the inserter loaded all 50 into the rocket. When the rocket became ready, the 50 went back to the chest and the character launched, arriving on platform-1 about 42 s later. The ore then loaded into the next rocket.
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live51`).
 
+### `s47-cont46-opus-open-2590060469-60m` (rerun): platform and character lost
+
+120 turns, 36 tool errors, not provider-limited. The run failed: the final samples could not run because the agent had no character ("no character for agent eval").
+
+- **Departure:** Buddy boarded buddy-1, and the platform left for Vulcanus with armament reported as armed (7/6 ready turrets, 4/4 in front, 600 piercing magazines in turrets and hub).
+- **Flight:**
+  - The hub kept filling, and Buddy jettisoned chunks, ore, carbon and ice each turn.
+  - Asteroids destroyed the collector, a crusher, a solar panel and 19 front foundation tiles. Weak magazines fell from 560 to 409, while piercing stayed at 100 in turrets and 500 in the hub.
+  - Around 61% of the way, at speed about 1.3, the hub was destroyed. That destroys the platform, its surface and the character aboard.
+  - The final save has no platforms and no `platform-1` surface.
+- **After the loss:** for the remaining turns (more than 60) every tool except production statistics failed, and nothing respawned the character. Buddy filed `evaltrial-xq5`.
+- **Cause:**
+  - On s46's save, four front turrets and two others each held 77–100 `firearm-magazine`. A gun turret has one ammo slot, so they fire it all before taking piercing rounds; the hub's 500 piercing were never used.
+  - The armament check counted a turret as ready with 50+ magazines of any kind, and counted piercing magazines across turrets and hub, so it reported armed.
+
+### Fixes after the s47 rerun
+
+- **Weak-loaded turrets are not ready.**
+  - `armament` counts a turret as ready only when it holds no `firearm-magazine` and is fed or holds 50+ stronger magazines. It reports `weak_loaded`, and `needs` names the fix.
+  - On s46's save: armed false (1 ready, 0 in front), and the `unarmed` hold is on, where before it reported armed.
+- **`load_turrets` swaps weak ammo.** A turret holding firearm magazines while the hub holds stronger ammo gets them swapped: the weak magazines go into the hub (only if all fit), and a stack of the best hub ammo goes in.
+  - On s46's save, 5 turrets were swapped to 100 piercing each (the hub's 500). Afterwards: 6 ready, 4 in front, armed. The seventh turret kept firearm because the hub had no piercing left, and `needs` names it.
+  - The no-ammo guidance now says to ship piercing-rounds-magazine, not firearm-magazine.
+- **Respawn.**
+  - An agent whose character was destroyed (killed, or lost with a destroyed platform, which raises no death event) gets a new character within a second, at the force's spawn on Nauvis with an empty inventory, as a player respawns.
+  - A body a human took over is never replaced. `storage.character_respawns` records the loss, and the snapshot warns for 30 minutes: where it was lost, whether that platform is gone, and to check the replacement platform's defence.
+  - Sandbox on s46's save, character placed on buddy-1 by script, hub killed with `die()`: within 5 s the platform was gone and the character was on Nauvis at (0,0) with 0 items. The warning appeared, and the next goal became "Create a space platform".
+  - Saves from before this tracking (s47's final save) have no record of the lost character, so they get no respawn.
+
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live52`).
+- The next trial, `s48-cont46`, branches again from s46's save (platform intact), because s47's save has neither a platform nor a character.
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

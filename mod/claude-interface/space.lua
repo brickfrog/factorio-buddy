@@ -363,7 +363,7 @@ local MIN_LOADED_AMMO = 50
 local function armament(platform)
     local surface = platform.surface
     local result = {
-        turrets = 0, turrets_ready = 0, front_turrets_ready = 0, turret_ammo = 0, hub_ammo = 0, weak_ammo = 0,
+        turrets = 0, turrets_ready = 0, front_turrets_ready = 0, turret_ammo = 0, hub_ammo = 0, weak_ammo = 0, weak_loaded = 0,
         min_ready_turrets = MIN_READY_TURRETS, min_front_turrets = MIN_FRONT_TURRETS, min_ammo = MIN_AMMO,
         missing_research = {},
     }
@@ -395,8 +395,16 @@ local function armament(platform)
     for _, turret in pairs(surface.find_entities_filtered{type = "ammo-turret", force = platform.force}) do
         result.turrets = result.turrets + 1
         local inventory = turret.get_inventory(defines.inventory.turret_ammo)
+        local weak, strong = 0, 0
+        for _, entry in pairs(inventory and inventory.get_contents() or {}) do
+            if WEAK_AMMO[entry.name] then weak = weak + entry.count else strong = strong + entry.count end
+        end
         if inventory then count_ammo(inventory.get_contents(), "turret_ammo") end
-        if fed[turret.unit_number] or (inventory and inventory.get_item_count() or 0) >= MIN_LOADED_AMMO then
+        -- A turret fires what it holds before taking anything better, so weak
+        -- magazines in its slot leave it unready however it is fed.
+        if weak > 0 then
+            result.weak_loaded = result.weak_loaded + 1
+        elseif fed[turret.unit_number] or strong >= MIN_LOADED_AMMO then
             result.turrets_ready = result.turrets_ready + 1
             if turret.position.y < hub_y then result.front_turrets_ready = result.front_turrets_ready + 1 end
         end
@@ -407,10 +415,11 @@ local function armament(platform)
     result.armed = result.turrets_ready >= MIN_READY_TURRETS and result.front_turrets_ready >= MIN_FRONT_TURRETS
         and result.hub_ammo + result.turret_ammo >= MIN_AMMO and not result.missing_research[1]
     result.needs = result.turrets_ready .. "/" .. MIN_READY_TURRETS .. " gun turrets ready (fed by an inserter or holding "
-        .. MIN_LOADED_AMMO .. "+ magazines), " .. result.front_turrets_ready .. "/" .. MIN_FRONT_TURRETS
+        .. MIN_LOADED_AMMO .. "+ piercing-rounds-magazine or better, and no firearm-magazine), " .. result.front_turrets_ready .. "/" .. MIN_FRONT_TURRETS
         .. " of them in the front half (ahead of the hub centre; smaller y is the direction of travel), "
         .. (result.hub_ammo + result.turret_ammo) .. "/" .. MIN_AMMO .. " piercing-rounds-magazine (or better) in turrets and hub"
         .. (result.weak_ammo > 0 and (" (" .. result.weak_ammo .. " firearm-magazine do not count: too weak)") or "")
+        .. (result.weak_loaded > 0 and ("; " .. result.weak_loaded .. " turrets hold firearm-magazine and fire it first: space_platform action=load_turrets swaps it for the hub's stronger ammo") or "")
         .. (result.missing_research[1] and (", research " .. table.concat(result.missing_research, ", ")) or "")
     return result
 end
@@ -2512,16 +2521,48 @@ end
 
 -- Have the hub fill every empty turret and turret ghost on the platform with
 -- one stack of the ammo it holds most of, and keep them topped up from now
--- on (see tend_platforms).
+-- on (see tend_platforms). A turret holding weak magazines while the hub has
+-- stronger ones gets them swapped: the weak ones go back to the hub.
+local function swap_weak_ammo(platform, turret)
+    local hub = platform.hub.get_inventory(defines.inventory.hub_main)
+    local slot = turret.get_inventory(defines.inventory.turret_ammo)
+    if not (hub and slot) then return nil end
+    local weak = {}
+    for _, entry in pairs(slot.get_contents()) do
+        if WEAK_AMMO[entry.name] then weak[#weak + 1] = entry end
+    end
+    if not weak[1] then return nil end
+    local better = nil
+    for _, name in ipairs(AMMO_PREFERENCE) do
+        if not WEAK_AMMO[name] and hub.get_item_count(name) > 0 then better = name break end
+    end
+    if not better then return nil end
+    for _, entry in ipairs(weak) do
+        local stack = {name = entry.name, quality = entry.quality, count = entry.count}
+        if hub.get_insertable_count(stack) < entry.count then return nil end
+    end
+    for _, entry in ipairs(weak) do
+        local stack = {name = entry.name, quality = entry.quality, count = entry.count}
+        hub.insert(stack)
+        slot.remove(stack)
+    end
+    local count = math.min(hub.get_item_count(better), prototypes.item[better].stack_size)
+    local inserted = slot.insert({name = better, count = count})
+    if inserted > 0 then hub.remove({name = better, count = inserted}) end
+    return {name = turret.name, position = turret.position, removed = weak, loaded = {name = better, count = inserted}}
+end
+
 local function action_load_turrets(platform)
     if not (platform.hub and platform.hub.valid) then
         return fail("platform_not_ready", platform.name .. " has no hub yet (" .. state_name(platform.state) .. ")")
     end
     storage.turret_ammo_orders = storage.turret_ammo_orders or {}
     storage.turret_ammo_orders[platform.index] = true
-    local loading = {}
+    local loading, swapped = {}, {}
     local surface = platform.surface
     for _, entity in pairs(surface.find_entities_filtered{type = "ammo-turret", force = platform.force}) do
+        local swap = swap_weak_ammo(platform, entity)
+        if swap then swapped[#swapped + 1] = swap end
         local count = request_turret_ammo(platform, entity)
         if count > 0 then loading[#loading + 1] = {name = entity.name, position = entity.position, count = count} end
     end
@@ -2531,10 +2572,10 @@ local function action_load_turrets(platform)
         local count = not dead[ghost.unit_number] and request_turret_ammo(platform, ghost) or 0
         if count > 0 then loading[#loading + 1] = {name = ghost.ghost_name, position = ghost.position, count = count, ghost = true} end
     end
-    local result = {success = true, loading = loading, armament = armament(platform)}
-    if not loading[1] then
+    local result = {success = true, loading = loading, swapped = swapped, armament = armament(platform)}
+    if not loading[1] and not swapped[1] then
         result.guidance = hub_ammo_for(platform, "gun-turret") and "Every turret already holds ammo or has a request. The hub keeps them topped up from now on."
-            or "The hub has no ammo for its turrets: ship firearm-magazine (space_platform action=ship)."
+            or "The hub has no ammo for its turrets: ship piercing-rounds-magazine (space_platform action=ship); firearm-magazine is too weak for flights."
     else
         result.guidance = "The hub delivers these within seconds and keeps every turret topped up from now on, in flight too; a turret holding "
             .. MIN_LOADED_AMMO .. "+ magazines counts as ready. Keep magazines and a few spare gun-turrets in the hub: it rebuilds destroyed turrets."

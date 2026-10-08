@@ -255,6 +255,10 @@ function M.find(agent_id)
     if character and character.valid and not is_player_character(character) then
         return character
     end
+    -- A human took this body over: never respawn a replacement.
+    if character and character.valid and storage.character_seen and storage.character_seen[agent_id] then
+        storage.character_seen[agent_id].player_owned = true
+    end
     storage.characters[agent_id] = nil
     return nil
 end
@@ -271,7 +275,45 @@ function M.remember(agent_id, character)
     if character.unit_number then
         storage.factorioctl_entities[character.unit_number] = character
     end
+    storage.character_seen = storage.character_seen or {}
+    storage.character_seen[agent_id] = {surface = character.surface.name, tick = game.tick}
     return true
+end
+
+-- Called every second. An agent whose character was destroyed (killed, or
+-- lost with a destroyed space platform, which raises no death event) gets a
+-- new one at the force's spawn on Nauvis with an empty inventory, as a
+-- player respawns. storage.character_respawns records what was lost.
+function M.respawn_lost()
+    -- Characters placed before this tracking existed.
+    storage.character_seen = storage.character_seen or {}
+    for agent_id, character in pairs(storage.characters or {}) do
+        if not storage.character_seen[agent_id] and character.valid and not is_player_character(character) then
+            storage.character_seen[agent_id] = {surface = character.surface.name, tick = game.tick}
+        end
+    end
+    for agent_id, seen in pairs(storage.character_seen) do
+        local character = M.find(agent_id)
+        if character then
+            seen.surface, seen.tick = character.surface.name, game.tick
+        elseif not seen.player_owned then
+            local home = game.surfaces["nauvis"]
+            local force = game.forces.player
+            local position = home and home.find_non_colliding_position("character", force.get_spawn_position(home), 32, 0.5)
+            local created = position and home.create_entity{name = "character", position = position, force = force}
+            if created then
+                local lost_on, lost_after = seen.surface, seen.tick
+                M.remember(agent_id, created)
+                storage.character_respawns = storage.character_respawns or {}
+                storage.character_respawns[agent_id] = {
+                    tick = game.tick,
+                    unit_number = created.unit_number,
+                    lost_on = lost_on,
+                    last_seen_tick = lost_after,
+                }
+            end
+        end
+    end
 end
 
 function M.register(agent_id, character)
