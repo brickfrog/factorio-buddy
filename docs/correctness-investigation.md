@@ -1296,9 +1296,9 @@ The provider refused 3 turns, at 16.5, 21.5 and 26.6 minutes; the rest ran norma
   - A body a human took over is never replaced. `storage.character_respawns` records the loss, and the snapshot warns for 30 minutes: where it was lost, whether that platform is gone, and to check the replacement platform's defence.
   - Sandbox on s46's save, character placed on buddy-1 by script, hub killed with `die()`: within 5 s the platform was gone and the character was on Nauvis at (0,0) with 0 items. The warning appeared, and the next goal became "Create a space platform".
   - Saves from before this tracking (s47's final save) have no record of the lost character, so they get no respawn.
-
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live52`).
 - The next trial, `s48-cont46`, branches again from s46's save (platform intact), because s47's save has neither a platform nor a character.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
