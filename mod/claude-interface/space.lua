@@ -1751,7 +1751,7 @@ end
 -- space_platform
 -- ============================================================
 
-local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, supply = true, jettison = true, clear_ghosts = true, load_turrets = true, schedule = true, board = true, land = true}
+local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, supply = true, jettison = true, clear_ghosts = true, deconstruct = true, load_turrets = true, schedule = true, board = true, land = true}
 
 local function resolve_platform(character, platform_name)
     local force = character.force
@@ -2444,6 +2444,38 @@ local function action_clear_ghosts(platform)
     return {success = true, removed = removed}
 end
 
+-- Marks the built entity at x,y on the platform for deconstruction, as with a
+-- deconstruction planner from remote view: the hub removes it and its
+-- contents go to the hub. Rebuild it with place_ghosts.
+local function action_deconstruct(character, platform, x, y)
+    if type(x) ~= "number" or type(y) ~= "number" then
+        return fail("invalid_position", "deconstruct needs x and y of an entity on the platform")
+    end
+    local surface = platform.surface
+    local found = nil
+    for _, entity in pairs(surface.find_entities_filtered{position = {x, y}, radius = 0.5, force = platform.force}) do
+        if entity.type ~= "entity-ghost" and entity.type ~= "tile-ghost" and entity.name ~= "space-platform-hub"
+            and entity.prototype.has_flag("player-creation")
+        then
+            found = entity
+            break
+        end
+    end
+    if not found then
+        return fail("entity_not_found", "no built entity at " .. x .. "," .. y .. " on " .. platform.name, {surface = surface.name})
+    end
+    local record = {name = found.name, position = found.position, direction = found.direction, unit_number = found.unit_number}
+    if not found.to_be_deconstructed() and not found.order_deconstruction(character.force) then
+        return fail("deconstruct_refused", "Factorio refused to mark " .. found.name .. " for deconstruction", record)
+    end
+    return {
+        success = true,
+        marked = record,
+        guidance = "The hub removes it within seconds and its contents go to the hub. Rebuild it with place_ghosts surface="
+            .. surface.name .. " (same name, position and direction) if it is still needed.",
+    }
+end
+
 -- Have the hub fill every empty turret and turret ghost on the platform with
 -- one stack of the ammo it holds most of, and keep them topped up from now
 -- on (see tend_platforms).
@@ -2652,7 +2684,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     local character = characters.find(agent_id)
     if not character then return no_character(agent_id) end
     if not ACTIONS[action] then
-        return fail("invalid_action", "action must be status, create, ship, unship, request, supply, jettison, clear_ghosts, load_turrets, schedule, board or land", {action = action})
+        return fail("invalid_action", "action must be status, create, ship, unship, request, supply, jettison, clear_ghosts, deconstruct, load_turrets, schedule, board or land", {action = action})
     end
     if action == "status" then return action_status(character) end
     if action == "create" then return action_create(character, platform_name) end
@@ -2663,6 +2695,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     if action == "board" then return action_board(agent_id, character, platform) end
     if action == "jettison" then return action_jettison(platform, items) end
     if action == "clear_ghosts" then return action_clear_ghosts(platform) end
+    if action == "deconstruct" then return action_deconstruct(character, platform, x, y) end
     if action == "load_turrets" then return action_load_turrets(platform) end
     if action == "unship" then return action_unship(character, platform, items) end
     if action == "schedule" then return action_schedule(character, platform, stops) end

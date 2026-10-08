@@ -2022,17 +2022,21 @@ impl FactorioClient {
         unit_number: u32,
         allowed_items: &[String],
     ) -> Result<serde_json::Value> {
-        self.approach_entity(unit_number).await?;
-        let response = self
-            .call_remote(
-                "configure_inserter",
-                &[
-                    json!(self.agent_id.as_str()),
-                    json!(unit_number),
-                    json!(allowed_items),
-                ],
-            )
-            .await?;
+        // Platform filters are set remotely (as from remote view), so walk
+        // only when the mod reports the inserter out of reach.
+        let args = [
+            json!(self.agent_id.as_str()),
+            json!(unit_number),
+            json!(allowed_items),
+        ];
+        let mut response = self.call_remote("configure_inserter", &args).await?;
+        let value: serde_json::Value = serde_json::from_str(&response)?;
+        if value.get("error_kind").and_then(|kind| kind.as_str()) == Some("out_of_reach") {
+            self.approach_entity(unit_number).await?;
+            response = self.call_remote("configure_inserter", &args).await?;
+        } else {
+            return Ok(value);
+        }
         // Preserve semantic failure kinds and rollback/readback evidence for
         // the MCP caller. The server's common semantic-error marker turns a
         // returned `{success:false}` payload into an MCP tool error.

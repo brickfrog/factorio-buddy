@@ -2264,7 +2264,7 @@ function M.configure_inserter(agent_id, unit_number, allowed_items)
         }
     end
 
-    local reach_error = characters.require_entity_reach(character, entity)
+    local reach_error = characters.require_settings_reach(character, entity)
     if reach_error then return reach_error end
 
     local normalized, validation_error = validate_allowed_items(allowed_items)

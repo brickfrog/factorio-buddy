@@ -1003,12 +1003,17 @@ local function progression(surface, force, facts, character)
         for _, stuck in ipairs(platform.resmelting or {}) do
             local feeders = {}
             for _, feeder in ipairs(stuck.feeders or {}) do feeders[#feeders + 1] = tostring(feeder.unit_number) end
+            local aboard = facts.space.character_surface == platform.surface
+            local fix = "configure_inserter unit_number=" .. table.concat(feeders, "/") .. " allowed_items=[" .. stuck.should_take .. "]"
+                .. " (works from anywhere), then "
+                .. (aboard
+                    and ("extract_items unit_number=" .. tostring(stuck.furnace.unit_number) .. " inventory_type=furnace_source item=" .. stuck.holds .. ".")
+                    or ("space_platform action=deconstruct x=" .. stuck.furnace.position.x .. " y=" .. stuck.furnace.position.y
+                        .. " (its " .. stuck.holds .. " goes to the hub) and place_ghosts surface=" .. tostring(platform.surface)
+                        .. " the " .. stuck.furnace.name .. " back at the same spot. No need to board."))
             warnings[#warnings + 1] = platform.name .. "'s " .. stuck.furnace.name .. " " .. tostring(stuck.furnace.unit_number)
                 .. " at " .. stuck.furnace.position.x .. "," .. stuck.furnace.position.y .. " holds " .. stuck.count .. " " .. stuck.holds
-                .. " from the hub, so it smelts " .. stuck.holds .. " again instead of the hub's "
-                .. stuck.should_take .. ". Board " .. platform.name .. " (space_platform action=board), configure_inserter unit_number="
-                .. table.concat(feeders, "/") .. " allowed_items=[" .. stuck.should_take .. "], then extract_items unit_number="
-                .. tostring(stuck.furnace.unit_number) .. " inventory_type=furnace_source item=" .. stuck.holds .. "."
+                .. " from the hub, so it smelts " .. stuck.holds .. " again instead of the hub's " .. stuck.should_take .. ". " .. fix
         end
         if platform.stranded_ghosts and platform.stranded_ghosts[1] then
             warnings[#warnings + 1] = platform.name .. " has ghosts the hub will never build or must not build: "

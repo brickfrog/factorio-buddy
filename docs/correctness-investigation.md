@@ -1198,6 +1198,29 @@ Open defects for the next round:
 
 The provider limit was reached about 32 minutes in; 6 turns were refused, and the final sample failed with it. The trial was renamed `-capped` and does not count; s45 is rerun from s44's save.
 
+### `s45-cont44-opus-open-2590060469-60m` (rerun)
+
+56 turns, 30 tool errors, 0 invariant failures, not provider-limited; `plate_automation` and `powered_production` still true.
+
+- **Research:** logistic-system went from 81.9% to 99.5%; 98 technologies researched, 66 rockets launched. To keep the labs busy, Buddy queued red/green/blue filler research (exoskeleton-equipment, battery-equipment and others).
+- **Platform furnace:**
+  - Buddy read the re-smelting warning and tried `configure_inserter` from Nauvis, which failed with `wrong_surface`.
+  - It then waited about 30 minutes for a rocket, trimming the hub so the collectors kept running, and finally boarded and followed the warning.
+  - Space science came down again, and logistic-system resumed from 95.5%.
+- **Copper:** Buddy filtered copper off the full x=62 belt onto a new belt for a starved cable assembler.
+- **Oil:** it replaced a dead-end solid-fuel chest at (386,-111) with belts into the rocket-fuel feed.
+- **Supply backbone:** unchanged; still no supply chest, since logistic-system had not finished.
+
+### Fixes after s45
+
+- **Platform settings from the ground.** In the game, remote view changes settings on any of the force's entities, platforms included, and marks them for deconstruction; Buddy instead waited 30 minutes for a rocket.
+  - `configure_inserter` now works on the force's own space platforms from any surface (`require_settings_reach`). Filters move no items.
+  - New `space_platform action=deconstruct x y` marks a built platform entity for deconstruction; the hub removes it and its contents go to the hub.
+  - Away from the platform, the re-smelting warning now gives this fix: filter the feeder, deconstruct the furnace, and `place_ghosts` it back, with no boarding. Aboard, it still says `extract_items`.
+  - Sandbox on s44's save, character on Nauvis: the filter and deconstruct calls succeeded. The furnace went to the hub, `place_ghosts` rebuilt it, it smelted iron ore into plates within 25 s, and the warning cleared.
+  - The Rust `configure_inserter` walked to the entity before calling the mod, which failed across surfaces. It now calls the mod first and walks and retries only on `out_of_reach`. MCP smoke: the platform filter was set from Nauvis with no walk; a Nauvis inserter about 110 tiles away was reached by walking, then configured. `space_platform action=deconstruct` at an empty spot returns `entity_not_found`.
+- Gates: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live48`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
