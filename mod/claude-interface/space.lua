@@ -1998,8 +1998,41 @@ local function launch_character(agent_id, character, platform, silo)
     return true
 end
 
--- Launch booked agents from the first ready, empty rocket in their reach.
--- Returns the surfaces where a booking still waits for a rocket.
+-- A booked seat goes before supply cargo the supply chest's inserter already
+-- loaded: that cargo moves back into the supply chests (all of it, or none),
+-- and the next rocket carries it. Returns true when the rocket is empty.
+local function return_supply_cargo(silo, cargo)
+    if cargo.is_empty() then return true end
+    local chests = supply_chests(silo)
+    if not chests[1] then return false end
+    local moved = {}
+    local function undo()
+        for _, entry in ipairs(moved) do
+            entry.inventory.remove({name = entry.name, quality = entry.quality, count = entry.count})
+        end
+    end
+    for _, item in pairs(cargo.get_contents()) do
+        local left = item.count
+        for _, chest in ipairs(chests) do
+            if left == 0 then break end
+            local inventory = chest.get_inventory(defines.inventory.chest)
+            local inserted = inventory and inventory.insert({name = item.name, quality = item.quality, count = left}) or 0
+            if inserted > 0 then
+                moved[#moved + 1] = {inventory = inventory, name = item.name, quality = item.quality, count = inserted}
+                left = left - inserted
+            end
+        end
+        if left > 0 then
+            undo()
+            return false
+        end
+    end
+    cargo.clear()
+    return true
+end
+
+-- Launch booked agents from the first ready rocket in their reach (emptied of
+-- supply cargo first). Returns the surfaces where a booking still waits.
 local function serve_bookings()
     local waiting = {}
     storage.board_bookings = storage.board_bookings or {}
@@ -2016,8 +2049,9 @@ local function serve_bookings()
             if location and character.surface.planet and location.name == character.surface.planet.name then
                 for _, silo in pairs(character.surface.find_entities_filtered{type = "rocket-silo", force = character.force}) do
                     local cargo = silo.get_inventory(defines.inventory.rocket_silo_rocket)
-                    if silo.rocket_silo_status == defines.rocket_silo_status.rocket_ready and (not cargo or cargo.is_empty())
+                    if silo.rocket_silo_status == defines.rocket_silo_status.rocket_ready
                         and not characters.require_entity_reach(character, silo)
+                        and (not cargo or return_supply_cargo(silo, cargo))
                     then
                         launched = launch_character(agent_id, character, platform, silo)
                         break

@@ -1252,6 +1252,22 @@ The provider limit was reached about 32 minutes in; 6 turns were refused, and th
   - Live repro on s45's save, with the stub belt 4485 removed as Buddy did: the same `route_belt` call now plans 22 belts on 22 distinct tiles and places them, connected.
 - Gates for the held-item and router fixes: `luac`, clippy, all cargo tests, release build, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live50`).
 
+### `s47-cont46-opus-open-2590060469-60m-capped` (invalid)
+
+The provider refused 3 turns, at 16.5, 21.5 and 26.6 minutes; the rest ran normally to 60 minutes. The trial was renamed `-capped` and does not count; s47 is rerun from s46's save. Its later turns still showed one defect:
+
+- Buddy booked a seat to buddy-1 (`board`) and waited at the silo. Meanwhile the supply chest's inserter loaded supply cargo into the rocket.
+- `serve_bookings` only boards an empty rocket, so the booking lapsed and the supply launch took the rocket ("Rocket left with supply cargo; I'm re-booked for the next one").
+- With processing units at about 11 per 10 minutes, the next rocket was about 45 minutes away.
+
+### Fixes after s47 (capped)
+
+- **A booked seat goes before supply cargo.**
+  - When a booked agent's rocket is ready, `return_supply_cargo` moves its cargo back into the silo's supply chests (all of it or none; partial moves are undone), and the agent launches. The next rocket carries the supply.
+  - The reach check runs first, so cargo is not moved while the agent is away from the silo.
+  - Sandbox on s46's save, character booked beside the silo, 50 iron ore in the supply chest, rocket parts completed by script: the inserter loaded all 50 into the rocket. When the rocket became ready, the 50 went back to the chest and the character launched, arriving on platform-1 about 42 s later. The ore then loaded into the next rocket.
+- Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live51`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
