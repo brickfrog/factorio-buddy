@@ -1433,6 +1433,29 @@ Valid: 87 turns, 15 tool errors, 0 provider-limited turns. `plate_automation` an
   - `home_shuttle_rung`: when something waits on that silo, the step after setting the standing supply is "Finish the Nauvis supply silo's rocket: 40/50 parts, it lacks processing-unit". It includes the 10-minute output of each ingredient, `diagnose_factory_blockers surface=nauvis x=92 y=129`, and the harvest bootstrap.
 - Gates: `luac`, all cargo tests. Live suite: 538 passed, 0 failed (`fb-evidence/git-gud/live65`).
 
+### `s54-cont52-opus-open-2590060469-60m`
+
+Valid: 43 turns, 12 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- **First metallurgic science packs.** Buddy made a foundry on Vulcanus pump lava into molten iron, then made tungsten plates (which unlocks metallurgic science), tungsten carbide, molten copper, and 4 metallurgic science packs. All of it was hand-fed and powered by solar and the base's steam.
+- **The stalled-silo step did its job.** Buddy went straight to the silo's feed and found the cause: the single processing-unit assembler (62.5,141.5) has one green-circuit assembler and one cable assembler behind it, and the cable assembler's copper belt is empty. Two supply rockets launched (they brought the 7 turrets); the next one reached 40/50 parts.
+- **Remote repairs:**
+  - He cancelled a removal order that kept robots looping on a chest that refilled.
+  - He pulled in 345 copper plates from a chest.
+  - He turned the foundation assembler into a firearm-magazine maker; piercing rounds then reached about 14 per minute, 240 in total, until magazines ran out.
+- **About 25 turns were idle** ("No changes this turn"). Buddy reported two things he could not get past:
+  - The cable assembler takes copper from storage chest 9395 through a plain inserter, while the copper went into 9394.
+  - New lines needed requester chests, long-handed inserters and poles that the robot network did not hold.
+- **Root cause, checked in a sandbox from this save:** Nauvis copper has collapsed.
+  - The original copper drills have run out; 23 drills report `no_minable_resources`. 21 copper furnaces lack ingredients.
+  - The two copper outposts are not connected to the base: (20,400), about 250 tiles south, and (261,88). Their furnaces are `full_output`, and both lie outside roboport range.
+  - Across Nauvis, 135 machines are blocked with full output.
+- **Masses that bound this route** (item weights from the engine; one rocket lifts 1 t):
+  - piercing-rounds-magazine 20 kg, so the 600-round minimum takes 12 rockets;
+  - rocket-silo 10 t (10 rockets);
+  - thruster 200 kg; space-platform-foundation 20 kg;
+  - one Vulcanus launch's rocket parts (processing-unit 3.3 kg, low-density-structure 5 kg, rocket-fuel 10 kg, 50 of each), about 1 t.
+  - At the current rate of about one rocket per 40 minutes, that is well over 15 hours of Nauvis launches.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
