@@ -767,6 +767,12 @@ local function scoped_character(agent_id)
     return find_factorioctl_character(agent_id or "default")
 end
 
+-- The surface a query names (any planet or platform), else the character's.
+local function named_surface(character, surface_name)
+    if type(surface_name) == "string" and surface_name ~= "" then return game.get_surface(surface_name) end
+    return character and character.surface or nil
+end
+
 local function plan_steam_power_impl(agent_id, water_x1, water_y1, water_x2, water_y2, target_x, target_y, intent)
     local character = find_factorioctl_character(agent_id)
     if not (character and character.valid) then
@@ -2653,9 +2659,9 @@ local api = {
         return json_remote_call("get_surfaces", entities.get_surfaces)
     end,
 
-    find_entities = function(x1, y1, x2, y2, entity_type, name, agent_id)
+    find_entities = function(x1, y1, x2, y2, entity_type, name, agent_id, surface_name)
         local character = scoped_character(agent_id)
-        return json_remote_call("find_entities", entities.find_entities, character and character.surface or nil, x1, y1, x2, y2, entity_type, name)
+        return json_remote_call("find_entities", entities.find_entities, named_surface(character, surface_name), x1, y1, x2, y2, entity_type, name)
     end,
 
     verify_production = function(x1, y1, x2, y2, agent_id)
@@ -2663,9 +2669,9 @@ local api = {
         return json_remote_call("verify_production", entities.verify_production, character and character.surface or nil, character and character.force or nil, x1, y1, x2, y2)
     end,
 
-    diagnose_factory_blockers = function(x1, y1, x2, y2, limit, agent_id)
+    diagnose_factory_blockers = function(x1, y1, x2, y2, limit, agent_id, surface_name)
         local character = scoped_character(agent_id)
-        return json_remote_call("diagnose_factory_blockers", entities.diagnose_factory_blockers, character and character.surface or nil, character and character.force or nil, x1, y1, x2, y2, limit)
+        return json_remote_call("diagnose_factory_blockers", entities.diagnose_factory_blockers, named_surface(character, surface_name), character and character.force or nil, x1, y1, x2, y2, limit)
     end,
 
     diagnose_fuel_sustainability = function(x1, y1, x2, y2, limit, agent_id)
@@ -2969,8 +2975,8 @@ local api = {
         return json_remote_call("robot_logistics", space.robot_logistics, agent_id, surface_name)
     end,
 
-    place_ghosts = function(agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run)
-        return json_remote_call("place_ghosts", space.place_ghosts, agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run)
+    place_ghosts = function(agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run, deconstruct)
+        return json_remote_call("place_ghosts", space.place_ghosts, agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run, deconstruct)
     end,
 
     space_platform = function(agent_id, action, platform_name, items, stops, x, y)

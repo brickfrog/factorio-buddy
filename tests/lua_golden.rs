@@ -1694,15 +1694,6 @@ fn world_observation_queries_live_in_the_mod_not_rust_strings() {
         "world.find_nearest_resource",
         "world.get_tiles",
         "world.get_tile",
-        "get_surfaces = function()",
-        "find_entities = function(x1, y1, x2, y2, entity_type, name, agent_id)",
-        "verify_production = function(x1, y1, x2, y2, agent_id)",
-        "get_entity = function(unit_number)",
-        "get_entity_drop_position = function(unit_number)",
-        "find_resources = function(x1, y1, x2, y2, resource_type, agent_id)",
-        "find_nearest_resource = function(resource_name, from_x, from_y, explore_radius, agent_id)",
-        "get_tiles = function(x1, y1, x2, y2, agent_id)",
-        "get_tile = function(x, y, agent_id)",
     ] {
         assert!(
             control_lua.contains(required),

@@ -5232,6 +5232,8 @@ pub struct GetEntitiesParams {
     /// Detailed result cap.
     #[serde(default = "default_entity_limit")]
     pub limit: usize,
+    /// Surface name (nauvis, vulcanus, platform-1); omit for yours.
+    pub surface: Option<String>,
 }
 
 /// Entity inventory query.
@@ -5287,6 +5289,8 @@ pub struct DiagnoseFactoryBlockersParams {
     pub radius: Option<u32>,
     /// Maximum number of ranked blockers to return
     pub limit: Option<u32>,
+    /// Surface name (nauvis, vulcanus, platform-1); omit for yours. Another surface needs x and y.
+    pub surface: Option<String>,
 }
 
 /// Parameters for diagnose_fuel_sustainability tool
@@ -8133,6 +8137,17 @@ pub struct PlaceGhostsParams {
     pub tiles: Vec<GhostTile>,
     #[serde(default)]
     pub dry_run: bool,
+    /// Built entities for robots (or the platform hub) to remove, max 200; they carry each one and its contents to storage, which stocks the network.
+    #[serde(default)]
+    pub deconstruct: Vec<GhostRemoval>,
+}
+
+/// Built entity to deconstruct, at dx/dy from the origin.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GhostRemoval {
+    pub name: String,
+    pub dx: f64,
+    pub dy: f64,
 }
 
 /// Tile ghost.
@@ -8175,22 +8190,25 @@ const MAX_GHOST_TILES: usize = 400;
 /// arrays. Errors are ready-to-return tool payloads.
 fn place_ghosts_request(
     params: &PlaceGhostsParams,
-) -> Result<(serde_json::Value, serde_json::Value), serde_json::Value> {
+) -> Result<(serde_json::Value, serde_json::Value, serde_json::Value), serde_json::Value> {
     let fail = |kind: &str, error: String, extra: serde_json::Value| {
         steam_power_failure(kind, error, extra)
     };
-    if params.entities.is_empty() && params.tiles.is_empty() {
+    if params.entities.is_empty() && params.tiles.is_empty() && params.deconstruct.is_empty() {
         return Err(fail(
             "invalid_layout",
-            "give at least one entity or tile".to_string(),
+            "give at least one entity, tile or deconstruct target".to_string(),
             serde_json::json!({}),
         ));
     }
-    if params.entities.len() > MAX_LAYOUT_ENTITIES || params.tiles.len() > MAX_GHOST_TILES {
+    if params.entities.len() > MAX_LAYOUT_ENTITIES
+        || params.tiles.len() > MAX_GHOST_TILES
+        || params.deconstruct.len() > MAX_LAYOUT_ENTITIES
+    {
         return Err(fail(
             "invalid_layout",
-            format!("at most {MAX_LAYOUT_ENTITIES} entities and {MAX_GHOST_TILES} tiles"),
-            serde_json::json!({"entities": params.entities.len(), "tiles": params.tiles.len()}),
+            format!("at most {MAX_LAYOUT_ENTITIES} entities or deconstruct targets and {MAX_GHOST_TILES} tiles"),
+            serde_json::json!({"entities": params.entities.len(), "tiles": params.tiles.len(), "deconstruct": params.deconstruct.len()}),
         ));
     }
     if !(params.origin_x.is_finite() && params.origin_y.is_finite()) {
@@ -8242,9 +8260,22 @@ fn place_ghosts_request(
         }
         tiles.push(serde_json::json!({"name": tile.name, "dx": tile.dx, "dy": tile.dy}));
     }
+    let mut deconstruct = Vec::with_capacity(params.deconstruct.len());
+    for (index, target) in params.deconstruct.iter().enumerate() {
+        if !(target.dx.is_finite() && target.dy.is_finite()) || target.name.is_empty() {
+            return Err(fail(
+                "invalid_layout",
+                format!("deconstruct {index} needs a name and finite dx/dy"),
+                serde_json::json!({"index": index}),
+            ));
+        }
+        deconstruct
+            .push(serde_json::json!({"name": target.name, "dx": target.dx, "dy": target.dy}));
+    }
     Ok((
         serde_json::Value::Array(entities),
         serde_json::Value::Array(tiles),
+        serde_json::Value::Array(deconstruct),
     ))
 }
 
@@ -9127,7 +9158,7 @@ impl FactorioMcp {
 
     /// Get all entities in an area. Returns entity names, positions, and types.
     #[tool(
-        description = "Find entities near x,y; crafting machines include their recipe (find the assemblers making an item with entity_type=assembling-machine). Prefer prototype name/type filters; narrow radius or limit when results are summarized."
+        description = "Find entities near x,y on your surface or another (surface=nauvis from Vulcanus); crafting machines include their recipe (find the assemblers making an item with entity_type=assembling-machine). Prefer prototype name/type filters; narrow radius or limit when results are summarized."
     )]
     async fn get_entities(&self, Parameters(params): Parameters<GetEntitiesParams>) -> String {
         let mut client = match self.connect().await {
@@ -9147,7 +9178,12 @@ impl FactorioMcp {
         };
 
         let result = match client
-            .find_entities(area, None, params.name.as_deref())
+            .find_entities_on_surface(
+                params.surface.as_deref(),
+                area,
+                None,
+                params.name.as_deref(),
+            )
             .await
         {
             Ok(entities) => {
@@ -9896,7 +9932,7 @@ impl FactorioMcp {
 
     /// Diagnose ranked factory blockers and likely causal repairs in an area.
     #[tool(
-        description = "Diagnose ranked production blockers near a point. Returns non-working entities, likely root causes such as unfueled boilers causing downstream no_power, and concrete suggested tool actions. Use this before spending turns manually debugging no_power, no_fuel, no_ingredients, output blockage, or idle labs."
+        description = "Diagnose ranked production blockers near a point, on your surface or another (surface=nauvis with x,y). Returns non-working entities, likely root causes such as unfueled boilers causing downstream no_power, and concrete suggested tool actions. Use this before spending turns manually debugging no_power, no_fuel, no_ingredients, output blockage, or idle labs."
     )]
     async fn diagnose_factory_blockers(
         &self,
@@ -9911,6 +9947,9 @@ impl FactorioMcp {
         let limit = params.limit.unwrap_or(10).clamp(1, 50);
         let position = match (params.x, params.y) {
             (Some(x), Some(y)) => Position::new(x, y),
+            (None, None) if params.surface.is_some() => {
+                return "Error: give x and y when diagnosing another surface".to_string();
+            }
             (None, None) => {
                 let status = match client.character_status().await {
                     Ok(status) => status,
@@ -9933,7 +9972,10 @@ impl FactorioMcp {
             left_top: Position::new(position.x - r, position.y - r),
             right_bottom: Position::new(position.x + r, position.y + r),
         };
-        let report = match client.diagnose_factory_blockers(area, limit).await {
+        let report = match client
+            .diagnose_factory_blockers(area, limit, params.surface.as_deref())
+            .await
+        {
             Ok(report) => report,
             Err(e) => return format!("Error: {}", e),
         };
@@ -17704,10 +17746,10 @@ impl FactorioMcp {
 
     /// Place ghosts for robots or a platform hub.
     #[tool(
-        description = "Build without walking: place ghosts on any surface (default yours) for robots or a platform hub to build. Planet ghosts must be in roboport construction range; platforms build from hub stock (add space-platform-foundation tiles to grow). Marks trees/rocks for removal. All-or-nothing; reports items the builders lack."
+        description = "Build without walking: place ghosts on any surface (default yours) for robots or a platform hub to build. Planet ghosts must be in roboport construction range; platforms build from hub stock (add space-platform-foundation tiles to grow). Marks trees/rocks for removal. deconstruct=[{name,dx,dy}] has robots remove built entities in range and carry them and their contents to storage chests: from another planet, that stocks an empty network with parts (machines, inserters, chests and what they hold). All-or-nothing; reports items the builders lack."
     )]
     async fn place_ghosts(&self, Parameters(params): Parameters<PlaceGhostsParams>) -> String {
-        let (entities, tiles) = match place_ghosts_request(&params) {
+        let (entities, tiles, deconstruct) = match place_ghosts_request(&params) {
             Ok(request) => request,
             Err(failure) => {
                 return serde_json::to_string_pretty(&failure)
@@ -17725,6 +17767,7 @@ impl FactorioMcp {
                 &entities,
                 &tiles,
                 params.dry_run,
+                &deconstruct,
             )
             .await
         {

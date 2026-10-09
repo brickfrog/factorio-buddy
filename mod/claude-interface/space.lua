@@ -1460,7 +1460,40 @@ local function add_needed(needed, items)
     if item then needed[item.name] = (needed[item.name] or 0) + item.count end
 end
 
-function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run)
+-- Built entities named in `targets` ({name, dx, dy} from the origin) that
+-- robots should remove, as with a deconstruction planner from remote view:
+-- they carry the entity and its contents to storage, which stocks the
+-- network from machines and chests. Returns the plan or a failure.
+local function plan_deconstruction(surface, force, origin_x, origin_y, targets)
+    local cells = (not surface.platform) and construction_cells(surface, force) or nil
+    local planned, seen = {}, {}
+    for index, spec in ipairs(targets) do
+        if not (type(spec) == "table" and type(spec.name) == "string" and finite(spec.dx) and finite(spec.dy)) then
+            return nil, fail("invalid_layout", "deconstruct " .. index .. " needs name, dx and dy", {index = index})
+        end
+        local position = {x = origin_x + spec.dx, y = origin_y + spec.dy}
+        local entity = surface.find_entities_filtered{name = spec.name, position = position, radius = 0.6, force = force, limit = 1}[1]
+        if not entity or entity.type == "character" or entity.name == "space-platform-hub" then
+            return nil, fail("nothing_to_deconstruct", "deconstruct " .. index .. ": no " .. spec.name .. " of yours at " .. position.x .. "," .. position.y .. "; nothing was changed", {index = index, position = position})
+        end
+        if cells and not covered(cells, entity.position) then
+            return nil, fail("no_construction_coverage", "deconstruct " .. index .. " (" .. spec.name .. ") is outside every roboport's construction range; nothing was changed", {index = index, position = pos_table(entity.position)})
+        end
+        if not seen[entity.unit_number or index] then
+            seen[entity.unit_number or index] = true
+            local yields = {}
+            for _, item in pairs(entity.prototype.items_to_place_this or {}) do yields[item.name] = (yields[item.name] or 0) + (item.count or 1) end
+            for slot = 1, entity.get_max_inventory_index() do
+                local inventory = entity.get_inventory(slot)
+                for _, item in pairs(inventory and inventory.get_contents() or {}) do yields[item.name] = (yields[item.name] or 0) + item.count end
+            end
+            planned[#planned + 1] = {index = index, entity = entity, name = entity.name, position = pos_table(entity.position), yields = top_counts(yields, 8)}
+        end
+    end
+    return planned
+end
+
+function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run, deconstruct)
     local character = characters.find(agent_id)
     if not character then return no_character(agent_id) end
     local surface, err = resolve_surface(character, surface_name)
@@ -1471,11 +1504,19 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
     end
     entities = type(entities) == "table" and entities or {}
     tiles = type(tiles) == "table" and tiles or {}
-    if #entities == 0 and #tiles == 0 then
-        return fail("invalid_layout", "give at least one entity or tile")
+    deconstruct = type(deconstruct) == "table" and deconstruct or {}
+    if #entities == 0 and #tiles == 0 and #deconstruct == 0 then
+        return fail("invalid_layout", "give at least one entity, tile or deconstruct target")
     end
-    if #entities > MAX_PLACE_ENTITIES or #tiles > MAX_PLACE_TILES then
-        return fail("invalid_layout", "at most " .. MAX_PLACE_ENTITIES .. " entities and " .. MAX_PLACE_TILES .. " tiles per call")
+    if #entities > MAX_PLACE_ENTITIES or #tiles > MAX_PLACE_TILES or #deconstruct > MAX_PLACE_ENTITIES then
+        return fail("invalid_layout", "at most " .. MAX_PLACE_ENTITIES .. " entities or deconstruct targets and " .. MAX_PLACE_TILES .. " tiles per call")
+    end
+    local removals, removal_err = plan_deconstruction(surface, force, origin_x, origin_y, deconstruct)
+    if not removals then return removal_err end
+    local function removal_report()
+        local list = {}
+        for _, plan in ipairs(removals) do list[#list + 1] = {index = plan.index, name = plan.name, position = plan.position, yields = plan.yields} end
+        return list
     end
 
     -- Validate and resolve positions.
@@ -1697,6 +1738,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             surface = surface.name,
             would_place = would_place,
             would_place_tiles = #new_tiles,
+            would_deconstruct = removal_report(),
             already_built = already_built,
             obstacles = #obstacles,
             missing_items = missing_items,
@@ -1714,12 +1756,19 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         for _, obstacle in ipairs(marked) do
             if obstacle.valid then obstacle.cancel_deconstruction(force) end
         end
+        for _, plan in ipairs(removals) do
+            if plan.entity.valid then plan.entity.cancel_deconstruction(force) end
+        end
         for _, old in ipairs(removed_stranded) do
             surface.create_entity{name = "entity-ghost", inner_name = old.name, position = old.position, direction = old.direction, force = force}
         end
     end
     for _, obstacle in ipairs(obstacles) do
         if obstacle.valid and obstacle.order_deconstruction(force) then marked[#marked + 1] = obstacle end
+    end
+    local deconstructing = 0
+    for _, plan in ipairs(removals) do
+        if plan.entity.valid and plan.entity.order_deconstruction(force) then deconstructing = deconstructing + 1 end
     end
     for _, ghost in ipairs(clear) do
         if ghost.valid then
@@ -1786,7 +1835,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         and ("The hub builds these from its inventory; bring missing_items with space_platform action=ship."
             .. (ammo_requested > 0 and " It also loads the new turrets with " .. ammo_requested .. " magazines from the hub." or ""))
         or (surface ~= character.surface
-            and "Robots build these from items in the network; you are on another surface, so if missing_items is not empty, have this planet make them: place_ghosts an assembler on each item (fed by inserters) with an inserter into a passive-provider-chest in range. Check progress with robot_logistics."
+            and "Robots build these from items in the network; you are on another surface, so if missing_items is not empty, have this planet make them: place_ghosts an assembler on each item (fed by inserters) with an inserter into a passive-provider-chest in range. If the network lacks even those parts, deconstruct machines or chests that hold them (deconstruct=[{name,dx,dy}]): robots carry them and their contents into storage chests. Check progress with robot_logistics."
             or "Robots build these from items in the network; put missing_items into a storage or passive-provider chest in range. Check progress with robot_logistics.")
     if recipe_failed then
         guidance = guidance .. " Recipes with recipe_set=false were not applied: set them with set_recipe once the machine is built and you are there."
@@ -1798,6 +1847,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         placed_tiles = #new_tiles,
         already_built = already_built,
         obstacles_marked = #marked,
+        deconstructing = deconstructing > 0 and removal_report() or nil,
         recipes = recipes,
         missing_items = missing_items,
         removed_stranded_ghosts = removed_stranded,

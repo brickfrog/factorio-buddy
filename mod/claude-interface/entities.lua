@@ -154,7 +154,7 @@ function M.get_surfaces()
 end
 
 function M.find_entities(surface, x1, y1, x2, y2, entity_type, name)
-    if not surface then return {error = "agent surface not found"} end
+    if not surface then return {error = "surface not found (no agent character, or no surface by that name)"} end
     storage.factorioctl_entities = storage.factorioctl_entities or {}
     local filters = {area = area_table(x1, y1, x2, y2)}
     if entity_type then filters.type = entity_type end
@@ -1579,7 +1579,7 @@ local function dead_end_belt_root_cause(surface, force, found, waiting_entities,
 end
 
 function M.diagnose_factory_blockers(surface, force, x1, y1, x2, y2, limit)
-    if not (surface and force) then return {error = "agent surface or force not found"} end
+    if not (surface and force) then return {error = "surface or force not found (no agent character, or no surface by that name)"} end
     limit = limit or 10
     local area = area_table(x1, y1, x2, y2)
     local found = surface.find_entities_filtered{

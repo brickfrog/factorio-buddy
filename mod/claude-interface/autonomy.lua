@@ -408,23 +408,30 @@ end
 
 local REMOTE_HOME = " Nauvis runs without you: check it with robot_logistics surface=nauvis and build there with place_ghosts surface=nauvis."
 
--- Building a new shuttle over Nauvis while you stay on Vulcanus, because
--- `stranded` sits over Vulcanus unarmed with no silo below to arm it. The
--- first missing step, or nil while it is on its way.
+-- How to stock an empty home network from another planet.
+local BOOTSTRAP_TEXT = " If robots lack the parts to build that (robot_logistics surface=nauvis missing_items), harvest them: get_entities surface=nauvis finds machines and chests in roboport range (machines blocked with full output hold their products), and place_ghosts surface=nauvis deconstruct=[{name,dx,dy}] has robots carry them and their contents into storage chests. Robots work while you are away: keep advancing Vulcanus meanwhile."
+
+-- Building a new shuttle over Nauvis while you stay on Vulcanus: no armed
+-- platform orbits Vulcanus and no silo stands there, so nothing can bring
+-- parts down or lift anything up. `stranded` is the unarmed platform still
+-- orbiting Vulcanus (its layout is copied), or nil once it is lost. The
+-- first missing step, or nil while the new shuttle is on its way.
 local function home_shuttle_rung(S, stranded)
     local H = S.home_supply or {}
-    local why = stranded.name .. " is stuck over Vulcanus: " .. tostring((stranded.armament or {}).needs)
-        .. ", and with no rocket silo here nothing can arm it. It cannot fly home, and asteroids wear it down."
+    local why = stranded
+        and (stranded.name .. " is stuck over Vulcanus: " .. tostring((stranded.armament or {}).needs)
+            .. ", and with no rocket silo here nothing can arm it. It cannot fly home, and asteroids wear it down.")
+        or "No armed platform serves Vulcanus and no rocket silo stands here: nothing can bring parts down or take products up."
     if (H.silos_with_supply_chest or 0) == 0 then
-        return "Give the Nauvis silo a supply chest from here: " .. stranded.name .. " is stuck.",
+        return "Give the Nauvis silo a supply chest from here: Vulcanus needs a new shuttle.",
             why .. " A new shuttle is built over Nauvis by its supply silo: place_ghosts surface=nauvis a requester-chest beside the rocket silo and an inserter from the chest into the silo, inside the roboport network."
     end
     local P = nil
     for _, platform in ipairs(S.platforms or {}) do
-        if platform.name ~= stranded.name and platform.space_location ~= "vulcanus" then P = platform end
+        if platform.space_location ~= "vulcanus" then P = platform end
     end
     if not P then
-        return "Build a new shuttle over Nauvis from here: " .. stranded.name .. " is stuck.",
+        return "Build a new shuttle over Nauvis from here.",
             why .. " space_platform action=create stops=[\"nauvis\"] creates one over Nauvis; Nauvis' supply silo launches its starter pack by itself once the home network holds one ("
             .. recipe_text("space-platform-starter-pack") .. "). Make it there with place_ghosts surface=nauvis if nothing does."
     end
@@ -435,7 +442,7 @@ local function home_shuttle_rung(S, stranded)
         return "Get a space-platform-starter-pack into the Nauvis network for " .. P.name .. ".",
             recipe_text("space-platform-starter-pack") .. ". The supply silo launches it once robots can bring one to its supply chest"
             .. ((H.network_lacks and H.network_lacks[1]) and (". The network lacks: " .. table.concat(H.network_lacks, ", ")) or "")
-            .. ". From here: place_ghosts surface=nauvis an assembler with that recipe, an inserter from it into a passive-provider-chest, and its inputs (requester chests or belts), inside the roboport network."
+            .. ". From here: place_ghosts surface=nauvis an assembler with that recipe, an inserter from it into a passive-provider-chest, and its inputs (requester chests or belts), inside the roboport network." .. BOOTSTRAP_TEXT
     end
     local supplied = {}
     for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
@@ -444,13 +451,19 @@ local function home_shuttle_rung(S, stranded)
             "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]: rockets keep its ammo, thruster ore and spare foundation topped up while it orbits Nauvis, and from then on also send what its ghosts lack. A leg to Vulcanus spends 300-400 magazines and it leaves only with 600+ piercing rounds aboard."
     end
     if (P.thrusters or 0) == 0 and (P.turrets or (P.armament or {}).turrets or 0) == 0 and not (P.ghosts_missing_items and P.ghosts_missing_items[1]) then
-        return "Lay out " .. P.name .. " like " .. stranded.name .. ".",
-            "space_platform action=copy_layout platform=" .. P.name .. " stops=[\"" .. stranded.name .. "\"] places ghosts of its foundation, turrets, thrusters and machines; the hub builds them from what the supply silo brings. Add what "
-            .. stranded.name .. " lacked (asteroid collectors at the foundation edge for thruster fuel, more turrets at the front) with place_ghosts surface=" .. tostring(P.surface) .. "."
+        if stranded then
+            return "Lay out " .. P.name .. " like " .. stranded.name .. ".",
+                "space_platform action=copy_layout platform=" .. P.name .. " stops=[\"" .. stranded.name .. "\"] places ghosts of its foundation, turrets, thrusters and machines; the hub builds them from what the supply silo brings. Add what "
+                .. stranded.name .. " lacked (asteroid collectors at the foundation edge for thruster fuel, more turrets at the front) with place_ghosts surface=" .. tostring(P.surface) .. "."
+        end
+        return "Lay out " .. P.name .. " as a shuttle with place_ghosts surface=" .. tostring(P.surface) .. ".",
+            "Its ghosts' parts come up from Nauvis' network through the supply silo. It needs: " .. turret_plan(P.armament or {}, P.surface)
+            .. " Thrusters at the back edge (" .. recipe_text("thruster") .. "), fed by pipes from chemical plants on " .. recipe_text("thruster-fuel") .. " and " .. recipe_text("thruster-oxidizer")
+            .. "; asteroid collectors at the foundation edge with crushers for the carbon, iron and ice they need; solar panels and poles; inserters to and from the hub; space-platform-foundation tiles under all of it."
     end
     if H.network_lacks and H.network_lacks[1] then
         return "Stock the Nauvis network with " .. table.concat(H.network_lacks, ", ") .. " for " .. P.name .. ".",
-            "The supply silo lifts only what robots can bring. From here: place_ghosts surface=nauvis assemblers for each of these with an inserter into a passive-provider-chest inside the roboport network, fed from the existing lines; check with robot_logistics surface=nauvis."
+            "The supply silo lifts only what robots can bring. From here: place_ghosts surface=nauvis assemblers for each of these with an inserter into a passive-provider-chest inside the roboport network, fed from the existing lines; check with robot_logistics surface=nauvis." .. BOOTSTRAP_TEXT
     end
     if (P.stops or {})[1] == nil then
         return "Send " .. P.name .. " to shuttle between Nauvis and Vulcanus.",
@@ -490,17 +503,17 @@ local function vulcanus_rung(here, force, character, S)
         return "Place your cargo-landing-pad on Vulcanus.",
             "build_layout it inside the power network. Platforms orbiting Vulcanus drop what it requests (space_platform action=request items=[...])." .. REMOTE_HOME
     end
-    -- A shuttle here without ammo cannot leave, and with no silo here
-    -- nothing can arm it: the next shuttle is built over Nauvis from here.
+    -- No armed platform here and no silo: nothing reaches orbit from here,
+    -- so the next shuttle is built over Nauvis from here (copying the
+    -- unarmed one still orbiting, if any).
     local stranded, armed_here = nil, false
     for _, platform in ipairs(S.platforms or {}) do
         if platform.space_location == "vulcanus" then
-            if (platform.armament or {}).armed then armed_here = true
-            elseif (platform.orbit_silos or 0) == 0 then stranded = platform end
+            if (platform.armament or {}).armed then armed_here = true else stranded = platform end
         end
     end
-    if armed_here then stranded = nil end
-    if stranded and (here.counts["cargo-landing-pad"] or 0) > 0 then
+    local silo_here = character.surface.count_entities_filtered{type = "rocket-silo", force = force, limit = 1} > 0
+    if not armed_here and not silo_here and (here.counts["cargo-landing-pad"] or 0) > 0 then
         local goal, how = home_shuttle_rung(S, stranded)
         if goal then return goal, how end
     end

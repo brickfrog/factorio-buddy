@@ -1254,8 +1254,9 @@ impl LuaCommand {
         )
     }
 
-    /// Place entity and tile ghosts for robots or a platform hub to build.
-    /// `entities` and `tiles` are JSON arrays of `{name, dx, dy, ...}`.
+    /// Place entity and tile ghosts for robots or a platform hub to build, and
+    /// order deconstruction of built entities. `entities`, `tiles` and
+    /// `deconstruct` are JSON arrays of `{name, dx, dy, ...}`.
     pub fn place_ghosts(
         agent_id: &AgentId,
         surface_name: Option<&str>,
@@ -1263,6 +1264,7 @@ impl LuaCommand {
         entities: &Value,
         tiles: &Value,
         dry_run: bool,
+        deconstruct: &Value,
     ) -> String {
         Self::claude_interface_json_call(
             "place_ghosts",
@@ -1274,6 +1276,7 @@ impl LuaCommand {
                 entities.to_string(),
                 tiles.to_string(),
                 dry_run.to_string(),
+                deconstruct.to_string(),
             ],
             "Run just sync/resume so the updated claude-interface mod is loaded before placing ghosts.",
         )

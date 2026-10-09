@@ -1373,6 +1373,27 @@ Every way back up from Vulcanus needs a rocket silo there. Building one needs pa
   - the rung text advanced step by step.
 - Gates: `luac`, clippy, all cargo tests, release build. Live suite: 530 passed, 0 failed (`fb-evidence/git-gud/live60`), including new tests for remote create, the supply-silo starter pack and `copy_layout` alignment.
 
+### `s50-cont49-opus-open-2590060469-60m`
+
+Valid: 34 turns, 13 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- Buddy followed the new rung: `create stops=["nauvis"]` made buddy-2 over Nauvis, and he laid out a starter-pack cell with `place_ghosts surface=nauvis`.
+- Deadlock: Nauvis' network held only iron ore, 14 piercing magazines and 3 foundation, so robots could not build even the cell. Buddy made no tool calls for about 30 turns.
+  - He filed `file_issue` "No way to discover/deconstruct home-surface entities while character is on another planet": `get_entities` and `diagnose_factory_blockers` read only his own surface, and nothing could mark Nauvis entities for deconstruction.
+- Late in the hour he went back to Vulcanus and crafted the big mining drill in the foundry, which unlocked metallurgic-science-pack research.
+- buddy-1 lost its last crushers and turrets and was destroyed. The rung required an unarmed platform at Vulcanus, so it stopped firing even though buddy-2 still waited.
+
+### Fixes after s50: work on Nauvis from Vulcanus
+
+- **`get_entities surface=` and `diagnose_factory_blockers surface= x y`** read any surface. The remotes take a trailing `surface_name`; `find_entities_on_surface` sits beside `find_entities`, whose other callers keep the character's surface.
+- **`place_ghosts deconstruct=[{name,dx,dy}]`** has robots, or a platform hub, remove built entities in construction range. They carry each entity and its contents to storage, so an empty network can be stocked from machines blocked with full output.
+  - It is all-or-nothing like the rest of the call; the dry run reports `would_deconstruct` with yields.
+  - Smoke on s50's save, from Vulcanus: two Nauvis assemblers (inserter and circuit) went from 0 to 2 assembler-1s, 3 circuits and 1 inserter in the network within 45 s.
+- **The shuttle rung fires without a stranded platform.** Its condition is now: no armed platform at Vulcanus and no silo there, with a landing pad.
+  - With no source platform to copy, the layout step lists what a shuttle needs: turrets, thrusters with their fuel chemistry, collectors and crushers, power, inserters and foundation.
+  - The starter-pack and network-stock steps explain the deconstruction bootstrap, and tell Buddy to keep advancing Vulcanus while robots work.
+- A golden test that pinned the exact `find_entities`/`diagnose_factory_blockers` signature strings was removed. The manifest test still checks the arguments.
+- Gates: `luac`, clippy, all cargo tests, release build. Live suite: 535 passed, 0 failed (`fb-evidence/git-gud/live63`), including new tests for `get_entities` on another surface and for `place_ghosts deconstruct` returning a chest to storage.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

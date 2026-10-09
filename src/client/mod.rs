@@ -560,9 +560,22 @@ impl FactorioClient {
 
     // --- Entity Queries ---
 
-    /// Find entities in an area
+    /// Find entities in an area of the character's surface.
     pub async fn find_entities(
         &mut self,
+        area: Area,
+        entity_type: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Vec<Entity>> {
+        self.find_entities_on_surface(None, area, entity_type, name)
+            .await
+    }
+
+    /// Find entities in an area of `surface_name` (any planet or platform;
+    /// default: the character's surface).
+    pub async fn find_entities_on_surface(
+        &mut self,
+        surface_name: Option<&str>,
         area: Area,
         entity_type: Option<&str>,
         name: Option<&str>,
@@ -578,6 +591,7 @@ impl FactorioClient {
                     entity_type.map_or(Value::Null, |value| json!(value)),
                     name.map_or(Value::Null, |value| json!(value)),
                     json!(self.agent_id.as_str()),
+                    json!(surface_name),
                 ],
             )
             .await?;
@@ -620,11 +634,13 @@ impl FactorioClient {
         Ok(entities)
     }
 
-    /// Diagnose ranked production blockers and likely root causes in an area.
+    /// Diagnose ranked production blockers and likely root causes in an area
+    /// of `surface_name` (default: the character's surface).
     pub async fn diagnose_factory_blockers(
         &mut self,
         area: Area,
         limit: u32,
+        surface_name: Option<&str>,
     ) -> Result<serde_json::Value> {
         let response = self
             .call_remote(
@@ -636,6 +652,7 @@ impl FactorioClient {
                     json!(area.right_bottom.y),
                     json!(limit),
                     json!(self.agent_id.as_str()),
+                    json!(surface_name),
                 ],
             )
             .await?;
@@ -2164,7 +2181,8 @@ impl FactorioClient {
         Ok(serde_json::from_str(&response)?)
     }
 
-    /// Place entity and tile ghosts for robots or a platform hub to build.
+    /// Place entity and tile ghosts for robots or a platform hub to build, and
+    /// order deconstruction of the built entities in `deconstruct`.
     pub async fn place_ghosts(
         &mut self,
         surface_name: Option<&str>,
@@ -2172,6 +2190,7 @@ impl FactorioClient {
         entities: &Value,
         tiles: &Value,
         dry_run: bool,
+        deconstruct: &Value,
     ) -> Result<serde_json::Value> {
         let response = self
             .call_remote(
@@ -2184,6 +2203,7 @@ impl FactorioClient {
                     entities.clone(),
                     tiles.clone(),
                     json!(dry_run),
+                    deconstruct.clone(),
                 ],
             )
             .await?;

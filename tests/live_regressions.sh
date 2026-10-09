@@ -984,7 +984,7 @@ gp_probe_error_semantics() {
     status=0
     output="$("${CLI[@]}" --agent-id gameplay-probe-missing get entities --area 0,0,4,4 2>&1)" || status=$?
     gp_record error_semantics "CLI find_entities for missing agent (exit $status)" "$output"
-    if (( status != 0 )) && [[ "$output" == *"agent surface not found"* && "$output" != *"invalid type"* ]]; then
+    if (( status != 0 )) && [[ "$output" == *"surface not found"* && "$output" != *"invalid type"* ]]; then
         pass "client array parsing reports the Lua error for a missing agent"
     else
         fail "client array parsing reports the Lua error for a missing agent" "exit=$status output=$output"
@@ -8026,6 +8026,32 @@ for _, e in pairs(src.surface.find_entities_filtered{force = 'player'}) do
 end
 rcon.print(helpers.table_to_json({total = total, matched = matched}))")" \
     '.total > 0 and .matched == .total'
+
+# Remote work on another surface: get_entities reads it, and place_ghosts
+# deconstruct has robots carry a built entity and its contents to storage.
+assert_json "get_entities reads another surface" \
+    "$(tool_payload "$(mcp_tool get_entities "{\"x\":0,\"y\":0,\"radius\":5,\"surface\":\"$SA_SURFACE\"}")")" \
+    '(if type == "array" then . else .entities end) | any(.[]; .name == "space-platform-hub")'
+sb_chests() {
+    raw_lua "local s = game.surfaces.nauvis
+local stored = 0
+for _, n in pairs(game.forces.player.logistic_networks.nauvis or {}) do stored = stored + n.get_item_count('iron-chest') end
+rcon.print(helpers.table_to_json({built = s.count_entities_filtered{name = 'iron-chest', position = {2005.5, 2000.5}, radius = 0.6}, stored = stored}))"
+}
+SB_BEFORE="$(sb_chests)"
+require_json "the robot-built chest stands" "$SB_BEFORE" '.built == 1'
+assert_json "place_ghosts refuses to deconstruct what is not there" \
+    "$(tool_payload "$(mcp_tool place_ghosts '{"surface":"nauvis","origin_x":0,"origin_y":0,"deconstruct":[{"name":"iron-chest","dx":2010.5,"dy":2000.5}]}')")" \
+    '.success == false and .error_kind == "nothing_to_deconstruct"'
+assert_json "place_ghosts orders deconstruction and reports what robots bring back" \
+    "$(tool_payload "$(mcp_tool place_ghosts '{"surface":"nauvis","origin_x":0,"origin_y":0,"deconstruct":[{"name":"iron-chest","dx":2005.5,"dy":2000.5}]}')")" \
+    '.success == true and any(.deconstructing[]; .name == "iron-chest" and any(.yields[]; .name == "iron-chest"))'
+for _ in $(seq 1 60); do
+    [[ "$(jq -r --argjson before "$(jq '.stored' <<<"$SB_BEFORE")" '.stored > $before' <<<"$(sb_chests)")" == "true" ]] && break
+    sleep 1
+done
+assert_json "robots carry the deconstructed chest into storage" "$(sb_chests)" \
+    --argjson before "$(jq '.stored' <<<"$SB_BEFORE")" '.built == 0 and .stored == $before + 1'
 
 stop_mcp
 
