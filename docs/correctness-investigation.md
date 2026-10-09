@@ -1339,6 +1339,40 @@ Open risk, found on s48's save while s49 ran:
 - Gates: `luac`, all cargo tests, `live_regressions.sh` 524 passed and 0 failed (`fb-evidence/git-gud/live54`).
 - Still open: re-arming buddy-1 at Vulcanus needs piercing rounds made there (copper and steel from the foundry chain) and lifted by a Vulcanus rocket silo, which Buddy also needs to board.
 
+### `s49-cont48-opus-open-2590060469-60m`
+
+Valid rerun from s48's save: 23 turns, 35 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- Buddy crafted the foundry on Vulcanus and built a landing pad there. buddy-1 dropped 600 iron plate and 100 carbon onto it.
+- Buddy then spent the rest of the hour on parts for a big mining drill: electric engines, a heavy-oil cracking chain for plastic, and a carbide line. No drill was made.
+- buddy-1 sat unarmed over Vulcanus the whole time: its schedule `["nauvis","vulcanus"]` stayed held `unarmed`, and it lost 3 of its 6 turrets to asteroids.
+- What Buddy was told was wrong in two ways:
+  - once its stops were set, no rung covered the stuck platform;
+  - the ghost-parts warning said "ship them", but no silo can reach Vulcanus orbit.
+
+### Fixes after s49: build the next shuttle from Vulcanus
+
+Every way back up from Vulcanus needs a rocket silo there. Building one needs parts from Nauvis, which buddy-1 can no longer fetch. So the next shuttle is built over Nauvis by its supply silo, while Buddy stays on Vulcanus.
+- **Remote create.** `space_platform action=create stops=["nauvis"]` creates a platform over Nauvis from anywhere. It refuses (`no_supply_silo`) when no silo there has a supply chest.
+- **Starter pack through the supply silo.** A platform waiting for its starter pack asks the supply chest for one. The rocket then launches to that platform (`cargo_destination.space_platform`).
+- **Ghost parts ride the supply rockets.** Once a hub imports anything from the planet below, its supply also covers what its ghosts lack. `home_supply.network_lacks` lists those parts too.
+- **`copy_layout stops=[source]`** copies another platform's foundation, buildings and ghosts as ghosts, at the same positions and directions, with recipes and filters (`copy_settings`).
+  - A blueprint copy came first and was dropped for two reasons. Its hub pasted buddy-1's requests over the new hub's. Without the hub, `build_blueprint` anchors on the bounding box, and only 11 of 84 ghosts landed in place.
+  - The direct copy places 95 of 95.
+- **Stale shipment.** Cargo queued for buddy-1 on Nauvis before it left (34 piercing magazines, ore and chunks) marked Nauvis busy, so standing supply skipped Nauvis entirely. A shipment now blocks its surface only while its platform orbits there.
+- **Rung `home_shuttle_rung`.** It fires on Vulcanus when a platform there is unarmed, has no silo below, and no armed platform orbits Vulcanus. It names the first missing step: supply chest, create, starter pack, supply (1100 piercing), copy_layout, network stock, schedule `["nauvis","vulcanus"]`, and the hold.
+  - The armed-shuttle rung now needs an armed platform.
+  - The ghost warning names the supply silo, or says that no silo below can send the parts.
+- **One unservable order no longer holds the silo.** Each silo serves one platform order at a time. A platform short only of items the network does not have (rocket, chests and network hold none) now skips the silo, so another platform's order can go up.
+  - Found by the new live test: the first platform's ghost-part imports took the silo every second, and the second platform's starter pack never launched (live57–59 failed). With the fix it launches (live60).
+- Smoke on s49's save, with one starter pack seeded into a Nauvis storage chest:
+  - the starter pack launched by itself and the hub stood within 45 s; before the stale-shipment fix it never launched;
+  - the supply chest requested piercing 1100, iron ore 1000 and every ghost part;
+  - the hub built the ghosts from its stock;
+  - a second copy returned `nothing_to_copy`;
+  - `schedule ["nauvis","vulcanus"]` was held `unarmed`;
+  - the rung text advanced step by step.
+- Gates: `luac`, clippy, all cargo tests, release build. Live suite: 530 passed, 0 failed (`fb-evidence/git-gud/live60`), including new tests for remote create, the supply-silo starter pack and `copy_layout` alignment.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

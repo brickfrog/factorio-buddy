@@ -408,6 +408,62 @@ end
 
 local REMOTE_HOME = " Nauvis runs without you: check it with robot_logistics surface=nauvis and build there with place_ghosts surface=nauvis."
 
+-- Building a new shuttle over Nauvis while you stay on Vulcanus, because
+-- `stranded` sits over Vulcanus unarmed with no silo below to arm it. The
+-- first missing step, or nil while it is on its way.
+local function home_shuttle_rung(S, stranded)
+    local H = S.home_supply or {}
+    local why = stranded.name .. " is stuck over Vulcanus: " .. tostring((stranded.armament or {}).needs)
+        .. ", and with no rocket silo here nothing can arm it. It cannot fly home, and asteroids wear it down."
+    if (H.silos_with_supply_chest or 0) == 0 then
+        return "Give the Nauvis silo a supply chest from here: " .. stranded.name .. " is stuck.",
+            why .. " A new shuttle is built over Nauvis by its supply silo: place_ghosts surface=nauvis a requester-chest beside the rocket silo and an inserter from the chest into the silo, inside the roboport network."
+    end
+    local P = nil
+    for _, platform in ipairs(S.platforms or {}) do
+        if platform.name ~= stranded.name and platform.space_location ~= "vulcanus" then P = platform end
+    end
+    if not P then
+        return "Build a new shuttle over Nauvis from here: " .. stranded.name .. " is stuck.",
+            why .. " space_platform action=create stops=[\"nauvis\"] creates one over Nauvis; Nauvis' supply silo launches its starter pack by itself once the home network holds one ("
+            .. recipe_text("space-platform-starter-pack") .. "). Make it there with place_ghosts surface=nauvis if nothing does."
+    end
+    if P.space_location == nil then
+        return nil
+    end
+    if P.state == "waiting_for_starter_pack" or P.state == "starter_pack_on_the_way" or P.state == "starter_pack_requested" then
+        return "Get a space-platform-starter-pack into the Nauvis network for " .. P.name .. ".",
+            recipe_text("space-platform-starter-pack") .. ". The supply silo launches it once robots can bring one to its supply chest"
+            .. ((H.network_lacks and H.network_lacks[1]) and (". The network lacks: " .. table.concat(H.network_lacks, ", ")) or "")
+            .. ". From here: place_ghosts surface=nauvis an assembler with that recipe, an inserter from it into a passive-provider-chest, and its inputs (requester chests or belts), inside the roboport network."
+    end
+    local supplied = {}
+    for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
+    if not (supplied["piercing-rounds-magazine"] and supplied["iron-ore"]) then
+        return "Set " .. P.name .. "'s standing supply from Nauvis.",
+            "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]: rockets keep its ammo, thruster ore and spare foundation topped up while it orbits Nauvis, and from then on also send what its ghosts lack. A leg to Vulcanus spends 300-400 magazines and it leaves only with 600+ piercing rounds aboard."
+    end
+    if (P.thrusters or 0) == 0 and (P.turrets or (P.armament or {}).turrets or 0) == 0 and not (P.ghosts_missing_items and P.ghosts_missing_items[1]) then
+        return "Lay out " .. P.name .. " like " .. stranded.name .. ".",
+            "space_platform action=copy_layout platform=" .. P.name .. " stops=[\"" .. stranded.name .. "\"] places ghosts of its foundation, turrets, thrusters and machines; the hub builds them from what the supply silo brings. Add what "
+            .. stranded.name .. " lacked (asteroid collectors at the foundation edge for thruster fuel, more turrets at the front) with place_ghosts surface=" .. tostring(P.surface) .. "."
+    end
+    if H.network_lacks and H.network_lacks[1] then
+        return "Stock the Nauvis network with " .. table.concat(H.network_lacks, ", ") .. " for " .. P.name .. ".",
+            "The supply silo lifts only what robots can bring. From here: place_ghosts surface=nauvis assemblers for each of these with an inserter into a passive-provider-chest inside the roboport network, fed from the existing lines; check with robot_logistics surface=nauvis."
+    end
+    if (P.stops or {})[1] == nil then
+        return "Send " .. P.name .. " to shuttle between Nauvis and Vulcanus.",
+            "space_platform action=schedule platform=" .. P.name .. " stops=[\"nauvis\",\"vulcanus\"]: it stays in orbit until armed and stocked (see departure_held), then leaves by itself; nobody needs to be aboard. Then request what Vulcanus needs on the pad here (space_platform action=request)."
+    end
+    if P.departure_held then
+        return "Get " .. P.name .. " out of Nauvis orbit (held: " .. P.departure_held .. ").",
+            (P.armament and not P.armament.armed) and ("It needs " .. tostring(P.armament.needs) .. "; the supply silo brings the magazines and turrets once the Nauvis network holds them.")
+                or "Follow the platform warnings: thruster fuel and its ghosts' parts come from Nauvis' network through the supply silo."
+    end
+    return nil
+end
+
 -- The Vulcanus ladder, read from what stands there and the trigger
 -- technologies: rocks and calcite, solar power, acid, one tungsten carbide
 -- (unlocks foundry), a foundry (unlocks big-mining-drill), tungsten plate
@@ -434,9 +490,23 @@ local function vulcanus_rung(here, force, character, S)
         return "Place your cargo-landing-pad on Vulcanus.",
             "build_layout it inside the power network. Platforms orbiting Vulcanus drop what it requests (space_platform action=request items=[...])." .. REMOTE_HOME
     end
+    -- A shuttle here without ammo cannot leave, and with no silo here
+    -- nothing can arm it: the next shuttle is built over Nauvis from here.
+    local stranded, armed_here = nil, false
+    for _, platform in ipairs(S.platforms or {}) do
+        if platform.space_location == "vulcanus" then
+            if (platform.armament or {}).armed then armed_here = true
+            elseif (platform.orbit_silos or 0) == 0 then stranded = platform end
+        end
+    end
+    if armed_here then stranded = nil end
+    if stranded and (here.counts["cargo-landing-pad"] or 0) > 0 then
+        local goal, how = home_shuttle_rung(S, stranded)
+        if goal then return goal, how end
+    end
     for _, platform in ipairs(S.platforms or {}) do
         local stops = platform.stops or {}
-        if platform.space_location == "vulcanus" and #stops < 2 and (here.counts["cargo-landing-pad"] or 0) > 0 then
+        if platform.space_location == "vulcanus" and (platform.armament or {}).armed and #stops < 2 and (here.counts["cargo-landing-pad"] or 0) > 0 then
             return "Turn " .. platform.name .. " into a shuttle between Nauvis and Vulcanus.",
                 "space_platform action=schedule platform=" .. platform.name .. " stops=[\"nauvis\",\"vulcanus\"]: at Nauvis it waits until its supply requests are filled (rockets bring them while you are here), at Vulcanus until the landing pad has taken what it requests. "
                 .. "Then add what Vulcanus needs to its supply (space_platform action=supply items=[...]) and to the pad's requests here (action=request). Orbiting Vulcanus with no supply, it is worn down by asteroids." .. REMOTE_HOME
@@ -1036,8 +1106,13 @@ local function progression(surface, force, facts, character)
             for _, item in ipairs(platform.ghosts_missing_items) do
                 lacking[#lacking + 1] = item.name .. " x" .. (item.needed - item.available)
             end
-            warnings[#warnings + 1] = platform.name .. "'s hub lacks " .. table.concat(lacking, ", ")
-                .. " for its ghosts: ship them (space_platform action=ship)."
+            local fix = "ship them (space_platform action=ship)."
+            if platform.supply and (platform.supply.silos_with_supply_chest or 0) > 0 then
+                fix = platform.supply.from .. "'s supply silo sends them once its logistic network holds them."
+            elseif platform.space_location and (platform.orbit_silos or 0) == 0 then
+                fix = "no rocket silo on " .. platform.space_location .. " can send them, so they arrive only where a silo stands below the platform."
+            end
+            warnings[#warnings + 1] = platform.name .. "'s hub lacks " .. table.concat(lacking, ", ") .. " for its ghosts: " .. fix
         end
         if platform.queued_cargo and platform.queued_cargo[1] and (facts.rocket_silos or 0) > 0 and not facts.rocket_ready then
             warnings[#warnings + 1] = "Cargo for " .. platform.name .. " waits for rockets, and the silo has "

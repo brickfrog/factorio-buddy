@@ -8146,14 +8146,14 @@ pub struct GhostTile {
 /// Space platform action.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SpacePlatformParams {
-    /// status, create, ship, unship, request, supply, jettison, clear_ghosts, deconstruct, load_turrets, schedule, board or land.
+    /// status, create, ship, unship, request, supply, jettison, clear_ghosts, copy_layout, deconstruct, load_turrets, schedule, board or land.
     pub action: String,
     /// Platform name (create: optional new name).
     pub platform: Option<String>,
     /// ship: items from your inventory; unship: queued items to take back (empty = all); request: landing-pad requests (count = minimum); supply: hub import requests (count = minimum, 0 drops); jettison: hub items to throw away.
     #[serde(default)]
     pub items: Vec<ItemCount>,
-    /// schedule: planet names in order (two or more = shuttle); empty = stay. supply: the planet the items come from (default home). request: the planet whose landing pads to set (default yours).
+    /// schedule: planet names in order (two or more = shuttle); empty = stay. supply: the planet the items come from (default home). request: the planet whose landing pads to set (default yours). create: the planet to build over (default yours; another needs a silo there with a supply chest). copy_layout: the platform to copy.
     #[serde(default)]
     pub stops: Vec<String>,
     /// land: spot to land near. deconstruct: position of the platform entity to remove.
@@ -17737,7 +17737,7 @@ impl FactorioMcp {
 
     /// Create, supply, fly, board and land space platforms.
     #[tool(
-        description = "Space platforms. status; create (needs rocket-silo); ship items from your inventory beside a silo: they leave by themselves with each ready rocket, 1 t per rocket, items the platform's ghosts lack first (a new platform needs its starter pack first); unship takes queued cargo back; request items on the landing pads here (or on the planet in stops); supply sets standing hub requests from a planet, filled by rockets whose silo has a supply chest (requester chest + inserter into the silo) while the platform orbits it, also when you are away; jettison hub items overboard (lost); clear_ghosts removes ghosts the hub can never build (over empty space, or on a built entity); deconstruct x,y has the hub remove that platform entity, its contents going to the hub (works from anywhere; rebuild with place_ghosts); load_turrets has the hub fill the platform's turrets with ammo; schedule planet stops (two or more shuttle: wait for supply where it imports, for the landing pads elsewhere); board (ride a ready rocket up, empty cargo); land (drop from the hub to the planet below)."
+        description = "Space platforms. status; create (needs rocket-silo; stops=[planet] builds it over another planet whose supply silo sends the starter pack from its network); ship items from your inventory beside a silo: they leave by themselves with each ready rocket, 1 t per rocket, items the platform's ghosts lack first (a new platform needs its starter pack first); unship takes queued cargo back; request items on the landing pads here (or on the planet in stops); supply sets standing hub requests from a planet, filled by rockets whose silo has a supply chest (requester chest + inserter into the silo) while the platform orbits it, also when you are away; jettison hub items overboard (lost); copy_layout stops=[source] lays the platform out as ghosts like another platform (recipes, filters, foundation); clear_ghosts removes ghosts the hub can never build (over empty space, or on a built entity); deconstruct x,y has the hub remove that platform entity, its contents going to the hub (works from anywhere; rebuild with place_ghosts); load_turrets has the hub fill the platform's turrets with ammo; schedule planet stops (two or more shuttle: wait for supply where it imports, for the landing pads elsewhere); board (ride a ready rocket up, empty cargo); land (drop from the hub to the planet below)."
     )]
     async fn space_platform(&self, Parameters(params): Parameters<SpacePlatformParams>) -> String {
         let mut client = match self.connect().await {

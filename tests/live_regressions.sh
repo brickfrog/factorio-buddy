@@ -7959,6 +7959,74 @@ done
 assert_json "the character lands near the requested spot" "$(sa_character)" \
     '.surface == "nauvis" and ((.x - 2000) | fabs) < 40 and ((.y - 2000) | fabs) < 40'
 
+# A second platform is built by the supply silo alone: a waiting platform
+# gets its starter pack from the network, copy_layout lays it out like the
+# first one at the same positions, and its hub keeps its own requests.
+assert_json "create over another planet needs a supply silo there" \
+    "$(tool_payload "$(mcp_tool space_platform '{"action":"create","stops":["vulcanus"]}')")" \
+    '.success == false and .error_kind == "no_supply_silo"'
+SB_FIXTURE="$(raw_lua "local s = game.surfaces.nauvis; local f = game.forces.player
+local silo = s.find_entities_filtered{name = 'rocket-silo', position = {2000.5, 1992.5}, radius = 1}[1]
+local chest = s.create_entity{name = 'requester-chest', position = {2000.5, 1998.5}, force = f}
+-- Facing south it drops north into the silo; targets resolve on a later
+-- tick. The site's substation grid leaves this spot unpowered.
+local inserter = s.create_entity{name = 'fast-inserter', position = {2000.5, 1997.5}, direction = defines.direction.south, force = f}
+s.create_entity{name = 'substation', position = {2003, 1999}, force = f}
+local rp = s.find_entities_filtered{name = 'roboport', position = {2000, 2010}, radius = 1}[1]
+rp.insert{name = 'logistic-robot', count = 10}
+s.find_entities_filtered{name = 'storage-chest', position = {2005.5, 2010.5}, radius = 1}[1].insert{name = 'space-platform-starter-pack', count = 1}
+silo.rocket_parts = silo.prototype.rocket_parts_required
+rcon.print(helpers.table_to_json({ok = inserter ~= nil and chest ~= nil and silo ~= nil}))")"
+require_json "supply silo fixture exists" "$SB_FIXTURE" '.ok == true'
+SB_CREATE="$(tool_payload "$(mcp_tool space_platform '{"action":"create"}')")"
+assert_json "a second platform waits for its starter pack" "$SB_CREATE" '.success == true and .state == "waiting_for_starter_pack"'
+SB_PLATFORM="$(jq -r '.name' <<<"$SB_CREATE")"
+SB_SPEC="{\"platform\":\"$SB_PLATFORM\""
+sb_platform() {
+    local status
+    status="$(tool_payload "$(mcp_tool space_platform '{"action":"status"}')")"
+    jq -c --arg p "$SB_PLATFORM" '.platforms[] | select(.name == $p)' <<<"$status"
+}
+for _ in $(seq 1 90); do
+    [[ "$(jq -r '.hub_slots != null' <<<"$(sb_platform)")" == "true" ]] && break
+    sleep 2
+done
+sb_supply_state() {
+    raw_lua "local s = game.surfaces.nauvis; local names = {}
+for k, v in pairs(defines.entity_status) do names[v] = k end
+local silo = s.find_entities_filtered{name = 'rocket-silo', position = {2000.5, 1992.5}, radius = 1}[1]
+local chest = s.find_entities_filtered{name = 'requester-chest', position = {2000.5, 1998.5}, radius = 1}[1]
+local inserter = s.find_entities_filtered{name = 'fast-inserter', position = {2000.5, 1997.5}, radius = 1}[1]
+local items = function(inv) local t = {} for _, e in pairs(inv and inv.get_contents() or {}) do t[e.name] = e.count end return t end
+rcon.print(helpers.table_to_json({silo = silo.rocket_silo_status, rocket = items(silo.get_inventory(defines.inventory.rocket_silo_rocket)),
+    chest = items(chest.get_inventory(defines.inventory.chest)), chest_network = chest.logistic_network ~= nil,
+    inserter = names[inserter.status], drop = inserter.drop_target and inserter.drop_target.name or '', pickup = inserter.pickup_target and inserter.pickup_target.name or ''}))"
+}
+assert_json "the supply silo launches the starter pack from the network" \
+    "$(jq -c --argjson d "$(sb_supply_state)" '. + {diag: $d}' <<<"$(sb_platform)")" '.hub_slots != null'
+tool_payload "$(mcp_tool space_platform "$SB_SPEC,\"action\":\"supply\",\"items\":[{\"name\":\"iron-ore\",\"count\":50}]}")" >/dev/null
+SB_COPY="$(tool_payload "$(mcp_tool space_platform "$SB_SPEC,\"action\":\"copy_layout\",\"stops\":[\"$SA_PLATFORM\"]}")")"
+assert_json "copy_layout places ghosts of the other platform" "$SB_COPY" \
+    --arg src "$SA_PLATFORM" '.success == true and .copied_from == $src and .entity_ghosts > 0 and any(.supply.requests[]; .name == "iron-ore" and .count == 50)'
+assert_json "copied ghosts sit where their originals stand, with the same direction" \
+    "$(raw_lua "local src, dst
+for _, p in pairs(game.forces.player.platforms) do
+    if p.name == '$SA_PLATFORM' then src = p elseif p.name == '$SB_PLATFORM' then dst = p end
+end
+local total, matched = 0, 0
+for _, e in pairs(src.surface.find_entities_filtered{force = 'player'}) do
+    local name = e.type == 'entity-ghost' and e.ghost_name or e.name
+    local proto = prototypes.entity[name]
+    if e.type ~= 'tile-ghost' and name ~= 'space-platform-hub' and proto.items_to_place_this and proto.items_to_place_this[1] then
+        total = total + 1
+        local g = dst.surface.find_entities_filtered{ghost_name = name, position = e.position}[1]
+            or dst.surface.find_entities_filtered{name = name, position = e.position}[1]
+        if g and g.direction == e.direction then matched = matched + 1 end
+    end
+end
+rcon.print(helpers.table_to_json({total = total, matched = matched}))")" \
+    '.total > 0 and .matched == .total'
+
 stop_mcp
 
 printf '\n=== live regression summary ===\n'

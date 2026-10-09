@@ -611,13 +611,24 @@ local function in_flight(platform)
     return items
 end
 
--- What the platform still needs from `planet` (name -> count), or nil.
+-- What the platform still needs from `planet` (name -> count), or nil:
+-- its starter pack while it waits for one; else, once its hub imports
+-- anything from there, those imports plus what its ghosts lack, so a
+-- platform laid out with place_ghosts is built from that planet's network.
 local function supply_deficits(platform, planet)
+    if platform.state == defines.space_platform_state.waiting_for_starter_pack then
+        return {["space-platform-starter-pack"] = 1}
+    end
     local hub = platform.hub
     if not (hub and hub.valid) then return nil end
+    local target = hub_imports(platform, planet)
+    if not next(target) then return nil end
+    for _, item in ipairs(surface_logistics(platform.surface, platform.force, false).missing_items) do
+        target[item.name] = math.max(target[item.name] or 0, item.needed)
+    end
     local deficits, any = {}, false
     local flying = in_flight(platform)
-    for name, min in pairs(hub_imports(platform, planet)) do
+    for name, min in pairs(target) do
         local short = min - hub.get_item_count(name) - (flying[name] or 0)
         if short > 0 then deficits[name], any = short, true end
     end
@@ -909,6 +920,9 @@ local function platform_summary(platform)
     if held then
         summary.departure_held = hold_reason(platform, next_station(platform, held_records, held.current)) or "releasing"
     end
+    -- Rockets reach a platform only from silos on the planet it orbits.
+    local below = location and game.get_surface(location.name)
+    summary.orbit_silos = below and below.count_entities_filtered{type = "rocket-silo", force = platform.force} or nil
     -- Standing supply from the planet it orbits: the hub's import requests
     -- and what is still missing (cargo already flying counts as delivered).
     if location and hub and hub.valid then
@@ -1087,6 +1101,11 @@ local function home_supply(home, force)
     local imports = {}
     for _, platform in ipairs(valid_platforms(force)) do
         for name, count in pairs(hub_imports(platform, home.name)) do imports[name] = math.max(imports[name] or 0, count) end
+        -- A platform at home also waits for its starter pack or ghost parts.
+        local location = platform.space_location
+        if location and location.name == home.name then
+            for name, count in pairs(supply_deficits(platform, home.name) or {}) do imports[name] = math.max(imports[name] or 0, count) end
+        end
     end
     result.imports = next(imports) and top_counts(imports, 15) or nil
     for name in pairs(imports) do
@@ -1791,7 +1810,7 @@ end
 -- space_platform
 -- ============================================================
 
-local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, supply = true, jettison = true, clear_ghosts = true, deconstruct = true, load_turrets = true, schedule = true, board = true, land = true}
+local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, supply = true, jettison = true, clear_ghosts = true, copy_layout = true, deconstruct = true, load_turrets = true, schedule = true, board = true, land = true}
 
 local function resolve_platform(character, platform_name)
     local force = character.force
@@ -1904,14 +1923,28 @@ local function action_status(character)
     }
 end
 
-local function action_create(character, platform_name)
+-- Creates a platform over the character's planet, or over stops[1] from
+-- anywhere when that planet's supply silo can send the starter pack
+-- unattended (process_supply launches it once its network holds one).
+local function action_create(character, platform_name, stops)
     local force = character.force
     if not tech_done(force, "rocket-silo") then
         return fail("rocket_silo_not_researched", "research rocket-silo first")
     end
+    local remote = type(stops) == "table" and stops[1] ~= nil and stops[1] ~= character.surface.name
     local planet = character.surface.planet
-    if not planet then
-        return fail("not_on_planet", "create a platform from a planet surface; you are on " .. character.surface.name)
+    if remote then planet = type(stops[1]) == "string" and game.planets[stops[1]] or nil end
+    if remote then
+        if not planet then return fail("invalid_planet", "stops[1] names the planet to build the platform over", {name = stops[1]}) end
+        local silo_ready = false
+        for _, silo in pairs(planet.surface and planet.surface.find_entities_filtered{type = "rocket-silo", force = force} or {}) do
+            if supply_chests(silo)[1] then silo_ready = true break end
+        end
+        if not silo_ready then
+            return fail("no_supply_silo", "no rocket silo on " .. planet.name .. " has a supply chest, so nothing there can launch the starter pack without you")
+        end
+    elseif not planet then
+        return fail("not_on_planet", "create a platform from a planet surface, or name the planet with stops=[planet]; you are on " .. character.surface.name)
     end
     local name = (type(platform_name) == "string" and platform_name ~= "") and platform_name
         or ("buddy-" .. (#valid_platforms(force) + 1))
@@ -1928,7 +1961,10 @@ local function action_create(character, platform_name)
     if not platform then return fail("create_failed", "the engine refused to create the platform") end
     local result = platform_summary(platform)
     result.success = true
-    result.guidance = "Ship its starter pack: space_platform action=ship items=[{name:'space-platform-starter-pack',count:1}] beside a silo; it leaves with the next ready rocket."
+    result.guidance = remote
+        and ("Created over " .. planet.name .. ". Its supply silo launches the starter pack by itself once " .. planet.name
+            .. "'s logistic network holds a space-platform-starter-pack. Once the hub stands, set its supply (action=supply) and lay it out with place_ghosts on its surface: the supply silo also sends what the ghosts lack.")
+        or "Ship its starter pack: space_platform action=ship items=[{name:'space-platform-starter-pack',count:1}] beside a silo; it leaves with the next ready rocket."
     return result
 end
 
@@ -2182,7 +2218,8 @@ local function supply_silo(platform, silo, chests, deficits)
     for index = 2, #chests do set_chest_requests(chests[index], {}) end
 
     if silo.rocket_silo_status ~= defines.rocket_silo_status.rocket_ready or rocket.is_empty() then return end
-    local hub_inventory = platform.hub.get_inventory(defines.inventory.hub_main)
+    local waiting = platform.state == defines.space_platform_state.waiting_for_starter_pack
+    local hub_inventory = not waiting and platform.hub.get_inventory(defines.inventory.hub_main) or nil
     if hub_inventory and hub_inventory.count_empty_stacks() == 0 then return end
     for name, short in pairs(deficits) do
         if rocket.get_item_count(name) < short and rocket.can_insert{name = name, count = 1} then
@@ -2193,7 +2230,10 @@ local function supply_silo(platform, silo, chests, deficits)
     end
     local items = {}
     for _, entry in pairs(rocket.get_contents()) do items[entry.name] = (items[entry.name] or 0) + entry.count end
-    local ok, launched = pcall(silo.launch_rocket, {type = defines.cargo_destination.station, station = platform.hub})
+    local destination = waiting
+        and {type = defines.cargo_destination.space_platform, space_platform = platform}
+        or {type = defines.cargo_destination.station, station = platform.hub}
+    local ok, launched = pcall(silo.launch_rocket, destination)
     if ok and launched then
         storage.supply_flights = storage.supply_flights or {}
         storage.supply_flights[platform.index] = storage.supply_flights[platform.index] or {}
@@ -2201,26 +2241,51 @@ local function supply_silo(platform, silo, chests, deficits)
     end
 end
 
+-- True when `silo`'s network, supply chests or rocket hold anything of
+-- `deficits`: a platform waiting only for what nobody has must not hold the
+-- silo while another platform's order could go up.
+local function servable(deficits, silo, chests)
+    local rocket = silo.get_inventory(defines.inventory.rocket_silo_rocket)
+    local network = chests[1].logistic_network
+    for name in pairs(deficits) do
+        if (rocket and rocket.get_item_count(name) or 0) > 0 then return true end
+        if network and network.get_item_count(name) > 0 then return true end
+        for _, chest in ipairs(chests) do
+            if chest.get_item_count(name) > 0 then return true end
+        end
+    end
+    return false
+end
+
 -- Called every second after process_shipments: platforms in orbit with hub
--- import requests from that planet are served by silos that have a supply
--- chest. The agent's own shipments and boarding bookings go first, so their
--- surfaces are skipped; idle supply chests stop requesting.
+-- import requests from that planet, or waiting there for their starter
+-- pack, are served by silos that have a supply chest. The agent's own
+-- shipments and boarding bookings go first, so their surfaces are skipped;
+-- idle supply chests stop requesting.
 function M.process_supply()
     local busy = {}
-    for _, shipment in ipairs(storage.space_shipments or {}) do busy[shipment.surface_index] = true end
+    -- Cargo for a platform that left waits for its return and launches
+    -- nothing meanwhile, so it must not stop the supply line there.
+    for _, shipment in ipairs(storage.space_shipments or {}) do
+        local location = shipment.platform and shipment.platform.valid and shipment.platform.space_location
+        local below = location and game.get_surface(location.name)
+        if below and below.index == shipment.surface_index then busy[shipment.surface_index] = true end
+    end
     for _, booking in pairs(storage.board_bookings or {}) do busy[booking.surface_index] = true end
     local active = {}
     for _, force in pairs(game.forces) do
         local claimed = {}
         for _, platform in pairs(force.platforms) do
-            local location = platform.valid and platform.hub and platform.hub.valid and platform.space_location
+            local ready = platform.valid and ((platform.hub and platform.hub.valid)
+                or platform.state == defines.space_platform_state.waiting_for_starter_pack)
+            local location = ready and platform.space_location
             local surface = location and game.get_surface(location.name)
             local deficits = surface and not busy[surface.index] and supply_deficits(platform, location.name)
             if deficits then
                 for _, silo in pairs(surface.find_entities_filtered{type = "rocket-silo", force = force}) do
                     if not claimed[silo.unit_number] then
                         local chests = supply_chests(silo)
-                        if chests[1] then
+                        if chests[1] and servable(deficits, silo, chests) then
                             claimed[silo.unit_number] = true
                             for _, chest in ipairs(chests) do active[chest.unit_number] = true end
                             supply_silo(platform, silo, chests, deficits)
@@ -2529,6 +2594,82 @@ local function action_clear_ghosts(platform)
     return {success = true, removed = removed}
 end
 
+-- Lays `platform` out like the platform named stops[1]: ghosts of the
+-- source's foundation and of its buildings and ghosts, at the same
+-- positions (hubs sit at the origin) and directions, with their settings
+-- (recipes, filters). The target hub keeps its own requests. The hub builds
+-- them from its stock; turrets get the standing ammo order.
+local function action_copy_layout(platform, stops)
+    local source_name = type(stops) == "table" and stops[1] or nil
+    local source = nil
+    for _, candidate in ipairs(valid_platforms(platform.force)) do
+        if candidate.name == source_name then source = candidate end
+    end
+    if not source or source == platform then
+        return fail("invalid_source", "copy_layout needs stops=[name of another platform] to copy", {platforms = platform_names(platform.force)})
+    end
+    if not (source.surface and platform.surface and platform.hub and platform.hub.valid) then
+        return fail("platform_not_ready", "both platforms need a hub (" .. platform.name .. ": " .. state_name(platform.state) .. ")")
+    end
+    local force, from, to = platform.force, source.surface, platform.surface
+    local tile_ghosts, entity_ghosts, turrets, failed = 0, 0, 0, {}
+    local foundation = from.find_tiles_filtered{name = "space-platform-foundation"}
+    for _, ghost in pairs(from.find_entities_filtered{type = "tile-ghost", force = force}) do
+        if ghost.ghost_name == "space-platform-foundation" then foundation[#foundation + 1] = {position = ghost.position} end
+    end
+    for _, tile in pairs(foundation) do
+        local x, y = math.floor(tile.position.x), math.floor(tile.position.y)
+        if to.get_tile(x, y).name ~= "space-platform-foundation"
+            and not to.find_entities_filtered{type = "tile-ghost", position = {x + 0.5, y + 0.5}, limit = 1}[1]
+        then
+            local ghost = to.create_entity{name = "tile-ghost", inner_name = "space-platform-foundation", position = {x, y}, force = force}
+            if ghost then tile_ghosts = tile_ghosts + 1 end
+        end
+    end
+    for _, original in pairs(from.find_entities_filtered{force = force}) do
+        local is_ghost = original.type == "entity-ghost"
+        local name = is_ghost and original.ghost_name or original.name
+        local prototype = prototypes.entity[name]
+        local placeable = prototype and prototype.items_to_place_this and prototype.items_to_place_this[1]
+        if placeable and original.type ~= "tile-ghost" and name ~= "space-platform-hub"
+            and not to.find_entities_filtered{position = original.position, name = name, limit = 1}[1]
+            and not to.find_entities_filtered{position = original.position, ghost_name = name, limit = 1}[1]
+        then
+            local ghost = to.create_entity{
+                name = "entity-ghost",
+                inner_name = name,
+                position = original.position,
+                direction = original.direction,
+                force = force,
+                recipe = prototype.type == "assembling-machine" and entity_recipe_name(original) or nil,
+            }
+            if ghost then
+                pcall(ghost.copy_settings, original)
+                entity_ghosts = entity_ghosts + 1
+                if prototype.type == "ammo-turret" then turrets = turrets + 1 end
+            elseif #failed < 10 then
+                failed[#failed + 1] = {name = name, position = pos_table(original.position)}
+            end
+        end
+    end
+    if entity_ghosts + tile_ghosts == 0 then
+        return fail("nothing_to_copy", platform.name .. " already has everything " .. source.name .. " has", {not_placed = failed})
+    end
+    if turrets > 0 then
+        storage.turret_ammo_orders = storage.turret_ammo_orders or {}
+        storage.turret_ammo_orders[platform.index] = true
+    end
+    local result = platform_summary(platform)
+    result.success = true
+    result.copied_from = source.name
+    result.entity_ghosts = entity_ghosts
+    result.tile_ghosts = tile_ghosts
+    result.not_placed = failed[1] and failed or nil
+    result.guidance = "The hub builds these from its stock. With standing supply from the planet below (action=supply), its supply silo also sends what the ghosts lack; missing_items in robot_logistics surface="
+        .. to.name .. " lists them."
+    return result
+end
+
 -- Marks the built entity at x,y on the platform for deconstruction, as with a
 -- deconstruction planner from remote view: the hub removes it and its
 -- contents go to the hub. Rebuild it with place_ghosts.
@@ -2801,10 +2942,10 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     local character = characters.find(agent_id)
     if not character then return no_character(agent_id) end
     if not ACTIONS[action] then
-        return fail("invalid_action", "action must be status, create, ship, unship, request, supply, jettison, clear_ghosts, deconstruct, load_turrets, schedule, board or land", {action = action})
+        return fail("invalid_action", "action must be status, create, ship, unship, request, supply, jettison, clear_ghosts, copy_layout, deconstruct, load_turrets, schedule, board or land", {action = action})
     end
     if action == "status" then return action_status(character) end
-    if action == "create" then return action_create(character, platform_name) end
+    if action == "create" then return action_create(character, platform_name, stops) end
     if action == "request" then return action_request(character, items, stops) end
     local platform, err = resolve_platform(character, platform_name)
     if not platform then return err end
@@ -2812,6 +2953,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     if action == "board" then return action_board(agent_id, character, platform) end
     if action == "jettison" then return action_jettison(platform, items) end
     if action == "clear_ghosts" then return action_clear_ghosts(platform) end
+    if action == "copy_layout" then return action_copy_layout(platform, stops) end
     if action == "deconstruct" then return action_deconstruct(character, platform, x, y) end
     if action == "load_turrets" then return action_load_turrets(platform) end
     if action == "unship" then return action_unship(character, platform, items) end
