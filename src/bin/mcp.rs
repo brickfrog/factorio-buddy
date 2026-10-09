@@ -12041,7 +12041,7 @@ impl FactorioMcp {
 
     /// Set recipe on a crafting machine.
     #[tool(
-        description = "Set or clear (empty string) a crafting machine recipe; returned_items reports unloaded items inserted or spilled on ground."
+        description = "Set or clear (empty string) a crafting machine recipe; returned_items reports unloaded items inserted or spilled on ground. A machine on another planet (unit_number from get_entities surface=...) is set from remote view; its unloaded items go to that planet's logistic network."
     )]
     async fn set_recipe(&self, Parameters(params): Parameters<SetRecipeParams>) -> String {
         let mut client = match self.connect().await {

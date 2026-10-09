@@ -2288,9 +2288,11 @@ impl FactorioClient {
         parse_lua_result(&response)
     }
 
-    /// Validate the recipe read-only, walk into reach, then set it. The mod
+    /// Validate the recipe read-only, walk into reach (unless the machine is
+    /// on another surface: set from remote view), then set it. The mod
     /// reports `previous_recipe` and every item the machine unloaded
-    /// (`returned_items[{name,quality,count,inserted,spilled,unrecovered}]`).
+    /// (`returned_items[{name,quality,count,inserted,spilled,unrecovered}]`;
+    /// a remote machine's go to its surface's logistic network).
     async fn set_recipe_value(&mut self, unit_number: u32, recipe: Option<&str>) -> Result<Value> {
         let recipe = recipe.map_or(Value::Null, |name| json!(name));
         let preflight = self
@@ -2303,8 +2305,10 @@ impl FactorioClient {
                 ],
             )
             .await?;
-        parse_lua_result::<Value>(&preflight)?;
-        self.approach_entity(unit_number).await?;
+        let preflight = parse_lua_result::<Value>(&preflight)?;
+        if preflight.get("remote").and_then(Value::as_bool) != Some(true) {
+            self.approach_entity(unit_number).await?;
+        }
         let response = self
             .call_remote(
                 "set_recipe",

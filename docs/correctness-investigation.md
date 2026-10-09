@@ -1456,6 +1456,17 @@ Valid: 43 turns, 12 tool errors, 0 provider-limited turns. `plate_automation` an
   - one Vulcanus launch's rocket parts (processing-unit 3.3 kg, low-density-structure 5 kg, rocket-fuel 10 kg, 50 of each), about 1 t.
   - At the current rate of about one rocket per 40 minutes, that is well over 15 hours of Nauvis launches.
 
+### Fixes after s54: remote repair
+
+The user chose to keep the s54 chain rather than branch again from a save from before Vulcanus.
+- **`set_recipe` works on another planet.** A machine on another surface (unit number from `get_entities surface=`) is set from remote view, as a player can in 2.0, without walking to it. The items it unloads go into that surface's logistic network, and anything left over is spilled there.
+  - The `check_recipe_choice` preflight reports `remote`, and the Rust client then skips `approach_entity`.
+  - The live test that pinned `wrong_surface` now checks the remote set and that the items stay on that surface.
+  - Sandbox from s54's save: assembler 10161 on Nauvis switched to inserter and back while Buddy stood on Vulcanus; its 2 magazines went into network storage.
+- **The full-output warning names the gaps.** It now lists items that some machines hold with full output while others starve for them, with counts and positions. On s54's save it reads "copper-ore (6 full at 21,397 24,397; 21 starved at -50,92 -50,95), copper-plate (6 full at 22,400 25,400; 17 starved at -31,115 -27,115), copper-cable (…)". It also says that a line outside roboport range needs the network extended to it first.
+- `BOOTSTRAP_TEXT` explains that an assembler fed from the network's chests can make, one recipe after another, the parts robots lack.
+- Gates: `luac`, clippy, all cargo tests, release build. Live suite: 538 passed, 0 failed (`fb-evidence/git-gud/live66`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

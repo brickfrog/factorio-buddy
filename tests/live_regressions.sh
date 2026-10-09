@@ -1022,14 +1022,14 @@ machine.get_inventory(defines.inventory.assembling_machine_input).insert{name = 
 rcon.print(machine.unit_number)
 ")"
     unit="$fixture"
-    before="$(gp_state "$unit")"
     reply="$(gp_recipe_call "$unit" '"copper-cable"')"
-    after="$(gp_state "$unit")"
-    gp_record error_semantics "set_recipe on another surface" "$before" "$reply" "$after"
-    assert_json "set_recipe on another surface reports wrong_surface" "$reply" \
-        '.success == false and .error_kind == "wrong_surface"'
-    gp_assert_unchanged "set_recipe on another surface leaves that machine untouched" "$before" "$after"
-    gp_lua "local e = gp_find($unit); if e then e.destroy() end rcon.print('ok')" >/dev/null
+    after="$(gp_lua "local e = gp_find($unit); local ground = 0; for _, item in pairs(e.surface.find_entities_filtered{name = 'item-on-ground', position = e.position, radius = 4}) do ground = ground + item.stack.count end; rcon.print(helpers.table_to_json({recipe = e.get_recipe() and e.get_recipe().name, input = e.get_inventory(defines.inventory.assembling_machine_input).get_item_count('iron-plate'), ground = ground}))")"
+    gp_record error_semantics "set_recipe on another surface" "$reply" "$after"
+    assert_json "set_recipe on another surface sets it from remote view" "$reply" \
+        '.success == true and .remote == true and .recipe == "copper-cable" and ([.returned_items[] | select(.name == "iron-plate") | .count == 20 and .unrecovered == 0 and (.inserted + .spilled) == 20] == [true])'
+    assert_json "a remote recipe change keeps the unloaded plates on that surface" "$after" \
+        '.recipe == "copper-cable" and .input == 0 and .ground == 20'
+    gp_lua "local e = gp_find($unit); if e then for _, item in pairs(e.surface.find_entities_filtered{name = 'item-on-ground', position = e.position, radius = 4}) do item.destroy() end; e.destroy() end rcon.print('ok')" >/dev/null
 
     gp_lua "
 local surface = game.surfaces['buddy-gameplay-probe']

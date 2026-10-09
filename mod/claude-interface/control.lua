@@ -2222,6 +2222,8 @@ local function check_recipe_choice_impl(agent_id, unit_number, recipe)
         recipe = requested_recipe,
         cleared = requested_recipe == nil,
         current_recipe = current and current.name or nil,
+        -- On another surface: set from remote view, without walking there.
+        remote = entity.surface ~= character.surface or nil,
     }
 end
 
@@ -2235,8 +2237,17 @@ local function set_recipe_impl(agent_id, unit_number, recipe)
         return action_failure("entity_not_found", "Entity not found", {unit_number = unit_number})
     end
 
-    local reach_error = characters.require_entity_reach(character, entity)
-    if reach_error then return reach_error end
+    -- A machine on another surface is configured from remote view, as a
+    -- player can; its returned items go to that surface's logistic network.
+    local remote = entity.surface ~= character.surface
+    if remote then
+        if entity.force ~= character.force then
+            return action_failure("wrong_force", "entity belongs to another force", {unit_number = unit_number})
+        end
+    else
+        local reach_error = characters.require_entity_reach(character, entity)
+        if reach_error then return reach_error end
+    end
 
     local requested_recipe = requested_recipe_name(recipe)
     local invalid = recipe_request_error(character, entity, requested_recipe)
@@ -2265,16 +2276,21 @@ local function set_recipe_impl(agent_id, unit_number, recipe)
         return action_failure("set_recipe_failed", tostring(returned_or_error), {requested_recipe = requested_recipe})
     end
 
-    local character_inventory = character.get_main_inventory()
+    local character_inventory = not remote and character.get_main_inventory() or nil
+    local network = remote and entity.surface.find_logistic_network_by_position(entity.position, entity.force) or nil
     local returned_items = {}
     local unrecovered = 0
     for _, item in pairs(returned_or_error or {}) do
+        local quality = inventory.quality_name(item)
+        local stored = network and network.insert{name = item.name, quality = quality, count = item.count} or 0
         local transfer = inventory.give_or_spill(
             character_inventory,
             entity.surface,
             entity.position,
-            {name = item.name, quality = inventory.quality_name(item), count = item.count}
+            {name = item.name, quality = quality, count = item.count - stored}
         )
+        transfer.count = item.count
+        transfer.inserted = transfer.inserted + stored
         unrecovered = unrecovered + transfer.unrecovered
         table.insert(returned_items, transfer)
     end
@@ -2284,6 +2300,7 @@ local function set_recipe_impl(agent_id, unit_number, recipe)
         previous_recipe = previous_name,
         previous_recipe_quality = previous_quality_name,
         returned_items = returned_items,
+        remote = remote or nil,
     }
     if unrecovered > 0 then
         return action_failure("item_conservation_failure", "returned machine items could not be stored or spilled", result)

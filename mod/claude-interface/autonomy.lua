@@ -194,6 +194,65 @@ local function supply_chain_text(force, surface, facts, item)
     return parts[1] and (" Not made in the last 10 min: " .. table.concat(parts, ", ") .. ".") or ""
 end
 
+-- A machine's recipe, or a furnace's last one while it sits idle.
+local function machine_recipe(entity)
+    local ok, recipe = pcall(function() return entity.get_recipe() end)
+    if ok and recipe then return recipe end
+    if entity.type ~= "furnace" then return nil end
+    local prev_ok, previous = pcall(function() return entity.previous_recipe end)
+    local name = prev_ok and previous and previous.name
+    if type(name) ~= "string" then name = name and name.name end
+    return name and prototypes.recipe[name] or nil
+end
+
+-- Items a machine blocked with full output holds back.
+local function held_products(entity)
+    if entity.type == "mining-drill" then
+        local ok, target = pcall(function() return entity.mining_target end)
+        return (ok and target and prototypes.item[target.name]) and {target.name} or {}
+    end
+    local items = {}
+    local output = entity.get_inventory(defines.inventory.crafter_output)
+    for _, stack in pairs(output and output.get_contents() or {}) do items[#items + 1] = stack.name end
+    return items
+end
+
+-- Item ingredients a starved machine holds less of than one craft needs.
+local function lacked_ingredients(entity)
+    local recipe = machine_recipe(entity)
+    local input = entity.get_inventory(defines.inventory.crafter_input)
+    local items = {}
+    for _, ingredient in pairs(recipe and input and recipe.ingredients or {}) do
+        if ingredient.type == "item" and input.get_item_count(ingredient.name) < ingredient.amount then items[#items + 1] = ingredient.name end
+    end
+    return items
+end
+
+local function note_gap(by_item, item, position)
+    local entry = by_item[item] or {count = 0, at = {}}
+    entry.count = entry.count + 1
+    if #entry.at < 2 then entry.at[#entry.at + 1] = math.floor(position.x) .. "," .. math.floor(position.y) end
+    by_item[item] = entry
+end
+
+-- Items some machines hold back with full output while others starve for
+-- them: the link between them is missing. Most starved first, at most three.
+local function supply_gaps_text(facts)
+    local gaps = {}
+    for item, starved in pairs(facts.starved_for or {}) do
+        local held = facts.held_output[item]
+        if held then gaps[#gaps + 1] = {item = item, held = held, starved = starved} end
+    end
+    table.sort(gaps, function(a, b) return a.starved.count > b.starved.count or (a.starved.count == b.starved.count and a.item < b.item) end)
+    local parts = {}
+    for i = 1, math.min(3, #gaps) do
+        local g = gaps[i]
+        parts[#parts + 1] = g.item .. " (" .. g.held.count .. " full at " .. table.concat(g.held.at, " ") .. "; "
+            .. g.starved.count .. " starved at " .. table.concat(g.starved.at, " ") .. ")"
+    end
+    return parts[1] and (" Made but not delivered: " .. table.concat(parts, ", ") .. ".") or ""
+end
+
 -- Rocket-part ingredients with how many of each were made in the last ten minutes.
 local function rocket_part_inputs(force, surface)
     local recipe = prototypes.recipe["rocket-part"]
@@ -409,7 +468,7 @@ end
 local REMOTE_HOME = " Nauvis runs without you: check it with robot_logistics surface=nauvis and build there with place_ghosts surface=nauvis."
 
 -- How to stock an empty home network from another planet.
-local BOOTSTRAP_TEXT = " If robots lack the parts to build that (robot_logistics surface=nauvis missing_items), harvest them: get_entities surface=nauvis finds machines and chests in roboport range (machines blocked with full output hold their products), and place_ghosts surface=nauvis deconstruct=[{name,dx,dy}] has robots carry them and their contents into storage chests. Robots work while you are away: keep advancing Vulcanus meanwhile."
+local BOOTSTRAP_TEXT = " If robots lack the parts to build that (robot_logistics surface=nauvis missing_items), harvest them: get_entities surface=nauvis finds machines and chests in roboport range (machines blocked with full output hold their products), and place_ghosts surface=nauvis deconstruct=[{name,dx,dy}] has robots carry them and their contents into storage chests. set_recipe also works on Nauvis machines from here: an assembler fed from the network's chests can make what robots lack (requester chests, inserters, poles), one recipe after another. Robots work while you are away: keep advancing Vulcanus meanwhile."
 
 -- Building a new shuttle over Nauvis while you stay on Vulcanus: no armed
 -- platform orbits Vulcanus and no silo stands there, so nothing can bring
@@ -997,8 +1056,8 @@ local function progression(surface, force, facts, character)
     end
     if facts.output_blocked >= 2 and facts.starved_assemblers >= 1 then
         warnings[#warnings + 1] = facts.output_blocked .. " machines are blocked with full output while "
-            .. facts.starved_assemblers .. " assemblers lack ingredients: production and consumers are not connected. "
-            .. "Carry items from the full machines to the starved assemblers with output inserters and belts (route_belt, build_layout) instead of moving them by hand."
+            .. facts.starved_assemblers .. " assemblers lack ingredients: production and consumers are not connected." .. supply_gaps_text(facts)
+            .. " Carry items from the full machines to the starved ones with output inserters and belts (route_belt, build_layout) instead of moving them by hand; a line outside roboport range needs the roboport network extended to it before robots can build there."
     end
     if facts.unset_machines and facts.unset_machines[1] then
         local idle = {}
@@ -1174,7 +1233,7 @@ function M.snapshot(character)
         labs = 0, labs_powered = 0, labs_working = 0,
         assemblers = 0, red_science_assemblers = 0, recipe_assemblers = {},
         burner_machines = 0, low_fuel_units = {}, low_fuel_count = 0,
-        output_blocked = 0, starved_assemblers = 0,
+        output_blocked = 0, starved_assemblers = 0, held_output = {}, starved_for = {},
     }
     local min_x, min_y, max_x, max_y = nil, nil, nil, nil
 
@@ -1200,6 +1259,7 @@ function M.snapshot(character)
             if status == "full_output" or status == "waiting_for_space_in_destination" then
                 if entity.type == "furnace" or entity.type == "mining-drill" or entity.type == "assembling-machine" then
                     facts.output_blocked = facts.output_blocked + 1
+                    for _, item in ipairs(held_products(entity)) do note_gap(facts.held_output, item, entity.position) end
                 end
                 if entity.type == "assembling-machine" then
                     local recipe_ok, recipe = pcall(function() return entity.get_recipe() end)
@@ -1209,8 +1269,13 @@ function M.snapshot(character)
                         facts.full_science_packs[recipe.name] = true
                     end
                 end
-            elseif status == "item_ingredient_shortage" and entity.type == "assembling-machine" then
-                facts.starved_assemblers = facts.starved_assemblers + 1
+            elseif status == "item_ingredient_shortage" or status == "no_ingredients" then
+                if entity.type == "assembling-machine" and status == "item_ingredient_shortage" then
+                    facts.starved_assemblers = facts.starved_assemblers + 1
+                end
+                if entity.type == "assembling-machine" or entity.type == "furnace" then
+                    for _, item in ipairs(lacked_ingredients(entity)) do note_gap(facts.starved_for, item, entity.position) end
+                end
             end
             if status then statuses[status] = (statuses[status] or 0) + 1 end
             if COVERAGE_TYPES[entity.type] then machine_positions[#machine_positions + 1] = entity.position end
