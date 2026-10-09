@@ -1421,6 +1421,10 @@ Valid: 87 turns, 15 tool errors, 0 provider-limited turns. `plate_automation` an
   - Piercing rounds run at about 2 per minute, and the silo waits on rocket parts (33 of 50). Throughput on Nauvis is now the bottleneck.
 - All 10 `place_ghosts` errors were the new guards: 8 `storage_full`, 1 `already_in_network` and 1 wrong position. Buddy freed storage slots (building stray items into a spot) and then harvested the steel chest, so no deadlock recurred.
 
+### `s53-cont52-opus-open-2590060469-60m-capped` (invalid)
+
+2 of 50 turns were refused by the provider limit, so the trial was renamed `-capped` and does not count. s53 is rerun from s52's save. At the end, buddy-2 held 7 gun turrets, 56 piercing rounds and 1,006 iron ore; it still lacked 1,044 piercing rounds and 30 foundation, and had no thrusters.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
