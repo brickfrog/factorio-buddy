@@ -1412,6 +1412,15 @@ Valid: 73 turns, 1 tool error, 0 provider-limited turns. `plate_automation` and 
   - the fullest chest in range (4,782 items, 49 stacks against 0 free slots) was refused with `storage_full`.
 - Gates: `luac`, clippy, all cargo tests, release build. Live suite: 538 passed, 0 failed (`fb-evidence/git-gud/live64`).
 
+### `s52-cont51-opus-open-2590060469-60m`
+
+Valid: 87 turns, 15 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- **buddy-2 built from Vulcanus.** Through remote deconstruction, Buddy made a space-platform-starter-pack on Nauvis: steel harvested from a 3,200-steel chest, a foundation line, and processing units from a chest he had robots take down. Robots carried it to the supply chest, and the silo launched it to buddy-2.
+- **buddy-2 is being stocked from Nauvis.** Its supply asks for 1,100 piercing rounds, 1,000 iron ore (1,004 aboard), 30 foundation and 7 gun turrets.
+  - Turrets come off a Nauvis line at about 2 per minute, and Buddy has placed turret and foundation ghosts on buddy-2.
+  - Piercing rounds run at about 2 per minute, and the silo waits on rocket parts (33 of 50). Throughput on Nauvis is now the bottleneck.
+- All 10 `place_ghosts` errors were the new guards: 8 `storage_full`, 1 `already_in_network` and 1 wrong position. Buddy freed storage slots (building stray items into a spot) and then harvested the steel chest, so no deadlock recurred.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
