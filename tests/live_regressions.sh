@@ -8052,6 +8052,18 @@ for _ in $(seq 1 60); do
 done
 assert_json "robots carry the deconstructed chest into storage" "$(sb_chests)" \
     --argjson before "$(jq '.stored' <<<"$SB_BEFORE")" '.built == 0 and .stored == $before + 1'
+assert_json "place_ghosts refuses to deconstruct a storage chest that holds items" \
+    "$(tool_payload "$(mcp_tool place_ghosts '{"surface":"nauvis","origin_x":0,"origin_y":0,"deconstruct":[{"name":"storage-chest","dx":2005.5,"dy":2010.5}]}')")" \
+    '.success == false and .error_kind == "already_in_network"'
+raw_lua "game.surfaces.nauvis.create_entity{name = 'wooden-chest', position = {2010.5, 2005.5}, force = 'player'}; rcon.print('ok')" >/dev/null
+tool_payload "$(mcp_tool place_ghosts '{"surface":"nauvis","origin_x":0,"origin_y":0,"deconstruct":[{"name":"wooden-chest","dx":2010.5,"dy":2005.5}]}')" >/dev/null
+assert_json "a removal order can be withdrawn" \
+    "$(tool_payload "$(mcp_tool place_ghosts '{"surface":"nauvis","origin_x":0,"origin_y":0,"deconstruct":[{"name":"wooden-chest","dx":2010.5,"dy":2005.5,"cancel":true}]}')")" \
+    '.success == true and .deconstruction_cancelled == 1'
+assert_json "the withdrawn chest stays" \
+    "$(raw_lua "local e = game.surfaces.nauvis.find_entities_filtered{name = 'wooden-chest', position = {2010.5, 2005.5}, radius = 0.6}[1]
+rcon.print(helpers.table_to_json({exists = e ~= nil, marked = e ~= nil and e.to_be_deconstructed()}))")" \
+    '.exists == true and .marked == false'
 
 stop_mcp
 

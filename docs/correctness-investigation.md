@@ -1394,6 +1394,24 @@ Valid: 34 turns, 13 tool errors, 0 provider-limited turns. `plate_automation` an
 - A golden test that pinned the exact `find_entities`/`diagnose_factory_blockers` signature strings was removed. The manifest test still checks the arguments.
 - Gates: `luac`, clippy, all cargo tests, release build. Live suite: 535 passed, 0 failed (`fb-evidence/git-gud/live63`), including new tests for `get_entities` on another surface and for `place_ghosts deconstruct` returning a chest to storage.
 
+### `s51-cont50-opus-open-2590060469-60m`
+
+Valid: 73 turns, 1 tool error, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- Buddy used the bootstrap: robots took spare parts apart on Nauvis, and the starter-pack assembler was built and set to its recipe.
+- He also ordered a passive provider chest holding 2,400 iron ore removed. The 10 construction robots spent the rest of the hour hauling that ore into Nauvis's only storage chest. Every other job (the pole and input chest for the cell) waited behind them, until the storage chest filled and all work deadlocked.
+- Buddy narrated the wait for about 60 turns and filed "No way to cancel a place_ghosts deconstruct order; storage-full deadlock on remote surface".
+
+### Fixes after s51: safe remote deconstruction
+
+- **Logistic chests that hold items are refused** (`already_in_network`): their contents already serve the network.
+- **Removals storage cannot hold are refused** (`storage_full`). The stacks the entities and their contents would bring back are counted against the free slots of each covering network's storage chests.
+- **`cancel: true` on a deconstruct target withdraws an earlier order** (`deconstruction_cancelled`).
+- Smoke on s51's save:
+  - cancelling Buddy's three stuck orders left none marked;
+  - the 2,400-ore provider chest was refused;
+  - the fullest chest in range (4,782 items, 49 stacks against 0 free slots) was refused with `storage_full`.
+- Gates: `luac`, clippy, all cargo tests, release build. Live suite: 538 passed, 0 failed (`fb-evidence/git-gud/live64`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

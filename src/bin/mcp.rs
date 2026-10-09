@@ -8148,6 +8148,9 @@ pub struct GhostRemoval {
     pub name: String,
     pub dx: f64,
     pub dy: f64,
+    /// Withdraw an earlier removal order for this entity instead.
+    #[serde(default)]
+    pub cancel: bool,
 }
 
 /// Tile ghost.
@@ -8270,7 +8273,7 @@ fn place_ghosts_request(
             ));
         }
         deconstruct
-            .push(serde_json::json!({"name": target.name, "dx": target.dx, "dy": target.dy}));
+            .push(serde_json::json!({"name": target.name, "dx": target.dx, "dy": target.dy, "cancel": target.cancel}));
     }
     Ok((
         serde_json::Value::Array(entities),
@@ -17746,7 +17749,7 @@ impl FactorioMcp {
 
     /// Place ghosts for robots or a platform hub.
     #[tool(
-        description = "Build without walking: place ghosts on any surface (default yours) for robots or a platform hub to build. Planet ghosts must be in roboport construction range; platforms build from hub stock (add space-platform-foundation tiles to grow). Marks trees/rocks for removal. deconstruct=[{name,dx,dy}] has robots remove built entities in range and carry them and their contents to storage chests: from another planet, that stocks an empty network with parts (machines, inserters, chests and what they hold). All-or-nothing; reports items the builders lack."
+        description = "Build without walking: place ghosts on any surface (default yours) for robots or a platform hub to build. Planet ghosts must be in roboport construction range; platforms build from hub stock (add space-platform-foundation tiles to grow). Marks trees/rocks for removal. deconstruct=[{name,dx,dy}] has robots remove built entities in range and carry them and their contents to storage chests: from another planet, that stocks an empty network with parts (machines, inserters, chests and what they hold). It refuses logistic chests that hold items (already in the network) and removals storage cannot hold; {name,dx,dy,cancel:true} withdraws an earlier removal. All-or-nothing; reports items the builders lack."
     )]
     async fn place_ghosts(&self, Parameters(params): Parameters<PlaceGhostsParams>) -> String {
         let (entities, tiles, deconstruct) = match place_ghosts_request(&params) {

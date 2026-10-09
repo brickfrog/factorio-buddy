@@ -1463,10 +1463,15 @@ end
 -- Built entities named in `targets` ({name, dx, dy} from the origin) that
 -- robots should remove, as with a deconstruction planner from remote view:
 -- they carry the entity and its contents to storage, which stocks the
--- network from machines and chests. Returns the plan or a failure.
+-- network from machines and chests. A target with cancel=true withdraws an
+-- earlier order instead. Refused: logistic chests that hold items (their
+-- contents already serve the network, and hauling them only fills storage),
+-- and removals whose items the network's storage chests cannot hold (robots
+-- then wait with full hands and every other job stalls). Returns the plan or
+-- a failure.
 local function plan_deconstruction(surface, force, origin_x, origin_y, targets)
     local cells = (not surface.platform) and construction_cells(surface, force) or nil
-    local planned, seen = {}, {}
+    local planned, seen, slots_by_network = {}, {}, {}
     for index, spec in ipairs(targets) do
         if not (type(spec) == "table" and type(spec.name) == "string" and finite(spec.dx) and finite(spec.dy)) then
             return nil, fail("invalid_layout", "deconstruct " .. index .. " needs name, dx and dy", {index = index})
@@ -1476,18 +1481,55 @@ local function plan_deconstruction(surface, force, origin_x, origin_y, targets)
         if not entity or entity.type == "character" or entity.name == "space-platform-hub" then
             return nil, fail("nothing_to_deconstruct", "deconstruct " .. index .. ": no " .. spec.name .. " of yours at " .. position.x .. "," .. position.y .. "; nothing was changed", {index = index, position = position})
         end
-        if cells and not covered(cells, entity.position) then
-            return nil, fail("no_construction_coverage", "deconstruct " .. index .. " (" .. spec.name .. ") is outside every roboport's construction range; nothing was changed", {index = index, position = pos_table(entity.position)})
+        local network = nil
+        if cells then
+            network = covering_network(cells, entity.position)
+            if not network then
+                return nil, fail("no_construction_coverage", "deconstruct " .. index .. " (" .. spec.name .. ") is outside every roboport's construction range; nothing was changed", {index = index, position = pos_table(entity.position)})
+            end
         end
-        if not seen[entity.unit_number or index] then
+        if spec.cancel == true then
+            if not entity.to_be_deconstructed() then
+                return nil, fail("nothing_to_cancel", "deconstruct " .. index .. ": " .. spec.name .. " at " .. position.x .. "," .. position.y .. " is not marked for removal; nothing was changed", {index = index})
+            end
+            planned[#planned + 1] = {index = index, entity = entity, name = entity.name, position = pos_table(entity.position), cancel = true}
+        elseif not seen[entity.unit_number or index] then
             seen[entity.unit_number or index] = true
-            local yields = {}
-            for _, item in pairs(entity.prototype.items_to_place_this or {}) do yields[item.name] = (yields[item.name] or 0) + (item.count or 1) end
+            local contents = {}
             for slot = 1, entity.get_max_inventory_index() do
                 local inventory = entity.get_inventory(slot)
-                for _, item in pairs(inventory and inventory.get_contents() or {}) do yields[item.name] = (yields[item.name] or 0) + item.count end
+                for _, item in pairs(inventory and inventory.get_contents() or {}) do contents[item.name] = (contents[item.name] or 0) + item.count end
+            end
+            local mode = entity.type == "logistic-container" and entity.prototype.logistic_mode or nil
+            if (mode == "passive-provider" or mode == "active-provider" or mode == "storage" or mode == "buffer") and next(contents) then
+                return nil, fail("already_in_network", "deconstruct " .. index .. ": " .. spec.name .. " already offers its " .. top_counts(contents, 1)[1].name
+                    .. " to the network; removing it only moves that into storage and keeps the robots busy. Nothing was changed", {index = index, holds = top_counts(contents, 5)})
+            end
+            local yields = {}
+            for _, item in pairs(entity.prototype.items_to_place_this or {}) do yields[item.name] = (yields[item.name] or 0) + (item.count or 1) end
+            for name, count in pairs(contents) do yields[name] = (yields[name] or 0) + count end
+            if network then
+                local key = network.network_id
+                local entry = slots_by_network[key] or {network = network, needed = 0}
+                for name, count in pairs(yields) do entry.needed = entry.needed + math.ceil(count / prototypes.item[name].stack_size) end
+                slots_by_network[key] = entry
             end
             planned[#planned + 1] = {index = index, entity = entity, name = entity.name, position = pos_table(entity.position), yields = top_counts(yields, 8)}
+        end
+    end
+    for _, entry in pairs(slots_by_network) do
+        local free = 0
+        for _, chest in pairs(entry.network.storages) do
+            local inventory = chest.valid and chest.get_inventory(defines.inventory.chest)
+            if inventory then free = free + inventory.count_empty_stacks() end
+        end
+        if entry.needed > free then
+            return nil, fail("storage_full", "the removals bring back about " .. entry.needed .. " stacks, but the network's storage chests have " .. free
+                .. " free slots: robots would wait with full hands and every other job would stall. Nothing was changed", {
+                stacks_needed = entry.needed,
+                free_storage_slots = free,
+                guidance = "Remove fewer or emptier entities, or first add a storage-chest with place_ghosts (robots need one in the network to build it).",
+            })
         end
     end
     return planned
@@ -1515,7 +1557,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
     if not removals then return removal_err end
     local function removal_report()
         local list = {}
-        for _, plan in ipairs(removals) do list[#list + 1] = {index = plan.index, name = plan.name, position = plan.position, yields = plan.yields} end
+        for _, plan in ipairs(removals) do list[#list + 1] = {index = plan.index, name = plan.name, position = plan.position, yields = plan.yields, cancel = plan.cancel} end
         return list
     end
 
@@ -1757,7 +1799,9 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             if obstacle.valid then obstacle.cancel_deconstruction(force) end
         end
         for _, plan in ipairs(removals) do
-            if plan.entity.valid then plan.entity.cancel_deconstruction(force) end
+            if plan.entity.valid then
+                if plan.cancel then plan.entity.order_deconstruction(force) else plan.entity.cancel_deconstruction(force) end
+            end
         end
         for _, old in ipairs(removed_stranded) do
             surface.create_entity{name = "entity-ghost", inner_name = old.name, position = old.position, direction = old.direction, force = force}
@@ -1767,8 +1811,16 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         if obstacle.valid and obstacle.order_deconstruction(force) then marked[#marked + 1] = obstacle end
     end
     local deconstructing = 0
+    local cancelled = 0
     for _, plan in ipairs(removals) do
-        if plan.entity.valid and plan.entity.order_deconstruction(force) then deconstructing = deconstructing + 1 end
+        if plan.entity.valid then
+            if plan.cancel then
+                plan.entity.cancel_deconstruction(force)
+                cancelled = cancelled + 1
+            elseif plan.entity.order_deconstruction(force) then
+                deconstructing = deconstructing + 1
+            end
+        end
     end
     for _, ghost in ipairs(clear) do
         if ghost.valid then
@@ -1848,6 +1900,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         already_built = already_built,
         obstacles_marked = #marked,
         deconstructing = deconstructing > 0 and removal_report() or nil,
+        deconstruction_cancelled = cancelled > 0 and cancelled or nil,
         recipes = recipes,
         missing_items = missing_items,
         removed_stranded_ghosts = removed_stranded,
