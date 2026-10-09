@@ -725,9 +725,9 @@ end
 
 -- Called every second, for each platform:
 -- * A platform about to leave orbit unarmed, short of thrust stock, or
---   without an agent aboard has its schedule parked in storage (pausing it
---   would also stop its hub building the turrets it needs); once all hold,
---   the schedule is put back and it leaves.
+--   without an agent aboard has its schedule parked in storage, so it stays
+--   in orbit while its hub keeps building; once all hold, the schedule is put
+--   back and it leaves.
 -- * With a standing ammo order (load_turrets, or turrets placed with
 --   place_ghosts), turrets below MIN_LOADED_AMMO get a request the hub fills,
 --   in flight too: loaded turrets otherwise run dry within two minutes, and
@@ -1079,7 +1079,8 @@ end
 
 -- The home side of standing supply: silos inside a logistic network's
 -- logistic range, silos with a supply chest, logistic robots, storage
--- chests, and hub imports from home the network holds none of.
+-- chests, hub imports from home the network holds none of, and a supply
+-- silo that cannot finish its rocket for lack of rocket-part ingredients.
 local function home_supply(home, force)
     local result = {silos = 0, silos_in_logistic_range = 0, silos_with_supply_chest = 0, logistic_robots = 0, storage_chests = 0, network_lacks = {}}
     local networks = force.logistic_networks[home.name] or {}
@@ -1096,7 +1097,22 @@ local function home_supply(home, force)
             end
             if covered_here then result.silos_in_logistic_range = result.silos_in_logistic_range + 1 break end
         end
-        if supply_chests(silo)[1] then result.silos_with_supply_chest = result.silos_with_supply_chest + 1 end
+        if supply_chests(silo)[1] then
+            result.silos_with_supply_chest = result.silos_with_supply_chest + 1
+            local recipe = prototypes.recipe["rocket-part"]
+            local input = silo.get_inventory(defines.inventory.crafter_input)
+            local starved = silo.status == defines.entity_status.item_ingredient_shortage or silo.status == defines.entity_status.no_ingredients
+            if starved and recipe and input then
+                local lacks = {}
+                for _, ingredient in pairs(recipe.ingredients) do
+                    if input.get_item_count(ingredient.name) < ingredient.amount then lacks[#lacks + 1] = ingredient.name end
+                end
+                if lacks[1] and not result.stalled_silo then
+                    result.stalled_silo = {rocket_parts = silo.rocket_parts, parts_required = silo.prototype.rocket_parts_required, lacks = lacks,
+                        x = math.floor(silo.position.x), y = math.floor(silo.position.y)}
+                end
+            end
+        end
     end
     local imports = {}
     for _, platform in ipairs(valid_platforms(force)) do

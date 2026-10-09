@@ -1425,6 +1425,14 @@ Valid: 87 turns, 15 tool errors, 0 provider-limited turns. `plate_automation` an
 
 2 of 50 turns were refused by the provider limit, so the trial was renamed `-capped` and does not count. s53 is rerun from s52's save. At the end, buddy-2 held 7 gun turrets, 56 piercing rounds and 1,006 iron ore; it still lacked 1,044 piercing rounds and 30 foundation, and had no thrusters.
 
+### Fixes after s53: a starved supply silo
+
+- **A paused platform's hub still builds.** At the end of s53, buddy-2 was paused with 7 turret ghosts and 7 turrets in its hub, and none were built. An advisory blamed the pause. In a sandbox from s53's save, unpausing built nothing. Putting 40 foundation in the hub while it stayed paused built all 7 turrets and 30 tiles within 25 s. The turrets stood over empty space, so the real blocker was the missing foundation. The `tend_platforms` comment that said pausing stops hub construction is corrected; there is no code change for this.
+- **The foundation never came up because the supply silo could not launch.** It had 40/50 rocket parts and no processing units. The rung told Buddy to "stock the Nauvis network with piercing rounds", and the queued-cargo warning only covers `ship`, not standing supply.
+  - `home_supply.stalled_silo`: a supply silo starved of ingredients reports its parts, the ingredients it lacks, and its position.
+  - `home_shuttle_rung`: when something waits on that silo, the step after setting the standing supply is "Finish the Nauvis supply silo's rocket: 40/50 parts, it lacks processing-unit". It includes the 10-minute output of each ingredient, `diagnose_factory_blockers surface=nauvis x=92 y=129`, and the harvest bootstrap.
+- Gates: `luac`, all cargo tests. Live suite: 538 passed, 0 failed (`fb-evidence/git-gud/live65`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

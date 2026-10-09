@@ -416,7 +416,7 @@ local BOOTSTRAP_TEXT = " If robots lack the parts to build that (robot_logistics
 -- parts down or lift anything up. `stranded` is the unarmed platform still
 -- orbiting Vulcanus (its layout is copied), or nil once it is lost. The
 -- first missing step, or nil while the new shuttle is on its way.
-local function home_shuttle_rung(S, stranded)
+local function home_shuttle_rung(S, stranded, force)
     local H = S.home_supply or {}
     local why = stranded
         and (stranded.name .. " is stuck over Vulcanus: " .. tostring((stranded.armament or {}).needs)
@@ -449,6 +449,14 @@ local function home_shuttle_rung(S, stranded)
     if not (supplied["piercing-rounds-magazine"] and supplied["iron-ore"]) then
         return "Set " .. P.name .. "'s standing supply from Nauvis.",
             "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]: rockets keep its ammo, thruster ore and spare foundation topped up while it orbits Nauvis, and from then on also send what its ghosts lack. A leg to Vulcanus spends 300-400 magazines and it leaves only with 600+ piercing rounds aboard."
+    end
+    -- Everything the supply silo sends waits on its next rocket.
+    local stalled = H.stalled_silo
+    if stalled and H.imports and H.imports[1] then
+        local home = game.get_surface("nauvis")
+        return "Finish the Nauvis supply silo's rocket: " .. stalled.rocket_parts .. "/" .. stalled.parts_required .. " parts, it lacks " .. table.concat(stalled.lacks, ", ") .. ".",
+            "Nothing reaches " .. P.name .. " until it launches. Each rocket part needs " .. (home and rocket_part_inputs(force, home) or "its ingredients")
+            .. ". From here: diagnose_factory_blockers surface=nauvis x=" .. stalled.x .. " y=" .. stalled.y .. " shows what starves the silo's feed; then place_ghosts surface=nauvis assemblers for the missing ingredients (and their inputs) with inserters and belts into the silo." .. BOOTSTRAP_TEXT
     end
     if (P.thrusters or 0) == 0 and (P.turrets or (P.armament or {}).turrets or 0) == 0 and not (P.ghosts_missing_items and P.ghosts_missing_items[1]) then
         if stranded then
@@ -514,7 +522,7 @@ local function vulcanus_rung(here, force, character, S)
     end
     local silo_here = character.surface.count_entities_filtered{type = "rocket-silo", force = force, limit = 1} > 0
     if not armed_here and not silo_here and (here.counts["cargo-landing-pad"] or 0) > 0 then
-        local goal, how = home_shuttle_rung(S, stranded)
+        local goal, how = home_shuttle_rung(S, stranded, force)
         if goal then return goal, how end
     end
     for _, platform in ipairs(S.platforms or {}) do
