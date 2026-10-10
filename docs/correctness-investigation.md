@@ -1467,6 +1467,26 @@ The user chose to keep the s54 chain rather than branch again from a save from b
 - `BOOTSTRAP_TEXT` explains that an assembler fed from the network's chests can make, one recipe after another, the parts robots lack.
 - Gates: `luac`, clippy, all cargo tests, release build. Live suite: 538 passed, 0 failed (`fb-evidence/git-gud/live66`).
 
+### `s55-cont54-opus-open-2590060469-60m`
+
+Valid: 62 turns, 4 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- **buddy-2 is built.** Rocket 75 brought its 30 foundation tiles; it now has 140 tiles and all 7 gun turrets. With 76 piercing rounds aboard, only 1 of the 6 turrets counts as ready.
+- **Ammo on Nauvis grew from nothing to about 16 piercing rounds a minute**, 828 made in total:
+  - Buddy had robots empty chests holding 2,100 and 3,100 iron plates into storage.
+  - When iron moved between the two storage chests, he turned the magazine assembler's inserters around several times. At the end it takes iron from both chests.
+  - 692 rounds then waited in the silo's supply chest.
+- **Rocket 76 carried iron ore, not piercing rounds.** Earlier, Buddy had raised buddy-2's iron-ore request to drain a full storage chest, and later dropped it. The 1,014 ore already delivered stayed in the supply chest, and its inserter loaded it into the rocket.
+- Remote `set_recipe` was not used. Most turns again ended with "No action this turn" while the rocket filled at about one part a minute, still short of processing units because copper is short.
+
+### Fixes after s55: supply chests hold only the order
+
+- `set_chest_requests` sets `trash_not_requested` on every supply chest each time it runs. Anything the order does not request goes to the chest's trash slots, and robots take it back to storage. The inserter does not pick from trash slots, so it can no longer load leftovers into the rocket.
+- Sandbox from s55's save: the supply chest held 746 piercing rounds and the flag was on. 200 iron ore inserted into it went straight to the trash slots (874 ore there, counting earlier leftovers), and the rocket kept loading piercing rounds.
+- New live test: coal inserted into the SB fixture's supply chest leaves the chest and never reaches the rocket.
+- **The first live run (live67) caught a loop** in "the supply silo launches the starter pack" (536 passed, 3 failed). While a robot carries an item, it counts neither in the network nor in the chest, so `servable` reported nothing and the order dropped. With the trash flag on, the pack arriving in the now-unrequested chest was sent back to storage, and the order was placed again, over and over. In a sandbox, `targeted_items_deliver` reported the pack while network and chest counts read 0.
+  - Fix: new `incoming(chest)` counts what robots are carrying to the chest. `servable` and the launch check in `supply_silo` include it.
+- Gates: `luac`, all cargo tests. Live suite: 539 passed, 0 failed (`fb-evidence/git-gud/live68`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

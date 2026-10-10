@@ -2297,6 +2297,9 @@ end
 
 -- Point a supply chest's request section at `wanted` (name -> count); only
 -- written when it changes, so robots are not re-dispatched every second.
+-- Anything else in the chest is trashed: its inserter would otherwise load
+-- it into the rocket ahead of what the platform needs (s55: 1,014 iron ore
+-- from a dropped request flew up instead of piercing rounds).
 local function set_chest_requests(chest, wanted)
     storage.supply_chest_requests = storage.supply_chest_requests or {}
     local names = {}
@@ -2307,6 +2310,8 @@ local function set_chest_requests(chest, wanted)
     local parts = {}
     for _, name in ipairs(names) do parts[#parts + 1] = name .. "=" .. wanted[name] end
     local signature = table.concat(parts, ",")
+    local point = chest.get_logistic_point(defines.logistic_member_index.logistic_container)
+    if point then point.trash_not_requested = true end
     local previous = storage.supply_chest_requests[chest.unit_number]
     if (previous and previous.signature or "") == signature then return end
     storage.supply_chest_requests[chest.unit_number] = signature ~= "" and {entity = chest, signature = signature} or nil
@@ -2316,6 +2321,14 @@ local function set_chest_requests(chest, wanted)
     for slot, name in ipairs(names) do
         section.set_slot(slot, {value = {type = "item", name = name, quality = "normal"}, min = wanted[name]})
     end
+end
+
+-- Items robots are carrying to `chest` (name -> count).
+local function incoming(chest)
+    local point = chest.get_logistic_point(defines.logistic_member_index.logistic_container)
+    local items = {}
+    for _, entry in pairs(point and point.targeted_items_deliver or {}) do items[entry.name] = (items[entry.name] or 0) + entry.count end
+    return items
 end
 
 -- Fill one platform's shortfall through `silo`: its first supply chest asks
@@ -2343,7 +2356,7 @@ local function supply_silo(platform, silo, chests, deficits)
     for name, short in pairs(deficits) do
         if rocket.get_item_count(name) < short and rocket.can_insert{name = name, count = 1} then
             local left = network and network.get_item_count(name) or 0
-            for _, chest in ipairs(chests) do left = left + chest.get_item_count(name) end
+            for _, chest in ipairs(chests) do left = left + chest.get_item_count(name) + (incoming(chest)[name] or 0) end
             if left > 0 then return end
         end
     end
@@ -2360,9 +2373,11 @@ local function supply_silo(platform, silo, chests, deficits)
     end
 end
 
--- True when `silo`'s network, supply chests or rocket hold anything of
--- `deficits`: a platform waiting only for what nobody has must not hold the
--- silo while another platform's order could go up.
+-- True when `silo`'s network, supply chests (or robots on the way to
+-- them) or rocket hold anything of `deficits`: a platform waiting only for
+-- what nobody has must not hold the silo while another platform's order
+-- could go up. Cargo in a robot counts nowhere else, and dropping the order
+-- then would trash it on arrival.
 local function servable(deficits, silo, chests)
     local rocket = silo.get_inventory(defines.inventory.rocket_silo_rocket)
     local network = chests[1].logistic_network
@@ -2370,7 +2385,7 @@ local function servable(deficits, silo, chests)
         if (rocket and rocket.get_item_count(name) or 0) > 0 then return true end
         if network and network.get_item_count(name) > 0 then return true end
         for _, chest in ipairs(chests) do
-            if chest.get_item_count(name) > 0 then return true end
+            if chest.get_item_count(name) > 0 or (incoming(chest)[name] or 0) > 0 then return true end
         end
     end
     return false

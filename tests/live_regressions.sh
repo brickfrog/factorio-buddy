@@ -8005,6 +8005,15 @@ rcon.print(helpers.table_to_json({silo = silo.rocket_silo_status, rocket = items
 assert_json "the supply silo launches the starter pack from the network" \
     "$(jq -c --argjson d "$(sb_supply_state)" '. + {diag: $d}' <<<"$(sb_platform)")" '.hub_slots != null'
 tool_payload "$(mcp_tool space_platform "$SB_SPEC,\"action\":\"supply\",\"items\":[{\"name\":\"iron-ore\",\"count\":50}]}")" >/dev/null
+# What the order does not need leaves the supply chest instead of riding
+# the next rocket (s55: leftover iron ore displaced piercing rounds).
+raw_lua "game.surfaces.nauvis.find_entities_filtered{name = 'requester-chest', position = {2000.5, 1998.5}, radius = 1}[1].insert{name = 'coal', count = 30}; rcon.print('ok')" >/dev/null
+for _ in $(seq 1 10); do
+    [[ "$(jq -r '(.chest.coal // 0) == 0' <<<"$(sb_supply_state)")" == "true" ]] && break
+    sleep 1
+done
+assert_json "unrequested items leave the supply chest and stay off the rocket" "$(sb_supply_state)" \
+    '(.chest.coal // 0) == 0 and (.rocket.coal // 0) == 0'
 SB_COPY="$(tool_payload "$(mcp_tool space_platform "$SB_SPEC,\"action\":\"copy_layout\",\"stops\":[\"$SA_PLATFORM\"]}")")"
 assert_json "copy_layout places ghosts of the other platform" "$SB_COPY" \
     --arg src "$SA_PLATFORM" '.success == true and .copied_from == $src and .entity_ghosts > 0 and any(.supply.requests[]; .name == "iron-ore" and .count == 50)'
