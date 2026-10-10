@@ -511,7 +511,7 @@ local function home_shuttle_rung(S, stranded, force)
     end
     -- A rocket lifts 50 piercing rounds but the plates for 160: a shuttle
     -- makes its own.
-    if (P.ammo_lines or 0) == 0 then
+    if (P.ammo_lines or 0) == 0 and P.ammo_line_fits then
         return "Give " .. P.name .. " its own ammo line: space_platform action=ammo_line platform=" .. P.name .. ".",
             "One rocket lifts 1 t: 50 piercing-rounds-magazine (20 kg each), or the iron, steel and copper plates for about 160 made aboard. ammo_line places ghosts behind the hub of two assembling-machine-1 (firearm-magazine, piercing-rounds-magazine) with inserters to and from the hub, a medium pole and two solar panels on foundation, and switches the standing supply from rounds to iron-plate 800, steel-plate 100 and copper-plate 200. The line keeps making rounds in flight too."
     end
@@ -576,6 +576,13 @@ local function vulcanus_rung(here, force, character, S)
         return "Place your cargo-landing-pad on Vulcanus.",
             "build_layout it inside the power network. Platforms orbiting Vulcanus drop what it requests (space_platform action=request items=[...])." .. REMOTE_HOME
     end
+    -- The carried silo is the only way anything leaves Vulcanus.
+    local silo_here = character.surface.count_entities_filtered{type = "rocket-silo", force = force, limit = 1} > 0
+    if not silo_here and have("rocket-silo") > 0 then
+        return "Place the rocket silo you carried on Vulcanus.",
+            "build_layout a rocket-silo (9x9) inside the power network with solar panels to spare (6x solar here). Then load one launch of rocket parts with feed_machine_from_inventory: "
+            .. recipe_text("rocket-part") .. " x50. Metallurgic packs leave Vulcanus only from it." .. REMOTE_HOME
+    end
     -- No armed platform here and no silo: nothing reaches orbit from here,
     -- so the next shuttle is built over Nauvis from here (copying the
     -- unarmed one still orbiting, if any).
@@ -585,7 +592,6 @@ local function vulcanus_rung(here, force, character, S)
             if (platform.armament or {}).armed then armed_here = true else stranded = platform end
         end
     end
-    local silo_here = character.surface.count_entities_filtered{type = "rocket-silo", force = force, limit = 1} > 0
     if not armed_here and not silo_here and (here.counts["cargo-landing-pad"] or 0) > 0 then
         local goal, how = home_shuttle_rung(S, stranded, force)
         if goal then return goal, how end
@@ -635,6 +641,22 @@ local function vulcanus_rung(here, force, character, S)
     if not tech_done(force, "metallurgic-science-pack") then
         return "Make a tungsten-plate in a foundry: it unlocks metallurgic-science-pack research.",
             recipe_text("tungsten-plate") .. " (a foundry recipe). " .. molten_iron_text() .. " " .. (here.made["tungsten-plate"] or 0) .. " tungsten-plate made." .. REMOTE_HOME
+    end
+    -- Packs reach Nauvis labs only by rocket, shuttle and the home pad.
+    local packs = have("metallurgic-science-pack")
+    if silo_here and packs >= 50 then
+        local shuttle = nil
+        for _, platform in ipairs(S.platforms or {}) do
+            for _, stop in ipairs(platform.stops or {}) do
+                if stop == "nauvis" and (platform.armament or {}).armed then shuttle = platform end
+            end
+        end
+        if shuttle then
+            return "Send your " .. packs .. " metallurgic science packs to Nauvis.",
+                "1) Beside the silo: space_platform action=ship platform=" .. shuttle.name .. " items=[{name:\"metallurgic-science-pack\",count:" .. packs .. "}]; they go up with the next ready rocket while "
+                .. shuttle.name .. " orbits Vulcanus (keep the silo fed with rocket parts). 2) space_platform action=request stops=[\"nauvis\"] items=[{name:\"metallurgic-science-pack\",count:" .. packs
+                .. "}] so the Nauvis landing pad takes them when the shuttle is home." .. REMOTE_HOME
+        end
     end
     return "Automate metallurgic science on Vulcanus.",
         recipe_text("metallurgic-science-pack") .. " in a foundry (molten copper from " .. recipe_text("molten-copper-from-lava")
@@ -717,9 +739,23 @@ local function space_science_rung(P, S)
         "space_platform action=request items=[{name:\"space-science-pack\",count:100}]. Platforms in orbit drop requested items on their own."
 end
 
+-- Rocket parts Nauvis must make per 10 minutes before you leave it to run
+-- alone: 30 is 3.6 rockets an hour (long40 made 22).
+local MIN_ROCKET_PARTS_BEFORE_LEAVING = 30
+
+-- Carried to Vulcanus in your inventory: its rocket silo, one launch of
+-- rocket parts, and a landing pad for the shuttle's drops.
+local VULCANUS_KIT = {
+    {name = "rocket-silo", count = 1},
+    {name = "processing-unit", count = 50},
+    {name = "low-density-structure", count = 50},
+    {name = "rocket-fuel", count = 50},
+    {name = "cargo-landing-pad", count = 1},
+}
+
 -- Space Age rungs after the first rocket, up to boarding for Vulcanus. Nil
 -- when the generic research rungs (on space_path) are the right next step.
-local function space_rung(facts, force, surface)
+local function space_rung(facts, force, surface, character)
     local S = facts.space
     local P = S.platforms[1]
     local vulcanus_found = S.techs.planet_discovery_vulcanus
@@ -852,7 +888,7 @@ local function space_rung(facts, force, surface)
     end
     local supplied = {}
     for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
-    if not (supplied["piercing-rounds-magazine"] and supplied["iron-ore"]) then
+    if not ((supplied["piercing-rounds-magazine"] or supplied["copper-plate"]) and supplied["iron-ore"]) then
         return "Set " .. P.name .. "'s standing supply from Nauvis.",
             "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]: whenever it orbits Nauvis, rockets keep its ammo, thruster ore and spare foundation topped up, also while you are away. A leg to Vulcanus spends 300-400 magazines and the platform only leaves with 600+ piercing rounds aboard, so 1100 brings it home again. Add what Vulcanus will need later the same way."
     end
@@ -860,12 +896,39 @@ local function space_rung(facts, force, surface)
         return "Stock the home network with " .. table.concat(H.network_lacks, ", ") .. " for " .. P.name .. "'s supply.",
             "Robots load only what the network holds: from each line making these, add an inserter into a passive-provider-chest inside the roboport network (build_layout), or put a stock of them into a storage chest."
     end
-    if (P.stops or {})[1] ~= "vulcanus" then
-        return "Set " .. P.name .. "'s course for Vulcanus.",
-            "space_platform action=schedule stops=[\"vulcanus\"]. It stays in orbit until you are aboard (and armed and stocked), then leaves by itself."
+    -- A shuttle that makes its own rounds needs only plates from Nauvis.
+    if (P.ammo_lines or 0) == 0 and P.ammo_line_fits then
+        return "Give " .. P.name .. " its own ammo line: space_platform action=ammo_line platform=" .. P.name .. ".",
+            "One rocket lifts 1 t: 50 piercing-rounds-magazine (20 kg each), or the iron, steel and copper plates for about 160 made aboard, in flight too. ammo_line places ghosts behind the hub (two assembling-machine-1, inserters, a medium pole, two solar panels, foundation) and switches the standing supply from rounds to iron-plate 800, steel-plate 100 and copper-plate 200."
+    end
+    -- Once you leave, Nauvis runs alone and every shuttle load rides its
+    -- rockets: s49-s57 stalled at one rocket per 45-90 minutes when copper
+    -- ran short and nobody was there to fix it.
+    local parts_made = made_last_ten_minutes(force, surface, "rocket-part")
+    if parts_made < MIN_ROCKET_PARTS_BEFORE_LEAVING then
+        return "Raise Nauvis' rocket rate before you leave: " .. parts_made .. " rocket parts in the last 10 minutes, " .. MIN_ROCKET_PARTS_BEFORE_LEAVING .. "+ needed.",
+            "After you leave only robots can change Nauvis, and they reach only roboport range. Each part needs " .. rocket_part_inputs(force, surface)
+            .. ". Fix the scarcest in person now: connect the ore patches and smelters that stand full to the lines that starve (route_belt, build_layout), add assemblers for it and its inputs, and extend roboport coverage over the outposts." .. supply_gaps_text(facts)
+    end
+    if (P.stops or {})[1] ~= "vulcanus" and (P.stops or {})[2] ~= "vulcanus" then
+        return "Set " .. P.name .. "'s course: a shuttle between Nauvis and Vulcanus.",
+            "space_platform action=schedule stops=[\"vulcanus\",\"nauvis\"]. It stays in orbit until you are aboard (and armed and stocked), then shuttles by itself: at Nauvis it waits for its supply, at Vulcanus for the landing pad."
+    end
+    -- Nothing leaves Vulcanus without a rocket silo there, and a silo's
+    -- 10 t would take ten rockets: carry it, and one launch of parts.
+    local inventory = character and character.get_main_inventory()
+    local missing = {}
+    for _, entry in ipairs(VULCANUS_KIT) do
+        local have = inventory and inventory.get_item_count(entry.name) or 0
+        if have < entry.count then missing[#missing + 1] = entry.name .. " " .. have .. "/" .. entry.count end
+    end
+    if missing[1] then
+        return "Pack the Vulcanus launch kit in your inventory: " .. table.concat(missing, ", ") .. ".",
+            "You ride the rocket with your whole inventory, but cargo sent up costs 1 t per rocket and a rocket-silo weighs 10 t. With a silo and one launch of parts on Vulcanus, its metallurgic packs go up to the shuttle. "
+            .. recipe_text("rocket-silo") .. " (craft it by hand once you carry the ingredients; collect them from chests and machines). Rocket parts: " .. rocket_part_inputs(force, surface) .. "."
     end
     return "Board " .. P.name .. " for Vulcanus.",
-        "It waits in orbit until you are aboard, then leaves. Carry what you need to start there: a cargo-landing-pad (the shuttle drops what you request there); Vulcanus has no water, so solar panels (4x power there) and accumulators, not steam; roboports, construction and logistic robots and a storage chest so place_ghosts works there; chemical plants and assembling-machine-2s (carbon, tungsten carbide), a pumpjack (sulfuric acid geysers), pipes, drills, steel furnaces, belts, inserters, poles. Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
+        "It waits in orbit until you are aboard, then leaves. Carry what you need to start there besides the launch kit: a cargo-landing-pad (the shuttle drops what you request there); Vulcanus has no water, so solar panels (6x power there) and accumulators, not steam; roboports, construction and logistic robots and a storage chest so place_ghosts works there; chemical plants and assembling-machine-2s (carbon, tungsten carbide), a pumpjack (sulfuric acid geysers), pipes, drills, steel furnaces, belts, inserters, poles. Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
 end
 
 -- Code-computed tech-progression ladder for the early game. Each rung names
@@ -911,7 +974,7 @@ local function progression(surface, force, facts, character)
     end
     local goal, how = travel_rung(facts.space, character, facts.here, force)
     local space_goal, space_how = nil, nil
-    if not goal and force.rockets_launched > 0 then space_goal, space_how = space_rung(facts, force, surface) end
+    if not goal and force.rockets_launched > 0 then space_goal, space_how = space_rung(facts, force, surface, character) end
     local silo_prototype = prototypes.entity["rocket-silo"]
     local parts_required = silo_prototype and silo_prototype.rocket_parts_required or 50
     if goal then

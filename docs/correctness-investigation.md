@@ -1532,6 +1532,26 @@ Valid: 54 turns, 4 tool errors, 0 provider-limited turns. `plate_automation` and
 - **The silo rate fell to about one processing unit every two minutes** as copper output dropped from 72 to 38 plates a minute.
 - **About 35 of 54 turns were "No changes this turn".** Buddy put it plainly: the copper smelters at (22,400) are outside robot range and "need me on Nauvis in person", and he cannot get back without a silo on Vulcanus.
 
+### Re-branch from long40: prepare before leaving
+
+The user chose to start a new chain from long40, the last save before Vulcanus. Here is what that save holds, checked in a sandbox:
+- **Nauvis:** 22 rocket parts made in 10 minutes (about 2.6 rockets an hour) and 225 copper plates a minute. The chests hold 800 electric-engine-unit, 1,680 concrete and 237 low-density-structure. Buddy stands at the copper outpost (15,403).
+- **buddy-1:** waiting in Nauvis orbit with 1 thruster, collectors and 600 piercing rounds aboard. Its turrets hold firearm magazines, so it is unarmed.
+- **No supply line yet.**
+
+New gates in `space_rung`, after the supply line and before boarding:
+1. **Ammo line,** only when one fits. buddy-1's four hub sides are all taken (thruster fuel at the back, crushers and assemblers at the sides, collectors in front), so `ammo_line` now tries back, left, right and front in turn and reports each side's blockers. `platform_summary.ammo_line_fits` drives the step, so a crowded platform skips it instead of sticking on it.
+2. **Rocket rate:** at least `MIN_ROCKET_PARTS_BEFORE_LEAVING` = 30 rocket parts per 10 minutes. The step names the ingredient rates and the undelivered-item gaps, and tells Buddy to fix them in person.
+3. **Shuttle course:** `stops=["vulcanus","nauvis"]`.
+4. **Launch kit in Buddy's inventory (`VULCANUS_KIT`):** rocket-silo, and 50 each of processing-unit, low-density-structure and rocket-fuel, plus a cargo-landing-pad. Buddy rides up with his whole inventory, while a rocket-silo shipped as cargo would take 10 rockets.
+
+New steps in `vulcanus_rung`:
+- With a carried silo and no silo placed: "Place the rocket silo you carried", then load the 50 rocket parts.
+- With a silo and 50 or more packs: "Send your N metallurgic science packs to Nauvis". Buddy uses `ship` to the armed shuttle and `request stops=[nauvis]` on the home landing pad.
+
+Sandbox walk on long40's save, with the supply-line prerequisites faked: the steps came in the order supply → "Raise Nauvis' rocket rate (22/30)" → (after 40 parts added to the production statistics) "Set course" → "Pack the Vulcanus launch kit: rocket-silo 0/1, processing-unit 19/50, …" → (with the kit in inventory) "Board buddy-1".
+- Gates: `luac`, all cargo tests. Live suite: 542 passed, 0 failed (`fb-evidence/git-gud/live71`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

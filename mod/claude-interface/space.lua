@@ -903,6 +903,9 @@ local function rockets_for(counts)
     return math.max(1, math.ceil(weight / lift))
 end
 
+-- Defined with the ammo line actions below.
+local ammo_line_plan
+
 local function platform_summary(platform)
     local location = platform.space_location
     local surface = platform.surface
@@ -915,6 +918,10 @@ local function platform_summary(platform)
         ammo_lines = surface and ammo_lines(surface) or 0,
         stops = {},
     }
+    -- A platform with no room for an ammo line keeps shipping rounds.
+    if summary.ammo_lines == 0 and platform.hub and platform.hub.valid then
+        summary.ammo_line_fits = ammo_line_plan(platform) ~= nil
+    end
     local schedule = platform.schedule
     local held = storage.departure_held and storage.departure_held[platform.index]
     local held_records = held and (held.records or held)
@@ -2821,26 +2828,50 @@ local function action_copy_layout(platform, stops)
     return result
 end
 
--- A shuttle's own ammo line behind its hub (the side away from travel):
--- assembling-machine-1s for firearm-magazine and piercing-rounds-magazine,
--- each with an inserter from the hub and one back, a medium pole and two
--- solar panels (one gives 180 kW in Nauvis orbit, more further out), on
--- foundation ghosts. Rounds made aboard cost 6.25 kg of plates each
--- (2 firearm-magazine from 8 iron-plate, 1 steel-plate and 2 copper-plate
--- per 2 rounds) against 20 kg shipped, so the standing supply swaps
--- piercing-rounds-magazine for those plates. Offsets are from the hub's
--- bottom-left corner; an inserter's direction faces where it picks up.
+-- A shuttle's own ammo line beside its hub: assembling-machine-1s for
+-- firearm-magazine and piercing-rounds-magazine, each with an inserter from
+-- the hub and one back, a medium pole and two solar panels (one gives
+-- 180 kW in Nauvis orbit, more further out), on foundation ghosts. Rounds
+-- made aboard cost 6.25 kg of plates each (2 firearm-magazine from 8
+-- iron-plate, 1 steel-plate and 2 copper-plate per 2 rounds) against 20 kg
+-- shipped, so the standing supply swaps piercing-rounds-magazine for those
+-- plates. `u` runs along a hub edge from its first corner, `v` away from the
+-- hub; `feeds` inserters pick from the hub, `returns` ones put back into it.
 local AMMO_LINE = {
-    {name = "inserter", dx = 0.5, dy = 0.5, direction = defines.direction.north},
-    {name = "inserter", dx = 2.5, dy = 0.5, direction = defines.direction.south},
-    {name = "assembling-machine-1", dx = 1.5, dy = 2.5, recipe = "firearm-magazine"},
-    {name = "inserter", dx = 4.5, dy = 0.5, direction = defines.direction.north},
-    {name = "inserter", dx = 6.5, dy = 0.5, direction = defines.direction.south},
-    {name = "assembling-machine-1", dx = 5.5, dy = 2.5, recipe = "piercing-rounds-magazine"},
-    {name = "medium-electric-pole", dx = 3.5, dy = 3.5},
-    {name = "solar-panel", dx = 1.5, dy = 5.5},
-    {name = "solar-panel", dx = 5.5, dy = 5.5},
+    {name = "inserter", u = 0.5, v = 0.5, feeds = true},
+    {name = "inserter", u = 2.5, v = 0.5, returns = true},
+    {name = "assembling-machine-1", u = 1.5, v = 2.5, recipe = "firearm-magazine"},
+    {name = "inserter", u = 4.5, v = 0.5, feeds = true},
+    {name = "inserter", u = 6.5, v = 0.5, returns = true},
+    {name = "assembling-machine-1", u = 5.5, v = 2.5, recipe = "piercing-rounds-magazine"},
+    {name = "medium-electric-pole", u = 3.5, v = 3.5},
+    {name = "solar-panel", u = 1.5, v = 5.5},
+    {name = "solar-panel", u = 5.5, v = 5.5},
 }
+-- The pole's tile joins the row beside the hub through this column, which
+-- the hub builds first: a tile ghost touching foundation only through
+-- other new tiles stayed unbuilt in the s56 sandbox.
+local AMMO_LINE_FILLER = {{3, 0}, {3, 1}, {3, 2}}
+-- Hub sides tried in order (the back first: turrets face forward, smaller
+-- y). `at` maps (u, v) to a position, `tile` maps tile indices, `toward` is
+-- the direction from the line to the hub.
+local function hub_sides(box)
+    local left, top = math.floor(box.left_top.x + 0.5), math.floor(box.left_top.y + 0.5)
+    local right, bottom = math.floor(box.right_bottom.x + 0.5), math.floor(box.right_bottom.y + 0.5)
+    local d = defines.direction
+    return {
+        {name = "back", toward = d.north, away = d.south,
+            at = function(u, v) return {x = left + u, y = bottom + v} end, tile = function(u, v) return {left + u, bottom + v} end},
+        {name = "left", toward = d.east, away = d.west,
+            at = function(u, v) return {x = left - v, y = top + u} end, tile = function(u, v) return {left - 1 - v, top + u} end},
+        {name = "right", toward = d.west, away = d.east,
+            at = function(u, v) return {x = right + v, y = top + u} end, tile = function(u, v) return {right + v, top + u} end},
+        {name = "front", toward = d.south, away = d.north,
+            at = function(u, v) return {x = left + u, y = top - v} end, tile = function(u, v) return {left + u, top - 1 - v} end},
+    }
+end
+-- Entities that do not stop a ghost from being placed over them.
+local AMMO_LINE_IGNORED = {["tile-ghost"] = true, ["item-request-proxy"] = true, ["item-entity"] = true, asteroid = true}
 local AMMO_LINE_SUPPLY = {
     {name = "piercing-rounds-magazine", count = 0},
     {name = "iron-plate", count = 800},
@@ -3040,6 +3071,41 @@ local function action_supply(character, platform, items, stops)
     return result
 end
 
+-- The first hub side where nothing stands in the ammo line's way: its
+-- parts with positions and directions, its tiles, the side's name; or nil
+-- and what blocks each side.
+ammo_line_plan = function(platform)
+    local surface = platform.surface
+    local blocked = {}
+    for _, candidate in ipairs(hub_sides(platform.hub.bounding_box)) do
+        local parts, area_tiles, blockers = {}, {}, {}
+        for _, part in ipairs(AMMO_LINE) do
+            local position = candidate.at(part.u, part.v)
+            local box = prototypes.entity[part.name].collision_box
+            local area = {{position.x + box.left_top.x, position.y + box.left_top.y}, {position.x + box.right_bottom.x, position.y + box.right_bottom.y}}
+            for _, other in pairs(surface.find_entities_filtered{area = area}) do
+                if not AMMO_LINE_IGNORED[other.type] then
+                    blockers[#blockers + 1] = {name = other.type == "entity-ghost" and other.ghost_name or other.name, position = pos_table(other.position)}
+                end
+            end
+            for x = math.floor(area[1][1] + 0.01), math.ceil(area[2][1] - 0.01) - 1 do
+                for y = math.floor(area[1][2] + 0.01), math.ceil(area[2][2] - 0.01) - 1 do area_tiles[x .. "," .. y] = {x, y} end
+            end
+            local direction = part.feeds and candidate.toward or part.returns and candidate.away or nil
+            parts[#parts + 1] = {part = part, position = position, direction = direction}
+        end
+        if not blockers[1] then
+            for _, filler in ipairs(AMMO_LINE_FILLER) do
+                local tile = candidate.tile(filler[1], filler[2])
+                area_tiles[tile[1] .. "," .. tile[2]] = tile
+            end
+            return parts, area_tiles, candidate.name, blocked
+        end
+        blocked[#blocked + 1] = {side = candidate.name, blockers = blockers}
+    end
+    return nil, nil, nil, blocked
+end
+
 local function action_ammo_line(character, platform)
     if not (platform.hub and platform.hub.valid) then
         return fail("platform_not_ready", platform.name .. " has no hub yet (" .. state_name(platform.state) .. ")")
@@ -3053,32 +3119,9 @@ local function action_ammo_line(character, platform)
             return fail("recipe_locked", recipe .. " is not researched", {recipe = recipe})
         end
     end
-    local corner = platform.hub.bounding_box.left_top
-    local x0, y0 = math.floor(corner.x + 0.5), math.floor(platform.hub.bounding_box.right_bottom.y + 0.5)
-    local placed, blockers, tiles = {}, {}, {}
-    for _, part in ipairs(AMMO_LINE) do
-        local position = {x = x0 + part.dx, y = y0 + part.dy}
-        local box = prototypes.entity[part.name].collision_box
-        local area = {{position.x + box.left_top.x, position.y + box.left_top.y}, {position.x + box.right_bottom.x, position.y + box.right_bottom.y}}
-        for _, other in pairs(surface.find_entities_filtered{area = area}) do
-            if other.type ~= "tile-ghost" and other.type ~= "item-request-proxy" then
-                blockers[#blockers + 1] = {name = other.type == "entity-ghost" and other.ghost_name or other.name, position = pos_table(other.position)}
-            end
-        end
-        for x = math.floor(area[1][1] + 0.01), math.ceil(area[2][1] - 0.01) - 1 do
-            for y = math.floor(area[1][2] + 0.01), math.ceil(area[2][2] - 0.01) - 1 do tiles[x .. "," .. y] = {x, y} end
-        end
-        placed[#placed + 1] = {part = part, position = position}
-    end
-    -- The pole's tile joins the row behind the hub through a column the hub
-    -- builds first: a tile ghost touching foundation only through other new
-    -- tiles stayed unbuilt in the s56 sandbox.
-    for dy = 0, 2 do
-        local x, y = x0 + 3, y0 + dy
-        tiles[x .. "," .. y] = {x, y}
-    end
-    if blockers[1] then
-        return fail("blocked", "the ammo line goes behind the hub (y " .. y0 .. " to " .. (y0 + 7) .. ", x " .. x0 .. " to " .. (x0 + 7) .. "); clear it first (action=deconstruct)", {blockers = blockers})
+    local placed, tiles, side, blocked = ammo_line_plan(platform)
+    if not placed then
+        return fail("blocked", "every side of the hub has something within 8 tiles where the ammo line goes (two 3x3 assemblers beside the hub edge, solar panels behind them); clear one side (action=deconstruct)", {sides = blocked})
     end
     local tile_ghosts = 0
     for _, tile in pairs(tiles) do
@@ -3091,7 +3134,7 @@ local function action_ammo_line(character, platform)
     local entity_ghosts = 0
     for _, entry in ipairs(placed) do
         local ghost = surface.create_entity{name = "entity-ghost", inner_name = entry.part.name, position = entry.position,
-            direction = entry.part.direction, force = force, recipe = entry.part.recipe}
+            direction = entry.direction, force = force, recipe = entry.part.recipe}
         if ghost then entity_ghosts = entity_ghosts + 1 end
     end
     local supplied = action_supply(character, platform, AMMO_LINE_SUPPLY, {M.home_surface(character).name})
@@ -3099,6 +3142,7 @@ local function action_ammo_line(character, platform)
     result.success = true
     result.entity_ghosts = entity_ghosts
     result.tile_ghosts = tile_ghosts
+    result.side = side
     result.supply_set = supplied.success == true
     result.guidance = "The hub builds the line from what the supply silo sends (its ghosts' parts come first). Standing supply now asks for iron-plate 800, steel-plate 100 and copper-plate 200 instead of piercing-rounds-magazine: "
         .. "they make 200 rounds per fill aboard, about 10 a minute, also in flight. Stock those plates in the home network; the hub keeps the turrets loaded from what the line makes."
