@@ -1487,6 +1487,15 @@ Valid: 62 turns, 4 tool errors, 0 provider-limited turns. `plate_automation` and
   - Fix: new `incoming(chest)` counts what robots are carrying to the chest. `servable` and the launch check in `supply_silo` include it.
 - Gates: `luac`, all cargo tests. Live suite: 539 passed, 0 failed (`fb-evidence/git-gud/live68`).
 
+### `s56-cont55-opus-open-2590060469-60m`
+
+Valid: 53 turns, 9 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- **Remote `set_recipe` used 6 times.** Buddy temporarily switched the magazine and piercing assemblers on Nauvis to copper cable and foundation, made the 11 missing foundation (up to about 5 a minute), then switched them back.
+- **Rocket 77 lifted 50 piercing rounds.** buddy-2 now has 126 rounds and 2 of 6 turrets ready. Buddy gave it the schedule `["nauvis","vulcanus"]`, and it is held `unarmed`.
+- **Vulcanus power failed once.** The acid-neutralisation plant ran out of calcite. Buddy restarted it with solar panels and hand-fed calcite; a lasting calcite belt is still missing.
+- **Rate:** about one rocket every 45 minutes, limited to about one processing unit a minute because copper is short. Buddy's planned fix (moving the copper input) needs transport belts that the Nauvis network does not hold.
+- Most turns again ended with "No changes this tick".
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
