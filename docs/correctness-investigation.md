@@ -1552,6 +1552,23 @@ New steps in `vulcanus_rung`:
 Sandbox walk on long40's save, with the supply-line prerequisites faked: the steps came in the order supply → "Raise Nauvis' rocket rate (22/30)" → (after 40 parts added to the production statistics) "Set course" → "Pack the Vulcanus launch kit: rocket-silo 0/1, processing-unit 19/50, …" → (with the kit in inventory) "Board buddy-1".
 - Gates: `luac`, all cargo tests. Live suite: 542 passed, 0 failed (`fb-evidence/git-gud/live71`).
 
+### `p1-cont40-opus-open-2590060469-60m`
+
+Valid: 31 turns, 28 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+
+Buddy worked on Nauvis in person and the rungs led him through the supply line:
+- **buddy-1 armed.** `load_turrets` swapped the firearm magazines for piercing rounds: 6 of 6 turrets ready, 4 at the front, 600 rounds.
+- **Supply-line steps reached:** a roboport by the silo (silo in logistic range); a battery line, then 20 logistic robots (an assembler switched to logistic robots, plus hand-crafting); a storage chest.
+- **buddy-1 makes space science.** He set its idle assembler to space science and fed the furnace.
+- **Research on `logistic-system` (needed for the requester supply chest) went from 25% to 68%.** Getting there took fixes across the Nauvis science chain:
+  - red science fed by hand;
+  - steel furnaces cleared of copper that had got into the feed;
+  - a copper unloader built from a 3,100-copper stockpile chest;
+  - two belt jams where a belt fed an underground entrance from the side;
+  - a chemical-science deadlock broken.
+- **buddy-1's hub filled up four times.** That stops its collectors and crushers and blocks incoming cargo. Buddy jettisoned iron ore, carbon and the 487 firearm magazines each time.
+- Of the 28 errors, most were crafting admissions and placement retries.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
