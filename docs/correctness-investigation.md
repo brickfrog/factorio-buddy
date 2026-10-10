@@ -1496,6 +1496,32 @@ Valid: 53 turns, 9 tool errors, 0 provider-limited turns. `plate_automation` and
 - **Rate:** about one rocket every 45 minutes, limited to about one processing unit a minute because copper is short. Buddy's planned fix (moving the copper input) needs transport belts that the Nauvis network does not hold.
 - Most turns again ended with "No changes this tick".
 
+### Cutting rocket mass: ammo made aboard
+
+The user chose to cut mass rather than keep grinding. Engine facts used here, all read in a sandbox from s56:
+- **Recipes:** piercing-rounds-magazine is 2 copper-plate + 1 steel-plate + 2 firearm-magazine → 2 rounds; firearm-magazine is 4 iron-plate; rocket-part is 1 each of processing-unit, low-density-structure and rocket-fuel.
+- **Rocket silo:** 1000 steel, 200 processing-unit, 200 electric-engine-unit, 100 pipe, 1000 concrete.
+- **Solar in space:** 300% at Nauvis, 600% at Vulcanus.
+- **Surface conditions:** stone and steel furnaces need pressure, so they cannot go on a platform; electric furnaces and assemblers can.
+- **Weight per round:** a round made aboard costs 6.25 kg of shipped plates, against 20 kg for a shipped round.
+
+**`space_platform action=ammo_line`** places ghosts behind the hub, on the side away from travel, using offsets from the hub's corner:
+- two assembling-machine-1, on firearm-magazine and piercing-rounds-magazine;
+- for each, an inserter from the hub and one back to it;
+- a medium pole, two solar panels, and 39 foundation tiles.
+
+It also replaces the piercing order in the standing supply with iron-plate 800, steel-plate 100 and copper-plate 200. It refuses `blocked` (listing the blockers), `already_built`, and `recipe_locked`. `platform_summary.ammo_lines` counts the piercing assemblers, built or ghost.
+
+Two problems found in the sandbox, both fixed:
+- **The turrets took every firearm magazine the line made**, so it never made a round. With an ammo line aboard, `hub_ammo_for` now skips weak ammo, and a turret loaded with weak ammo gets no top-up.
+- **A lone foundation ghost** (under the pole) that touched built foundation only through tiles that were themselves still ghosts stayed unbuilt. The layout now adds a column of tiles from the row behind the hub.
+
+After both fixes, the line built from hub stock and made rounds at about 9 a minute. buddy-2's piercing rose from 126 to 138 in under a minute, and the turrets held no firearm magazines.
+
+**Rung:** the ammo-line step follows the supply step. The shuttle layout step (thrusters, collectors, crushers) now fires whenever a platform has no thrusters and no unbuilt ghosts, not only when it has no turrets. The stalled-silo step now comes after these, so that the ghosts' parts are on order before Buddy works on the silo.
+- **Live tests:** `ammo_line` places 9 ghosts and switches the supply; a second call is refused; with an ammo line aboard, a turret gets no firearm magazines. live69 failed these tests only because the fixture force had not researched piercing rounds, and the turret test showed the old behaviour (20 firearm magazines loaded). The test now unlocks the recipe.
+- Gates: `luac`, clippy, all cargo tests, release build. Live suite: 542 passed, 0 failed (`fb-evidence/git-gud/live70`).
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

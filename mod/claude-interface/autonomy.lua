@@ -505,19 +505,17 @@ local function home_shuttle_rung(S, stranded, force)
     end
     local supplied = {}
     for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
-    if not (supplied["piercing-rounds-magazine"] and supplied["iron-ore"]) then
+    if not ((supplied["piercing-rounds-magazine"] or supplied["copper-plate"]) and supplied["iron-ore"]) then
         return "Set " .. P.name .. "'s standing supply from Nauvis.",
             "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]: rockets keep its ammo, thruster ore and spare foundation topped up while it orbits Nauvis, and from then on also send what its ghosts lack. A leg to Vulcanus spends 300-400 magazines and it leaves only with 600+ piercing rounds aboard."
     end
-    -- Everything the supply silo sends waits on its next rocket.
-    local stalled = H.stalled_silo
-    if stalled and H.imports and H.imports[1] then
-        local home = game.get_surface("nauvis")
-        return "Finish the Nauvis supply silo's rocket: " .. stalled.rocket_parts .. "/" .. stalled.parts_required .. " parts, it lacks " .. table.concat(stalled.lacks, ", ") .. ".",
-            "Nothing reaches " .. P.name .. " until it launches. Each rocket part needs " .. (home and rocket_part_inputs(force, home) or "its ingredients")
-            .. ". From here: diagnose_factory_blockers surface=nauvis x=" .. stalled.x .. " y=" .. stalled.y .. " shows what starves the silo's feed; then place_ghosts surface=nauvis assemblers for the missing ingredients (and their inputs) with inserters and belts into the silo." .. BOOTSTRAP_TEXT
+    -- A rocket lifts 50 piercing rounds but the plates for 160: a shuttle
+    -- makes its own.
+    if (P.ammo_lines or 0) == 0 then
+        return "Give " .. P.name .. " its own ammo line: space_platform action=ammo_line platform=" .. P.name .. ".",
+            "One rocket lifts 1 t: 50 piercing-rounds-magazine (20 kg each), or the iron, steel and copper plates for about 160 made aboard. ammo_line places ghosts behind the hub of two assembling-machine-1 (firearm-magazine, piercing-rounds-magazine) with inserters to and from the hub, a medium pole and two solar panels on foundation, and switches the standing supply from rounds to iron-plate 800, steel-plate 100 and copper-plate 200. The line keeps making rounds in flight too."
     end
-    if (P.thrusters or 0) == 0 and (P.turrets or (P.armament or {}).turrets or 0) == 0 and not (P.ghosts_missing_items and P.ghosts_missing_items[1]) then
+    if (P.thrusters or 0) == 0 and not (P.ghosts_missing_items and P.ghosts_missing_items[1]) then
         if stranded then
             return "Lay out " .. P.name .. " like " .. stranded.name .. ".",
                 "space_platform action=copy_layout platform=" .. P.name .. " stops=[\"" .. stranded.name .. "\"] places ghosts of its foundation, turrets, thrusters and machines; the hub builds them from what the supply silo brings. Add what "
@@ -527,6 +525,14 @@ local function home_shuttle_rung(S, stranded, force)
             "Its ghosts' parts come up from Nauvis' network through the supply silo. It needs: " .. turret_plan(P.armament or {}, P.surface)
             .. " Thrusters at the back edge (" .. recipe_text("thruster") .. "), fed by pipes from chemical plants on " .. recipe_text("thruster-fuel") .. " and " .. recipe_text("thruster-oxidizer")
             .. "; asteroid collectors at the foundation edge with crushers for the carbon, iron and ice they need; solar panels and poles; inserters to and from the hub; space-platform-foundation tiles under all of it."
+    end
+    -- Everything the supply silo sends waits on its next rocket.
+    local stalled = H.stalled_silo
+    if stalled and H.imports and H.imports[1] then
+        local home = game.get_surface("nauvis")
+        return "Finish the Nauvis supply silo's rocket: " .. stalled.rocket_parts .. "/" .. stalled.parts_required .. " parts, it lacks " .. table.concat(stalled.lacks, ", ") .. ".",
+            "Nothing reaches " .. P.name .. " until it launches. Each rocket part needs " .. (home and rocket_part_inputs(force, home) or "its ingredients")
+            .. ". From here: diagnose_factory_blockers surface=nauvis x=" .. stalled.x .. " y=" .. stalled.y .. " shows what starves the silo's feed; then place_ghosts surface=nauvis assemblers for the missing ingredients (and their inputs) with inserters and belts into the silo." .. BOOTSTRAP_TEXT
     end
     if H.network_lacks and H.network_lacks[1] then
         return "Stock the Nauvis network with " .. table.concat(H.network_lacks, ", ") .. " for " .. P.name .. ".",

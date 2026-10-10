@@ -8074,6 +8074,37 @@ assert_json "the withdrawn chest stays" \
 rcon.print(helpers.table_to_json({exists = e ~= nil, marked = e ~= nil and e.to_be_deconstructed()}))")" \
     '.exists == true and .marked == false'
 
+# A shuttle's ammo line: ghosts behind the hub, and the standing supply
+# swaps rounds for the plates they are made of.
+raw_lua "game.forces.player.recipes['piercing-rounds-magazine'].enabled = true; rcon.print('ok')" >/dev/null
+SB_AMMO="$(tool_payload "$(mcp_tool space_platform "$SB_SPEC,\"action\":\"ammo_line\"}")")"
+assert_json "ammo_line places the line behind the hub and switches the supply to plates" "$SB_AMMO" \
+    '.success == true and .entity_ghosts == 9 and .ammo_lines == 1
+     and any(.supply.requests[]; .name == "copper-plate" and .count == 200)
+     and any(.supply.requests[]; .name == "iron-plate" and .count == 800)'
+assert_json "a second ammo_line is refused" \
+    "$(tool_payload "$(mcp_tool space_platform "$SB_SPEC,\"action\":\"ammo_line\"}")")" \
+    '.success == false and .error_kind == "already_built"'
+# Its firearm magazines are an ingredient: the hub must not load them into
+# turrets (they took every one in the s56 sandbox).
+raw_lua "local p
+for _, x in pairs(game.forces.player.platforms) do if x.name == '$SB_PLATFORM' then p = x end end
+p.hub.get_inventory(defines.inventory.hub_main).insert{name = 'firearm-magazine', count = 20}
+local s = p.surface
+local tiles = {}
+for x = -14, -12 do for y = -14, -12 do tiles[#tiles + 1] = {name = 'space-platform-foundation', position = {x, y}} end end
+s.set_tiles(tiles)
+s.create_entity{name = 'gun-turret', position = {-13, -13}, force = 'player'}
+rcon.print('ok')" >/dev/null
+tool_payload "$(mcp_tool space_platform "$SB_SPEC,\"action\":\"load_turrets\"}")" >/dev/null
+sleep 3
+assert_json "with an ammo line aboard, turrets get no firearm-magazine" \
+    "$(raw_lua "local p
+for _, x in pairs(game.forces.player.platforms) do if x.name == '$SB_PLATFORM' then p = x end end
+local t = p.surface.find_entities_filtered{name = 'gun-turret', position = {-13, -13}, radius = 1}[1]
+rcon.print(helpers.table_to_json({loaded = t.get_inventory(defines.inventory.turret_ammo).get_item_count(), proxy = t.item_request_proxy ~= nil, hub = p.hub.get_inventory(defines.inventory.hub_main).get_item_count('firearm-magazine')}))")" \
+    '.loaded == 0 and .proxy == false and .hub == 20'
+
 stop_mcp
 
 printf '\n=== live regression summary ===\n'

@@ -515,15 +515,30 @@ local function turret_slots(platform, wanted, front_only)
     return slots
 end
 
+-- Assemblers (built or ghosts) making piercing rounds on `surface`.
+local function ammo_lines(surface)
+    local count = 0
+    for _, entity in pairs(surface.find_entities_filtered{type = {"assembling-machine", "entity-ghost"}}) do
+        local is_machine = entity.type == "assembling-machine" or entity.ghost_type == "assembling-machine"
+        if is_machine and entity_recipe_name(entity) == "piercing-rounds-magazine" then count = count + 1 end
+    end
+    return count
+end
+
 -- The ammo in the hub that `turret_name` can fire: the first of
 -- AMMO_PREFERENCE it holds, else the one it holds most of; nil when none.
+-- With an ammo line aboard, firearm-magazine is its intermediate and never
+-- goes to the turrets (s56 sandbox: the turrets took every magazine the
+-- line made, so it never made a piercing round).
 local function hub_ammo_for(platform, turret_name)
     local hub = platform.hub
     if not (hub and hub.valid) then return nil end
+    local skip_weak = ammo_lines(platform.surface) > 0
     local categories = {}
     for _, category in pairs(prototypes.entity[turret_name].attack_parameters.ammo_categories or {}) do categories[category] = true end
     local inventory = hub.get_inventory(defines.inventory.hub_main)
     local function fits(name)
+        if skip_weak and WEAK_AMMO[name] then return false end
         local proto = prototypes.item[name]
         local category = proto and proto.type == "ammo" and proto.ammo_category
         return category and categories[category.name]
@@ -560,6 +575,7 @@ local function request_turret_ammo(platform, entity)
     if have >= MIN_LOADED_AMMO then return 0 end
     local loaded = not inventory.is_empty() and inventory[1].valid_for_read and inventory[1].name
     local ammo = loaded or hub_ammo_for(platform, entity.name)
+    if loaded and WEAK_AMMO[loaded] and ammo_lines(platform.surface) > 0 then ammo = nil end
     if not ammo then return 0 end
     local count = prototypes.item[ammo].stack_size - have
     entity.surface.create_entity{name = "item-request-proxy", position = entity.position, force = entity.force, target = entity, modules = plan(ammo, count)}
@@ -896,6 +912,7 @@ local function platform_summary(platform)
         space_location = location and location.name or nil,
         surface = surface and surface.name or nil,
         paused = platform.paused,
+        ammo_lines = surface and ammo_lines(surface) or 0,
         stops = {},
     }
     local schedule = platform.schedule
@@ -1929,7 +1946,7 @@ end
 -- space_platform
 -- ============================================================
 
-local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, supply = true, jettison = true, clear_ghosts = true, copy_layout = true, deconstruct = true, load_turrets = true, schedule = true, board = true, land = true}
+local ACTIONS = {status = true, create = true, ship = true, unship = true, request = true, supply = true, jettison = true, clear_ghosts = true, copy_layout = true, ammo_line = true, deconstruct = true, load_turrets = true, schedule = true, board = true, land = true}
 
 local function resolve_platform(character, platform_name)
     local force = character.force
@@ -2804,6 +2821,33 @@ local function action_copy_layout(platform, stops)
     return result
 end
 
+-- A shuttle's own ammo line behind its hub (the side away from travel):
+-- assembling-machine-1s for firearm-magazine and piercing-rounds-magazine,
+-- each with an inserter from the hub and one back, a medium pole and two
+-- solar panels (one gives 180 kW in Nauvis orbit, more further out), on
+-- foundation ghosts. Rounds made aboard cost 6.25 kg of plates each
+-- (2 firearm-magazine from 8 iron-plate, 1 steel-plate and 2 copper-plate
+-- per 2 rounds) against 20 kg shipped, so the standing supply swaps
+-- piercing-rounds-magazine for those plates. Offsets are from the hub's
+-- bottom-left corner; an inserter's direction faces where it picks up.
+local AMMO_LINE = {
+    {name = "inserter", dx = 0.5, dy = 0.5, direction = defines.direction.north},
+    {name = "inserter", dx = 2.5, dy = 0.5, direction = defines.direction.south},
+    {name = "assembling-machine-1", dx = 1.5, dy = 2.5, recipe = "firearm-magazine"},
+    {name = "inserter", dx = 4.5, dy = 0.5, direction = defines.direction.north},
+    {name = "inserter", dx = 6.5, dy = 0.5, direction = defines.direction.south},
+    {name = "assembling-machine-1", dx = 5.5, dy = 2.5, recipe = "piercing-rounds-magazine"},
+    {name = "medium-electric-pole", dx = 3.5, dy = 3.5},
+    {name = "solar-panel", dx = 1.5, dy = 5.5},
+    {name = "solar-panel", dx = 5.5, dy = 5.5},
+}
+local AMMO_LINE_SUPPLY = {
+    {name = "piercing-rounds-magazine", count = 0},
+    {name = "iron-plate", count = 800},
+    {name = "steel-plate", count = 100},
+    {name = "copper-plate", count = 200},
+}
+
 -- Marks the built entity at x,y on the platform for deconstruction, as with a
 -- deconstruction planner from remote view: the hub removes it and its
 -- contents go to the hub. Rebuild it with place_ghosts.
@@ -2996,6 +3040,71 @@ local function action_supply(character, platform, items, stops)
     return result
 end
 
+local function action_ammo_line(character, platform)
+    if not (platform.hub and platform.hub.valid) then
+        return fail("platform_not_ready", platform.name .. " has no hub yet (" .. state_name(platform.state) .. ")")
+    end
+    local surface, force = platform.surface, platform.force
+    if ammo_lines(surface) > 0 then
+        return fail("already_built", platform.name .. " already has an assembler on piercing-rounds-magazine")
+    end
+    for _, recipe in ipairs({"firearm-magazine", "piercing-rounds-magazine"}) do
+        if not force.recipes[recipe].enabled then
+            return fail("recipe_locked", recipe .. " is not researched", {recipe = recipe})
+        end
+    end
+    local corner = platform.hub.bounding_box.left_top
+    local x0, y0 = math.floor(corner.x + 0.5), math.floor(platform.hub.bounding_box.right_bottom.y + 0.5)
+    local placed, blockers, tiles = {}, {}, {}
+    for _, part in ipairs(AMMO_LINE) do
+        local position = {x = x0 + part.dx, y = y0 + part.dy}
+        local box = prototypes.entity[part.name].collision_box
+        local area = {{position.x + box.left_top.x, position.y + box.left_top.y}, {position.x + box.right_bottom.x, position.y + box.right_bottom.y}}
+        for _, other in pairs(surface.find_entities_filtered{area = area}) do
+            if other.type ~= "tile-ghost" and other.type ~= "item-request-proxy" then
+                blockers[#blockers + 1] = {name = other.type == "entity-ghost" and other.ghost_name or other.name, position = pos_table(other.position)}
+            end
+        end
+        for x = math.floor(area[1][1] + 0.01), math.ceil(area[2][1] - 0.01) - 1 do
+            for y = math.floor(area[1][2] + 0.01), math.ceil(area[2][2] - 0.01) - 1 do tiles[x .. "," .. y] = {x, y} end
+        end
+        placed[#placed + 1] = {part = part, position = position}
+    end
+    -- The pole's tile joins the row behind the hub through a column the hub
+    -- builds first: a tile ghost touching foundation only through other new
+    -- tiles stayed unbuilt in the s56 sandbox.
+    for dy = 0, 2 do
+        local x, y = x0 + 3, y0 + dy
+        tiles[x .. "," .. y] = {x, y}
+    end
+    if blockers[1] then
+        return fail("blocked", "the ammo line goes behind the hub (y " .. y0 .. " to " .. (y0 + 7) .. ", x " .. x0 .. " to " .. (x0 + 7) .. "); clear it first (action=deconstruct)", {blockers = blockers})
+    end
+    local tile_ghosts = 0
+    for _, tile in pairs(tiles) do
+        if surface.get_tile(tile[1], tile[2]).name ~= "space-platform-foundation"
+            and not surface.find_entities_filtered{type = "tile-ghost", position = {tile[1] + 0.5, tile[2] + 0.5}, limit = 1}[1]
+        then
+            if surface.create_entity{name = "tile-ghost", inner_name = "space-platform-foundation", position = tile, force = force} then tile_ghosts = tile_ghosts + 1 end
+        end
+    end
+    local entity_ghosts = 0
+    for _, entry in ipairs(placed) do
+        local ghost = surface.create_entity{name = "entity-ghost", inner_name = entry.part.name, position = entry.position,
+            direction = entry.part.direction, force = force, recipe = entry.part.recipe}
+        if ghost then entity_ghosts = entity_ghosts + 1 end
+    end
+    local supplied = action_supply(character, platform, AMMO_LINE_SUPPLY, {M.home_surface(character).name})
+    local result = platform_summary(platform)
+    result.success = true
+    result.entity_ghosts = entity_ghosts
+    result.tile_ghosts = tile_ghosts
+    result.supply_set = supplied.success == true
+    result.guidance = "The hub builds the line from what the supply silo sends (its ghosts' parts come first). Standing supply now asks for iron-plate 800, steel-plate 100 and copper-plate 200 instead of piercing-rounds-magazine: "
+        .. "they make 200 rounds per fill aboard, about 10 a minute, also in flight. Stock those plates in the home network; the hub keeps the turrets loaded from what the line makes."
+    return result
+end
+
 local function action_schedule(character, platform, stops)
     local force = character.force
     stops = type(stops) == "table" and stops or {}
@@ -3076,7 +3185,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     local character = characters.find(agent_id)
     if not character then return no_character(agent_id) end
     if not ACTIONS[action] then
-        return fail("invalid_action", "action must be status, create, ship, unship, request, supply, jettison, clear_ghosts, copy_layout, deconstruct, load_turrets, schedule, board or land", {action = action})
+        return fail("invalid_action", "action must be status, create, ship, unship, request, supply, jettison, clear_ghosts, copy_layout, ammo_line, deconstruct, load_turrets, schedule, board or land", {action = action})
     end
     if action == "status" then return action_status(character) end
     if action == "create" then return action_create(character, platform_name, stops) end
@@ -3088,6 +3197,7 @@ function M.space_platform(agent_id, action, platform_name, items, stops, x, y)
     if action == "jettison" then return action_jettison(platform, items) end
     if action == "clear_ghosts" then return action_clear_ghosts(platform) end
     if action == "copy_layout" then return action_copy_layout(platform, stops) end
+    if action == "ammo_line" then return action_ammo_line(character, platform) end
     if action == "deconstruct" then return action_deconstruct(character, platform, x, y) end
     if action == "load_turrets" then return action_load_turrets(platform) end
     if action == "unship" then return action_unship(character, platform, items) end
