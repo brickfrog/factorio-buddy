@@ -1522,6 +1522,16 @@ After both fixes, the line built from hub stock and made rounds at about 9 a min
 - **Live tests:** `ammo_line` places 9 ghosts and switches the supply; a second call is refused; with an ammo line aboard, a turret gets no firearm magazines. live69 failed these tests only because the fixture force had not researched piercing rounds, and the turret test showed the old behaviour (20 firearm magazines loaded). The test now unlocks the recipe.
 - Gates: `luac`, clippy, all cargo tests, release build. Live suite: 542 passed, 0 failed (`fb-evidence/git-gud/live70`).
 
+### `s57-cont56-opus-open-2590060469-60m`
+
+Valid: 54 turns, 4 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- **Buddy called `ammo_line` on his first turn.** It placed 9 machine ghosts and 39 foundation ghosts, and the supply switched to plates.
+- **The line was never built: the Nauvis network did not hold its parts.** At the end it still lacks iron-plate, solar-panel, medium-electric-pole and space-platform-foundation.
+  - Buddy queued 6 removals: an overflow chest with 2,700 iron and 428 copper plates, plus assemblers, inserters and solar panels. The 10 construction robots took about 20 minutes to start on them, because older jobs came first.
+  - Rocket 78 carried the 50 piercing rounds already waiting (buddy-2 now has 176), and none of the line's parts.
+- **The silo rate fell to about one processing unit every two minutes** as copper output dropped from 72 to 38 plates a minute.
+- **About 35 of 54 turns were "No changes this turn".** Buddy put it plainly: the copper smelters at (22,400) are outside robot range and "need me on Nauvis in person", and he cannot get back without a silo on Vulcanus.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
