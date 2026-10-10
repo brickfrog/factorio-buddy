@@ -1569,6 +1569,16 @@ Buddy worked on Nauvis in person and the rungs led him through the supply line:
 - **buddy-1's hub filled up four times.** That stops its collectors and crushers and blocks incoming cargo. Buddy jettisoned iron ore, carbon and the 487 firearm magazines each time.
 - Of the 28 errors, most were crafting admissions and placement retries.
 
+### `p2-cont-p1-opus-open-2590060469-60m`
+
+Valid: 49 turns, 38 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- **`logistic-system` done; supply chest built** (requester at (98.5,126.5) with an inserter into the silo). buddy-1's standing supply is set to piercing 1,100, iron ore 1,000 and foundation 20.
+- **Stocking the network:** a magazine cell near (72,100) runs on belt-fed iron, copper and steel. It makes about 16 piercing rounds a minute into a passive provider. A foundation assembler is hand-fed with steel.
+  - Belt jams from sideways underground entrances came up three more times, two of them in lines `route_belt` built.
+- **buddy-1:** got 2 more solar panels, from foundation Buddy shipped up. It has 640 piercing rounds aboard and is still asking for 1,060 more. Its hub filled up and was jettisoned 5 more times.
+- **Silo:** 19–21/50 parts, limited by processing units. The rocket-rate gate (30 parts per 10 minutes) has not come up yet, because stocking the network for the supply order comes first.
+- buddy-1 has no room for an ammo line, so `ammo_line_fits` is false and the step was skipped as designed.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
