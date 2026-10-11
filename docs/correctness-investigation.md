@@ -1579,6 +1579,18 @@ Valid: 49 turns, 38 tool errors, 0 provider-limited turns. `plate_automation` an
 - **Silo:** 19–21/50 parts, limited by processing units. The rocket-rate gate (30 parts per 10 minutes) has not come up yet, because stocking the network for the supply order comes first.
 - buddy-1 has no room for an ammo line, so `ammo_line_fits` is false and the step was skipped as designed.
 
+### Fixes after p2
+
+- **Router fed underground entrances from the side.**
+  - In Factorio 2.0 an underground entrance takes items only from behind. The belt search (`src/world/pathfind.rs`, `find_belt_route_with_options`) could tunnel in any direction except straight back, so it turned on the entrance tile itself. The belt or underground exit before that entrance then fed it from the side, and the line jammed.
+  - Undergrounds are cheaper than surface belts in the search, so routes chain them. An exit feeding the next entrance sideways was the most common result.
+  - Fix: a tunnel must continue the arrival direction. The tile before every entrance is a belt or exit facing the same way; a turn happens on a surface tile before it. A route start that an existing belt, underground exit or splitter already feeds may not be an entrance either; it opens with a surface belt.
+  - Regression test `underground_entrances_are_fed_from_behind_never_from_the_side`: it routes to every goal below a full-width wall, and to the same goals on an open field. The old router fed an entrance from the side; the new router reaches all 132 goals with connected routes and in-line entrances. Unit test `route_start_fed_by_an_existing_belt_is_detected` covers the start check.
+
+### `p3-cont-p2-opus-open-2590060469-60m-capped`
+
+Invalid: the provider limit hit during the hour. It runs again from p2's save.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

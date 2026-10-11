@@ -556,7 +556,15 @@ pub fn find_belt_route_with_options(
                     Direction::South,
                     Direction::West,
                 ] {
-                    if current.state.arrival == Some(direction.opposite()) {
+                    // An entrance takes items only from behind (Factorio
+                    // 2.0): tunnelling across the arrival direction would
+                    // feed it from the side and jam the line, so the belt
+                    // or exit before an entrance must face the same way.
+                    if current
+                        .state
+                        .arrival
+                        .is_some_and(|arrival| arrival != direction)
+                    {
                         continue;
                     }
                     // Try underground jumps of length 2 to max_distance
@@ -586,11 +594,7 @@ pub fn find_belt_route_with_options(
                         let ug_cost = options.underground_penalty * 2.0
                             + (skipped as f64 * options.underground_skip_cost);
 
-                        let turn_cost = match current.state.arrival {
-                            Some(arrival) if arrival != direction => 0.1,
-                            _ => 0.0,
-                        };
-                        let tentative_g = current.g_cost + ug_cost + turn_cost;
+                        let tentative_g = current.g_cost + ug_cost;
 
                         let current_g = g_score.get(&exit_state).copied().unwrap_or(f64::INFINITY);
                         if tentative_g < current_g {
@@ -1680,6 +1684,58 @@ mod tests {
             "no buildable route exists: {:?}",
             result.belts
         );
+    }
+
+    /// Factorio 2.0 underground entrances take items only from behind, so the
+    /// belt before each entrance must sit behind it and face the same way.
+    fn sideways_fed_entrance(belts: &[BeltPlacement]) -> Option<(BeltPlacement, BeltPlacement)> {
+        belts.windows(2).find_map(|pair| {
+            let (feeder, entrance) = (&pair[0], &pair[1]);
+            let behind =
+                GridPos::from_position(&entrance.position).offset(entrance.direction.opposite(), 1);
+            (entrance.kind == BeltKind::UndergroundEntry
+                && (feeder.direction != entrance.direction
+                    || GridPos::from_position(&feeder.position) != behind))
+                .then(|| (feeder.clone(), entrance.clone()))
+        })
+    }
+
+    #[test]
+    fn underground_entrances_are_fed_from_behind_never_from_the_side() {
+        // p1/p2 trials: lines jammed where the router turned straight into an
+        // underground entrance, so a belt or an underground exit fed the
+        // entrance from its side. Every goal below the full-width wall ('#')
+        // needs a tunnel, and most need a turn near it; the open field
+        // turns between tunnels too.
+        //   S . . . . . .
+        //   . . . . . . .
+        //   # # # # # # #
+        //   . . . . . . .   goals: every tile in rows 3..=8
+        let options = RoutingOptions {
+            allow_underground: true,
+            underground_config: UndergroundConfig::from_belt_type("transport-belt"),
+            ..RoutingOptions::default()
+        };
+        let mut walled = CollisionMap::new(Area::new(-2.0, -2.0, 8.0, 8.0));
+        for x in -2..=8 {
+            walled.block(GridPos::new(x, 2));
+        }
+        let open = CollisionMap::new(Area::new(-2.0, -2.0, 8.0, 8.0));
+
+        for (label, map) in [("wall", &walled), ("open field", &open)] {
+            for goal in (-2..=8).flat_map(|x| (3..=8).map(move |y| GridPos::new(x, y))) {
+                let result = find_belt_route_with_options(GridPos::new(0, 0), goal, map, &options);
+                assert!(result.success, "{label} to {goal:?}: {:?}", result.error);
+                assert!(
+                    result.topology.as_ref().is_some_and(|t| t.connected),
+                    "{label} to {goal:?}: {:?}",
+                    result.topology
+                );
+                if let Some((feeder, entrance)) = sideways_fed_entrance(&result.belts) {
+                    panic!("{label} to {goal:?}: {feeder:?} feeds {entrance:?} from the side");
+                }
+            }
+        }
     }
 
     #[test]

@@ -2739,8 +2739,9 @@ mod tests {
         bounded_bootstrap_output_count, compact_fuel_diagnosis, compact_fuel_repair,
         compact_long_route_plan, compound_route_preflight, direct_placement_requires_route,
         endpoint_belt_incompatibility, exact_fuel_feeder_transfer_observed, execute_lua_refusal,
-        existing_belt_compatibility, existing_underground_pair_reservations, flow_lookup,
-        flow_scan_area, fuel_consumer_activity_verification_summary, fuel_delivery_budget_ticks,
+        existing_belt_compatibility, existing_belt_feeds_tile,
+        existing_underground_pair_reservations, flow_lookup, flow_scan_area,
+        fuel_consumer_activity_verification_summary, fuel_delivery_budget_ticks,
         fuel_delivery_path_operational, fuel_delivery_wait_budget,
         fuel_route_protects_existing_source, fuel_topology_upstream_hops,
         fuel_topology_verification, incremental_infrastructure_verification,
@@ -4111,6 +4112,44 @@ mod tests {
         assert!(reserved.contains(&GridPos::new(-41, 52)));
         assert!(!reserved.contains(&GridPos::new(-44, 52)));
         assert!(!reserved.contains(&GridPos::new(-40, 52)));
+    }
+
+    #[test]
+    fn route_start_fed_by_an_existing_belt_is_detected() {
+        let make = |entity_type: &str, x: f64, direction: Direction, mode: Option<&str>| Entity {
+            unit_number: Some(7),
+            name: entity_type.to_string(),
+            entity_type: Some(entity_type.to_string()),
+            position: Position::new(x, 0.5),
+            direction: direction.to_factorio(),
+            health: Some(150.0),
+            force: Some("player".to_string()),
+            bounding_box: None,
+            bounding_box_orientation: None,
+            pickup_position: None,
+            drop_position: None,
+            belt_to_ground_type: mode.map(str::to_string),
+            underground_belt_neighbour: None,
+            belt_input_neighbours: Vec::new(),
+            belt_output_neighbours: Vec::new(),
+            belt_neighbours_observed: false,
+            recipe: None,
+        };
+        let start = GridPos::new(0, 0);
+
+        let belt = make("transport-belt", -0.5, Direction::East, None);
+        assert!(existing_belt_feeds_tile(&[belt], start));
+        let exit = make("underground-belt", -0.5, Direction::East, Some("output"));
+        assert!(existing_belt_feeds_tile(&[exit], start));
+
+        let leaving = make("transport-belt", -0.5, Direction::West, None);
+        let passing = make("transport-belt", -0.5, Direction::North, None);
+        let entrance = make("underground-belt", -0.5, Direction::East, Some("input"));
+        let chest = make("container", -0.5, Direction::East, None);
+        assert!(!existing_belt_feeds_tile(
+            &[leaving, passing, entrance, chest],
+            start
+        ));
     }
 
     #[test]
@@ -6061,6 +6100,25 @@ fn existing_underground_pair_reservations(
         )
     });
     (reserved_tiles, reservations)
+}
+
+/// Whether an existing belt, underground exit or splitter outputs onto `tile`.
+/// A route starting there must open with a surface belt: Factorio 2.0
+/// underground entrances accept items only from behind, so an entrance fed
+/// across its direction jams the line.
+fn existing_belt_feeds_tile(entities: &[Entity], tile: GridPos) -> bool {
+    entities.iter().any(|entity| {
+        let outputs = match entity.entity_type.as_deref() {
+            Some("transport-belt" | "splitter") => true,
+            Some("underground-belt") => entity.belt_to_ground_type.as_deref() == Some("output"),
+            _ => false,
+        };
+        let direction = entity.direction_enum();
+        outputs
+            && entity_occupied_tiles(entity)
+                .into_iter()
+                .any(|occupied| GridPos::new(occupied.x, occupied.y).offset(direction, 1) == tile)
+    })
 }
 
 fn endpoint_belt_incompatibility(
@@ -12591,7 +12649,9 @@ impl FactorioMcp {
             }
         }
 
-        if existing_surface_belts.contains_key(&start) {
+        if existing_surface_belts.contains_key(&start)
+            || existing_belt_feeds_tile(&route_entities, start)
+        {
             underground_forbidden_tiles.insert(start);
         }
         if existing_surface_belts.contains_key(&goal) {
