@@ -4263,3 +4263,91 @@ fn factory_blocker_diagnostics_promote_terminal_belt_lane_root_causes() {
         "symptom entities traced to the root belt run must not remain peer-ranked blockers"
     );
 }
+
+/// Runs a Lua chunk with `lua5.4` (CI installs it) or `lua`, returning stdout.
+fn run_lua(chunk: &str) -> String {
+    for binary in ["lua5.4", "lua"] {
+        match std::process::Command::new(binary)
+            .arg("-e")
+            .arg(chunk)
+            .output()
+        {
+            Ok(output) => {
+                assert!(
+                    output.status.success(),
+                    "{binary} failed:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return String::from_utf8_lossy(&output.stdout).into_owned();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("could not run {binary}: {error}"),
+        }
+    }
+    panic!("running the mod's pure Lua modules needs lua5.4 or lua on PATH");
+}
+
+#[test]
+fn hub_governor_stops_producers_with_hysteresis() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/mod/claude-interface/hub_governor.lua"
+    );
+    let script = r#"
+local high, low = g.caps(50, 450)
+assert(high == 550 and low == 500, "thrust inputs: reserve + 100, again under reserve + 50")
+high, low = g.caps(100, nil)
+assert(high == 500 and low == 400, "plates: 5 stacks, again under 4")
+
+local collector = {id = 1, collector = true, products = {"iron-ore", "carbon"}}
+local furnace = {id = 2, collector = false, products = {"iron-plate"}}
+local bare = {id = 3, collector = true, products = {}}
+local machines = {collector, furnace, bare}
+local function items(ore, carbon, plate)
+    return {
+        ["iron-ore"] = {count = ore, high = 550, low = 500},
+        carbon = {count = carbon, high = 550, low = 500},
+        ["iron-plate"] = {count = plate, high = 500, low = 400},
+    }
+end
+
+local state = {}
+local stop = g.step(state, 20, items(100, 100, 100), machines)
+assert(next(stop) == nil, "room and nothing at cap: everything runs")
+stop = g.step(state, 7, items(100, 100, 100), machines)
+assert(next(stop) == nil, "7 free slots: still runs")
+stop = g.step(state, 6, items(100, 100, 100), machines)
+assert(stop[1] == "hub_slots_low" and stop[3] == "hub_slots_low", "6 free slots stop every collector")
+assert(stop[2] == nil, "low slots never stop a furnace: smelting frees slots")
+stop = g.step(state, 9, items(100, 100, 100), machines)
+assert(stop[1] == "hub_slots_low", "9 free slots: still stopped")
+stop = g.step(state, 10, items(100, 100, 100), machines)
+assert(stop[1] == nil and stop[3] == nil, "10 free slots: collectors run again")
+
+stop = g.step(state, 20, items(560, 100, 100), machines)
+assert(stop[1] == nil, "a collector runs while one crushed product is short")
+stop = g.step(state, 20, items(560, 550, 100), machines)
+assert(stop[1] == "hub_has_enough", "every crushed product at cap stops it")
+stop = g.step(state, 20, items(520, 510, 100), machines)
+assert(stop[1] == "hub_has_enough", "between low and high it stays stopped")
+stop = g.step(state, 20, items(520, 499, 100), machines)
+assert(stop[1] == nil, "one product under low starts it again")
+stop = g.step(state, 20, items(520, 520, 100), machines)
+assert(stop[1] == nil, "a rising product stops it only at high again")
+
+stop = g.step(state, 20, items(0, 0, 500), machines)
+assert(stop[2] == "hub_has_enough", "500 plates stop the furnace")
+stop = g.step(state, 20, items(0, 0, 400), machines)
+assert(stop[2] == "hub_has_enough", "400 plates: still stopped")
+stop = g.step(state, 20, items(0, 0, 399), machines)
+assert(stop[2] == nil, "under 400 plates the furnace runs again")
+
+stop = g.step({}, 20, items(9999, 9999, 9999), {bare})
+assert(stop[3] == nil, "with no crusher aboard a collector stops only for slots")
+stop = g.step({}, 3, items(600, 600, 0), machines)
+assert(stop[1] == "hub_slots_low", "low slots name the slots, even with enough products")
+print("ok")
+"#;
+    let output = run_lua(&format!("local g = dofile({path:?})\n{script}"));
+    assert_eq!(output.trim(), "ok", "hub governor script output:\n{output}");
+}

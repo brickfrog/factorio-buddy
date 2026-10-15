@@ -1,6 +1,7 @@
 -- Space Age for one character: robot logistics on any surface, ghost
 -- placement for robots and platform hubs, and space platform travel.
 local characters = require("characters")
+local hub_governor = require("hub_governor")
 
 local M = {}
 
@@ -739,6 +740,9 @@ local function hold_reason(platform, destination)
     return nil
 end
 
+-- Defined with the thrust helpers below.
+local govern_hub
+
 -- Called every second, for each platform:
 -- * A platform about to leave orbit unarmed, short of thrust stock, or
 --   without an agent aboard has its schedule parked in storage, so it stays
@@ -748,13 +752,19 @@ end
 --   place_ghosts), turrets below MIN_LOADED_AMMO get a request the hub fills,
 --   in flight too: loaded turrets otherwise run dry within two minutes, and
 --   rebuilt ones start empty.
+-- * A parked platform's collectors and furnaces stop while its hub is
+--   nearly full or holds enough of what they make (govern_hub).
 function M.tend_platforms()
     storage.departure_held = storage.departure_held or {}
     storage.turret_ammo_orders = storage.turret_ammo_orders or {}
+    storage.hub_governor = storage.hub_governor or {}
     local held = storage.departure_held
+    local governed = {}
     for _, force in pairs(game.forces) do
         for _, platform in pairs(force.platforms) do
             if platform.valid and platform.hub and platform.hub.valid then
+                governed[platform.index] = true
+                govern_hub(platform)
                 if storage.turret_ammo_orders[platform.index] then
                     for _, turret in pairs(platform.surface.find_entities_filtered{type = "ammo-turret", force = force}) do
                         request_turret_ammo(platform, turret)
@@ -783,6 +793,15 @@ function M.tend_platforms()
                     end
                 end
             end
+        end
+    end
+    -- Platforms gone, or without a hub: let go of what the governor stopped.
+    for index, record in pairs(storage.hub_governor) do
+        if not governed[index] then
+            for _, entry in pairs(record.paused) do
+                if entry.entity.valid then entry.entity.disabled_by_script = false end
+            end
+            storage.hub_governor[index] = nil
         end
     end
 end
@@ -893,6 +912,143 @@ local function thrust_inputs(platform)
     return names
 end
 
+-- Platform states at a location. Any other state is a trip or a departure,
+-- and the thrusters then need everything the platform makes.
+local PARKED_STATES = {
+    [defines.space_platform_state.waiting_at_station] = true,
+    [defines.space_platform_state.no_schedule] = true,
+    [defines.space_platform_state.no_path] = true,
+    [defines.space_platform_state.paused] = true,
+}
+
+-- Item products of a recipe prototype that it does not also take (not a
+-- crusher's returned chunk).
+local function recipe_outputs(recipe)
+    local inputs, outputs = {}, {}
+    for _, ingredient in pairs(recipe.ingredients) do inputs[ingredient.name] = true end
+    for _, product in pairs(recipe.products) do
+        if product.type == "item" and not inputs[product.name] then outputs[#outputs + 1] = product.name end
+    end
+    return outputs
+end
+
+local function governor_reason(code, free, products, items)
+    if code == "hub_slots_low" then
+        return "hub has " .. free .. " free slots; runs again at " .. hub_governor.SLOTS_RESUME
+    end
+    local parts = {}
+    for _, name in ipairs(products) do
+        parts[#parts + 1] = name .. " " .. items[name].count .. " (runs again under " .. items[name].low .. ")"
+    end
+    return "hub holds enough " .. table.concat(parts, ", ")
+end
+
+-- Hub inflow governor (hub_governor.step), every second and on each state
+-- change. Parked, a platform keeps collecting and smelting with nothing to
+-- burn it (p2: its hub filled and was jettisoned 14 times in an hour). Its
+-- asteroid collectors stop while the hub has few free slots or holds enough
+-- of everything its crushers make, and its furnaces while it holds enough of
+-- their products; they run again past a lower threshold. Crushers always
+-- run: a chunk takes a whole slot, its products far less. In transit, or
+-- leaving, everything runs. Only entities the governor stopped (kept in
+-- storage by unit number) are started again.
+govern_hub = function(platform)
+    storage.hub_governor = storage.hub_governor or {}
+    local record = storage.hub_governor[platform.index]
+    if not record then
+        record = {full = {}, paused = {}}
+        storage.hub_governor[platform.index] = record
+    end
+    local reasons, entities = {}, {}
+    local inventory = platform.hub.get_inventory(defines.inventory.hub_main)
+    if inventory and platform.space_location and PARKED_STATES[platform.state] then
+        local crushed, seen, machines, collectors = {}, {}, {}, {}
+        for _, entity in pairs(platform.surface.find_entities_filtered{type = {"asteroid-collector", "assembling-machine", "furnace"}, force = platform.force}) do
+            if entity.type == "asteroid-collector" then
+                collectors[#collectors + 1] = entity
+            else
+                local name = entity_recipe_name(entity)
+                local recipe = name and prototypes.recipe[name]
+                if recipe and recipe.category == "crushing" then
+                    for _, product in ipairs(recipe_outputs(recipe)) do
+                        if not seen[product] then seen[product], crushed[#crushed + 1] = true, product end
+                    end
+                elseif recipe and entity.type == "furnace" then
+                    machines[#machines + 1] = {id = entity.unit_number, collector = false, products = recipe_outputs(recipe)}
+                    entities[entity.unit_number] = entity
+                end
+            end
+        end
+        for _, collector in ipairs(collectors) do
+            machines[#machines + 1] = {id = collector.unit_number, collector = true, products = crushed}
+            entities[collector.unit_number] = collector
+        end
+        local counts = contents_counts(inventory.get_contents())
+        local fuel = thrust_inputs(platform)
+        local items, products = {}, {}
+        for _, machine in ipairs(machines) do
+            products[machine.id] = machine.products
+            for _, name in ipairs(machine.products) do
+                if not items[name] then
+                    local item = prototypes.item[name]
+                    local high, low = hub_governor.caps(item and item.stack_size or 50, fuel[name] and THRUST_RESERVE or nil)
+                    items[name] = {count = counts[name] or 0, high = high, low = low}
+                end
+            end
+        end
+        local free = inventory.count_empty_stacks()
+        for id, code in pairs(hub_governor.step(record, free, items, machines)) do
+            reasons[id] = governor_reason(code, free, products[id], items)
+        end
+    else
+        record.slots_low, record.full = false, {}
+    end
+    for unit, entry in pairs(record.paused) do
+        if not reasons[unit] then
+            if entry.entity.valid then entry.entity.disabled_by_script = false end
+            record.paused[unit] = nil
+        end
+    end
+    for unit, reason in pairs(reasons) do
+        local entity, entry = entities[unit], record.paused[unit]
+        if entry then
+            entry.reason = reason
+            entity.disabled_by_script = true
+        elseif not entity.disabled_by_script then
+            entity.disabled_by_script = true
+            record.paused[unit] = {entity = entity, reason = reason}
+        end
+    end
+end
+
+-- A platform that changes state (leaves orbit, arrives) is governed at once,
+-- not up to a second later: a departing one gets its producers back.
+function M.on_platform_state_changed(event)
+    local platform = event.platform
+    if platform and platform.valid and platform.hub and platform.hub.valid then govern_hub(platform) end
+end
+
+-- What the governor holds still on `platform`: {name, count, reason}, or nil.
+local function throttled(platform)
+    local record = storage.hub_governor and storage.hub_governor[platform.index]
+    local groups, list = {}, {}
+    for _, entry in pairs(record and record.paused or {}) do
+        if entry.entity.valid then
+            local key = entry.entity.name .. "|" .. entry.reason
+            if not groups[key] then
+                groups[key] = {name = entry.entity.name, count = 0, reason = entry.reason}
+                list[#list + 1] = groups[key]
+            end
+            groups[key].count = groups[key].count + 1
+        end
+    end
+    table.sort(list, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        return a.reason < b.reason
+    end)
+    return list[1] and list or nil
+end
+
 local function rockets_for(counts)
     local lift = safe_value(function() return prototypes.utility_constants.rocket_lift_weight end)
     if not lift then return 1 end
@@ -934,6 +1090,8 @@ local function platform_summary(platform)
         summary.hub_items = inventory and top_counts(contents_counts(inventory.get_contents()), 15) or {}
         summary.hub_slots = inventory and #inventory or nil
         summary.hub_free_slots = inventory and inventory.count_empty_stacks() or nil
+        -- Collectors and furnaces the hub governor stopped, and why.
+        summary.throttled = throttled(platform)
     end
     summary.armament = armament(platform)
     if not summary.armament.armed then

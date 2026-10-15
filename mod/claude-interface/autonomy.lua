@@ -470,6 +470,25 @@ local REMOTE_HOME = " Nauvis runs without you: check it with robot_logistics sur
 -- How to stock an empty home network from another planet.
 local BOOTSTRAP_TEXT = " If robots lack the parts to build that (robot_logistics surface=nauvis missing_items), harvest them: get_entities surface=nauvis finds machines and chests in roboport range (machines blocked with full output hold their products), and place_ghosts surface=nauvis deconstruct=[{name,dx,dy}] has robots carry them and their contents into storage chests. set_recipe also works on Nauvis machines from here: an assembler fed from the network's chests can make what robots lack (requester chests, inserters, poles), one recipe after another. Robots work while you are away: keep advancing Vulcanus meanwhile."
 
+-- True when a crusher on platform `P` makes iron ore (metallic asteroid
+-- crushing): its thruster oxidizer then needs no ore from Nauvis, and a
+-- standing ore order only fills its hub (p2).
+local function crushes_ore(P)
+    for recipe in pairs(P.recipes or {}) do
+        if recipe:find("metallic%-asteroid%-crushing$") then return true end
+    end
+    return false
+end
+
+-- The standing supply a shuttle needs from Nauvis: the items argument, and
+-- what they keep topped up.
+local function supply_order_text(P)
+    if crushes_ore(P) then
+        return "items=[piercing-rounds-magazine 1100, space-platform-foundation 20]", "its ammo and spare foundation (its metallic crusher makes the thruster ore)"
+    end
+    return "items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]", "its ammo, thruster ore and spare foundation"
+end
+
 -- Building a new shuttle over Nauvis while you stay on Vulcanus: no armed
 -- platform orbits Vulcanus and no silo stands there, so nothing can bring
 -- parts down or lift anything up. `stranded` is the unarmed platform still
@@ -505,9 +524,10 @@ local function home_shuttle_rung(S, stranded, force)
     end
     local supplied = {}
     for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
-    if not ((supplied["piercing-rounds-magazine"] or supplied["copper-plate"]) and supplied["iron-ore"]) then
+    if not ((supplied["piercing-rounds-magazine"] or supplied["copper-plate"]) and (supplied["iron-ore"] or crushes_ore(P))) then
+        local items, keeps = supply_order_text(P)
         return "Set " .. P.name .. "'s standing supply from Nauvis.",
-            "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]: rockets keep its ammo, thruster ore and spare foundation topped up while it orbits Nauvis, and from then on also send what its ghosts lack. A leg to Vulcanus spends 300-400 magazines and it leaves only with 600+ piercing rounds aboard."
+            "space_platform action=supply platform=" .. P.name .. " " .. items .. ": rockets keep " .. keeps .. " topped up while it orbits Nauvis, and from then on also send what its ghosts lack. A leg to Vulcanus spends 300-400 magazines and it leaves only with 600+ piercing rounds aboard."
     end
     -- A rocket lifts 50 piercing rounds but the plates for 160: a shuttle
     -- makes its own.
@@ -888,9 +908,10 @@ local function space_rung(facts, force, surface, character)
     end
     local supplied = {}
     for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
-    if not ((supplied["piercing-rounds-magazine"] or supplied["copper-plate"]) and supplied["iron-ore"]) then
+    if not ((supplied["piercing-rounds-magazine"] or supplied["copper-plate"]) and (supplied["iron-ore"] or crushes_ore(P))) then
+        local items, keeps = supply_order_text(P)
         return "Set " .. P.name .. "'s standing supply from Nauvis.",
-            "space_platform action=supply platform=" .. P.name .. " items=[piercing-rounds-magazine 1100, iron-ore 1000, space-platform-foundation 20]: whenever it orbits Nauvis, rockets keep its ammo, thruster ore and spare foundation topped up, also while you are away. A leg to Vulcanus spends 300-400 magazines and the platform only leaves with 600+ piercing rounds aboard, so 1100 brings it home again. Add what Vulcanus will need later the same way."
+            "space_platform action=supply platform=" .. P.name .. " " .. items .. ": whenever it orbits Nauvis, rockets keep " .. keeps .. " topped up, also while you are away. A leg to Vulcanus spends 300-400 magazines and the platform only leaves with 600+ piercing rounds aboard, so 1100 brings it home again. Add what Vulcanus will need later the same way."
     end
     if H.network_lacks and H.network_lacks[1] then
         return "Stock the home network with " .. table.concat(H.network_lacks, ", ") .. " for " .. P.name .. "'s supply.",
@@ -1217,7 +1238,7 @@ local function progression(surface, force, facts, character)
         end
         if platform.hub_free_slots == 0 then
             warnings[#warnings + 1] = platform.name .. "'s hub is full (" .. tostring(platform.hub_slots)
-                .. " slots): its collectors and crushers stop and rocket cargo cannot be delivered. Jettison what it cannot use soon (space_platform action=jettison: uncrushed chunks, surplus iron-ore or ice), then ship what unblocks it (space-platform-foundation, the missing machines)."
+                .. " slots): its crushers stop and rocket cargo cannot be delivered. Parked, its collectors and furnaces stop by themselves before that (throttled in its status); in flight they keep running for thrust. Jettison what it cannot use (space_platform action=jettison: uncrushed chunks, surplus plates), and lower standing supply counts that fill it (space_platform action=supply, 0 drops an item)."
         end
         local uncrushed = {}
         for _, item in ipairs(platform.hub_items or {}) do

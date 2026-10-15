@@ -3113,6 +3113,9 @@ script.on_nth_tick(60, function()
     space.tend_platforms()
 end)
 
+-- A platform leaving orbit gets back what the hub governor stopped, at once.
+script.on_event(defines.events.on_space_platform_changed_state, space.on_platform_state_changed)
+
 -- Character paths requested from Factorio's pathfinder.
 script.on_event(defines.events.on_script_path_request_finished, characters.on_path_finished)
 
