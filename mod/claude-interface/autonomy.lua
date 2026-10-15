@@ -938,15 +938,45 @@ local function space_rung(facts, force, surface, character)
     -- Nothing leaves Vulcanus without a rocket silo there, and a silo's
     -- 10 t would take ten rockets: carry it, and one launch of parts.
     local inventory = character and character.get_main_inventory()
-    local missing = {}
-    for _, entry in ipairs(VULCANUS_KIT) do
-        local have = inventory and inventory.get_item_count(entry.name) or 0
-        if have < entry.count then missing[#missing + 1] = entry.name .. " " .. have .. "/" .. entry.count end
+    local function have(name) return inventory and inventory.get_item_count(name) or 0 end
+    -- Without a silo in hand its ingredients are part of the kit: p4 packed
+    -- 19/50 processing units for an hour, blind to the silo's 200.
+    local needed, order = {}, {}
+    local function need(name, count)
+        if not needed[name] then order[#order + 1] = name end
+        needed[name] = (needed[name] or 0) + count
+    end
+    for _, entry in ipairs(VULCANUS_KIT) do need(entry.name, entry.count) end
+    local silo_recipe = prototypes.recipe["rocket-silo"]
+    if have("rocket-silo") < 1 and silo_recipe then
+        for _, ingredient in pairs(silo_recipe.ingredients) do
+            if ingredient.type ~= "fluid" then need(ingredient.name, ingredient.amount) end
+        end
+    end
+    local missing, rocket_inputs, starved = {}, {}, nil
+    for _, ingredient in pairs(prototypes.recipe["rocket-part"] and prototypes.recipe["rocket-part"].ingredients or {}) do rocket_inputs[ingredient.name] = true end
+    for _, name in ipairs(order) do
+        local count = have(name)
+        if count < needed[name] then
+            missing[#missing + 1] = name .. " " .. count .. "/" .. needed[name]
+            -- A shortfall above ten minutes of output cannot come off the
+            -- rocket-part line without dropping the rocket rate.
+            local short, made = needed[name] - count, made_last_ten_minutes(force, surface, name)
+            if rocket_inputs[name] and short > made and not (starved and starved.short >= short) then
+                starved = {name = name, short = short, made = made}
+            end
+        end
     end
     if missing[1] then
+        local extra = ""
+        if starved then
+            extra = " " .. starved.name .. " also feeds the home silo's rocket parts (" .. starved.made
+                .. " made in 10 min): taking " .. starved.short .. " from that line drops the rocket rate below " .. MIN_ROCKET_PARTS_BEFORE_LEAVING
+                .. ". Build more " .. starved.name .. " production first, with its own output chest: " .. recipe_text(starved.name) .. "."
+        end
         return "Pack the Vulcanus launch kit in your inventory: " .. table.concat(missing, ", ") .. ".",
             "You ride the rocket with your whole inventory, but cargo sent up costs 1 t per rocket and a rocket-silo weighs 10 t. With a silo and one launch of parts on Vulcanus, its metallurgic packs go up to the shuttle. "
-            .. recipe_text("rocket-silo") .. " (craft it by hand once you carry the ingredients; collect them from chests and machines). Rocket parts: " .. rocket_part_inputs(force, surface) .. "."
+            .. recipe_text("rocket-silo") .. " (craft it by hand once you carry the ingredients; collect them from chests and machines). Rocket parts: " .. rocket_part_inputs(force, surface) .. "." .. extra
     end
     return "Board " .. P.name .. " for Vulcanus.",
         "It waits in orbit until you are aboard, then leaves. Carry what you need to start there besides the launch kit: a cargo-landing-pad (the shuttle drops what you request there); Vulcanus has no water, so solar panels (6x power there) and accumulators, not steam; roboports, construction and logistic robots and a storage chest so place_ghosts works there; chemical plants and assembling-machine-2s (carbon, tungsten carbide), a pumpjack (sulfuric acid geysers), pipes, drills, steel furnaces, belts, inserters, poles. Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."

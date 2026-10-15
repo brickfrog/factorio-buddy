@@ -1612,6 +1612,20 @@ Valid: 64 turns, 19 tool errors, 0 provider-limited turns. `plate_automation` an
   - Evidence: on p3b's final save, `network_lacks` went from iron-ore and piercing rounds to empty, and the next goal moved to "Set buddy-1's course" (Nauvis made 38 rocket parts in the last 10 minutes, above the gate of 30).
   - Live test: an unmet order the network cannot fill is a lack; once the hub holds the order, it is not.
 
+### `p4-cont-p3b-opus-open-2590060469-60m`
+
+Valid: 64 turns, 15 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true. First trial with the hub governor and the `network_lacks` fix.
+- **Course set in the first action** (`stops=["vulcanus","nauvis"]`), then the kit step for the rest of the hour. Buddy never boarded.
+- **Kit at the end:** low-density structures 50/50 and a cargo landing pad were packed, plus the silo's steel, engines, pipe and concrete. Missing: the silo itself, processing units 19/50, rocket fuel 48/50.
+- **Processing units were the blocker.** Nauvis made about 39 every 10 minutes and the home silo used them all. The silo craft needs 200 more, which the kit step never showed (it said 19/50). Twice Buddy diverted the processing-unit inserter to a chest; each time the rocket rate fell below 30 (24, then 26) and the rate gate sent him back to undo it. He never built more processing-unit assemblers.
+- buddy-1: 7/7 turrets, 926 rounds aboard. The hub ended at 1 free slot with the collector throttled; it filled with space science packs (992 → 1,327) and iron ore. Only 3 jettisons, against 14 in p2.
+- The iron-ore standing order flipped 5 times: the thruster-fuel step wanted ore above 450 while Buddy cleared the order to pass the network step.
+- Tool bugs filed: JVC-38 (`verify_production` ignores `unit_number`), JVC-39 (`bootstrap_smelting_once` on electric furnaces), JVC-40 (`craft` reports a busy queue before a disabled recipe).
+
+### Fixes after p4
+
+- **The kit step hid the silo's ingredients.** Without a silo in hand, the step now adds the silo recipe to the kit, so it reads "processing-unit 19/250". When a rocket-part input is short by more than ten minutes of output, the how-text says that taking it from the silo line drops the rocket rate below 30 and gives the recipe to build more of it with its own output chest. Sandbox on p4's save: "Pack the Vulcanus launch kit in your inventory: rocket-silo 0/1, processing-unit 19/250, rocket-fuel 48/50", with the processing-unit advice.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
