@@ -652,6 +652,14 @@ local function supply_deficits(platform, planet)
     return any and deficits or nil
 end
 
+-- Items robots are carrying to `chest` (name -> count).
+local function incoming(chest)
+    local point = chest.get_logistic_point(defines.logistic_member_index.logistic_container)
+    local items = {}
+    for _, entry in pairs(point and point.targeted_items_deliver or {}) do items[entry.name] = (items[entry.name] or 0) + entry.count end
+    return items
+end
+
 -- Requester or buffer chests whose inserter loads `silo`'s rocket.
 local function supply_chests(silo)
     local chests = {}
@@ -1270,7 +1278,12 @@ local function home_supply(home, force)
         result.logistic_robots = result.logistic_robots + network.all_logistic_robots
         result.storage_chests = result.storage_chests + #network.storages
     end
+    -- Items already on their way up: in a supply chest, flying to one, or in a rocket.
+    local queued = {}
+    local function add_queued(name, count) queued[name] = (queued[name] or 0) + count end
     for _, silo in pairs(home.find_entities_filtered{type = "rocket-silo", force = force}) do
+        local rocket = silo.get_inventory(defines.inventory.rocket_silo_rocket)
+        for _, entry in pairs(rocket and rocket.get_contents() or {}) do add_queued(entry.name, entry.count) end
         result.silos = result.silos + 1
         for _, network in pairs(networks) do
             local covered_here = false
@@ -1279,7 +1292,12 @@ local function home_supply(home, force)
             end
             if covered_here then result.silos_in_logistic_range = result.silos_in_logistic_range + 1 break end
         end
-        if supply_chests(silo)[1] then
+        local chests = supply_chests(silo)
+        for _, chest in ipairs(chests) do
+            for _, entry in pairs(chest.get_inventory(defines.inventory.chest).get_contents()) do add_queued(entry.name, entry.count) end
+            for name, count in pairs(incoming(chest)) do add_queued(name, count) end
+        end
+        if chests[1] then
             result.silos_with_supply_chest = result.silos_with_supply_chest + 1
             local recipe = prototypes.recipe["rocket-part"]
             local input = silo.get_inventory(defines.inventory.crafter_input)
@@ -1296,18 +1314,20 @@ local function home_supply(home, force)
             end
         end
     end
-    local imports = {}
+    -- network_lacks: what some platform still falls short of that nothing
+    -- here holds. A standing request the hub already meets, or one whose
+    -- items wait in a supply chest or rocket, is not a lack.
+    local imports, short = {}, {}
     for _, platform in ipairs(valid_platforms(force)) do
         for name, count in pairs(hub_imports(platform, home.name)) do imports[name] = math.max(imports[name] or 0, count) end
-        -- A platform at home also waits for its starter pack or ghost parts.
-        local location = platform.space_location
-        if location and location.name == home.name then
-            for name, count in pairs(supply_deficits(platform, home.name) or {}) do imports[name] = math.max(imports[name] or 0, count) end
+        for name, count in pairs(supply_deficits(platform, home.name) or {}) do
+            imports[name] = math.max(imports[name] or 0, count)
+            short[name] = true
         end
     end
     result.imports = next(imports) and top_counts(imports, 15) or nil
-    for name in pairs(imports) do
-        local stock = 0
+    for name in pairs(short) do
+        local stock = queued[name] or 0
         for _, network in pairs(networks) do stock = stock + network.get_item_count(name) end
         if stock == 0 then result.network_lacks[#result.network_lacks + 1] = name end
     end
@@ -2503,14 +2523,6 @@ local function set_chest_requests(chest, wanted)
     for slot, name in ipairs(names) do
         section.set_slot(slot, {value = {type = "item", name = name, quality = "normal"}, min = wanted[name]})
     end
-end
-
--- Items robots are carrying to `chest` (name -> count).
-local function incoming(chest)
-    local point = chest.get_logistic_point(defines.logistic_member_index.logistic_container)
-    local items = {}
-    for _, entry in pairs(point and point.targeted_items_deliver or {}) do items[entry.name] = (items[entry.name] or 0) + entry.count end
-    return items
 end
 
 -- Fill one platform's shortfall through `silo`: its first supply chest asks

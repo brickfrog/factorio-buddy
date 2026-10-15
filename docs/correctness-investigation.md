@@ -1597,6 +1597,21 @@ Valid: 49 turns, 38 tool errors, 0 provider-limited turns. `plate_automation` an
 
 Invalid: the provider limit hit during the hour. It runs again from p2's save.
 
+### `p3b-cont-p2-opus-open-2590060469-60m`
+
+Valid: 64 turns, 19 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true. It ran with the belt-router fix but without the hub governor.
+- **Stuck on one step for the whole hour:** "Stock the home network with iron-ore, piercing-rounds-magazine … for buddy-1's supply." The rocket-rate, course, kit and board steps never came up, and Buddy never left Nauvis.
+- **Why the step could not clear:** `home_supply.network_lacks` listed every standing hub request that the Nauvis network held none of. Iron ore was listed though the hub already held more than the 1,000 ordered. Piercing rounds were listed because the supply chest took each round as soon as robots could move it, so the network never showed any.
+- Turns 1–40 went to the piercing line (iron, steel and copper feeds) and to jettisoning the full hub. Turns 41–64 were mostly idle: 26 turns made no tool call. Research did not move (0 of 18 labs working).
+- No new underground sideways-feed jams were reported.
+
+### Fixes after p3b
+
+- **`network_lacks` named orders already met.**
+  - Fix: `home_supply` lists only items some platform still falls short of (`supply_deficits`: request − hub − in flight). Items in a supply chest, flying to one, or in a silo's rocket count as stock along with the network.
+  - Evidence: on p3b's final save, `network_lacks` went from iron-ore and piercing rounds to empty, and the next goal moved to "Set buddy-1's course" (Nauvis made 38 rocket parts in the last 10 minutes, above the gate of 30).
+  - Live test: an unmet order the network cannot fill is a lack; once the hub holds the order, it is not.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

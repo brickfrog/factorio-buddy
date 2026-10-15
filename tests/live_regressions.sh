@@ -8014,6 +8014,14 @@ for _ in $(seq 1 10); do
 done
 assert_json "unrequested items leave the supply chest and stay off the rocket" "$(sb_supply_state)" \
     '(.chest.coal // 0) == 0 and (.rocket.coal // 0) == 0'
+# network_lacks names only what a platform still falls short of (p3b: a
+# met iron-ore order blocked the departure steps for an hour).
+sb_network_lacks() {
+    raw_lua "rcon.print(remote.call('claude_interface', 'autonomy_snapshot', '$AGENT_ID'))" | jq -c '.space.home_supply.network_lacks // []'
+}
+require_json "an unmet supply order the network cannot fill is a lack" "$(sb_network_lacks)" 'index("iron-ore") != null'
+raw_lua "for _, p in pairs(game.forces.player.platforms) do if p.name == '$SB_PLATFORM' then p.hub.insert{name = 'iron-ore', count = 50} end end; rcon.print('ok')" >/dev/null
+assert_json "a supply order the hub already meets is not a lack" "$(sb_network_lacks)" 'index("iron-ore") == null'
 SB_COPY="$(tool_payload "$(mcp_tool space_platform "$SB_SPEC,\"action\":\"copy_layout\",\"stops\":[\"$SA_PLATFORM\"]}")")"
 assert_json "copy_layout places ghosts of the other platform" "$SB_COPY" \
     --arg src "$SA_PLATFORM" '.success == true and .copied_from == $src and .entity_ghosts > 0 and any(.supply.requests[]; .name == "iron-ore" and .count == 50)'
