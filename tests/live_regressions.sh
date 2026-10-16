@@ -7215,6 +7215,59 @@ local machine = c.surface.find_entities_filtered{name = 'assembling-machine-1', 
 if machine then machine.destroy() end
 " >/dev/null
 
+# A rocket silo is a crafting machine with the fixed rocket-part recipe:
+# feed_machine_from_inventory accepts one launch of parts (50 crafts, past the
+# 20-craft cap of other machines) and loads its input. The executed load stays
+# at 30 crafts because a fresh force's silo input slot holds only 40 rocket
+# fuel. The silo is inactive so it never crafts.
+SILO_FEED_FIXTURE="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local spot = s.find_non_colliding_position('rocket-silo', {c.position.x + 8, c.position.y}, 12, 1)
+local silo = s.create_entity{name = 'rocket-silo', position = spot, force = c.force}
+silo.active = false
+storage.live_silo_feed_spot = silo.position
+storage.live_silo_feed_counts = {}
+local inv = c.get_main_inventory()
+for _, name in ipairs({'processing-unit', 'low-density-structure', 'rocket-fuel'}) do
+    local have = inv.get_item_count(name)
+    storage.live_silo_feed_counts[name] = have
+    if have > 0 then inv.remove{name = name, count = have} end
+    inv.insert{name = name, count = 50}
+end
+rcon.print(helpers.table_to_json({unit = silo.unit_number}))
+")"
+SILO_FEED_UNIT="$(jq -r '.unit' <<<"$SILO_FEED_FIXTURE")"
+assert_json "feed_machine_from_inventory accepts one launch of rocket parts for a rocket silo" \
+    "$(tool_payload "$(mcp_tool feed_machine_from_inventory "$(jq -cn --argjson unit "$SILO_FEED_UNIT" '{unit_number:$unit, crafts:50}')")")" \
+    '.success == true and .recipe == "rocket-part" and .crafts_to_load == 50 and .maximum_crafts >= 50'
+assert_json "feed_machine_from_inventory loads rocket-part ingredients into a rocket silo" \
+    "$(tool_payload "$(mcp_tool feed_machine_from_inventory "$(jq -cn --argjson unit "$SILO_FEED_UNIT" '{unit_number:$unit, crafts:30, dry_run:false}')")")" \
+    '.success == true and .recipe == "rocket-part" and .crafts_loaded == 30'
+SILO_FEED_WORLD="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local silo = c.surface.find_entities_filtered{name = 'rocket-silo', position = storage.live_silo_feed_spot, radius = 0.5}[1]
+local silo_inv = silo.get_inventory(defines.inventory.rocket_silo_input)
+local inv = c.get_main_inventory()
+local out = {}
+for _, name in ipairs({'processing-unit', 'low-density-structure', 'rocket-fuel'}) do
+    out[name] = {silo = silo_inv.get_item_count(name), character = inv.get_item_count(name)}
+end
+rcon.print(helpers.table_to_json(out))
+")"
+assert_json "the rocket silo input holds the loaded rocket-part ingredients" "$SILO_FEED_WORLD" \
+    'to_entries | length == 3 and all(.[]; .value.silo == 30 and .value.character == 20)'
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local inv = c.get_main_inventory()
+for name, count in pairs(storage.live_silo_feed_counts) do
+    if inv.get_item_count(name) > 0 then inv.remove{name = name, count = inv.get_item_count(name)} end
+    if count > 0 then inv.insert{name = name, count = count} end
+end
+local silo = c.surface.find_entities_filtered{name = 'rocket-silo', position = storage.live_silo_feed_spot, radius = 0.5}[1]
+if silo then silo.destroy() end
+" >/dev/null
+
 # Invalid model-authored issue fields must fail validation before `bd create`.
 # Snapshot the full issue identity/state projection around the MCP call so this
 # live test cannot silently mutate the real repository tracker.

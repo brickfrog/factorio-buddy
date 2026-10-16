@@ -690,6 +690,26 @@ local function resuppliable(surface, force)
     return false
 end
 
+-- True when piercing rounds can reach a platform over `surface`: a silo
+-- there has a supply chest, or an agent there holds rounds beside a silo
+-- that has started a rocket. An agent and an empty silo are not enough
+-- (p7: buddy-1 waited over Vulcanus for rounds nobody there had).
+local function ammo_reachable(surface, force)
+    if not surface then return false end
+    local silos = surface.find_entities_filtered{type = "rocket-silo", force = force}
+    local building = false
+    for _, silo in pairs(silos) do
+        if supply_chests(silo)[1] then return true end
+        if silo.rocket_parts > 0 or silo.rocket_silo_status == defines.rocket_silo_status.rocket_ready then building = true end
+    end
+    if not building then return false end
+    for _, character in pairs(storage.characters or {}) do
+        local inventory = character.valid and character.surface == surface and character.get_main_inventory()
+        if inventory and (inventory.get_item_count("piercing-rounds-magazine") + inventory.get_item_count("uranium-rounds-magazine")) > 0 then return true end
+    end
+    return false
+end
+
 -- The station a schedule (`records`, from `current` on) sends the platform
 -- to when it next leaves its orbit; nil in transit or when every stop is
 -- where it is. Assigning a schedule, or vanilla advancing it once the wait
@@ -715,10 +735,15 @@ local function crewed(platform)
 end
 
 -- Why a departure for `destination` is held:
--- * "unarmed" anywhere: turrets loaded with piercing-rounds-magazine or
---   better and MIN_AMMO of it aboard (yellow-fed turrets were destroyed on
---   the way, s47 included), so a shuttle that spent its ammo stays parked
---   until piercing rounds reach it;
+-- * "unarmed" where ammo can reach it: turrets loaded with
+--   piercing-rounds-magazine or better and MIN_AMMO of it aboard
+--   (yellow-fed turrets were destroyed on the way, s47 included), so a
+--   shuttle that spent its ammo stays parked until piercing rounds reach it.
+--   Away from Nauvis, where none can (p7: held over Vulcanus, it shot its
+--   last 530 rounds at drifting asteroids in 29 minutes, then took hull
+--   damage), it leaves with what it has, unless that is nothing;
+-- * "crew_landing" while its crew is aboard over a planet the force has
+--   nothing on yet: on the first arrival it would otherwise fly on with them;
 -- * "thrust_stock" (thruster-fluid ingredients under THRUST_RESERVE: the
 --   thrusters burn out within seconds and the platform stalls) where it can
 --   be restocked;
@@ -733,7 +758,10 @@ local function hold_reason(platform, destination)
     -- Crew aboard can land and ship, where the planet below has a silo.
     local restockable = resuppliable(here, platform.force)
         or (here ~= nil and crewed(platform) and here.find_entities_filtered{type = "rocket-silo", force = platform.force, limit = 1}[1] ~= nil)
-    if not armament(platform).armed then return "unarmed" end
+    local arms = armament(platform)
+    local away = here ~= nil and here.name ~= "nauvis"
+    if not arms.armed and (not away or ammo_reachable(here, platform.force) or arms.hub_ammo + arms.turret_ammo == 0) then return "unarmed" end
+    if here and crewed(platform) and here.count_entities_filtered{force = platform.force, limit = 1} == 0 then return "crew_landing" end
     if restockable and thrust_shortages(platform)[1] then return "thrust_stock" end
     local target = destination and game.get_surface(destination)
     local visited = target ~= nil and target.count_entities_filtered{force = platform.force, limit = 1} > 0
@@ -2886,7 +2914,20 @@ local function action_request(character, items, stops)
             section.set_slot(slot, {value = {type = "item", name = item.name, quality = "normal"}, min = item.count})
         end
     end
-    return {success = true, surface = surface.name, pads = #pads, requests = list}
+    -- Pads take from any platform in orbit, thruster inputs too (p7: the
+    -- pad drained buddy-1's carbon and iron ore, and it could not leave).
+    local drains = {}
+    for _, platform in pairs(character.force.platforms) do
+        if platform.valid and platform.space_location and platform.space_location.name == surface.name then
+            local fuel = thrust_inputs(platform)
+            for _, item in ipairs(list) do
+                if fuel[item.name] then drains[#drains + 1] = platform.name .. ": " .. item.name end
+            end
+        end
+    end
+    return {success = true, surface = surface.name, pads = #pads, requests = list,
+        warning = drains[1] and ("These requests take thruster-fuel inputs from platforms in orbit (" .. table.concat(drains, ", ") .. "). Below "
+            .. THRUST_RESERVE .. " of each a platform cannot leave; request them only while no shuttle needs to fly, or mine them here.") or nil}
 end
 
 -- Throw items out of the hub, as an inserter over the platform edge would;
@@ -3372,6 +3413,8 @@ local function action_schedule(character, platform, stops)
         result.guidance = "Course set, but " .. platform.name .. " stays parked: nothing could restock it or you after it leaves. Before the first trip, give a silo here a supply chest and the platform standing supply (space_platform action=supply); see progression for the next step."
     elseif result.departure_held == "no_crew" then
         result.guidance = "Course set; " .. platform.name .. " waits in orbit until you are aboard (space_platform action=board beside a silo), then leaves by itself."
+    elseif result.departure_held == "crew_landing" then
+        result.guidance = "Course set; " .. platform.name .. " waits in orbit until you land (space_platform action=land), then flies on by itself."
     end
     return result
 end

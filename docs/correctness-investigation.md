@@ -1650,6 +1650,24 @@ Valid: 68 of 69 turns completed, 8 tool errors, 0 provider-limited turns. `plate
 
 - **A silo between deliveries counted as stalled.** `home_supply.stalled_silo` now needs the silo to report an ingredient shortage and to have made no new rocket part for 3 minutes (`storage.silo_progress` keeps the last parts count and when it changed). Sandbox on p6's save: with the silo working (45 parts, launch, then 10) the goal stays "Board buddy-1 for Vulcanus"; with its inserters disabled and input cleared, 4 game minutes later the goal is "Feed the Nauvis silo again before you board: 45/50 parts, it lacks processing-unit, low-density-structure, rocket-fuel."
 
+### `p7-cont-p6-opus-open-2590060469-60m`
+
+Valid: 44 turns, 34 tool errors (13 `build_layout` cliff collisions), 0 provider-limited turns. `plate_automation` and `powered_production` are both true. First run of this chain to reach Vulcanus.
+- **Boarding:** the first turn spent its 5 minutes on a crafting wait, and the next rocket left without Buddy. He booked the following one and rode it at about 01:49:30.
+- **Flight:** about 4 minutes. buddy-1 used 446 piercing rounds and took no damage. It arrived with 530 rounds, under the 600 a departure needs.
+- **On Vulcanus:** pad and solar field placed, the carried silo placed at (−118.5, 54.5), acid, carbon, tungsten carbide, water, concrete and lubricant lines built, three trigger techs done. No foundry (40/50 steel at the end), no miners, no metallurgic packs.
+- **The silo stayed empty.** `feed_machine_from_inventory` rejected it (`not_a_crafting_machine`), and the Vulcanus steps never asked for it to be loaded.
+- **buddy-1 stranded.** Held "unarmed" over Vulcanus, it shot its 530 rounds at drifting asteroids in 29 minutes and then took hull damage (8 tiles). The Vulcanus pad requested carbon and iron ore, which it took from buddy-1's hub, so the shuttle was also short of thruster fuel.
+- **Nauvis:** with buddy-1 away, the home silo's finished rocket waited from 02:05 on; it stood at 50/50 parts from 02:22.
+
+### Fixes after p7
+
+- **`feed_machine_from_inventory` loads rocket silos** (rocket-part ingredients into `rocket_silo_input`, up to one launch, 50). The silo reply now points to `space_platform action=ship`, not an empty launch. Live tests: a 50-craft dry run is accepted; a 30-craft load fills the silo's input. Sandbox on p7's save: 50 of each loaded, and the silo built a rocket.
+- **Vulcanus steps:** after placing the silo, "Load the rocket silo … with the rocket-part inputs you carried" (with the exact call). Before that, when a shuttle in orbit is short of thruster fuel and the pad requests those items, "Stop the landing pad taking buddy-1's thruster fuel". After loading, a thruster-fuel shortfall becomes "Send buddy-1 its thruster fuel from Vulcanus". `space_platform action=request` warns when a request takes thruster inputs from a platform in orbit. The board step says to book first and keep carbon and iron ore off the Vulcanus pad.
+- **Departure holds away from home.** "unarmed" now holds only at Nauvis, where piercing rounds can reach the platform (a silo with a supply chest, or an agent holding rounds beside a silo that has started a rocket), or when it has no ammo at all. Elsewhere the shuttle flies home with what it has. A new hold, "crew_landing", keeps a crewed platform over a planet the force has nothing on, so the shuttle does not fly on with Buddy before he lands.
+  - Sandbox on p7's save, with pad requests cleared and 300 rounds plus 500 carbon and iron ore put in the hub: the hold released, buddy-1 flew Vulcanus → Nauvis in about 3 game minutes and arrived with 334 carbon and 402 iron ore. Without rounds it stays held as "unarmed".
+- p7's own state cannot recover (the shuttle has no rounds and nothing on Vulcanus makes them), so the chain re-branches from p6's save.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

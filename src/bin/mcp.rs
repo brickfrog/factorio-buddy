@@ -8043,9 +8043,9 @@ pub struct FeedLabFromInventoryParams {
 /// Parameters for feed_machine_from_inventory tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct FeedMachineFromInventoryParams {
-    /// Unit number of an assembler, chemical plant, or foundry with a recipe set
+    /// Unit number of an assembler, chemical plant, or foundry with a recipe set, or a rocket silo
     pub unit_number: u32,
-    /// Whole crafts to load, from 1 through 20.
+    /// Whole crafts to load, from 1 through 20 (a rocket silo: one launch, 50 parts).
     pub crafts: u32,
     /// If true, only validate and return an execution step. Defaults to true.
     #[serde(default = "default_true")]
@@ -17548,7 +17548,7 @@ impl FactorioMcp {
 
     /// Load a machine's recipe ingredients from the agent inventory.
     #[tool(
-        description = "Dry-run or load 1-20 crafts of a machine's current recipe (item ingredients only) from your inventory into an exact assembler/chemical plant/foundry for bootstrap. Fluids must be piped. Then feed it with inserters."
+        description = "Dry-run or load 1-20 crafts of a machine's current recipe (item ingredients only) from your inventory into an exact assembler/chemical plant/foundry for bootstrap, or up to one launch of rocket parts (50) into a rocket silo. Fluids must be piped. Then feed it with inserters."
     )]
     async fn feed_machine_from_inventory(
         &self,

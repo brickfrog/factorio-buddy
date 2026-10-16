@@ -603,6 +603,77 @@ local function vulcanus_rung(here, force, character, S)
             "build_layout a rocket-silo (9x9) inside the power network with solar panels to spare (6x solar here). Then load one launch of rocket parts with feed_machine_from_inventory: "
             .. recipe_text("rocket-part") .. " x50. Metallurgic packs leave Vulcanus only from it." .. REMOTE_HOME
     end
+    -- The pad takes from any platform in orbit: requests for a shuttle's
+    -- thruster inputs keep it from ever flying home (p7, and a sandbox run
+    -- from p7: 450 iron ore put in the hub was gone to the pad in seconds).
+    for _, platform in ipairs(S.platforms or {}) do
+        if platform.space_location == "vulcanus" and platform.thrust_short and platform.thrust_short[1] then
+            local short = {}
+            for _, producer in ipairs(platform.thrust_short) do
+                for _, item in ipairs(producer.short or {}) do short[item.name] = true end
+            end
+            local drained = {}
+            for _, pad in pairs(character.surface.find_entities_filtered{name = "cargo-landing-pad", force = force}) do
+                for _, section in pairs(pad.get_logistic_sections().sections) do
+                    if section.active then
+                        for slot = 1, section.filters_count do
+                            local filter = section.get_slot(slot)
+                            local name = filter.value and filter.value.name
+                            if name and short[name] and (filter.min or 0) > 0 and not drained[name] then
+                                drained[name] = true
+                                drained[#drained + 1] = name
+                            end
+                        end
+                    end
+                end
+            end
+            if drained[1] then
+                return "Stop the landing pad taking " .. platform.name .. "'s thruster fuel: drop " .. table.concat(drained, ", ") .. " from its requests.",
+                    "The pad takes requested items from any platform in orbit, and " .. platform.name .. " cannot leave until its hub holds " .. tostring(platform.thrust_reserve or 450)
+                    .. " of each thruster input. space_platform action=request replaces the pad's requests: call it with the list you still want, without these. Its collectors and crushers then refill them in orbit. Get them here from rocks and coal instead." .. REMOTE_HOME
+            end
+        end
+    end
+    -- A placed silo builds nothing until its rocket parts' inputs reach it
+    -- (p7: the carried ones stayed in the inventory for 35 minutes).
+    if silo_here then
+        local silo = character.surface.find_entities_filtered{type = "rocket-silo", force = force, limit = 1}[1]
+        local recipe = prototypes.recipe["rocket-part"]
+        local input = silo.get_inventory(defines.inventory.crafter_input)
+        local carried, loaded, required = math.huge, math.huge, silo.prototype.rocket_parts_required or 50
+        for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
+            carried = math.min(carried, math.floor(have(ingredient.name) / ingredient.amount))
+            loaded = math.min(loaded, math.floor((input and input.get_item_count(ingredient.name) or 0) / ingredient.amount))
+        end
+        local room = required - silo.rocket_parts - loaded
+        if carried > 0 and room > 0 and silo.rocket_parts == 0 and loaded == 0 then
+            return "Load the rocket silo at " .. math.floor(silo.position.x) .. "," .. math.floor(silo.position.y) .. " with the rocket-part inputs you carried.",
+                "feed_machine_from_inventory unit_number=" .. silo.unit_number .. " crafts=" .. math.min(carried, room) .. " dry_run=false: " .. recipe_text("rocket-part")
+                .. ". It builds the parts by itself; once it holds " .. required .. " the rocket can carry metallurgic packs to an orbiting platform." .. REMOTE_HOME
+        end
+    end
+    -- A shuttle short of thruster-fuel inputs over Vulcanus cannot fly home;
+    -- the silo here is the only way up (p7: the pad requests drained them).
+    if silo_here then
+        for _, platform in ipairs(S.platforms or {}) do
+            if platform.space_location == "vulcanus" and platform.departure_held == "thrust_stock" then
+                local items, seen = {}, {}
+                for _, producer in ipairs(platform.thrust_short or {}) do
+                    for _, item in ipairs(producer.short or {}) do
+                        if not seen[item.name] then
+                            seen[item.name] = true
+                            items[#items + 1] = item.name .. " (hub has " .. item.hub .. ", keep " .. tostring(platform.thrust_reserve or 450) .. "+)"
+                        end
+                    end
+                end
+                if items[1] then
+                    return "Send " .. platform.name .. " its thruster fuel from Vulcanus: " .. table.concat(items, ", ") .. ".",
+                        "It cannot fly home without them. Gather them here (big volcanic rocks drop iron ore; coal makes carbon), then space_platform action=ship platform=" .. platform.name
+                        .. " items=[...] from beside the silo once its rocket is ready. Drop thruster inputs from the landing pad's requests (action=request) so the pad does not take them again." .. REMOTE_HOME
+                end
+            end
+        end
+    end
     -- No armed platform here and no silo: nothing reaches orbit from here,
     -- so the next shuttle is built over Nauvis from here (copying the
     -- unarmed one still orbiting, if any).
@@ -993,6 +1064,8 @@ local function space_rung(facts, force, surface, character)
     end
     return "Board " .. P.name .. " for Vulcanus.",
         "It waits in orbit until you are aboard, then leaves. Carry what you need to start there besides the launch kit: a cargo-landing-pad (the shuttle drops what you request there); Vulcanus has no water, so solar panels (6x power there) and accumulators, not steam; roboports, construction and logistic robots and a storage chest so place_ghosts works there; chemical plants and assembling-machine-2s (carbon, tungsten carbide), a pumpjack (sulfuric acid geysers), pipes, drills, steel furnaces, belts, inserters, poles. Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
+        .. " Book first and craft while you wait: in p7 the next rocket left without you during a 5-minute crafting wait."
+        .. " Over Vulcanus, keep carbon and iron ore off the landing pad's requests: the pad takes them from the shuttle, which then cannot fly home."
 end
 
 -- Code-computed tech-progression ladder for the early game. Each rung names

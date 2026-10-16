@@ -5,6 +5,7 @@ local M = {}
 local MAX_LAB_FEED_COUNT = 200
 local MAX_MACHINE_FEED_CRAFTS = 20
 local MACHINE_FEED_GUIDANCE = "One-time bootstrap (e.g. a first craft that triggers research on a new planet); feed it durably with inserters and belts afterwards."
+local FEEDABLE_MACHINE_TYPES = {["assembling-machine"] = true, ["rocket-silo"] = true}
 
 local function pos_table(pos)
     if not pos then return nil end
@@ -342,8 +343,17 @@ local function machine_summary(machine)
     }
 end
 
+-- Whole crafts one call may load: a silo takes one launch of rocket parts.
+local function machine_feed_cap(machine)
+    if machine.type == "rocket-silo" then
+        return math.max(MAX_MACHINE_FEED_CRAFTS, machine.prototype.rocket_parts_required or 0)
+    end
+    return MAX_MACHINE_FEED_CRAFTS
+end
+
 -- Load whole crafts of a crafting machine's current recipe (item ingredients
 -- only, all together) from the character inventory. Fluids must be piped.
+-- Rocket silos take their fixed rocket-part recipe.
 function M.feed_machine_from_inventory(character, unit_number, crafts, dry_run)
     local parsed_crafts = tonumber(crafts)
     local do_dry_run = dry_run ~= false
@@ -366,15 +376,11 @@ function M.feed_machine_from_inventory(character, unit_number, crafts, dry_run)
 
     if not parsed_crafts
         or parsed_crafts ~= parsed_crafts
-        or parsed_crafts == math.huge
-        or parsed_crafts == -math.huge
         or parsed_crafts <= 0
         or parsed_crafts ~= math.floor(parsed_crafts)
-        or parsed_crafts > MAX_MACHINE_FEED_CRAFTS
     then
-        result.error_kind = parsed_crafts and parsed_crafts > MAX_MACHINE_FEED_CRAFTS
-            and "crafts_exceed_limit" or "invalid_crafts"
-        result.error = "crafts must be a positive integer no greater than " .. tostring(MAX_MACHINE_FEED_CRAFTS)
+        result.error_kind = "invalid_crafts"
+        result.error = "crafts must be a positive integer"
         result.action_needed = "choose_bounded_craft_count"
         add_blocker(result, result.error_kind, result.error)
         return result
@@ -392,10 +398,25 @@ function M.feed_machine_from_inventory(character, unit_number, crafts, dry_run)
     end
     result.machine = machine_summary(machine)
 
-    if machine.type ~= "assembling-machine" then
+    if not FEEDABLE_MACHINE_TYPES[machine.type] then
         add_blocker(result, "not_a_crafting_machine", "Entity " .. tostring(unit_number) .. " is " .. tostring(machine.name)
-            .. " (" .. tostring(machine.type) .. "), not an assembler, chemical plant, or foundry.")
+            .. " (" .. tostring(machine.type) .. "), not an assembler, chemical plant, foundry, or rocket silo.")
         return expected_miss(result, "choose_crafting_machine")
+    end
+    local is_silo = machine.type == "rocket-silo"
+    if is_silo then
+        result.rocket_parts = machine.rocket_parts
+        result.rocket_parts_required = machine.prototype.rocket_parts_required
+    end
+
+    local max_crafts = machine_feed_cap(machine)
+    result.maximum_crafts = max_crafts
+    if parsed_crafts > max_crafts then
+        result.error_kind = "crafts_exceed_limit"
+        result.error = "crafts must be no greater than " .. tostring(max_crafts) .. " for " .. tostring(machine.name)
+        result.action_needed = "choose_bounded_craft_count"
+        add_blocker(result, result.error_kind, result.error)
+        return result
     end
 
     local recipe, quality = machine.get_recipe()
@@ -436,9 +457,10 @@ function M.feed_machine_from_inventory(character, unit_number, crafts, dry_run)
         return result
     end
 
-    local machine_inv = machine.get_inventory(defines.inventory.assembling_machine_input)
+    local machine_inv = machine.get_inventory(is_silo and defines.inventory.rocket_silo_input
+        or defines.inventory.assembling_machine_input)
     if not machine_inv then
-        add_blocker(result, "no_machine_input_inventory", "Machine has no assembling_machine_input inventory.")
+        add_blocker(result, "no_machine_input_inventory", "Machine has no crafting input inventory.")
         return expected_miss(result, "choose_crafting_machine")
     end
 
@@ -560,6 +582,14 @@ function M.feed_machine_from_inventory(character, unit_number, crafts, dry_run)
     end
 
     result.success = true
+    if is_silo then
+        result.rocket_parts = machine.rocket_parts
+        result.next_action = "space_platform"
+        result.follow_up_actions = {"space_platform"}
+        result.guidance = "The silo builds one rocket part per craft. Once it holds " .. tostring(result.rocket_parts_required)
+            .. ", send cargo to a platform in orbit with space_platform action=ship; an empty launch wastes the rocket."
+        return result
+    end
     result.next_action = "build_assembler_feed"
     result.follow_up_actions = {"build_assembler_feed", "verify_production"}
     return result
