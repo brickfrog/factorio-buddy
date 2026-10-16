@@ -700,7 +700,10 @@ function M.silo_can_launch(silo)
         end
         sets = math.min(sets, math.floor(count / ingredient.amount))
     end
-    return sets ~= math.huge and silo.rocket_parts + sets >= (silo.prototype.rocket_parts_required or 50)
+    -- The part being built has already taken its set of inputs (p7d: a silo
+    -- loaded with 50 read 49/50 all through its build).
+    local building = silo.is_crafting() and 1 or 0
+    return sets ~= math.huge and silo.rocket_parts + building + sets >= (silo.prototype.rocket_parts_required or 50)
 end
 
 local function launchable_silo(surface, force)
@@ -1828,6 +1831,43 @@ local function plan_deconstruction(surface, force, origin_x, origin_y, targets)
     return planned
 end
 
+-- Validated `requests` of a place_ghosts entity: a list of {name, count}
+-- for a requester or buffer chest; nil when none, or nil and an error.
+local MAX_CHEST_REQUESTS = 30
+local function parse_chest_requests(index, spec, proto)
+    if spec.requests == nil or (type(spec.requests) == "table" and next(spec.requests) == nil) then return nil end
+    local mode = proto.type == "logistic-container" and proto.logistic_mode
+    if mode ~= "requester" and mode ~= "buffer" then
+        return nil, fail("invalid_requests", "entity " .. index .. " (" .. proto.name .. ") takes no requests: only requester and buffer chests do", {index = index})
+    end
+    if type(spec.requests) ~= "table" or #spec.requests > MAX_CHEST_REQUESTS then
+        return nil, fail("invalid_requests", "entity " .. index .. ": requests must be a list of at most " .. MAX_CHEST_REQUESTS .. " {name, count}", {index = index})
+    end
+    local list = {}
+    for slot, request in ipairs(spec.requests) do
+        local name = type(request) == "table" and request.name
+        local count = type(request) == "table" and request.count
+        if not (type(name) == "string" and prototypes.item[name]) or type(count) ~= "number" or count < 1 or count ~= math.floor(count) or count > 65535 then
+            return nil, fail("invalid_requests", "entity " .. index .. " request " .. slot .. " needs an item name and a whole count 1-65535", {index = index, request = request})
+        end
+        list[#list + 1] = {name = name, count = count}
+    end
+    return list
+end
+
+-- Replace the first logistic section of `entity` (a chest or its ghost)
+-- with `list`. True when set.
+local function apply_chest_requests(entity, list)
+    return (pcall(function()
+        local sections = entity.get_logistic_sections()
+        local section = sections.get_section(1) or sections.add_section()
+        for slot = section.filters_count, 1, -1 do section.clear_slot(slot) end
+        for slot, request in ipairs(list) do
+            section.set_slot(slot, {value = {type = "item", name = request.name, quality = "normal"}, min = request.count})
+        end
+    end))
+end
+
 function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, tiles, dry_run, deconstruct)
     local character = characters.find(agent_id)
     if not character then return no_character(agent_id) end
@@ -1874,6 +1914,8 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             y = snap(origin_y + spec.dy, height),
         }
         local x1, y1, x2, y2 = rotated_box(proto, direction)
+        local requests, requests_err = parse_chest_requests(index, spec, proto)
+        if requests_err then return requests_err end
         planned_entities[#planned_entities + 1] = {
             index = index,
             name = spec.name,
@@ -1882,6 +1924,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             position = position,
             area = {{position.x + x1, position.y + y1}, {position.x + x2, position.y + y2}},
             recipe = type(spec.recipe) == "string" and spec.recipe ~= "" and spec.recipe or nil,
+            requests = requests,
         }
     end
     for index, spec in ipairs(tiles) do
@@ -1981,7 +2024,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
     end
     -- Pasting a machine with a recipe over the same built machine sets its
     -- recipe, as a blueprint paste does.
-    local retarget = {}
+    local retarget, rerequest = {}, {}
     for _, plan in ipairs(planned_entities) do
         local built = nil
         for _, found in pairs(surface.find_entities_filtered{position = plan.position, radius = 1, force = force}) do
@@ -1997,6 +2040,8 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
                     retarget[#retarget + 1] = {entity = built, recipe = plan.recipe, index = plan.index}
                 end
             end
+            -- Pasting a chest with requests over the built one sets them.
+            if plan.requests then rerequest[#rerequest + 1] = {entity = built, requests = plan.requests, index = plan.index} end
         else
             for _, found in pairs(surface.find_entities_filtered{area = plan.area, type = "entity-ghost"}) do
                 if stranded[found.unit_number] and not clear_keys[found.unit_number] then
@@ -2135,6 +2180,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         created[#created + 1] = ghost
     end
     local recipes, placed, recipe_failed, ammo_requested = {}, 0, false, 0
+    local requests_set, requests_failed = {}, false
     for _, plan in ipairs(new_entities) do
         local ghost = surface.create_entity{
             name = "entity-ghost",
@@ -2153,6 +2199,11 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             local ok = pcall(ghost.set_recipe, plan.recipe)
             if not ok then recipe_failed = true end
             recipes[#recipes + 1] = {index = plan.index, recipe = plan.recipe, recipe_set = ok}
+        end
+        if plan.requests then
+            local ok = apply_chest_requests(ghost, plan.requests)
+            if not ok then requests_failed = true end
+            requests_set[#requests_set + 1] = {index = plan.index, requests_set = ok}
         end
         if surface.platform and ghost.ghost_type == "ammo-turret" then
             ammo_requested = ammo_requested + request_turret_ammo(surface.platform, ghost)
@@ -2175,6 +2226,11 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             if left > 0 then surface.spill_item_stack{position = entity.position, stack = {name = item.name, count = left, quality = item.quality}} end
         end
     end
+    for _, change in ipairs(rerequest) do
+        local ok = apply_chest_requests(change.entity, change.requests)
+        if not ok then requests_failed = true end
+        requests_set[#requests_set + 1] = {index = change.index, requests_set = ok, existing = true}
+    end
 
     local guidance = surface.platform
         and ("The hub builds these from its inventory; bring missing_items with space_platform action=ship."
@@ -2184,6 +2240,9 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
             or "Robots build these from items in the network; put missing_items into a storage or passive-provider chest in range. Check progress with robot_logistics.")
     if recipe_failed then
         guidance = guidance .. " Recipes with recipe_set=false were not applied: set them with set_recipe once the machine is built and you are there."
+    end
+    if requests_failed then
+        guidance = guidance .. " Chest requests with requests_set=false were not applied."
     end
     return {
         success = true,
@@ -2195,6 +2254,7 @@ function M.place_ghosts(agent_id, surface_name, origin_x, origin_y, entities, ti
         deconstructing = deconstructing > 0 and removal_report() or nil,
         deconstruction_cancelled = cancelled > 0 and cancelled or nil,
         recipes = recipes,
+        chest_requests = requests_set[1] and requests_set or nil,
         missing_items = missing_items,
         removed_stranded_ghosts = removed_stranded,
         ammo_requested = ammo_requested,
@@ -2916,10 +2976,15 @@ local function action_board(agent_id, character, platform)
 end
 
 -- Landing-pad requests on the planet you stand on, or on stops[1] (pads are
--- configured remotely, as from the map).
+-- configured remotely, as from the map). An empty list clears them (p7d:
+-- with no way to, the pad kept pulling a shuttle's iron ore).
 local function action_request(character, items, stops)
-    local list, err = normalize_items(items)
-    if not list then return err end
+    local list = {}
+    if not (type(items) == "table" and next(items) == nil) then
+        local err
+        list, err = normalize_items(items)
+        if not list then return err end
+    end
     local surface = character.surface
     if type(stops) == "table" and stops[1] then
         surface = game.planets[stops[1]] and game.get_surface(stops[1])
@@ -3440,9 +3505,16 @@ local function action_schedule(character, platform, stops)
     result.success = true
     local location = platform.space_location
     local orbit = location and game.get_surface(location.name)
-    if #stops == 0 and orbit and orbit.name ~= "nauvis" and not ammo_reachable(orbit, force) then
+    local goes_home = false
+    for _, stop in ipairs(stops) do
+        if stop == "nauvis" then goes_home = true end
+    end
+    if not goes_home and orbit and orbit.name ~= "nauvis" and not ammo_reachable(orbit, force) then
         result.warning = "Parked over " .. orbit.name .. " with no rounds coming, " .. platform.name
-            .. " shoots its ammo at drifting asteroids and then takes hull damage (p7c: 381 rounds down to 51 in 17 minutes; it was then destroyed flying home). Keep it on its route unless it must wait here."
+            .. " shoots its ammo at drifting asteroids and then takes hull damage (p7c: 381 rounds down to 51 in 17 minutes; it was then destroyed flying home). Add a Nauvis stop unless it must wait here."
+    elseif not goes_home and #stops > 0 then
+        result.warning = platform.name .. " has no Nauvis stop: once at " .. stops[#stops] .. " it stays there, where nothing rearms it, and burns its rounds on asteroids (p7d: stops=[\"vulcanus\"], 976 rounds down to 0). Use stops=[\""
+            .. table.concat(stops, "\",\"") .. "\",\"nauvis\"]."
     end
     if result.departure_held == "unarmed" then
         local a = result.armament

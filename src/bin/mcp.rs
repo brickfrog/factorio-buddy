@@ -8160,6 +8160,9 @@ pub struct LayoutEntity {
     pub direction: String,
     /// Optional recipe for assemblers/chemical plants.
     pub recipe: Option<String>,
+    /// place_ghosts only: logistic requests (count = minimum) for a requester or buffer chest; a built chest at the spot takes them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<ItemCount>,
 }
 
 /// Layout.
@@ -8226,7 +8229,7 @@ pub struct SpacePlatformParams {
     pub action: String,
     /// Platform name (create: optional new name).
     pub platform: Option<String>,
-    /// ship: items from your inventory; unship: queued items to take back (empty = all); request: landing-pad requests (count = minimum); supply: hub import requests (count = minimum, 0 drops); jettison: hub items to throw away.
+    /// ship: items from your inventory; unship: queued items to take back (empty = all); request: landing-pad requests (count = minimum, empty = clear); supply: hub import requests (count = minimum, 0 drops); jettison: hub items to throw away.
     #[serde(default)]
     pub items: Vec<ItemCount>,
     /// schedule: planet names in order (two or more = shuttle); empty = stay. supply: the planet the items come from (default home). request: the planet whose landing pads to set (default yours). create: the planet to build over (default yours; another needs a silo there with a supply chest). copy_layout: the platform to copy.
@@ -8308,6 +8311,7 @@ fn place_ghosts_request(
             "dy": entity.dy,
             "direction": direction.to_factorio(),
             "recipe": entity.recipe,
+            "requests": entity.requests,
         }));
     }
     let mut tiles = Vec::with_capacity(params.tiles.len());

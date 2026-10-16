@@ -498,8 +498,8 @@ local function home_shuttle_rung(S, stranded, force)
     local H = S.home_supply or {}
     local why = stranded
         and (stranded.name .. " is stuck over Vulcanus: " .. tostring((stranded.armament or {}).needs)
-            .. ", and with no rocket silo here nothing can arm it. It cannot fly home, and asteroids wear it down.")
-        or "No armed platform serves Vulcanus and no rocket silo stands here: nothing can bring parts down or take products up."
+            .. ", and no silo here can finish a rocket to arm it. Asteroids wear it down.")
+        or "No armed platform serves Vulcanus and no silo here can finish a rocket: nothing can bring parts down or take products up."
     if (H.silos_with_supply_chest or 0) == 0 then
         return "Give the Nauvis silo a supply chest from here: Vulcanus needs a new shuttle.",
             why .. " A new shuttle is built over Nauvis by its supply silo: place_ghosts surface=nauvis a requester-chest beside the rocket silo and an inserter from the chest into the silo, inside the roboport network."
@@ -520,7 +520,7 @@ local function home_shuttle_rung(S, stranded, force)
         return "Get a space-platform-starter-pack into the Nauvis network for " .. P.name .. ".",
             recipe_text("space-platform-starter-pack") .. ". The supply silo launches it once robots can bring one to its supply chest"
             .. ((H.network_lacks and H.network_lacks[1]) and (". The network lacks: " .. table.concat(H.network_lacks, ", ")) or "")
-            .. ". From here: place_ghosts surface=nauvis an assembler with that recipe, an inserter from it into a passive-provider-chest, and its inputs (requester chests or belts), inside the roboport network." .. BOOTSTRAP_TEXT
+            .. ". From here: place_ghosts surface=nauvis an assembler with that recipe, an inserter from it into a passive-provider-chest, and a requester-chest with an inserter into the assembler, inside the roboport network; give that chest its inputs with requests=[{name,count}] (on a built chest, place_ghosts at its spot sets them)." .. BOOTSTRAP_TEXT
     end
     local supplied = {}
     for _, request in ipairs(P.supply and P.supply.requests or {}) do supplied[request.name] = true end
@@ -577,12 +577,16 @@ end
 local function vulcanus_rung(here, force, character, S)
     local inventory = character.get_main_inventory()
     local function have(item) return inventory and inventory.get_item_count(item) or 0 end
-    -- A platform parked here without rounds coming burns what it has on
-    -- drifting asteroids (p7c: buddy-1, paused with stops=[], went 381 -> 51
-    -- rounds in 17 minutes and was destroyed flying home).
+    -- A platform here without rounds coming burns what it has on drifting
+    -- asteroids unless its route takes it home (p7c: paused with stops=[],
+    -- 381 -> 51 rounds in 17 minutes; p7d: stops=["vulcanus"], 976 -> 0).
     for _, platform in ipairs(S.platforms or {}) do
         local a = platform.armament or {}
-        if platform.space_location == "vulcanus" and (platform.stops or {})[1] == nil and not a.armed and (a.turret_ammo or 0) + (a.hub_ammo or 0) > 0 then
+        local goes_home = false
+        for _, stop in ipairs(platform.stops or {}) do
+            if stop == "nauvis" then goes_home = true end
+        end
+        if platform.space_location == "vulcanus" and not goes_home and not a.armed and (a.turret_ammo or 0) + (a.hub_ammo or 0) > 0 then
             return "Send " .. platform.name .. " home to Nauvis now: parked here it shoots its last rounds at asteroids.",
                 "space_platform action=schedule platform=" .. platform.name .. " stops=[\"nauvis\",\"vulcanus\"]: it has " .. ((a.turret_ammo or 0) + (a.hub_ammo or 0))
                 .. " rounds and leaves by itself (see departure_held); Nauvis rearms it and it comes back by itself. Nothing on Vulcanus makes rounds yet." .. REMOTE_HOME
@@ -658,7 +662,7 @@ local function vulcanus_rung(here, force, character, S)
             carried = math.min(carried, math.floor(have(ingredient.name) / ingredient.amount))
             loaded = math.min(loaded, math.floor((input and input.get_item_count(ingredient.name) or 0) / ingredient.amount))
         end
-        local room = required - silo.rocket_parts - loaded
+        local room = required - silo.rocket_parts - loaded - (silo.is_crafting() and 1 or 0)
         if carried > 0 and room > 0 and loaded == 0 then
             return "Load the rocket silo at " .. math.floor(silo.position.x) .. "," .. math.floor(silo.position.y) .. " with the rocket-part inputs you carried.",
                 "feed_machine_from_inventory unit_number=" .. silo.unit_number .. " crafts=" .. math.min(carried, room) .. " dry_run=false: " .. recipe_text("rocket-part")
@@ -820,10 +824,11 @@ local function travel_rung(S, character, here, force)
                 "Queued shipments keep going up without you. If none is queued, you are aboard and cannot ship: land on Nauvis (space_platform action=land), ship them, then board again (board books the next ready rocket for you)."
         end
         return "Get " .. here.name .. " moving to Vulcanus (" .. tostring(here.state) .. ").",
-            "It leaves once its thrusters get both thruster-fuel and thruster-oxidizer: follow the thruster warnings, building pipe and foundation with place_ghosts on " .. tostring(here.surface) .. ", and ship what its ghosts lack."
+            "Its course (" .. table.concat(here.stops or {}, ", ") .. ") is set: do not schedule it again, which would replace the return stop (p7d: stops=[\"vulcanus\"] stranded it there). "
+            .. "It leaves once its thrusters get both thruster-fuel and thruster-oxidizer: follow the thruster warnings, building pipe and foundation with place_ghosts on " .. tostring(here.surface) .. ", and ship what its ghosts lack."
     end
     if S.vulcanus_unlocked then
-        return "Set course for Vulcanus.", "space_platform action=schedule stops=[\"vulcanus\"]."
+        return "Set course for Vulcanus.", "space_platform action=schedule stops=[\"vulcanus\",\"nauvis\"]: the Nauvis stop brings it back to rearm and restock."
     end
     return nil
 end

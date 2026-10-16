@@ -8024,9 +8024,9 @@ assert_json "place_ghosts refuses foundation that closes off empty space" \
     "$(tool_payload "$(mcp_tool place_ghosts "{\"surface\":\"$SA_SURFACE\",\"origin_x\":0,\"origin_y\":0,\"dry_run\":true,\"tiles\":$SA_RING}")")" \
     '.success == false and .error_kind == "encloses_space" and .holes == [{"x":10,"y":-1}]'
 raw_lua "game.forces.player.unlock_space_location('vulcanus'); rcon.print('ok')" >/dev/null
-assert_json "an unarmed platform is held in orbit when scheduled away" \
+assert_json "an unarmed platform is held in orbit when scheduled away, warned it has no return stop" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"schedule\",\"stops\":[\"vulcanus\"]}")")" \
-    '.success == true and .departure_held == "unarmed" and .stops == ["vulcanus"] and .space_location == "nauvis" and .armament.armed == false'
+    '.success == true and .departure_held == "unarmed" and .stops == ["vulcanus"] and .space_location == "nauvis" and .armament.armed == false and .warning != null'
 sleep 3
 assert_json "the held platform stays at Nauvis" "$(sa_platform)" '.space_location == "nauvis" and .departure_held == "unarmed"'
 # An inserter feeds a turret only while the hub holds rounds: a fed, empty
@@ -8057,9 +8057,9 @@ assert_json "a fed turret with no rounds in it or the hub is not ready" "$(sa_pl
 raw_lua "
 for _, e in pairs(game.surfaces['$SA_SURFACE'].find_entities_filtered{name = {'inserter', 'gun-turret'}}) do e.destroy() end
 rcon.print('ok')" >/dev/null
-assert_json "space_platform schedules a stop" \
+assert_json "space_platform schedules a stop without a warning when it includes Nauvis" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"schedule\",\"stops\":[\"nauvis\"]}")")" \
-    '.success == true and .stops == ["nauvis"]'
+    '.success == true and .stops == ["nauvis"] and .warning == null'
 assert_json "space_platform supply sets a hub import request and reports what is missing" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"supply\",\"items\":[{\"name\":\"iron-gear-wheel\",\"count\":30}]}")")" \
     '.success == true and .supply.from == "nauvis" and any(.supply.requests[]; .name == "iron-gear-wheel" and .count == 30)
@@ -8076,6 +8076,67 @@ for _ in $(seq 1 45); do
 done
 assert_json "the character lands near the requested spot" "$(sa_character)" \
     '.surface == "nauvis" and ((.x - 2000) | fabs) < 40 and ((.y - 2000) | fabs) < 40'
+
+# place_ghosts sets requester-chest requests on a new ghost (robots build the
+# chest with them) and on a built chest at the spot; other chests take none
+# (p7d: no tool could set them, so no starter pack could be made).
+raw_lua "game.surfaces.nauvis.create_entity{name = 'requester-chest', position = {2012.5, 2010.5}, force = 'player'}; rcon.print('ok')" >/dev/null
+assert_json "place_ghosts sets requests on a requester-chest ghost and on a built one" \
+    "$(tool_payload "$(mcp_tool place_ghosts '{"surface":"nauvis","origin_x":2010,"origin_y":2010,"entities":[{"name":"requester-chest","dx":0.5,"dy":0.5,"requests":[{"name":"steel-plate","count":20}]},{"name":"requester-chest","dx":2.5,"dy":0.5,"requests":[{"name":"iron-gear-wheel","count":7}]}]}')")" \
+    '.success == true and .placed == 1 and (.chest_requests | length) == 2 and all(.chest_requests[]; .requests_set == true)'
+assert_json "the ghost and the built chest hold the requests" "$(raw_lua "
+local s = game.surfaces.nauvis
+local function slots(e)
+    local t = {}
+    for _, section in pairs(e.get_logistic_sections().sections) do
+        for i = 1, section.filters_count do
+            local f = section.get_slot(i)
+            if f and f.value then t[f.value.name] = f.min end
+        end
+    end
+    return t
+end
+local ghost = s.find_entities_filtered{ghost_name = 'requester-chest', position = {2010.5, 2010.5}, radius = 0.5}[1]
+local chest = s.find_entities_filtered{name = 'requester-chest', position = {2012.5, 2010.5}, radius = 0.5}[1]
+rcon.print(helpers.table_to_json({ghost = slots(ghost), chest = slots(chest)}))
+")" '.ghost["steel-plate"] == 20 and .chest["iron-gear-wheel"] == 7'
+assert_json "place_ghosts refuses requests on a chest that takes none" \
+    "$(tool_payload "$(mcp_tool place_ghosts '{"surface":"nauvis","origin_x":2010,"origin_y":2010,"dry_run":true,"entities":[{"name":"wooden-chest","dx":4.5,"dy":0.5,"requests":[{"name":"steel-plate","count":1}]}]}')")" \
+    '.success == false and .error_kind == "invalid_requests"'
+raw_lua "
+for _, e in pairs(game.surfaces.nauvis.find_entities_filtered{area = {{2009, 2009}, {2016, 2012}}}) do
+    if e.name == 'requester-chest' or (e.type == 'entity-ghost' and e.ghost_name == 'requester-chest') then e.destroy() end
+end
+rcon.print('ok')" >/dev/null
+
+# An empty request list clears the landing pad's requests (p7d: [] and
+# count 0 were refused, so the pad kept pulling a shuttle's iron ore).
+raw_lua "
+local s = game.surfaces.nauvis
+if s.count_entities_filtered{name = 'cargo-landing-pad'} == 0 then
+    s.create_entity{name = 'cargo-landing-pad', position = {2020, 2020}, force = 'player'}
+end
+rcon.print('ok')" >/dev/null
+require_json "a landing pad on Nauvis takes a request" \
+    "$(tool_payload "$(mcp_tool space_platform '{"action":"request","items":[{"name":"iron-plate","count":5}]}')")" \
+    '.success == true and .surface == "nauvis"'
+tool_payload "$(mcp_tool space_platform '{"action":"request","items":[]}')" >/dev/null
+assert_json "space_platform request with no items clears the pad's requests" "$(raw_lua "
+local n = 0
+for _, pad in pairs(game.surfaces.nauvis.find_entities_filtered{name = 'cargo-landing-pad'}) do
+    for _, section in pairs(pad.get_logistic_sections().sections) do
+        for i = 1, section.filters_count do
+            local f = section.get_slot(i)
+            if f and f.value then n = n + 1 end
+        end
+    end
+end
+rcon.print(helpers.table_to_json({filters = n}))
+")" '.filters == 0'
+raw_lua "
+local pad = game.surfaces.nauvis.find_entities_filtered{name = 'cargo-landing-pad', position = {2020, 2020}, radius = 1}[1]
+if pad then pad.destroy() end
+rcon.print('ok')" >/dev/null
 
 # A second platform is built by the supply silo alone: a waiting platform
 # gets its starter pack from the network, copy_layout lays it out like the

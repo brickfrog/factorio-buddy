@@ -1687,6 +1687,24 @@ Valid: 32 turns, 29 tool errors in 354 calls, 0 provider-limited turns. `plate_a
 - **Turrets fed from an empty hub are not ready.** `armament` counted an inserter-fed turret as ready with no rounds in it or the hub (JVC-42). Live test added. Sandbox on p7's save: with turrets emptied, `turrets_ready` is 0, where 3 fed turrets counted before.
 - **`collect_from_chest` takes items out of a cargo landing pad** (JVC-41). Live test added. Sandbox on p7's save: 15 steel moved from the Vulcanus pad to Buddy.
 
+### `p7d-cont-p6-opus-open-2590060469-60m`
+
+Valid: 41 turns, 49 tool errors in 417 calls, 0 provider-limited turns. `plate_automation` and `powered_production` are true. No metallurgic packs were made.
+- **The kit held.** Buddy loaded all 50 sets into the Vulcanus silo, and it built a rocket. The rocket was never used.
+- **The return stop was dropped.** Just after the `no_crew` hold released, the platform still showed `no_schedule`, and the step said "Get buddy-1 moving". Buddy set `stops=["vulcanus"]`, which replaced `[vulcanus, nauvis]`. The send-home step and the parking warning only checked for an empty route, so neither fired. buddy-1 sat over Vulcanus and its rounds went 976 → 0 by the 53rd minute.
+- **False "build a new shuttle".** While the silo built its rocket, `silo_can_launch` counted 49/50: the part being built had already taken its set. For 4 turns the goal was a new shuttle, so Buddy created buddy-2 and switched a home ammo assembler to starter packs.
+- **No way to set chest requests.** The starter-pack step said to use requester chests, but no tool could set their requests. Buddy filed this himself.
+- **Pad requests could not be cleared.** `request` refused `[]` and count 0. The pad kept pulling iron ore from buddy-1, and its hub dropped below the thruster reserve.
+- On Vulcanus everything was hand-fed. The foundry was crafted in the 45th minute. No drills were placed, and no advanced circuits were made for the big mining drill.
+
+### Fixes after p7d
+
+- **A route without Nauvis counts as parked.** The send-home step fires for an unarmed platform over Vulcanus that has rounds and no Nauvis stop. `schedule` warns about any route without a Nauvis stop. The "Set course" step now gives `stops=["vulcanus","nauvis"]`, and the "Get moving" step says not to schedule again. Live tests: `["vulcanus"]` warns, `["nauvis"]` does not. Sandbox on p7d's save with 200 rounds in the hub: the goal is "Send buddy-1 home to Nauvis now".
+- **`silo_can_launch` counts the part being built**, as does the load step's room. Sandbox on p7's save, with 50 sets loaded and the silo building: the goal stays "Craft a foundry", not a new shuttle.
+- **`place_ghosts` sets requester and buffer chest requests:** `requests=[{name,count}]` on an entity. A new ghost keeps them when robots build it, and a built chest at the spot takes them. Other entities refuse them (`invalid_requests`). Live tests added. Sandbox on p7d's save: a ghost with steel and processing units was built with those requests, and a built chest took a foundation request.
+- **`space_platform action=request items=[]` clears the pad's requests.** Live test added.
+- The home-shuttle step no longer says there is no silo on Vulcanus or that the shuttle cannot fly home.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
