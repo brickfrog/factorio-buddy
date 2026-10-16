@@ -1664,9 +1664,11 @@ Valid: 44 turns, 34 tool errors (13 `build_layout` cliff collisions), 0 provider
 
 - **`feed_machine_from_inventory` loads rocket silos** (rocket-part ingredients into `rocket_silo_input`, up to one launch, 50). The silo reply now points to `space_platform action=ship`, not an empty launch. Live tests: a 50-craft dry run is accepted; a 30-craft load fills the silo's input. Sandbox on p7's save: 50 of each loaded, and the silo built a rocket.
 - **Vulcanus steps:** after placing the silo, "Load the rocket silo … with the rocket-part inputs you carried" (with the exact call). Before that, when a shuttle in orbit is short of thruster fuel and the pad requests those items, "Stop the landing pad taking buddy-1's thruster fuel". After loading, a thruster-fuel shortfall becomes "Send buddy-1 its thruster fuel from Vulcanus". `space_platform action=request` warns when a request takes thruster inputs from a platform in orbit. The board step says to book first and keep carbon and iron ore off the Vulcanus pad.
+  - The load step first fired only on an empty silo with no parts, so a partial load (some silos take only 40 rocket fuel) was never topped up. It now fires whenever a full set of inputs is gone and parts are short. Sandbox on p7's save: load 40 → no load step while inputs remain → after they build (40 parts) the step asks for `crafts=10` → top-up → rocket ready.
 - **Departure holds away from home.** "unarmed" now holds only at Nauvis, where piercing rounds can reach the platform (a silo with a supply chest, or an agent holding rounds beside a silo that has started a rocket), or when it has no ammo at all. Elsewhere the shuttle flies home with what it has. A new hold, "crew_landing", keeps a crewed platform over a planet the force has nothing on, so the shuttle does not fly on with Buddy before he lands.
   - Sandbox on p7's save, with pad requests cleared and 300 rounds plus 500 carbon and iron ore put in the hub: the hold released, buddy-1 flew Vulcanus → Nauvis in about 3 game minutes and arrived with 334 carbon and 402 iron ore. Without rounds it stays held as "unarmed".
 - p7's own state cannot recover (the shuttle has no rounds and nothing on Vulcanus makes them), so the chain re-branches from p6's save.
+- p7b (re-run from p6's save) hit the provider limit and was renamed `-capped`.
 
 ## Comparison with other harnesses
 

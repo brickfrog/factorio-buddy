@@ -635,7 +635,9 @@ local function vulcanus_rung(here, force, character, S)
         end
     end
     -- A placed silo builds nothing until its rocket parts' inputs reach it
-    -- (p7: the carried ones stayed in the inventory for 35 minutes).
+    -- (p7: the carried ones stayed in the inventory for 35 minutes). Ask
+    -- again whenever a full set of inputs is gone and parts are still short,
+    -- so a partial load (a silo that took only 40 fuel) gets topped up.
     if silo_here then
         local silo = character.surface.find_entities_filtered{type = "rocket-silo", force = force, limit = 1}[1]
         local recipe = prototypes.recipe["rocket-part"]
@@ -646,7 +648,7 @@ local function vulcanus_rung(here, force, character, S)
             loaded = math.min(loaded, math.floor((input and input.get_item_count(ingredient.name) or 0) / ingredient.amount))
         end
         local room = required - silo.rocket_parts - loaded
-        if carried > 0 and room > 0 and silo.rocket_parts == 0 and loaded == 0 then
+        if carried > 0 and room > 0 and loaded == 0 then
             return "Load the rocket silo at " .. math.floor(silo.position.x) .. "," .. math.floor(silo.position.y) .. " with the rocket-part inputs you carried.",
                 "feed_machine_from_inventory unit_number=" .. silo.unit_number .. " crafts=" .. math.min(carried, room) .. " dry_run=false: " .. recipe_text("rocket-part")
                 .. ". It builds the parts by itself; once it holds " .. required .. " the rocket can carry metallurgic packs to an orbiting platform." .. REMOTE_HOME
