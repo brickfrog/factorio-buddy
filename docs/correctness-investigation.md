@@ -1626,6 +1626,18 @@ Valid: 64 turns, 15 tool errors, 0 provider-limited turns. `plate_automation` an
 
 - **The kit step hid the silo's ingredients.** Without a silo in hand, the step now adds the silo recipe to the kit, so it reads "processing-unit 19/250". When a rocket-part input is short by more than ten minutes of output, the how-text says that taking it from the silo line drops the rocket rate below 30 and gives the recipe to build more of it with its own output chest. Sandbox on p4's save: "Pack the Vulcanus launch kit in your inventory: rocket-silo 0/1, processing-unit 19/250, rocket-fuel 48/50", with the processing-unit advice.
 
+### `p5-cont-p4-opus-open-2590060469-60m`
+
+Valid: 40 turns, 26 tool errors (9 from `collect_from_chest`), 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- **Kit:** processing units went from 19 to 75 of 250, rocket fuel was finished, and the silo was never crafted. Buddy never boarded.
+- **One new processing-unit assembler** at (83.5,141.5) made nothing: it got green circuits only in the last turn and never got advanced circuits. Nauvis made 39 processing units per 10 minutes before and 37 after.
+- **The kit and the rate gate still fought.** Buddy took the silo line's processing units three times, against the advice. Each time the rocket-part count fell, and turns 16–35 went back to "raise the rocket rate", six of them at 0 parts per 10 minutes. At the end the home silo was stalled at 26/50 parts for lack of processing units.
+- About 15 of the 40 turns made no tool call.
+
+### Fixes after p5
+
+- **The rate gate punished packing the kit.** It counted rocket parts the silo made, so taking processing units for the kit failed it although Nauvis made just as many. It now counts the rocket-part inputs Nauvis makes in 10 minutes (the scarcest of processing units, low-density structures and rocket fuel). The kit step now says to take the scarce input from the silo line while packing (with the time that takes at the current rate) and to add assemblers meanwhile. A new step before boarding asks to feed the home silo again when it is stalled. Sandbox on p5's save: the goal stays on the kit ("processing-unit 75/250", about 48 minutes at 37 per 10 minutes); `stalled_silo` reports 26/50 parts lacking processing units, which the new step will catch before boarding.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

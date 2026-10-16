@@ -924,10 +924,17 @@ local function space_rung(facts, force, surface, character)
     end
     -- Once you leave, Nauvis runs alone and every shuttle load rides its
     -- rockets: s49-s57 stalled at one rocket per 45-90 minutes when copper
-    -- ran short and nobody was there to fix it.
-    local parts_made = made_last_ten_minutes(force, surface, "rocket-part")
-    if parts_made < MIN_ROCKET_PARTS_BEFORE_LEAVING then
-        return "Raise Nauvis' rocket rate before you leave: " .. parts_made .. " rocket parts in the last 10 minutes, " .. MIN_ROCKET_PARTS_BEFORE_LEAVING .. "+ needed.",
+    -- ran short and nobody was there to fix it. The gate counts what Nauvis
+    -- makes for rocket parts, not what its silo uses: in p4 and p5, taking
+    -- processing units for the kit dropped the parts count and sent Buddy
+    -- back here to undo it.
+    local parts_capacity, part_recipe = math.huge, prototypes.recipe["rocket-part"]
+    for _, ingredient in pairs(part_recipe and part_recipe.ingredients or {}) do
+        parts_capacity = math.min(parts_capacity, math.floor(made_last_ten_minutes(force, surface, ingredient.name) / ingredient.amount))
+    end
+    if parts_capacity == math.huge then parts_capacity = 0 end
+    if parts_capacity < MIN_ROCKET_PARTS_BEFORE_LEAVING then
+        return "Raise Nauvis' rocket rate before you leave: its last 10 minutes made inputs for " .. parts_capacity .. " rocket parts, " .. MIN_ROCKET_PARTS_BEFORE_LEAVING .. "+ needed.",
             "After you leave only robots can change Nauvis, and they reach only roboport range. Each part needs " .. rocket_part_inputs(force, surface)
             .. ". Fix the scarcest in person now: connect the ore patches and smelters that stand full to the lines that starve (route_belt, build_layout), add assemblers for it and its inputs, and extend roboport coverage over the outposts." .. supply_gaps_text(facts)
     end
@@ -959,8 +966,6 @@ local function space_rung(facts, force, surface, character)
         local count = have(name)
         if count < needed[name] then
             missing[#missing + 1] = name .. " " .. count .. "/" .. needed[name]
-            -- A shortfall above ten minutes of output cannot come off the
-            -- rocket-part line without dropping the rocket rate.
             local short, made = needed[name] - count, made_last_ten_minutes(force, surface, name)
             if rocket_inputs[name] and short > made and not (starved and starved.short >= short) then
                 starved = {name = name, short = short, made = made}
@@ -970,13 +975,21 @@ local function space_rung(facts, force, surface, character)
     if missing[1] then
         local extra = ""
         if starved then
-            extra = " " .. starved.name .. " also feeds the home silo's rocket parts (" .. starved.made
-                .. " made in 10 min): taking " .. starved.short .. " from that line drops the rocket rate below " .. MIN_ROCKET_PARTS_BEFORE_LEAVING
-                .. ". Build more " .. starved.name .. " production first, with its own output chest: " .. recipe_text(starved.name) .. "."
+            extra = " Nauvis makes " .. starved.made .. " " .. starved.name .. " in 10 min, all of it for the home silo. Take them from that line while you pack:"
+                .. " point its inserter into a chest, or set_recipe on one of its assemblers to fill a chest; the rate check counts what is made, not what the silo uses."
+                .. " At that rate " .. starved.short .. " more take about " .. math.ceil(starved.short / math.max(starved.made, 1) * 10) .. " minutes, so add assemblers for it in the meantime: " .. recipe_text(starved.name) .. "."
+                .. " Turn the line back to the silo before you board."
         end
         return "Pack the Vulcanus launch kit in your inventory: " .. table.concat(missing, ", ") .. ".",
             "You ride the rocket with your whole inventory, but cargo sent up costs 1 t per rocket and a rocket-silo weighs 10 t. With a silo and one launch of parts on Vulcanus, its metallurgic packs go up to the shuttle. "
             .. recipe_text("rocket-silo") .. " (craft it by hand once you carry the ingredients; collect them from chests and machines). Rocket parts: " .. rocket_part_inputs(force, surface) .. "." .. extra
+    end
+    -- Whatever you took for the kit must flow to the home silo again.
+    local stalled = H.stalled_silo
+    if stalled then
+        return "Feed the Nauvis silo again before you board: " .. stalled.rocket_parts .. "/" .. stalled.parts_required .. " parts, it lacks " .. table.concat(stalled.lacks, ", ") .. ".",
+            "Turn back any inserter or recipe you changed to pack the kit, so the silo at " .. stalled.x .. "," .. stalled.y .. " gets " .. table.concat(stalled.lacks, ", ")
+            .. " again; after you leave nothing can fix it. Each part needs " .. rocket_part_inputs(force, surface) .. "."
     end
     return "Board " .. P.name .. " for Vulcanus.",
         "It waits in orbit until you are aboard, then leaves. Carry what you need to start there besides the launch kit: a cargo-landing-pad (the shuttle drops what you request there); Vulcanus has no water, so solar panels (6x power there) and accumulators, not steam; roboports, construction and logistic robots and a storage chest so place_ghosts works there; chemical plants and assembling-machine-2s (carbon, tungsten carbide), a pumpjack (sulfuric acid geysers), pipes, drills, steel furnaces, belts, inserters, poles. Stand within reach of a silo and call space_platform action=board once: with no rocket ready it books the next one and launches you when it is ready. Do not unship cargo to board."
