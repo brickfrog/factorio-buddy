@@ -1267,10 +1267,12 @@ function M.home_surface(character)
     return surface
 end
 
+local SILO_STALL_TICKS = 3 * 60 * 60
+
 -- The home side of standing supply: silos inside a logistic network's
 -- logistic range, silos with a supply chest, logistic robots, storage
 -- chests, hub imports from home the network holds none of, and a supply
--- silo that cannot finish its rocket for lack of rocket-part ingredients.
+-- silo that made no rocket part for SILO_STALL_TICKS for lack of ingredients.
 local function home_supply(home, force)
     local result = {silos = 0, silos_in_logistic_range = 0, silos_with_supply_chest = 0, logistic_robots = 0, storage_chests = 0, network_lacks = {}}
     local networks = force.logistic_networks[home.name] or {}
@@ -1302,6 +1304,16 @@ local function home_supply(home, force)
             local recipe = prototypes.recipe["rocket-part"]
             local input = silo.get_inventory(defines.inventory.crafter_input)
             local starved = silo.status == defines.entity_status.item_ingredient_shortage or silo.status == defines.entity_status.no_ingredients
+            -- A silo between deliveries also reports a shortage: stalled
+            -- means no new part for SILO_STALL_TICKS (p6 lost six turns to a
+            -- silo climbing 26 -> 33 parts).
+            storage.silo_progress = storage.silo_progress or {}
+            local seen = storage.silo_progress[silo.unit_number]
+            if not seen or seen.parts ~= silo.rocket_parts then
+                seen = {parts = silo.rocket_parts, tick = game.tick}
+                storage.silo_progress[silo.unit_number] = seen
+            end
+            if starved and game.tick - seen.tick < SILO_STALL_TICKS then starved = false end
             if starved and recipe and input then
                 local lacks = {}
                 for _, ingredient in pairs(recipe.ingredients) do

@@ -1638,6 +1638,18 @@ Valid: 40 turns, 26 tool errors (9 from `collect_from_chest`), 0 provider-limite
 
 - **The rate gate punished packing the kit.** It counted rocket parts the silo made, so taking processing units for the kit failed it although Nauvis made just as many. It now counts the rocket-part inputs Nauvis makes in 10 minutes (the scarcest of processing units, low-density structures and rocket fuel). The kit step now says to take the scarce input from the silo line while packing (with the time that takes at the current rate) and to add assemblers meanwhile. A new step before boarding asks to feed the home silo again when it is stalled. Sandbox on p5's save: the goal stays on the kit ("processing-unit 75/250", about 48 minutes at 37 per 10 minutes); `stalled_silo` reports 26/50 parts lacking processing units, which the new step will catch before boarding.
 
+### `p6-cont-p5-opus-open-2590060469-60m`
+
+Valid: 68 of 69 turns completed, 8 tool errors, 0 provider-limited turns. `plate_automation` and `powered_production` are both true.
+- **Kit packed.** Buddy took processing units from the silo line as the new kit step said: 75 → 250 over the hour. He crafted the rocket silo at 01:00:50 and had the full kit at 01:05:09 (silo, 60 processing units, 50 low-density structures, 58 rocket fuel, landing pad).
+- **Feed-the-silo step** from 01:05:52 to 01:12:14, then "Board buddy-1" appeared with 34 seconds of the hour left. Buddy did not board.
+- The feed step read the silo's status at one instant, so it reported a stall while the parts count climbed from 26 to 33. That cost about 6 turns.
+- Processing-unit output stayed at 36–37 per 10 minutes. No new processing-unit or advanced-circuit assemblers were built; assembler 10250 made 11, all from circuits fed by hand. 29 turns made no tool call while the chest filled.
+
+### Fixes after p6
+
+- **A silo between deliveries counted as stalled.** `home_supply.stalled_silo` now needs the silo to report an ingredient shortage and to have made no new rocket part for 3 minutes (`storage.silo_progress` keeps the last parts count and when it changed). Sandbox on p6's save: with the silo working (45 parts, launch, then 10) the goal stays "Board buddy-1 for Vulcanus"; with its inserters disabled and input cleared, 4 game minutes later the goal is "Feed the Nauvis silo again before you board: 45/50 parts, it lacks processing-unit, low-density-structure, rocket-fuel."
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**
