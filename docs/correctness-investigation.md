@@ -1670,6 +1670,23 @@ Valid: 44 turns, 34 tool errors (13 `build_layout` cliff collisions), 0 provider
 - p7's own state cannot recover (the shuttle has no rounds and nothing on Vulcanus makes them), so the chain re-branches from p6's save.
 - p7b (re-run from p6's save) hit the provider limit and was renamed `-capped`.
 
+### `p7c-cont-p6-opus-open-2590060469-60m`
+
+Valid: 32 turns, 29 tool errors in 354 calls, 0 provider-limited turns. `plate_automation` and `powered_production` are true. No metallurgic packs were made.
+- **Boarding worked.** Buddy booked first and rode the next rocket. No rocket left without him. The new "crew_landing" hold kept buddy-1 in Vulcanus orbit until he landed.
+- **The kit was spent at home.** While waiting to board, Buddy fed 3 sets of rocket-part inputs from his kit into the Nauvis silo. On Vulcanus he loaded the other 47. The Vulcanus silo is stuck at 47/50 parts: nothing on Vulcanus makes low-density structures.
+- **buddy-1 was lost.** buddy-1 left Nauvis with 976 rounds and arrived with 427. Buddy then cleared its route (`stops=[]`) "so it won't head home without me". Parked, it shot 381 → 51 rounds in 17 minutes. The `thrust_stock` hold then counted the 47/50 silo as a way to restock it. Asteroids destroyed it on the way home, with 1291 space science packs aboard.
+- **Stranded.** The new platform buddy-2 waited over Nauvis for a starter pack. The step that says how to get one was hidden, because a silo stood on Vulcanus. Buddy spent the last 30 minutes on the foundry, all hand-fed, and crafted it at the end.
+
+### Fixes after p7c
+
+- **The kit is kept.** While Buddy carries a rocket silo, `feed_machine_from_inventory` refuses to put the kit's launch inputs into a silo (`kit_reserved`, with `spare_crafts`). Live test added. Sandbox on p6's save: feeding 3 sets to the Nauvis silo is refused, with 0 to spare.
+- **A silo counts as a way up only if it can finish a rocket.** `space.silo_can_launch` is true when a rocket is built, an inserter loads the silo, or its parts plus the input sets in it and on agents beside it reach 50. The `thrust_stock` hold, `ammo_reachable`, and the Vulcanus home-shuttle step all use it. Sandbox on p7c's final save: the goal is now "Get a space-platform-starter-pack into the Nauvis network for buddy-2", not "Craft a foundry".
+- **Parking away from home is flagged.** `space_platform action=schedule stops=[]` over another planet with no rounds coming returns a warning. A new first Vulcanus step says "Send buddy-1 home to Nauvis now" for an unarmed, parked platform that still has rounds. Sandbox on p7's save with 200 rounds in the hub: the warning and the step both appear.
+- The `unarmed` and `thrust_stock` hold texts no longer say the platform waits for you to board.
+- **Turrets fed from an empty hub are not ready.** `armament` counted an inserter-fed turret as ready with no rounds in it or the hub (JVC-42). Live test added. Sandbox on p7's save: with turrets emptied, `turrets_ready` is 0, where 3 fed turrets counted before.
+- **`collect_from_chest` takes items out of a cargo landing pad** (JVC-41). Live test added. Sandbox on p7's save: 15 steel moved from the Vulcanus pad to Buddy.
+
 ## Comparison with other harnesses
 
 - **[rmalde/minecraft-agent](https://github.com/rmalde/minecraft-agent)**

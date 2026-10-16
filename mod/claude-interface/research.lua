@@ -444,6 +444,28 @@ function M.feed_machine_from_inventory(character, unit_number, crafts, dry_run)
         return expected_miss(result, "pipe_fluid_ingredients")
     end
 
+    -- While you carry a rocket silo, one launch of its parts' inputs is the
+    -- kit for the new planet: feeding them to a silo here leaves the carried
+    -- silo unable to launch (p7c: 3 sets into the Nauvis silo left Vulcanus
+    -- at 47/50 parts, with no low-density structure there to finish it).
+    local carried_inventory = character.get_main_inventory()
+    if is_silo and carried_inventory and carried_inventory.get_item_count("rocket-silo") > 0 then
+        local sets = math.huge
+        for _, ingredient in ipairs(item_ingredients) do
+            sets = math.min(sets, math.floor(carried_inventory.get_item_count(ingredient.name) / ingredient.amount))
+        end
+        local spare = math.max(0, sets - (machine.prototype.rocket_parts_required or 0))
+        if parsed_crafts > spare then
+            result.error_kind = "kit_reserved"
+            result.error = "You carry a rocket silo: " .. tostring(machine.prototype.rocket_parts_required)
+                .. " sets of rocket-part inputs are its first launch. You have " .. tostring(sets) .. " sets, " .. tostring(spare) .. " to spare."
+            result.action_needed = "keep_kit_for_carried_silo"
+            result.spare_crafts = spare
+            add_blocker(result, result.error_kind, result.error)
+            return result
+        end
+    end
+
     local reach_error = characters.require_entity_reach(character, machine)
     if reach_error then
         result.error = reach_error.error

@@ -393,6 +393,9 @@ local function armament(platform)
         end
     end
     local hub_y = platform.hub and platform.hub.valid and platform.hub.position.y or 0
+    if platform.hub and platform.hub.valid then
+        count_ammo(platform.hub.get_inventory(defines.inventory.hub_main).get_contents(), "hub_ammo")
+    end
     for _, turret in pairs(surface.find_entities_filtered{type = "ammo-turret", force = platform.force}) do
         result.turrets = result.turrets + 1
         local inventory = turret.get_inventory(defines.inventory.turret_ammo)
@@ -402,16 +405,15 @@ local function armament(platform)
         end
         if inventory then count_ammo(inventory.get_contents(), "turret_ammo") end
         -- A turret fires what it holds before taking anything better, so weak
-        -- magazines in its slot leave it unready however it is fed.
+        -- magazines in its slot leave it unready however it is fed. An
+        -- inserter feeds it only while the hub holds rounds (p7: 0 everywhere,
+        -- yet fed turrets counted as ready).
         if weak > 0 then
             result.weak_loaded = result.weak_loaded + 1
-        elseif fed[turret.unit_number] or strong >= MIN_LOADED_AMMO then
+        elseif (fed[turret.unit_number] and (strong > 0 or result.hub_ammo > 0)) or strong >= MIN_LOADED_AMMO then
             result.turrets_ready = result.turrets_ready + 1
             if turret.position.y < hub_y then result.front_turrets_ready = result.front_turrets_ready + 1 end
         end
-    end
-    if platform.hub and platform.hub.valid then
-        count_ammo(platform.hub.get_inventory(defines.inventory.hub_main).get_contents(), "hub_ammo")
     end
     result.armed = result.turrets_ready >= MIN_READY_TURRETS and result.front_turrets_ready >= MIN_FRONT_TURRETS
         and result.hub_ammo + result.turret_ammo >= MIN_AMMO and not result.missing_research[1]
@@ -675,8 +677,42 @@ local function supply_chests(silo)
     return chests
 end
 
+-- True when `silo` can finish a rocket: one is built, an inserter loads it,
+-- or its parts plus the whole sets of rocket-part inputs in it and on the
+-- agents beside it reach one launch. A silo short of an input nobody there
+-- can make is no way up (p7c: 47/50 on Vulcanus, with no low-density
+-- structure on the planet, still held the shuttle for thruster fuel).
+function M.silo_can_launch(silo)
+    if silo.rocket_silo_status ~= defines.rocket_silo_status.building_rocket then return true end
+    local box = silo.bounding_box
+    local area = {{box.left_top.x - 2, box.left_top.y - 2}, {box.right_bottom.x + 2, box.right_bottom.y + 2}}
+    for _, inserter in pairs(silo.surface.find_entities_filtered{type = "inserter", force = silo.force, area = area}) do
+        if inserter.drop_target == silo then return true end
+    end
+    local recipe = prototypes.recipe["rocket-part"]
+    local input = silo.get_inventory(defines.inventory.crafter_input)
+    local sets = math.huge
+    for _, ingredient in pairs(recipe and recipe.ingredients or {}) do
+        local count = input and input.get_item_count(ingredient.name) or 0
+        for _, character in pairs(storage.characters or {}) do
+            local inventory = character.valid and character.surface == silo.surface and character.get_main_inventory()
+            if inventory then count = count + inventory.get_item_count(ingredient.name) end
+        end
+        sets = math.min(sets, math.floor(count / ingredient.amount))
+    end
+    return sets ~= math.huge and silo.rocket_parts + sets >= (silo.prototype.rocket_parts_required or 50)
+end
+
+local function launchable_silo(surface, force)
+    for _, silo in pairs(surface.find_entities_filtered{type = "rocket-silo", force = force}) do
+        if M.silo_can_launch(silo) then return true end
+    end
+    return false
+end
+
 -- True when silos on `surface` can resupply a platform: one has a supply
--- chest, or an agent stands there to ship by hand.
+-- chest, or an agent stands there to ship by hand from a silo that can
+-- finish a rocket.
 local function resuppliable(surface, force)
     if not surface then return false end
     local silos = surface.find_entities_filtered{type = "rocket-silo", force = force}
@@ -685,24 +721,22 @@ local function resuppliable(surface, force)
     end
     if not silos[1] then return false end
     for _, character in pairs(storage.characters or {}) do
-        if character.valid and character.surface == surface then return true end
+        if character.valid and character.surface == surface then return launchable_silo(surface, force) end
     end
     return false
 end
 
 -- True when piercing rounds can reach a platform over `surface`: a silo
 -- there has a supply chest, or an agent there holds rounds beside a silo
--- that has started a rocket. An agent and an empty silo are not enough
+-- that can finish a rocket. An agent and an empty silo are not enough
 -- (p7: buddy-1 waited over Vulcanus for rounds nobody there had).
 local function ammo_reachable(surface, force)
     if not surface then return false end
     local silos = surface.find_entities_filtered{type = "rocket-silo", force = force}
-    local building = false
     for _, silo in pairs(silos) do
         if supply_chests(silo)[1] then return true end
-        if silo.rocket_parts > 0 or silo.rocket_silo_status == defines.rocket_silo_status.rocket_ready then building = true end
     end
-    if not building then return false end
+    if not launchable_silo(surface, force) then return false end
     for _, character in pairs(storage.characters or {}) do
         local inventory = character.valid and character.surface == surface and character.get_main_inventory()
         if inventory and (inventory.get_item_count("piercing-rounds-magazine") + inventory.get_item_count("uranium-rounds-magazine")) > 0 then return true end
@@ -755,9 +789,10 @@ end
 --   shuttle there without crew.
 local function hold_reason(platform, destination)
     local here = platform.space_location and game.get_surface(platform.space_location.name)
-    -- Crew aboard can land and ship, where the planet below has a silo.
+    -- Crew aboard can land and ship, where the planet below has a silo
+    -- that can finish a rocket.
     local restockable = resuppliable(here, platform.force)
-        or (here ~= nil and crewed(platform) and here.find_entities_filtered{type = "rocket-silo", force = platform.force, limit = 1}[1] ~= nil)
+        or (here ~= nil and crewed(platform) and launchable_silo(here, platform.force))
     local arms = armament(platform)
     local away = here ~= nil and here.name ~= "nauvis"
     if not arms.armed and (not away or ammo_reachable(here, platform.force) or arms.hub_ammo + arms.turret_ammo == 0) then return "unarmed" end
@@ -3403,12 +3438,18 @@ local function action_schedule(character, platform, stops)
     M.tend_platforms()
     local result = platform_summary(platform)
     result.success = true
+    local location = platform.space_location
+    local orbit = location and game.get_surface(location.name)
+    if #stops == 0 and orbit and orbit.name ~= "nauvis" and not ammo_reachable(orbit, force) then
+        result.warning = "Parked over " .. orbit.name .. " with no rounds coming, " .. platform.name
+            .. " shoots its ammo at drifting asteroids and then takes hull damage (p7c: 381 rounds down to 51 in 17 minutes; it was then destroyed flying home). Keep it on its route unless it must wait here."
+    end
     if result.departure_held == "unarmed" then
         local a = result.armament
         result.guidance = "Course set, but " .. platform.name .. " stays parked until it is armed: asteroids destroy it on the way. It has "
-            .. a.needs .. ". It leaves by itself once armed and you are aboard."
+            .. a.needs .. ". It leaves by itself once armed."
     elseif result.departure_held == "thrust_stock" then
-        result.guidance = "Course set, but " .. platform.name .. " stays parked until its hub holds the thruster-fuel ingredients for the trip (thrust_short): ship them, then it leaves once you are aboard."
+        result.guidance = "Course set, but " .. platform.name .. " stays parked until its hub holds the thruster-fuel ingredients for the trip (thrust_short): ship them or let its crushers make them, then it leaves by itself."
     elseif result.departure_held == "no_supply_line" then
         result.guidance = "Course set, but " .. platform.name .. " stays parked: nothing could restock it or you after it leaves. Before the first trip, give a silo here a supply chest and the platform standing supply (space_platform action=supply); see progression for the next step."
     elseif result.departure_held == "no_crew" then

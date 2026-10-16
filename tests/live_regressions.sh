@@ -7215,6 +7215,27 @@ local machine = c.surface.find_entities_filtered{name = 'assembling-machine-1', 
 if machine then machine.destroy() end
 " >/dev/null
 
+# Shuttle deliveries land in the cargo landing pad; collect_from_chest must
+# take them out (p7: it rejected the pad on Vulcanus).
+PAD_COLLECT_UNIT="$(raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local s = c.surface
+local spot = s.find_non_colliding_position('cargo-landing-pad', {c.position.x + 6, c.position.y}, 12, 1)
+local pad = s.create_entity{name = 'cargo-landing-pad', position = spot, force = c.force}
+pad.get_inventory(defines.inventory.cargo_landing_pad_main).insert{name = 'iron-gear-wheel', count = 5}
+storage.live_pad_collect_spot = pad.position
+rcon.print(pad.unit_number)
+")"
+assert_json "collect_from_chest takes delivered items out of a cargo landing pad" \
+    "$(tool_payload "$(mcp_tool collect_from_chest "$(jq -cn --argjson unit "$PAD_COLLECT_UNIT" '{unit_number:$unit, item:"iron-gear-wheel", count:3}')")")" \
+    '.success == true and .transferred == 3'
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+c.get_main_inventory().remove{name = 'iron-gear-wheel', count = 3}
+local pad = c.surface.find_entities_filtered{name = 'cargo-landing-pad', position = storage.live_pad_collect_spot, radius = 0.5}[1]
+if pad then pad.destroy() end
+" >/dev/null
+
 # A rocket silo is a crafting machine with the fixed rocket-part recipe:
 # feed_machine_from_inventory accepts one launch of parts (50 crafts, past the
 # 20-craft cap of other machines) and loads its input. The executed load stays
@@ -7257,6 +7278,22 @@ rcon.print(helpers.table_to_json(out))
 ")"
 assert_json "the rocket silo input holds the loaded rocket-part ingredients" "$SILO_FEED_WORLD" \
     'to_entries | length == 3 and all(.[]; .value.silo == 30 and .value.character == 20)'
+# Carrying a rocket silo, one launch of its inputs is the kit: none of it may
+# go into a silo here (p7c fed 3 sets to Nauvis and Vulcanus stuck at 47/50).
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+storage.live_silo_feed_carried_silos = c.get_main_inventory().get_item_count('rocket-silo')
+c.get_main_inventory().insert{name = 'rocket-silo', count = 1}
+rcon.print('ok')" >/dev/null
+assert_json "feed_machine_from_inventory keeps a carried silo's launch kit" \
+    "$(tool_payload "$(mcp_tool feed_machine_from_inventory "$(jq -cn --argjson unit "$SILO_FEED_UNIT" '{unit_number:$unit, crafts:1}')")")" \
+    '.success == false and .error_kind == "kit_reserved" and .spare_crafts == 0'
+raw_lua "
+local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
+local inv = c.get_main_inventory()
+inv.remove{name = 'rocket-silo', count = inv.get_item_count('rocket-silo')}
+if storage.live_silo_feed_carried_silos > 0 then inv.insert{name = 'rocket-silo', count = storage.live_silo_feed_carried_silos} end
+rcon.print('ok')" >/dev/null
 raw_lua "
 local c = remote.call('claude_interface', 'get_character', '$AGENT_ID')
 local inv = c.get_main_inventory()
@@ -7992,6 +8029,34 @@ assert_json "an unarmed platform is held in orbit when scheduled away" \
     '.success == true and .departure_held == "unarmed" and .stops == ["vulcanus"] and .space_location == "nauvis" and .armament.armed == false'
 sleep 3
 assert_json "the held platform stays at Nauvis" "$(sa_platform)" '.space_location == "nauvis" and .departure_held == "unarmed"'
+# An inserter feeds a turret only while the hub holds rounds: a fed, empty
+# turret with none in the hub is not ready (p7 counted them).
+raw_lua "
+local s = game.surfaces['$SA_SURFACE']
+local hub = s.find_entities_filtered{name = 'space-platform-hub'}[1]
+local bx, hy = math.floor(hub.bounding_box.left_top.x), math.floor(hub.position.y)
+local tiles = {}
+for dx = 1, 4 do for dy = -1, 2 do tiles[#tiles + 1] = {name = 'space-platform-foundation', position = {bx - dx, hy + dy}} end end
+s.set_tiles(tiles)
+-- Facing east it picks up from the hub on its right and drops to its left.
+s.create_entity{name = 'inserter', position = {bx - 0.5, hy + 0.5}, direction = defines.direction.east, force = 'player'}
+s.create_entity{name = 'gun-turret', position = {bx - 2, hy + 1}, force = 'player'}
+rcon.print('ok')" >/dev/null
+sleep 1
+SA_FED="$(raw_lua "
+local s = game.surfaces['$SA_SURFACE']
+local hub = s.find_entities_filtered{name = 'space-platform-hub'}[1]
+local inserter = s.find_entities_filtered{name = 'inserter'}[1]
+rcon.print(helpers.table_to_json({
+    fed = inserter ~= nil and inserter.pickup_target == hub and inserter.drop_target ~= nil and inserter.drop_target.name == 'gun-turret',
+    hub_rounds = hub.get_inventory(defines.inventory.hub_main).get_item_count('piercing-rounds-magazine')}))
+")"
+require_json "a hub-fed gun turret fixture exists" "$SA_FED" '.fed == true and .hub_rounds == 0'
+assert_json "a fed turret with no rounds in it or the hub is not ready" "$(sa_platform)" \
+    '.armament.turrets >= 1 and .armament.turrets_ready == 0'
+raw_lua "
+for _, e in pairs(game.surfaces['$SA_SURFACE'].find_entities_filtered{name = {'inserter', 'gun-turret'}}) do e.destroy() end
+rcon.print('ok')" >/dev/null
 assert_json "space_platform schedules a stop" \
     "$(tool_payload "$(mcp_tool space_platform "$SA_SPEC,\"action\":\"schedule\",\"stops\":[\"nauvis\"]}")")" \
     '.success == true and .stops == ["nauvis"]'

@@ -577,6 +577,17 @@ end
 local function vulcanus_rung(here, force, character, S)
     local inventory = character.get_main_inventory()
     local function have(item) return inventory and inventory.get_item_count(item) or 0 end
+    -- A platform parked here without rounds coming burns what it has on
+    -- drifting asteroids (p7c: buddy-1, paused with stops=[], went 381 -> 51
+    -- rounds in 17 minutes and was destroyed flying home).
+    for _, platform in ipairs(S.platforms or {}) do
+        local a = platform.armament or {}
+        if platform.space_location == "vulcanus" and (platform.stops or {})[1] == nil and not a.armed and (a.turret_ammo or 0) + (a.hub_ammo or 0) > 0 then
+            return "Send " .. platform.name .. " home to Nauvis now: parked here it shoots its last rounds at asteroids.",
+                "space_platform action=schedule platform=" .. platform.name .. " stops=[\"nauvis\",\"vulcanus\"]: it has " .. ((a.turret_ammo or 0) + (a.hub_ammo or 0))
+                .. " rounds and leaves by itself (see departure_held); Nauvis rearms it and it comes back by itself. Nothing on Vulcanus makes rounds yet." .. REMOTE_HOME
+        end
+    end
     if not tech_done(force, "tungsten-carbide") then
         return "Mine a big volcanic rock: it unlocks tungsten-carbide research.",
             "find_nearest_minable big-volcanic-rock, walk_to it, mine_at it. Rocks drop tungsten-ore (no drill you have can mine tungsten ore patches), calcite, coal and iron and copper ore." .. REMOTE_HOME
@@ -685,7 +696,13 @@ local function vulcanus_rung(here, force, character, S)
             if (platform.armament or {}).armed then armed_here = true else stranded = platform end
         end
     end
-    if not armed_here and not silo_here and (here.counts["cargo-landing-pad"] or 0) > 0 then
+    -- A silo that cannot finish a rocket is no way up either (p7c: 47/50
+    -- parts with no low-density structure on Vulcanus hid this rung).
+    local silo_up = false
+    for _, silo in pairs(character.surface.find_entities_filtered{type = "rocket-silo", force = force}) do
+        if space.silo_can_launch(silo) then silo_up = true break end
+    end
+    if not armed_here and not silo_up and (here.counts["cargo-landing-pad"] or 0) > 0 then
         local goal, how = home_shuttle_rung(S, stranded, force)
         if goal then return goal, how end
     end
